@@ -144,3 +144,38 @@ export class WorkerExecutionError extends FactoryError {
     this.cause = cause;
   }
 }
+
+/**
+ * A row read back from durable storage does not have the shape a domain
+ * value is required to have (TASK-002: "validate data loaded from
+ * persistence rather than assuming stored rows are valid TypeScript
+ * values"). Distinct from a bug in this codebase: it signals the database
+ * file itself contains something this version of the Factory did not write.
+ */
+export class PersistenceCorruptionError extends FactoryError {
+  constructor(message: string) {
+    super(message, "PERSISTENCE_CORRUPTION");
+  }
+}
+
+/** The database file's schema_meta version does not match what this build expects. */
+export class SchemaVersionError extends FactoryError {
+  constructor(message: string) {
+    super(message, "SCHEMA_VERSION_MISMATCH");
+  }
+}
+
+/**
+ * The database's `schema_version` marker matches this build (or is entirely
+ * absent from an otherwise non-empty database), but the actual table/column/
+ * constraint/index shape does not match what this build requires — e.g. a
+ * hand-edited or partially-initialized table that is missing the
+ * `PRIMARY KEY` an append-only guarantee depends on. Distinct from
+ * `SchemaVersionError` (a known-but-unsupported version marker) and
+ * `PersistenceCorruptionError` (a single row's data, not the table shape).
+ */
+export class SchemaIntegrityError extends FactoryError {
+  constructor(message: string) {
+    super(message, "SCHEMA_INTEGRITY_VIOLATION");
+  }
+}

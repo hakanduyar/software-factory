@@ -2,11 +2,16 @@
  * Shared test fixtures. Deterministic clock and ids so assertions are exact.
  */
 
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { FactoryService } from "../../src/app/factoryService.js";
 import { createInMemoryStore } from "../../src/adapters/memory/inMemoryStore.js";
 import { createLocalHumanIdentityGate } from "../../src/adapters/security/localHumanIdentityGate.js";
 import { createLocalWorkerRegistry } from "../../src/adapters/security/localWorkerRegistry.js";
 import { createMockWorker } from "../../src/adapters/workers/mockWorker.js";
+import { createSqliteStore, type SqliteFactoryStore } from "../../src/adapters/sqlite/sqliteStore.js";
 import { agent, human, system } from "../../src/domain/actor.js";
 import { createSequentialIdGenerator } from "../../src/domain/ids.js";
 import type { FactoryRole } from "../../src/domain/role.js";
@@ -45,6 +50,56 @@ export function newFactory(): TestFactory {
     workerRegistry: createLocalWorkerRegistry(clock),
   });
   return { factory, clock, store };
+}
+
+const createdTempDirs: string[] = [];
+
+/**
+ * A fresh temp-directory database path. Every directory created this way is
+ * tracked and removed by `cleanupTempDbs()` — call that from an `after()` in
+ * any test file that uses this, rather than relying on OS temp cleanup
+ * (Round-2 review, LOW finding).
+ */
+export function tempDbPath(prefix = "factory-test-"): string {
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  createdTempDirs.push(dir);
+  return join(dir, "factory.db");
+}
+
+/** Removes every temp directory `tempDbPath()` has created so far, best-effort. */
+export function cleanupTempDbs(): void {
+  while (createdTempDirs.length > 0) {
+    const dir = createdTempDirs.pop();
+    if (dir !== undefined) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+}
+
+export interface TestSqliteFactory {
+  readonly factory: FactoryService;
+  readonly clock: Clock;
+  readonly store: SqliteFactoryStore;
+  readonly dbPath: string;
+}
+
+/**
+ * A FactoryService backed by a real SQLite file at `dbPath` (or `:memory:`
+ * for a throwaway one). Reusing the same `dbPath` across two calls, with the
+ * first store closed in between, is exactly the restart scenario TASK-002
+ * must prove — see tests/persistenceRestart.test.ts.
+ */
+export function newSqliteFactory(dbPath: string = ":memory:"): TestSqliteFactory {
+  const clock = createFixedClock(FIXTURE_START);
+  const store = createSqliteStore(dbPath);
+  const factory = new FactoryService({
+    store,
+    clock,
+    ids: createSequentialIdGenerator(),
+    identityGate: createLocalHumanIdentityGate({ credential: TEST_CREDENTIAL, clock }),
+    workerRegistry: createLocalWorkerRegistry(clock),
+  });
+  return { factory, clock, store, dbPath };
 }
 
 /** A bare WorkItem in an arbitrary status, for pure workflow-table tests. */

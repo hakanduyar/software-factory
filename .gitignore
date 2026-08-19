@@ -3,3 +3,12 @@ dist/
 *.tsbuildinfo
 .env
 .env.*
+
+# Local SQLite persistence (TASK-002) — runtime data, never committed.
+.factory-data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+*.db-wal
+*.db-shm

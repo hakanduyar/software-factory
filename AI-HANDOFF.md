@@ -1,565 +1,622 @@
 # AI HANDOFF
 
-Status: REMEDIATED_ROUND_6_AWAITING_RE_REVIEW
-Current task: TASK-001
-Plan version: bootstrap-v1
+Status: IMPLEMENTED_AWAITING_VERIFICATION
+Current task: TASK-002
+Plan version: persistence-v1
+
+Prior task: TASK-001 (Local Factory Core Skeleton) shipped as commit
+`5071079` after six independent review rounds. Its full implementer/reviewer
+history is archived at `docs/tasks/archive/TASK-001-AI-HANDOFF.md`.
 
 ## Implementer output
 
-### Round 1 (Claude Code / Opus 5, IMPLEMENTATION ENGINEER)
-Implemented the local Factory core skeleton: domain types, an explicit workflow
-transition table, a gate guard for the four protected approvals, in-memory
-repository adapters, a provider-neutral worker port with a deterministic mock
-worker, a FactoryService application layer, and an `sf` CLI with a demo flow.
-Independent review (Codex-class, see below) returned CHANGES_REQUIRED with
-3 CRITICAL, 4 HIGH and 2 MEDIUM findings.
+Worker: Claude Code (Sonnet 5), role IMPLEMENTATION ENGINEER.
 
-### Round 2 — remediation (Claude Code / Fable 5, IMPLEMENTATION ENGINEER)
-Closed every CRITICAL and HIGH finding, plus the architectural-prerequisite
-MEDIUM findings, without weakening `docs/FACTORY_CONSTITUTION.md`. Summary of
-what changed, mapped to the reviewer's findings:
+Wrote `docs/tasks/TASK-002-persistence.md` before implementation (per
+protocol), then added a second `FactoryStore` adapter — `src/adapters/sqlite/`
+— backed by `node:sqlite` (built into Node since 22.5; zero new npm
+dependencies, no ORM). It satisfies the exact same port
+(`src/ports/repositories.ts`) as the in-memory adapter, so **no line of
+`src/domain/`, `src/workflow/`, or `src/app/factoryService.ts` changed**. The
+port itself was not weakened.
 
-1. **Hollow-DONE CRITICAL** — the transition table (`src/workflow/transitions.ts`)
-   now carries a `precondition` on `IMPLEMENTING -> VERIFYING`,
-   `VERIFYING -> REVIEW`, `REVIEW -> WAITING_FOR_HUMAN` and
-   `WAITING_FOR_HUMAN -> DONE`. Each precondition (`src/workflow/preconditions.ts`)
-   reads real Run/Review/AcceptanceCriterionVerification records — never a
-   worker's claim — and is revision-bound. A work item can no longer reach
-   DONE by traversing statuses with zero runs and zero evidence.
-2. **BLOCKED plan-gate-bypass CRITICAL** — `WorkItem` gained `blockedFrom`
-   (`src/domain/workItem.ts`); `WorkflowService` now refuses any resume target
-   other than the exact status the item was blocked from
-   (`src/workflow/workflowService.ts`), even though the transition table still
-   declares `BLOCKED -> READY` as a row (because READY is itself a legitimate
-   blockable origin). `ANALYSIS -> BLOCKED -> READY` no longer skips
-   PLAN_REVIEW/PLAN_APPROVAL.
-3. **Caller-asserted HUMAN CRITICAL** — added a trusted-human boundary:
-   `TrustedHumanToken` (`src/domain/humanIdentity.ts`), the
-   `HumanIdentityGate` port (`src/ports/humanIdentityGate.ts`), and a local,
-   credential-checked, HMAC-signed implementation
-   (`src/adapters/security/localHumanIdentityGate.ts`). No external auth
-   infrastructure was added, per the task's constraint — the boundary is a
-   locally-configured shared secret that a Worker adapter is never given.
-   `FactoryService.recordApproval` now rejects any actor without a token that
-   verifies for that exact actor (`src/app/factoryService.ts`).
-4. **Reviewer-independence-by-string HIGH** — `RecordReviewInput` now takes a
-   `reviewerRunId`, not a caller-supplied `reviewerId` string; the reviewer's
-   identity and independence are derived from a real, `SUCCEEDED`,
-   `REVIEWER`-role Run (`src/app/factoryService.ts`). A passing review is now
-   a hard precondition, not optional, for `REVIEW -> WAITING_FOR_HUMAN`.
-5. **Approvals not bound to plan/spec version HIGH** — `WorkItem` gained a
-   `revision` counter, bumped only on the four "sent back for rework" edges
-   (`PLAN_REVIEW -> ANALYSIS`, `VERIFYING -> IMPLEMENTING`,
-   `REVIEW -> IMPLEMENTING`, `WAITING_FOR_HUMAN -> IMPLEMENTING`); ordinary
-   forward progress does not bump it, so evidence recorded earlier in the same
-   attempt stays valid all the way to DONE. `Approval.context.revision` is
-   stamped by `FactoryService` from the work item itself — never
-   caller-supplied — and `evaluateGate`/`requireGate`
-   (`src/workflow/gateGuard.ts`) refuse a stale approval whose recorded
-   revision no longer matches. A later REJECTED decision still revokes an
-   earlier APPROVED one (unchanged, already correct).
-6. **Worker exceptions leave RUNNING runs HIGH** — `FactoryService.runWorker`
-   now wraps `worker.execute()` in try/catch: on throw, it persists the Run as
-   FAILED with a failure summary and a NOTE evidence record, then rethrows
-   `WorkerExecutionError`. A FAILED run (from a throw or a normal FAILED
-   outcome) never satisfies the `IMPLEMENTING -> VERIFYING` precondition.
-7. **No AC verification path HIGH** — added `AcceptanceCriterionVerification`
-   (`src/domain/acceptanceCriterionVerification.ts`) and
-   `FactoryService.verifyAcceptanceCriteria`, which derives PASSED/FAILED
-   per criterion from a successful VERIFIER run's own recorded Evidence
-   (matched via a new `Evidence.criterionId` field, not text parsing) — never
-   from `claimsAcceptanceMet`. `WAITING_FOR_HUMAN -> DONE` requires every
-   criterion PASSED at the current revision. `createWorkItem` now also
-   requires at least one acceptance criterion.
-8. **Synchronous approval lookup MEDIUM** — `ApprovalRepository.listBySubject`
-   is now `Promise`-returning like every other repository method;
-   `evaluateGate`/`requireGate`/`WorkflowService.check`/`transition` are all
-   async (`src/workflow/gateGuard.ts`, `src/workflow/workflowService.ts`).
-   `WorkItemRepository` was split into `create` (new item) and
-   `compareAndSave` (optimistic-concurrency update via a new `WorkItem.version`
-   counter, bumped on every write) so a real filesystem/SQLite/PostgreSQL
-   adapter has a concurrency-safe contract to implement, without needing to
-   build one now.
-9. **Concurrency / lost update** (self-identified while fixing #8) —
-   `compareAndSave` throws `ConcurrencyError` when the stored version has
-   moved on; see `tests/concurrency.test.ts` for a genuine two-writer race.
-10. **Audit integrity** (self-identified while fixing #8) — Evidence, Review,
-    Approval and AcceptanceCriterionVerification tables are append-only
-    (`AppendOnlyViolationError` on id reuse); every object returned by the
-    in-memory store is deep-frozen (`src/domain/freeze.ts`) so a caller
-    cannot mutate stored state through a held reference.
-11. **Untracked duplicate MEDIUM** — confirmed `software-factory-bootstrap/`
-    was a byte-identical copy of the tracked bootstrap docs (`diff -rq`
-    showed no differences beyond files this task itself edited) and removed
-    it. No unique content was deleted.
+### Design
 
-Commands run (see below for the final clean-state run):
-- `npm install --registry=https://registry.npmjs.org` — OK (the npmrc-configured
-  registry `registry.hmb.gov.tr` did not resolve from this machine)
+- **Schema** (`src/adapters/sqlite/schema.ts`): eight tables, one per
+  repository, each storing the full domain record as a JSON `data` column
+  (domain values are already JSON-safe — see TASK-001's `Timestamp`/
+  `deepFreeze` work) plus the columns each method needs to query or enforce
+  invariants on without parsing JSON first: `work_items.version` (CAS token),
+  `runs.status` (lifecycle guard), and `work_item_id` / `subject_type`+
+  `subject_id` indexes for the `listByX` queries. A `schema_meta` table
+  stamps a `schema_version`; opening a database written by a different
+  version throws `SchemaVersionError` rather than guessing (the "smallest
+  sensible" versioning baseline the task asked for — no migration runner).
+- **Serialization** (`src/adapters/sqlite/serialization.ts`): every row read
+  back from disk is validated field-by-field (enum membership, numeric
+  finiteness, array shape) before being trusted as a domain value, not cast.
+  A malformed row throws `PersistenceCorruptionError`.
+- **Transactions**: SQLite provides real ACID transactions, so unlike the
+  in-memory adapter's staged-overlay-plus-revalidation, this adapter writes
+  directly inside `BEGIN IMMEDIATE` / `COMMIT` / `ROLLBACK`. `node:sqlite`'s
+  `DatabaseSync` is one synchronous connection — two overlapping transactions
+  on it is a hard SQLite error, and letting one write slip into another's
+  open transaction would be worse than not atomic. A small FIFO in-process
+  mutex (`createMutex` in `sqliteStore.ts`) serializes every `transaction()`
+  call — including the single-operation ones each top-level repository
+  method opens, mirroring the in-memory adapter's `solo` helper — so exactly
+  one logical unit of work ever touches the connection at a time.
+- **CAS and run lifecycle**: real conditional SQL — `UPDATE work_items SET
+  ... WHERE id = ? AND version = ?` and `UPDATE runs SET ... WHERE id = ? AND
+  status = 'RUNNING'` — checked via `changes`, rather than comparing
+  separately-read values.
+- **Append-only tables**: SQLite's own `PRIMARY KEY` `UNIQUE` constraint; the
+  violation is translated to `AppendOnlyViolationError`.
+- **Shared logic, not duplicated**: `captureRun`/`captureCompletion` (the
+  Round-4/5 single-read-before-validate defense against hostile getters) were
+  extracted from the in-memory adapter into `src/adapters/shared/
+  runCapture.ts` and are now used by **both** adapters, so this guarantee
+  cannot silently diverge between them (the in-memory adapter's behavior is
+  unchanged — this was a pure extraction, re-verified by the full existing
+  suite staying green).
+
+### One genuine, documented behavioral difference
+
+The in-memory adapter's `transaction()` opens an independent overlay per
+call, so two *concurrent* calls can each read the same pre-race snapshot and
+race on the final write (one wins, one gets `ConcurrencyError`). The SQLite
+adapter's mutex fully serializes transactions, so a second transaction's read
+always sees the first's already-committed result — closer to a real
+database's behavior under `BEGIN IMMEDIATE`. Concretely: two concurrent
+`FactoryService.advance()` calls can produce one CAS-rejected loser against
+the in-memory store; against SQLite, the second call's fresh read may find a
+*different* legitimate transition and succeed too, rather than losing a race.
+Neither is a bug — races are still never allowed to corrupt state or
+double-apply a change — but two of my first-draft rollback tests assumed the
+in-memory adapter's specific interleaving and had to be rewritten around a
+genuinely stale externally-held snapshot instead of a same-process race; see
+`tests/persistenceRollback.test.ts` for the corrected tests and the comments
+explaining why. This is documented in the README's persistence section.
+
+### Restart and rollback proof
+
+- `tests/persistenceRestart.test.ts`: builds a fully-released work item
+  through one store instance, closes it, opens a second instance against the
+  same file, and confirms identical status/version/specRevision/history plus
+  every run/evidence/review/approval/criterion-verification, and that a
+  brand-new `FactoryService` on the reopened store still enforces every
+  invariant (forged cancellation refused, a new worker run succeeds).
+- `tests/persistenceRollback.test.ts`: an append-only violation mid-
+  transaction, a thrown worker, a concurrent run-start race, and a
+  stale-snapshot write are each proven to leave no partial write.
+- `tests/support/storeContract.ts` + `tests/sqliteStore.test.ts`: the same
+  CAS/append-only/run-lifecycle/atomicity/frozen-return/Date-rejection/
+  insertion-order assertions run against **both** adapters from one shared
+  test body, proving parity (acceptance criterion 5).
+- `sf demo:persistent` / `npm run demo:persistent`: seeds a full lifecycle to
+  DONE, closes and reopens the store in-process, then — run a second time as
+  a genuinely new OS process — reads back the same state with no re-seeding.
+  Manually verified twice in a row from a clean `.factory-data/`; also
+  covered headlessly by `tests/persistentDemo.test.ts`.
+
+### Commands run (clean state)
+
+- `rm -rf node_modules dist` → `npm install --registry=https://registry.npmjs.org` — OK (default registry unreachable from this machine, same as TASK-001)
 - `npm run typecheck` — PASS
 - `npm run build` — PASS
-- `npm test` — 131 tests, 131 pass, 0 fail (up from 69; +62 test cases across
-  8 test files, 3 of them new: `preconditions.test.ts`, `concurrency.test.ts`,
-  `auditIntegrity.test.ts`)
-- `npm run demo` — reached DONE via the full path; refused all 10 bypass
-  attempts (up from 5), one for each remediation above
-- `git diff --check` — clean, no whitespace errors
+- `npm test` — **219 tests, 219 pass, 0 fail** (up from 188 at the end of TASK-001; +31 new tests across 6 new test files)
+- `npm run demo` (in-memory) — unchanged: DONE, 15 refusals
+- `npm run demo:persistent` — run twice from a clean `.factory-data/`: first run seeds to DONE and proves in-process restart; second run (new OS process) reads back identical state with no re-seeding
+- `git diff --check` — clean
+- `git status --short` — inspected; `.factory-data/` correctly absent (gitignored)
 
-Not done by the implementer, by design: no commit, no push, no merge;
-TASK-002 was not started; no GitHub/n8n/Telegram/server/real-provider
-integration was added; the Constitution was not modified.
+### Files created/modified
 
-### Round 3 — remediation (Claude Code / Fable 5, IMPLEMENTATION ENGINEER)
-Round-2 re-review found that per-case guards kept being circumvented. This
-round replaced the guards with four root invariants rather than adding more
-special cases. `docs/FACTORY_CONSTITUTION.md` was not modified.
+Created: `docs/tasks/TASK-002-persistence.md`, `docs/tasks/archive/TASK-001-AI-HANDOFF.md` (archival copy), `src/adapters/sqlite/{schema,serialization,sqliteStore}.ts`, `src/adapters/shared/runCapture.ts`, `src/cli/persistentDemo.ts`, `tests/{sqliteStore,persistenceRestart,persistenceRollback,persistentDemo}.test.ts`, `tests/support/storeContract.ts`.
 
-**Step 1 — reproduced first.** `tests/round2Exploits.test.ts` was written
-against the Round-2 code and confirmed failing before any fix: 7 tests, 0
-pass, 7 fail, each for the correct reason ("Missing expected rejection: a plan
-approval must only be grantable while the item is at PLAN_REVIEW"; "... a
-worker must not review its own run by renaming itself"; "... a terminal run
-must never be rewritten as SUCCEEDED"; "... cancellation must require trusted
-human authorization"; a mutated Date changing a stored record; and "run
-run-0002 is durable but was never attached to the WorkItem (orphan)"). That
-file now holds 19 passing tests.
+Modified: `package.json` (engines bumped to `>=22.5.0`, added `demo:persistent` script), `.gitignore` (runtime DB files), `src/adapters/memory/inMemoryStore.ts` (import shared `captureRun`/`captureCompletion` instead of local duplicates — no behavioral change), `src/cli/main.ts` (added `demo:persistent` command, lazy-imported so plain `sf demo` never loads `node:sqlite`), `src/domain/errors.ts` (added `PersistenceCorruptionError`, `SchemaVersionError`), `tests/support/factoryFixtures.ts` (added `newSqliteFactory`, `tempDbPath`), `README.md`, `LOOP.md`, `LOOP-PLANS.md`, `AI-HANDOFF.md` (reset for TASK-002; TASK-001's full record archived rather than deleted).
 
-**Root-cause fixes.**
-1. *Trusted principals* — `WorkerPrincipal` (`src/domain/workerPrincipal.ts`),
-   the `WorkerRegistry` port and `createLocalWorkerRegistry`, which keys
-   principals on the Worker **object** via a WeakMap. Runs store
-   `workerPrincipalId` (trusted) alongside `declaredWorkerId` (audit only),
-   roles are captured at registration, and C4 compares principals. Renaming,
-   re-roling or aliasing a worker no longer makes it independent of itself,
-   and an unregistered worker cannot run at all.
-2. *Content-addressed release snapshots* — `ReleaseSnapshot`
-   (`src/domain/executionSnapshot.ts`) plus `releaseSnapshotResolver.ts`. The
-   snapshot id hashes the exact implementation run, verifier run,
-   deterministic review, semantic review and criterion-verification ids in
-   force. Verifier/reviewer runs now carry `targetRunId` and criterion
-   verifications carry `implementationRunId`, so a new implementation run
-   orphans all prior proof by construction. `WorkItem.revision` was replaced
-   by `specRevision` (plan identity only) — the counter no longer pretends to
-   track implementation state, which is what Round 2 exploited.
-3. *Status-bound, snapshot-bound approvals* — `GATE_DECISION_STATUS` plus
-   checks in `recordApproval`: PLAN_APPROVAL is only recordable at
-   PLAN_REVIEW, RELEASE_APPROVAL only at WAITING_FOR_HUMAN and only when a
-   complete snapshot exists. Pre-recording at IDEA is now impossible rather
-   than merely ineffective, and the gate guard compares the approval's
-   snapshot hash against the live one.
-4. *Append-only lifecycle* — `RunRepository` lost its general `save`; a run is
-   `create`d RUNNING and `complete`d once, terminal is immutable
-   (`RunLifecycleError`). Timestamps became `Timestamp` (epoch ms) everywhere
-   and `deepFreeze` now throws on any `Date`, so the Round-2 timestamp
-   mutation has no surface left.
-5. *Atomic units of work* — `FactoryStore.transaction` stages writes in an
-   overlay and revalidates every operation against a working copy at commit,
-   applying all-or-nothing. `runWorker`, `advance`, `recordApproval`,
-   `recordReview`, `verifyAcceptanceCriteria` and `createWorkItem` each run as
-   one unit, so a lost CAS race discards the whole operation instead of
-   leaving an orphan run.
-6. *Cancellation is a protected human decision* — the rule flag became
-   `requiresHumanAuthorization` and `WorkflowService` verifies a
-   `TrustedHumanToken` through the identity gate, the same boundary approvals
-   use.
+Not done, by design: no commit, no push, no merge; TASK-003 not started; no Claude/Codex worker execution, model routing, GitHub, n8n, Telegram, server deployment or content pipeline added; no ORM/query-builder dependency; no migration-runner platform (only version detection); the Constitution was not modified.
 
-**Commands run** (final clean-state run below): `npm run typecheck` PASS,
-`npm run build` PASS, `npm test` 158 tests / 158 pass / 0 fail (up from 131),
-`npm run demo` reaches DONE and refuses all 15 bypass attempts,
-`git diff --check` clean.
+## Implementer remediation (Round 2)
 
-Two demo/message defects were found and fixed by the new tests themselves: a
-refusal was mislabelled (it tripped the evidence precondition, not the
-release gate), and the C4 error message embedded a random principal id, which
-broke transcript determinism. The message now names the two run ids instead.
+Worker: Claude Code (Sonnet 5), role IMPLEMENTATION ENGINEER, responding to
+the CHANGES_REQUIRED review below. Both HIGH findings are fixed. Scope was
+kept to `src/adapters/sqlite/{schema,serialization,sqliteStore}.ts`,
+`src/domain/errors.ts`, `tests/support/factoryFixtures.ts` (temp-dir
+cleanup), and one new test file — no TASK-003 work, no port changes, no
+weakening of any TASK-001/TASK-002 invariant.
 
-Not done by the implementer, by design: no commit, no push, no merge;
-TASK-002 was not started; no GitHub/n8n/Telegram/server/real-provider
-integration was added; the Constitution was not modified.
+### 1. Root cause of both HIGH findings
 
-### Round 4 — remediation (Claude Code / Fable 5, IMPLEMENTATION ENGINEER)
-Fixed the five Round-3 findings at the invariant level, no Constitution
-changes, no scope growth.
+- **Finding 1 (schema masquerade):** `ensureSchema()` ran `CREATE TABLE IF
+  NOT EXISTS` unconditionally and only ever checked
+  `schema_meta.schema_version`. A table that kept the right name but lost its
+  `PRIMARY KEY` (or any other constraint/column/index) was never inspected,
+  so it silently passed as "version 1" — losing append-only protection
+  without any error.
+- **Finding 2 (deserialization trusts unchecked data):** the parsers checked
+  JSON shape and enum membership, but (a) never compared the indexed SQL
+  columns (`work_items.version`, `runs.status`, `approvals.subject_id`, ...)
+  against the JSON payload they're supposed to mirror, and (b) didn't
+  validate every domain lifecycle invariant — a WorkItem could carry a
+  negative `version`, and a Run could be RUNNING with `finishedAt` set, and
+  both would be returned as if trusted.
 
-**Step 1 — reproduced first.** `tests/round3Exploits.test.ts` was written
-against the Round-3 code and confirmed failing before any fix: 15 tests,
-3 pass (companion cases already guarded), 12 fail, each for the intended
-reason ("Missing expected rejection" on: DONE after failed implementation B,
-DONE after a later FAIL review, runWorker/recordReview/verify on a DONE item,
-worker ops on CANCELLED, RUNNING and bogus completion statuses; "Missing
-expected exception (TypeError)" on pre-frozen nested arrays; and the smuggled
-nested Date being accepted). That file now holds 15 passing tests.
+### 2. Schema-open invariant introduced
 
-**Root-cause fixes, one per finding:**
-1. *CRITICAL — failed implementation B ignored*: `resolveCurrentImplementation`
-   now selects the newest IMPLEMENTER **attempt** at the current spec revision
-   (lineage head) and fails resolution unless that exact attempt SUCCEEDED.
-   The same lineage rule was applied to verifier attempts. Falling back to an
-   older successful run is structurally impossible; a failed head leaves the
-   item unreleasable until fresh proof exists.
-2. *HIGH — earlier PASS review outranked a later FAIL*: review resolution now
-   selects the **latest applicable** review (semantic and deterministic) in
-   append-only insertion order — deterministic, no timestamp races — and
-   requires that authoritative review to be PASS and independent. PASS->FAIL
-   blocks; FAIL->PASS may re-qualify; a fresh approval is still needed since
-   the snapshot hash changes with the review id.
-3. *HIGH — DONE items writable via runWorker*: one central policy,
-   `FactoryService.requireOperableWorkItem`, refuses runWorker, recordReview
-   and verifyAcceptanceCriteria on DONE and CANCELLED items (checked again
-   inside the run-attachment transaction to close the execute/commit race).
-   Transitions need no extra check: terminal statuses have no outgoing edges.
-4. *MEDIUM — pre-frozen root bypassed deep freeze*: `deepFreeze` no longer
-   short-circuits on `Object.isFrozen(root)`; it traverses through frozen
-   nodes with a visited-set cycle guard, freezing every nested value and
-   still refusing any nested `Date`.
-5. *MEDIUM — `complete` accepted runtime status "RUNNING"*: the repository
-   now validates the completion status at runtime (only SUCCEEDED/FAILED)
-   and copies completion fields explicitly instead of spreading the caller's
-   object, so smuggled runtime fields cannot rewrite a run's identity.
+`ensureSchema()` (`src/adapters/sqlite/schema.ts`) now strictly orders its
+checks so no DDL that could change table structure ever runs against an
+existing database:
 
-**Commands run** (final clean-state run below): `npm run typecheck` PASS,
-`npm run build` PASS, `npm test` 175 tests / 175 pass / 0 fail (up from 158),
-`npm run demo` reaches DONE with 15 refusals, `git diff --check` clean.
-All Rounds 1–3 adversarial coverage re-ran green (round2Exploits.test.ts,
-round3Exploits.test.ts and the 8 prior suites).
+1. Is there a `schema_meta` table at all?
+   - No, and no other Factory-named table exists either → genuinely fresh
+     database; this is the *only* path that runs `SCHEMA_DDL` and stamps the
+     version.
+   - No, but some Factory-named table *does* exist → `SchemaIntegrityError`
+     (a database with Factory tables but no version marker is neither fresh
+     nor trustworthy).
+2. Does `schema_meta` have a `schema_version` row? No → `SchemaIntegrityError`.
+3. Does the stored version match `SCHEMA_VERSION`? No → `SchemaVersionError`,
+   with zero DDL executed before the throw.
+4. Version matches → `validateSchema()` (see below) runs; any mismatch there
+   also throws before any table is used. An existing, version-matched
+   database is validated, never "repaired".
 
-Not done by the implementer, by design: no commit, no push, no merge;
-TASK-002 not started; no external integrations; Constitution untouched.
+### 3. Full-schema validation performed
 
-### Round 5 — remediation (Claude Code / Fable 5, IMPLEMENTATION ENGINEER)
-Fixed the Round-4 blocker (cross-generation criterion proof) and the runtime
-completion-input hardening concern. No Constitution changes, no scope growth.
+`validateSchema()` walks a fixed `EXPECTED_TABLES` spec (kept in sync with
+`SCHEMA_DDL` by hand — TASK-002 intentionally has no schema-derivation
+framework) and, per table, checks via `PRAGMA table_info(...)` and
+`sqlite_master`: the table exists; every expected column exists with the
+right type/`NOT NULL`/`PRIMARY KEY` flags (this is what catches the
+reviewer's exact repro — an `evidence` table missing `PRIMARY KEY` on `id`);
+and every index this adapter's queries rely on
+(`idx_work_items_project_id`, ..., `idx_approvals_subject`) exists. Table
+names interpolated into `PRAGMA table_info("...")` always come from the
+fixed constant, never from external input.
 
-**Step 1 — reproduced first.** `tests/round4Exploits.test.ts` was written
-against the Round-4 code and confirmed failing before any fix: 9 tests,
-3 pass (cases Round 4 already guarded), 6 fail for the intended reasons —
-release still possible after a newer verifier attempt produced a FAILED
-criterion result, after an incomplete newer generation, and with partial
-B results backfilled from A; plus a completion status getter read more than
-once and hostile getters on the run object given to create(). The file now
-holds 9 passing tests.
+### 4. Runtime persisted-record validation introduced
 
-**Root-cause fixes:**
-1. *CRITICAL — criterion proof mixed across verification generations*:
-   `resolveReleaseSnapshot` previously did "find a PASSED record per
-   criterion" filtered only by implementation run. It now restricts criterion
-   records to the CURRENT verification generation — records whose
-   `verifierRunId` is the authoritative (lineage-head) verifier attempt, for
-   the current implementation, at the current spec revision — and takes the
-   latest record per criterion within that generation. An older generation
-   can neither fill a gap nor override a current FAIL. The snapshot hash was
-   already bound to `verifierRunId` + the criterion-verification id set, so a
-   new qualifying generation changes the snapshot id and stales any prior
-   RELEASE_APPROVAL automatically (tested).
-2. *Runtime completion-input hardening*: `RunRepository.create` and
-   `.complete` now capture every caller-supplied field exactly once into a
-   plain internal value (`captureRun`/`captureCompletion`) BEFORE any
-   validation; validation and persistence consult only the captured copy and
-   the caller's object is never re-read. A getter answering "SUCCEEDED" to
-   the validator and "RUNNING" to persistence is neutralised (read-count
-   asserted in tests); identity fields (id, principal, role, targetRunId,
-   specRevision, startedAt) come only from the stored row.
+`src/adapters/sqlite/serialization.ts` gained a `positiveInt` validator (used
+for `WorkItem.version`/`specRevision`, `Run.specRevision`,
+`Review.specRevision`, `AcceptanceCriterionVerification.specRevision`, and
+`ApprovalContext.specRevision` — confirmed always ≥1 by how
+`src/app/factoryService.ts`/`src/workflow/workflowService.ts` initialize and
+increment them) plus two lifecycle-coherence checks:
+- `WorkItem.blockedFrom` is now required iff `status === "BLOCKED"` (and
+  forbidden otherwise), matching `workflowService.ts`'s actual invariant.
+- `Run.finishedAt` is now required iff `status !== "RUNNING"` (terminal), and
+  forbidden while RUNNING, matching `run.ts`'s documented lifecycle.
+- `ApprovalContext.statusWhenDecided` is now validated against
+  `WORK_ITEM_STATUSES` (was a bare string before).
 
-One Round-3 test was updated to match the strengthened boundary: runs are now
-capture-copied, so a caller's retained nested array stays mutable but can no
-longer touch durable state; the test now asserts the durable-state invariant
-(stored copy frozen and unchanged) instead of requiring the caller's own
-array to throw.
+### 5. SQL/JSON cross-checks introduced
 
-**Commands run** (final clean-state run below): `npm run typecheck` PASS,
-`npm run build` PASS, `npm test` 184 tests / 184 pass / 0 fail (up from 175),
-`npm run demo` DONE with 15 refusals, `git diff --check` clean. All Rounds
-1–4 adversarial coverage re-ran green (round2/round3/round4 exploit suites
-plus the 8 core suites).
+Every `parseX` function now takes an `expected` parameter carrying the
+row's indexed SQL columns and throws `PersistenceCorruptionError` (via a new
+shared `crossCheck` helper) on any mismatch against the decoded JSON:
+`Project.id`; `WorkItem.id`/`projectId`/`version`;
+`AcceptanceCriterion.id`/`workItemId`; `Run.id`/`workItemId`/`status`;
+`Review.id`/`workItemId`; `Evidence.id`/`workItemId`;
+`AcceptanceCriterionVerification.id`/`workItemId`;
+`Approval.id`/`subject.type`/`subject.id`. `sqliteStore.ts`'s `SELECT`
+statements were widened to fetch these columns alongside `data`, and every
+call site (`findById`, `listByX`, plus the CAS-conflict lookup inside
+`compareAndSave`) now passes them through. Neither the SQL column nor the
+JSON value is ever preferred silently — any disagreement is a hard refusal.
 
-Not done by the implementer, by design: no commit, no push, no merge;
-TASK-002 not started; no external integrations; Constitution untouched.
+### 6. Proof regression tests failed before fixes
 
-### Round 6 — remediation (Claude Code / Fable 5, IMPLEMENTATION ENGINEER)
-Fixed the Round-5 CRITICAL race: runWorker invoked the worker before the
-RUNNING attempt was durably created, so while a delayed IMPLEMENTER/VERIFIER
-B executed, generation A stayed authoritative, DONE could succeed mid-flight,
-and B then failed to persist against the terminal item.
+New `tests/persistenceCorruption.test.ts` (27 tests) was written and run
+against the pre-fix code first: **15 of 27 failed**, reproducing both HIGH
+findings exactly as described —
+- schema-shape tests (missing `PRIMARY KEY`, missing `version`/`status`
+  column, missing index, tables-without-marker) all failed to throw;
+- the `work_items.version=77` / JSON `version=-1` cross-check, `runs.status`
+  divergence, and `approvals.subject_id` divergence cases all failed to
+  throw;
+- `blockedFrom` incoherence, `Run` RUNNING-with-`finishedAt`,
+  terminal-without-`finishedAt`, and non-positive `specRevision` cases all
+  failed to throw;
+- the negative-version and non-integer-version WorkItem cases failed to
+  throw (the pre-fix `num()` validator accepted any finite number).
 
-**Step 1 — reproduced first.** `tests/round5Exploits.test.ts` uses gated
-workers whose execution pauses deterministically after start. Against
-Round-5 code: 4 tests, 2 fail for the intended reason — "a RUNNING attempt
-must be durable before the worker executes" for both the delayed IMPLEMENTER
-and delayed VERIFIER cases (no audit run existed while the worker ran, and
-DONE succeeded mid-flight). The two race tests passed pre-fix (the
-sequential terminal case was already guarded). All 4 now pass.
+After the fixes above, the same 27/27 pass. The "B" test (incompatible
+version must not mutate) already passed before the fix — `CREATE TABLE/INDEX
+IF NOT EXISTS` were already no-ops against an existing schema — but is kept
+as a permanent regression guard, proven via a full `sqlite_master` +
+row-count snapshot taken before and after the refused open.
 
-**Root-cause fix — three-phase runWorker (`src/app/factoryService.ts`):**
-- PHASE 1 (atomic start): validate operable item + role/state legality +
-  target run, create the Run RUNNING, attach it to the WorkItem under CAS,
-  commit — all BEFORE Worker.execute(). If this transaction fails the worker
-  is never invoked and nothing is durable.
-- PHASE 2 (execute): external call with no transaction held open.
-- PHASE 3 (atomic finalize): persist evidence and complete that exact run
-  (repository refuses unless still RUNNING); touches only run/evidence
-  tables, so a concurrent item change can never orphan the audit record.
-  Success, returned failure and thrown exception all finalize the same run.
+### 7. Files changed
 
-**Supporting invariants:**
-- `resolveReleaseSnapshot` now refuses while ANY attached run is RUNNING
-  (implementer, verifier or reviewer): nothing is releasable while an
-  attempt is in flight, and RELEASE_APPROVAL cannot be minted mid-flight
-  either (it requires a resolvable snapshot).
-- Serialization via the existing CAS/transaction abstraction, no ad-hoc
-  flags: either DONE commits first (PHASE 1's CAS fails; no execution) or
-  PHASE 1 commits first (RUNNING head; DONE refused). Tested: no
-  interleaving lets both succeed.
-- New central role/state policy (`src/workflow/rolePolicy.ts`, code
-  INVALID_OPERATION_STATE): execution roles (IMPLEMENTER/VERIFIER/REVIEWER)
-  start only in IMPLEMENTING/VERIFYING/REVIEW/WAITING_FOR_HUMAN — never
-  before PLAN_APPROVAL gates the item into execution, never in BLOCKED;
-  ANALYST/PLANNER map to the planning states; CONTENT has no startable state
-  in TASK-001 (Roadmap Phase 11). Existing rework/resume behavior unchanged
-  (all prior suites pass unmodified).
+Modified: `src/domain/errors.ts` (added `SchemaIntegrityError`),
+`src/adapters/sqlite/schema.ts` (ordered version/shape validation before any
+DDL, added `EXPECTED_TABLES` + `validateSchema`),
+`src/adapters/sqlite/serialization.ts` (added `positiveInt`, `crossCheck`;
+every `parseX` now takes and checks `expected` metadata; added
+`blockedFrom`/`finishedAt`/`statusWhenDecided` coherence checks),
+`src/adapters/sqlite/sqliteStore.ts` (`SELECT`s widened to fetch indexed
+columns; every parse call site passes them through; added row-shape
+interfaces), `tests/support/factoryFixtures.ts` (added `cleanupTempDbs()`;
+`tempDbPath()` now tracks what it creates — Round-2 LOW finding),
+`tests/persistenceRestart.test.ts` and `tests/persistentDemo.test.ts`
+(wired `after(cleanupTempDbs)`).
 
-**Commands run** (final clean-state run below): `npm run typecheck` PASS,
-`npm run build` PASS, `npm test` 188 tests / 188 pass / 0 fail (up from
-184), `npm run demo` DONE with 15 refusals, `git diff --check` clean. All
-Rounds 1–5 adversarial coverage re-ran green.
+Created: `tests/persistenceCorruption.test.ts` (27 tests: schema integrity,
+SQL/JSON cross-checks, invalid-domain-value rejection).
 
-Not done by the implementer, by design: no commit, no push, no merge;
-TASK-002 not started; no external integrations; Constitution untouched.
+Not touched: the persistence port, the in-memory adapter, domain/workflow
+code, README (out of this round's stated scope), any TASK-003 work.
+
+### 8. Exact verification results (clean state)
+
+- `rm -rf node_modules dist` → `npm install --registry=https://registry.npmjs.org` — OK
+- `npm run typecheck` — PASS
+- `npm run build` — PASS
+- `npm test` — **246 tests, 246 pass, 0 fail** (up from 219; +27 from the new corruption suite)
+- `node --test dist/tests/persistenceCorruption.test.js` — 27/27 pass (run standalone to confirm in isolation)
+- `npm run demo` — DONE, 15 refusals, unchanged
+- `npm run demo:persistent` run twice (seed, then a second real OS process reading back) — unchanged behavior, version 12, runs=3, evidence=6 both times
+- `git diff --check` — clean
+- `git status --short` — matches the files listed above; confirmed no leftover temp directories under `/tmp` after the new/updated tests run (`ls /tmp | grep -E "factory-test-|factory-corrupt-|persistent-demo-"` → empty)
+
+### 9. Remaining limitations
+
+- `EXPECTED_TABLES` in `schema.ts` is hand-kept in sync with `SCHEMA_DDL`
+  rather than derived from one source — acceptable for TASK-002's "no schema
+  framework" scope, but a future migration mechanism should consider
+  generating one from the other.
+- Schema validation checks column name/type/`NOT NULL`/`PRIMARY KEY` and
+  index presence; it does not re-verify `STRICT`/`WITHOUT ROWID` table
+  options or foreign-key definitions (none are relied on for correctness
+  here — `PRAGMA foreign_keys = OFF` is set deliberately, see original
+  design notes above).
+- All prior TASK-002 limitations still apply unchanged (single-writer mutex,
+  no migration runner, local-file-only, `node:sqlite` still experimental
+  upstream).
+
+### 10. Ready for independent re-review: YES
+
+## Implementer remediation (Round 3)
+
+Worker: Claude Code (Sonnet 5), role IMPLEMENTATION ENGINEER, responding to
+the Round-2 re-review's two HIGH and two MEDIUM findings below. All four are
+fixed. Scope stayed inside `src/adapters/sqlite/schema.ts` (the file every
+finding this round is about) plus two new test files and one new shared test
+helper — no other adapter file, port, or domain code changed.
+
+### 1. Root causes
+
+- **HIGH — failed opens still mutated the target DB:** `ensureSchema()` ran
+  `PRAGMA journal_mode = WAL` and `PRAGMA foreign_keys = OFF` unconditionally
+  as its first two statements, before any classification of the database had
+  happened. A refused open (unsupported version, corrupt schema, unrelated
+  DB) still left `journal_mode` changed from `DELETE` to `WAL` — a real,
+  persistent mutation of a database the store was about to reject.
+- **HIGH — unrelated non-empty DB treated as fresh:** the "is this a fresh
+  database" check only asked "does a Factory-named table exist?". A database
+  with unrelated user tables (no Factory tables, no `schema_meta`) has no
+  Factory-named table either, so it satisfied that check and had the full
+  Factory schema silently installed into someone else's database file.
+- **MEDIUM — malformed `schema_meta` could leak a raw SQLite error:** the
+  version lookup (`SELECT value FROM schema_meta WHERE key = ...`) ran
+  immediately once a table named `schema_meta` was found, with no check that
+  it actually had a `value` column. A `schema_meta` missing that column made
+  the query itself throw a raw `ERR_SQLITE_ERROR` ("no such column: value")
+  instead of a controlled `SchemaIntegrityError`.
+- **MEDIUM — index validation checked names, not definitions:** the index
+  check was `SELECT name FROM sqlite_master WHERE type='index' AND name=? AND
+  tbl_name=?` — proof an index with that name exists on that table, not proof
+  of what column(s) it actually indexes. An index recreated under the
+  expected name but over the wrong column (or a composite index with its
+  columns swapped) passed silently.
+
+### 2. Read-only DB classification design
+
+`ensureSchema()` now delegates to a new `classifyDatabase()` that performs
+*only* read-only introspection — `sqlite_master` queries, `PRAGMA
+table_info`/`index_list`/`index_info`, and plain `SELECT`s — and returns one
+of five classifications without ever executing DDL or a mutating `PRAGMA`:
+`EMPTY`, `CURRENT_FACTORY`, `UNSUPPORTED_FACTORY_VERSION` (carries the raw
+stored version string), `CORRUPT_OR_INCOMPLETE_FACTORY` (carries a reason),
+or `NON_FACTORY_NONEMPTY` (carries a reason). `ensureSchema()` then does a
+single `switch` on the result — the *only* place any mutating statement
+executes, and only in the `EMPTY` and `CURRENT_FACTORY` arms.
+
+### 3. When mutating PRAGMAs now execute
+
+`PRAGMA journal_mode = WAL` and `PRAGMA foreign_keys = OFF` now execute in
+exactly two places, both *after* classification has already decided the
+database is safe: the `EMPTY` arm (immediately before the one-time
+`SCHEMA_DDL` + version-stamp insert), and the `CURRENT_FACTORY` arm (after
+`classifyDatabase` has already run full column/index validation on every
+table). Every other arm (`UNSUPPORTED_FACTORY_VERSION`,
+`CORRUPT_OR_INCOMPLETE_FACTORY`, `NON_FACTORY_NONEMPTY`) throws without
+executing a single statement beyond the read-only classification queries.
+
+### 4. Empty vs non-Factory DB rule
+
+`listUserSchemaObjects()` selects every `sqlite_master` row and filters out
+anything whose name starts with `sqlite_` (SQLite's own internal bookkeeping
+objects — `sqlite_sequence`, `sqlite_stat1`, etc.). A database is `EMPTY` iff
+that filtered list has zero rows — no tables, indexes, triggers, or views of
+any kind, Factory or otherwise. Anything else falls through to the
+Factory-marker check (`CORRUPT_OR_INCOMPLETE_FACTORY` if some Factory-named
+table exists without a marker, `NON_FACTORY_NONEMPTY` otherwise) — there is
+no longer a path where "no Factory-named table happens to exist yet" is
+treated as license to initialize.
+
+### 5. `schema_meta` structural validation
+
+`validateTableColumns()` (extracted from the combined column+index validator
+used in Round 2) is called against the `schema_meta` table's own shape
+*before* the version row is ever queried. Only if that structural check
+passes does `classifyDatabase` run `SELECT value FROM schema_meta WHERE key =
+'schema_version'` — wrapped in its own `try/catch` that converts any
+unexpected error into `CORRUPT_OR_INCOMPLETE_FACTORY` rather than letting it
+propagate raw. It also now checks the query returns exactly one row (not
+zero, not more than one — duplicate `schema_version` rows are only possible
+if `schema_meta`'s `PRIMARY KEY` was itself removed, which the structural
+check above would normally already have caught, but the row-count check is a
+second, independent guard). Finally, a `schema_version` value that fails
+`Number.isInteger` is classified `CORRUPT_OR_INCOMPLETE_FACTORY`, not
+`UNSUPPORTED_FACTORY_VERSION` — `SchemaVersionError` is now reserved
+specifically for "a structurally valid Factory schema declares a known,
+well-formed, but unsupported version number."
+
+### 6. Index-definition validation
+
+`ExpectedIndex` now carries `columns: readonly string[]` (in order) and
+`unique: boolean`, not just a bare name. `validateTableIndexes()` looks up
+each expected index via `PRAGMA index_list(table)` (checking existence and
+the `unique` flag), then `PRAGMA index_info(indexName)` — sorted by `seqno`
+— and compares the resulting column sequence element-by-element against the
+expected columns, in order. `idx_approvals_subject`'s expected columns are
+`["subject_type", "subject_id"]`, so a same-named index built as
+`(subject_id, subject_type)` now fails validation. Only the seven indexes
+this adapter's queries actually rely on are declared in `EXPECTED_TABLES`;
+no attempt is made to enumerate or reject indexes the implementation doesn't
+use.
+
+### 7. Proof all four regression cases failed before fixes
+
+New `tests/persistenceSchemaOpening.test.ts` (14 tests, plus a new shared
+`tests/support/dbSnapshot.ts` helper for the "before vs. after a refused
+open" comparisons) was run against the pre-fix code first: **6 of 14
+failed**, reproducing every finding —
+- the journal-mode/full-snapshot test failed (`journal_mode` became `wal`
+  after a refused open);
+- the unrelated-non-empty-database test failed (no throw at all — the
+  Factory schema was installed into it);
+- the "`schema_meta` missing its `value` column" case failed (a raw SQLite
+  error, not `SCHEMA_INTEGRITY_VIOLATION`, propagated);
+- the "non-integer `schema_version` value" case failed (it threw
+  `SCHEMA_VERSION_MISMATCH` instead of `SCHEMA_INTEGRITY_VIOLATION` — the
+  reserved-for-valid-version-only rule from finding 5 above);
+- both wrong-index-definition cases failed (wrong single column; swapped
+  composite-index column order) — the pre-fix code only checked the index
+  name existed.
+
+The remaining 8 (already-empty DB still initializes; internal
+`sqlite_*`-only DB still initializes; missing-PK/no-version-row/duplicate-
+rows/wrong-column-type `schema_meta` cases; missing-index and
+correct-index-passes cases) already passed pre-fix, since Round 2's
+`validateSchema` already covered them as part of full post-version-check
+validation — they are kept as permanent regression guards for this round's
+restructuring. After the fixes above, all 14/14 pass.
+
+### 8. Files changed
+
+Modified: `src/adapters/sqlite/schema.ts` (the entire classification/
+validation/`ensureSchema` design described above; `EXPECTED_TABLES`' index
+entries now carry `columns`/`unique`; `SCHEMA_DDL` exported for test use).
+
+Created: `tests/persistenceSchemaOpening.test.ts` (14 tests: read-only-
+refusal proof, unrelated-DB refusal, empty-DB precision, `schema_meta`
+structural validation, index-definition validation),
+`tests/support/dbSnapshot.ts` (reusable `snapshotDb`/`readJournalMode`
+before/after comparator).
+
+Not touched: `src/adapters/sqlite/serialization.ts`, `sqliteStore.ts`, the
+persistence port, the in-memory adapter, domain/workflow code, README, any
+TASK-003 work. (The reviewer's report also notes stored-value payloads
+appearing in some `PersistenceCorruptionError` messages via `JSON.stringify`
+— this was not one of the four findings enumerated for this round's scope
+and was left untouched; flagged under Remaining limitations below for a
+follow-up round if wanted.)
+
+### 9. Exact verification results (clean state)
+
+- `rm -rf node_modules dist` → `npm install --registry=https://registry.npmjs.org` — OK
+- `npm run typecheck` — PASS
+- `npm run build` — PASS
+- `npm test` — **260 tests, 260 pass, 0 fail** (up from 246; +14 from the new schema-opening suite)
+- `node --test dist/tests/persistenceSchemaOpening.test.js` — 14/14 pass standalone
+- `node --test dist/tests/persistenceCorruption.test.js` — 27/27 pass standalone (Round-2 suite unaffected)
+- `npm run demo` — DONE, 15 refusals, unchanged
+- `npm run demo:persistent` run twice (seed, then a second real OS process reading back) — unchanged: version 12, runs=3, evidence=6 both times
+- `git diff --check` — clean
+- `git status --short` — matches the files listed above; no leftover temp directories under `/tmp` after the new tests run
+
+### 10. Remaining limitations
+
+- The reviewer's Round-2 re-review also flagged that some
+  `PersistenceCorruptionError` messages echo `JSON.stringify` of stored
+  values; this round's explicit scope was the two HIGH findings plus the
+  two MEDIUM schema findings (malformed `schema_meta`, index-definition
+  validation) — the message-content concern was left unchanged pending
+  explicit instruction.
+- `EXPECTED_TABLES` remains hand-kept in sync with `SCHEMA_DDL` (unchanged
+  from Round 2's noted limitation — no schema-derivation framework, by
+  design).
+- Index validation checks column sequence and the `unique` flag; it does not
+  re-verify partial-index `WHERE` clauses or collation (none are used by any
+  Factory index).
+- All prior TASK-001/TASK-002 limitations still apply unchanged
+  (single-writer mutex, no migration runner, local-file-only, `node:sqlite`
+  still experimental upstream).
+
+### 11. Ready for independent re-review: YES
 
 ## Verification output
-Rounds 1–5 verification are superseded by the Round-6 remediation. An
-independent verification pass should re-run `npm run verify && npm run demo`
-from a clean checkout against the current code before re-review.
+Pending — an independent verification pass should re-run `npm run verify &&
+npm run demo && npm run demo:persistent` from a clean checkout.
 
 ## Reviewer output
 
-### Round 1 (Codex-class independent reviewer) — preserved verbatim
-Independent review verdict: CHANGES_REQUIRED.
+Independent persistence review (Codex, 2026-08-19): **CHANGES_REQUIRED**.
 
-Blocking findings:
-- CRITICAL: workflow transitions do not require successful implementation or
-  verification runs, passing deterministic/semantic reviews, or verified
-  acceptance criteria. With approvals present, an agent can advance a work
-  item to DONE with zero runs and zero evidence.
-- CRITICAL: `BLOCKED -> READY|IMPLEMENTING` loses the pre-block state and can
-  bypass PLAN_REVIEW and PLAN_APPROVAL entirely.
-- CRITICAL: approval authority is caller-asserted data. Any caller, including
-  an AI-controlled adapter, can construct an Actor whose `kind` is `HUMAN` and
-  record a protected approval; no trusted human identity boundary exists.
-- HIGH: reviewer independence is only an arbitrary string inequality and a
-  passing review is not required for REVIEW -> WAITING_FOR_HUMAN.
-- HIGH: approvals are not bound to plan/spec version or reviewed evidence and
-  may be pre-recorded/reused after rework; revocation cannot affect a completed
-  transition.
-- HIGH: worker exceptions leave runs stuck RUNNING, while FAILED outcomes do
-  not prevent later workflow advancement.
-- HIGH: acceptance criteria have no executable verification/attestation path;
-  worker-authored evidence is accepted without provenance or validation.
-- MEDIUM: synchronous approval lookup conflicts with the otherwise async
-  persistence ports and cannot be implemented by normal filesystem/SQLite/
-  PostgreSQL adapters without redesign; read-modify-save operations also lack
-  optimistic concurrency/version checks.
-- MEDIUM: an untracked `software-factory-bootstrap/` duplicate repository tree
-  is present and is not part of the implementation report.
+### HIGH — incomplete/corrupt schema can masquerade as schema version 1 and remove append-only protection
 
-Reviewer verification on 2026-08-18:
+`ensureSchema()` uses `CREATE TABLE IF NOT EXISTS` and verifies only the
+`schema_meta.schema_version` value; it never verifies the existing table
+definitions, keys, or constraints before preparing/using them. Reproduction
+against a temporary SQLite file: initialize a valid store, replace `evidence`
+with `CREATE TABLE evidence (id TEXT, work_item_id TEXT NOT NULL, data TEXT
+NOT NULL) STRICT`, then reopen the store. Open succeeds and two writes with
+the same Evidence id both succeed (`listByWorkItem` returns two rows). This
+violates TASK-002's append-only requirement and the explicit requirement that
+a partially initialized schema cannot masquerade as valid. A database whose
+marker says an incompatible version is also modified with the current DDL
+before `SchemaVersionError` is thrown.
+
+Remediation: validate the full expected schema (including primary keys and
+required columns/indexes) before use; refuse any mismatch before mutating a
+version-mismatched database. Make fresh-schema creation/version stamping one
+safe, atomic initialization path.
+
+### HIGH — deserialization accepts invalid persisted domain state and indexed/data divergence
+
+The parsers check JSON shape and enum membership but do not validate row
+metadata against serialized state or all domain lifecycle/value invariants.
+Reproduction against a temporary SQLite file: set
+`work_items.version = 77` while its JSON `data.version = -1`; reopening and
+`findById()` succeeds and returns version `-1`, rather than throwing
+`PERSISTENCE_CORRUPTION`. Likewise, adding `finishedAt` to the JSON for a
+`RUNNING` Run is accepted and returned. Neither `work_items.version` nor
+`runs.status` is selected/compared to serialized state, and WorkItem versions
+are accepted as arbitrary finite numbers. This fails the TASK-002 requirement
+to explicitly reject corrupted/incompatible data, invalid versions, and
+invalid Run lifecycle state; it can inject untrusted audit/workflow state into
+`FactoryService`.
+
+Remediation: select and cross-check identity/query/CAS/lifecycle columns
+against decoded JSON, enforce WorkItem version constraints, and validate the
+complete Run lifecycle shape before returning a record. Any discrepancy must
+throw `PersistenceCorruptionError` without repairing or continuing from it.
+
+All required automated checks passed on Node v22.23.1: `npm run typecheck`,
+`npm run build`, `npm test` (16 test files, 0 failures), `npm run demo` (DONE,
+15 refusals), and two separate `npm run demo:persistent` invocations (seed,
+then restart readback without re-seeding). Focused SQL checks also confirmed
+rollback/no residue for stale-CAS run attachment, invalid Run finalization,
+and multi-write append-only failure; normal two-store contention was safely
+refused as `SQLITE_BUSY` and succeeded after the first transaction committed.
+
+### Round 2 independent persistence re-review (Codex, 2026-08-19): **CHANGES_REQUIRED**
+
+The two original HIGH findings are closed: a same-version `evidence` table
+without its primary key now fails with `SCHEMA_INTEGRITY_VIOLATION` and is not
+repaired; direct SQL/JSON disagreement for Project, WorkItem, Criterion, Run,
+Review, Evidence, Verification, and Approval now consistently fails with
+`PERSISTENCE_CORRUPTION`. Persisted invalid WorkItem version/lifecycle and Run
+lifecycle cases are also refused.
+
+### HIGH — failed incompatible opens still modify the target database
+
+`ensureSchema()` executes `PRAGMA journal_mode = WAL` before distinguishing a
+fresh database from a version-mismatched or malformed one. Reproduction using
+a temporary database containing only `schema_meta.schema_version = 999`:
+opening throws `SCHEMA_VERSION_MISMATCH`, no tables/rows change, but the
+persisted journal mode changes from `delete` to `wal`. This violates the
+re-review requirement that a failed open/validation leave the database
+unmodified.
+
+Remediation: perform all existing-database classification, version checks,
+and structural validation before any persistent PRAGMA/DDL; close the newly
+opened connection on refusal. Set WAL only after successful validation (or on
+the confirmed fresh-initialization path).
+
+### HIGH — an unrelated nonempty SQLite database is treated as fresh and altered
+
+The "fresh" branch checks only for Factory-named tables. A temporary SQLite
+database containing an unrelated `user_records` table and data, but no
+Factory table, opened successfully and acquired all Factory tables plus a
+schema marker. This violates the required distinction between a genuinely
+new/empty database and an existing database, and can alter user data stores
+passed as the SQLite path.
+
+Remediation: before fresh initialization, verify that `sqlite_master` has no
+non-internal user schema objects; otherwise refuse with
+`SchemaIntegrityError` without any persistent change. Add a regression test
+covering an unrelated nonempty SQLite file.
+
+### MEDIUM — structural/error validation remains incomplete
+
+`schema_meta` missing its `value` column fails with raw `ERR_SQLITE_ERROR`,
+not `SchemaIntegrityError`, because it is queried before shape validation.
+Also, validation accepts `idx_evidence_work_item_id` when that same-named
+index is recreated on `evidence(id)` rather than `work_item_id`; only index
+name/table presence is checked. Finally, several corruption messages include
+`JSON.stringify` of arbitrary values read from storage. Validate
+`schema_meta` before querying it, validate each index's columns, and report
+record/table context without echoing stored payloads.
+
+Reviewer verification on Node v22.23.1: `npm run typecheck`, `npm run build`,
+`npm test` (17 test files, 0 failures), standalone
+`node --test dist/tests/persistenceCorruption.test.js`, `npm run demo` (DONE,
+15 refusals), and two `npm run demo:persistent` processes (seed then
+readback) all passed. Focused temporary-file probes confirmed atomic rollback,
+stale-CAS preservation, terminal-Run refusal, two-store `SQLITE_BUSY` safety,
+and cleanup of tracked test database directories.
+
+### Round 3 final focused independent re-review (Codex, 2026-08-19): **PASS_WITH_NON_BLOCKING_NOTES**
+
+All four Round-2 blockers are closed and independently reproduced as fixed:
+
+- An unsupported-version Factory database left `DELETE` journal mode,
+  `sqlite_master`, and application rows unchanged before
+  `SchemaVersionError`.
+- A nonempty unrelated database containing a table, and separate probes with
+  an index, trigger, or view, were refused with `SchemaIntegrityError`; no
+  Factory schema objects or marker were created.
+- Malformed `schema_meta` shape, missing/duplicate version rows, and invalid
+  version values were classified as `SchemaIntegrityError` before version
+  use, without raw SQLite schema-query errors or repair.
+- Same-name indexes with wrong columns, swapped composite order, missing
+  definitions, or wrong uniqueness were rejected with `SchemaIntegrityError`.
+
+Read-only classification now precedes all persistent PRAGMAs/DDL; only EMPTY
+databases initialize, and CURRENT_FACTORY databases enable WAL after complete
+validation. Round-2 SQL/JSON cross-checks and persisted WorkItem/Run lifecycle
+validation remain green. Normal restart, transactions, rollback, CAS,
+append-only records, workflow continuation, and all TASK-001 regression suites
+remain green.
+
+### Non-blocking note (MEDIUM/LOW)
+
+Some `PersistenceCorruptionError` messages include `JSON.stringify` of an
+invalid persisted field (for example an invalid enum value). A focused probe
+confirmed that an arbitrary token stored in a corrupt Evidence `kind` appears
+in the thrown message. No automatic logging or new persistence of secrets was
+observed, so this is not a TASK-002 acceptance blocker; future cleanup should
+use table/record/field context without echoing arbitrary stored payloads.
+
+Final verification on Node v22.23.1:
+
 - `npm run typecheck` — PASS
 - `npm run build` — PASS
-- `npm test` — PASS (Node reports 5 test-file subtests)
-- `npm run demo` — PASS (reaches DONE and prints 5 expected refusals)
-
-TASK-001 is not technically ready for human acceptance or commit. See the
-independent review report for precise remediation requirements.
-
-### Round 2
-Independent re-review verdict: CHANGES_REQUIRED.
-
-Verified blocking findings:
-- CRITICAL: approvals may be recorded at any workflow status and forward
-  progress does not change `revision`. PLAN_APPROVAL and RELEASE_APPROVAL
-  recorded while the item was still IDEA remained valid; the item reached
-  DONE using both pre-recorded approvals.
-- CRITICAL: running a new IMPLEMENTER after RELEASE_APPROVAL does not bump the
-  revision. After adding a new semantic review but no new verification, the
-  item reached DONE using the old release approval and old acceptance-
-  criterion verifications. The stored approval's `runIds`/`reviewId` snapshot
-  is not checked by the gate guard.
-- HIGH: reviewer independence remains based on mutable, self-asserted worker
-  metadata. The same Worker object implemented, changed its `id` and role,
-  then successfully recorded a passing semantic review of its own run.
-- HIGH: Run records remain overwriteable. A FAILED implementation Run was
-  replaced through `RunRepository.save` with `SUCCEEDED`, after which
-  IMPLEMENTING -> VERIFYING succeeded.
-- HIGH: human-only cancellation checks only caller-supplied `Actor.kind`; an
-  AI-created `{ kind: "HUMAN" }` actor successfully cancelled a work item
-  without a TrustedHumanToken.
-- MEDIUM: `deepFreeze` does not make Date values immutable. Mutating a retained
-  Evidence `createdAt` Date changed the stored append-only audit record.
-- MEDIUM: concurrent `runWorker` calls are not atomic: one call returned a
-  concurrency conflict after both successful Runs and their evidence had
-  already been persisted; the rejected run was left stored but unattached.
-
-Correctly refused in re-review: no implementation run, ordinary FAILED run,
-missing verifier/review/criterion verification, same-id self-review, forged or
-mismatched human approval token, BLOCKED resume to the wrong state, approvals
-after an actual revision bump, stale WorkItem CAS write, and a thrown worker
-(persisted FAILED with no RUNNING residue).
-
-Reviewer commands on 2026-08-18:
-- `npm run typecheck` — PASS
-- `npm run build` — PASS
-- `npm test` — PASS (8 test-file subtests reported)
-- `npm run demo` — PASS (DONE; 10 expected refusals)
+- `npm test` — 260 tests, 260 pass, 0 fail (18 test files)
+- `node --test dist/tests/persistenceSchemaOpening.test.js` — PASS
+- `node --test dist/tests/persistenceCorruption.test.js` — PASS
+- `npm run demo` — DONE with 15 refusals
+- `npm run demo:persistent` — first process seeded and reopened; second
+  process read DONE state without re-seeding
 - `git diff --check` — PASS
-- `git status --short` — inspected; duplicate bootstrap tree is gone
+- `git status --short` — inspected; temporary test directories cleaned
 
-TASK-001 is not technically ready for human acceptance or commit.
-
-### Round 3
-Independent re-review verdict: CHANGES_REQUIRED.
-
-Verified blocking findings:
-- CRITICAL: `resolveCurrentImplementation` ignores newer FAILED IMPLEMENTER
-  runs. Starting legitimate rework from WAITING_FOR_HUMAN, recording failed
-  implementation B, then advancing VERIFYING -> REVIEW -> WAITING_FOR_HUMAN
-  -> DONE succeeded using implementation A's verification, review, criterion
-  verifications and RELEASE_APPROVAL. The final status was DONE.
-- HIGH: snapshot resolution uses an earlier passing semantic review even when
-  a later semantic review of the same implementation records FAIL. The live
-  snapshot id remained unchanged and DONE succeeded despite the later
-  blocking review.
-- HIGH: terminal WorkItems are still writable through `runWorker`. After a
-  valid transition to DONE, a new successful IMPLEMENTER run was persisted
-  and attached to the DONE item; the item remained DONE while its release
-  snapshot became unresolved.
-- MEDIUM: `deepFreeze` returns immediately for an already-frozen root without
-  traversing its children. A pre-frozen Review with a mutable `findings` array
-  and a pre-frozen Run with mutable `evidenceIds` were saved, then their nested
-  arrays were mutated through retained references, changing durable state.
-- MEDIUM: `RunRepository.complete` does not validate the terminal status at
-  runtime. Passing `status: "RUNNING"` through the JavaScript boundary rewrote
-  the same RUNNING record's content and allowed a later second completion.
-
-Correctly refused/contained in Round 3: early PLAN/RELEASE approval, forged
-approval and cancellation identity, same-object worker rename/re-role,
-unregistered workers, direct same-id or terminal run replacement, missing
-implementation/verification/evidence/criterion verification/semantic review/
-release approval, stale plan approval, successful implementation B using A's
-proof, invalid BLOCKED resumes, direct stored-object mutation, mutable Date
-storage, stale WorkItem CAS writes, and concurrent run attachment (one loser;
-zero durable orphan runs/evidence).
-
-NOTE: two distinct registered Worker wrapper objects sharing one execute
-closure are treated as independent principals. This was reproduced, but is
-the explicitly documented TASK-001 in-process object-identity trust boundary;
-workers do not receive the registry, so it is not classified as a blocker for
-this task.
-
-Reviewer commands on 2026-08-19:
-- `npm run typecheck` — PASS
-- `npm run build` — PASS
-- `npm test` — PASS (9 test-file subtests reported)
-- `npm run demo` — PASS (DONE; 15 expected refusals)
-- `git diff --check` — PASS
-- `git status --short` — inspected
-
-TASK-001 is not technically ready for human acceptance or commit.
-
-### Round 4
-Independent re-review verdict: CHANGES_REQUIRED (blocker: release snapshot
-resolution reused PASSED criterion verifications from an older verifier
-attempt after a newer verifier attempt produced FAILED/incomplete results;
-concern: completion-object getters were read more than once at the repository
-boundary).
-
-### Round 5
-Independent final review verdict: CHANGES_REQUIRED.
-
-Reproducible blocker:
-- CRITICAL: `FactoryService.runWorker` invokes `worker.execute` before the
-  RUNNING Run is created and attached. Starting a delayed IMPLEMENTER B or
-  VERIFIER B after release approval A, waiting until its `execute` method has
-  entered, and then advancing the item allowed `WAITING_FOR_HUMAN -> DONE`
-  with snapshot/approval A. When B subsequently finished, its transaction was
-  rejected with `TERMINAL_WORK_ITEM`, leaving no durable record of the newer
-  attempt. This bypasses newest-attempt authority while the attempt is in
-  flight and loses the failed/superseding attempt from audit history.
-
-Round-5 fixes independently verified:
-- Criterion proof is restricted to the current verifier generation. A newer
-  generation with a FAILED result, no results, or only one current result
-  could not borrow generation A records and produced no release snapshot.
-- After a failed B, a complete C produced a snapshot containing only C's
-  criterion-verification ids; approval A was stale and DONE required a fresh
-  release approval.
-- Run create/complete getters and proxies were captured once per accepted
-  field; completion identity extras were not read, stored identity remained
-  unchanged, invalid statuses were refused, and a second completion failed.
-- A genuinely persisted RUNNING or FAILED IMPLEMENTER/VERIFIER head correctly
-  invalidated the old release snapshot. The bypass is specifically the public
-  `runWorker` execute-before-persist window.
-
-Required remediation:
-- Atomically create and attach the RUNNING Run before invoking the worker, and
-  invoke the worker only after that transaction commits. This makes the new
-  lineage head visible to snapshot resolution immediately.
-- Atomically record evidence and complete that same Run exactly once after the
-  worker returns or throws. Define cancellation handling so a Run already in
-  progress is terminalized without reopening release state or being erased.
-- Add delayed-worker regression tests for both IMPLEMENTER and VERIFIER roles:
-  after `execute` enters but before it resolves, the old snapshot/approval
-  must not permit DONE; success, failure and throw must all leave the expected
-  terminal audit record without an orphan.
-
-Reviewer commands on 2026-08-19:
-- `npm run typecheck` — PASS
-- `npm run build` — PASS
-- `npm test` — PASS (11 test-file subtests, 0 failures)
-- `npm run demo` — PASS (DONE; 15 expected refusals)
-- `git diff --check` — PASS after the reviewer-only handoff update
-- `git status --short` — inspected
-
-TASK-001 is not safe for human acceptance or commit.
-
-### Round 6
-Independent final review verdict: PASS.
-
-No CRITICAL or HIGH TASK-001 correctness defect remains.
-
-Round-6 verification:
-- A delayed IMPLEMENTER and delayed VERIFIER were each observed after their
-  Phase-1 transaction: the exact Run was RUNNING, attached to the WorkItem,
-  and visible before `execute()` began. The prior snapshot disappeared and
-  both DONE and a new RELEASE_APPROVAL were refused while each run was in
-  flight.
-- With release committed first, a later worker start was rejected before
-  execution, with no Run or Evidence residue. With worker start committed
-  first, the RUNNING head rejected DONE. The existing race regression also
-  passed, so both operations cannot commit successfully.
-- Successful, returned-failure and thrown worker outcomes finalized the exact
-  Phase-1 Run once. Evidence referenced that same Run; no replacement or
-  orphan was observed.
-- IMPLEMENTER/VERIFIER/REVIEWER starts before plan execution, while BLOCKED,
-  DONE or CANCELLED, and invalid planning/content combinations were refused
-  before execution. A legitimate WAITING_FOR_HUMAN -> IMPLEMENTING rework
-  path succeeded.
-- A trusted human cancellation during an in-flight run left the WorkItem
-  CANCELLED, allowed the already-authorized Run to finalize its audit record,
-  and refused later progress or worker starts.
-
-Historical TASK-001 regression suites remained green for lineage and verifier
-coherence, review ordering, approval timing and staleness, trusted identities,
-verification/evidence/criteria gates, BLOCKED/resume, terminal WorkItems and
-runs, CAS/transaction rollback, orphan prevention, and audit immutability.
-
-Reviewer commands on 2026-08-19:
-- `npm run typecheck` — PASS
-- `npm run build` — PASS
-- `npm test` — PASS (12 test-file subtests, 0 failures)
-- `npm run demo` — PASS (DONE; 15 expected refusals)
-- `git diff --check` — PASS after the reviewer-only handoff update
-- `git status --short` — inspected
-
-TASK-001 is safe for human acceptance and commit.
+TASK-002 is safe for human acceptance and commit.
 
 ## Human decision
 Pending.

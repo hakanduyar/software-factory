@@ -33,20 +33,23 @@ mock workers.
 
 ### Requirements
 
-- Node.js >= 20.11 (developed on Node 22)
+- Node.js >= 22.5 (developed on Node 22.23; bumped from >=20.11 in TASK-002
+  because durable persistence uses `node:sqlite`, built into Node since
+  22.5 — no npm dependency added)
 - npm
 
 ### Exact commands
 
 ```bash
-npm install        # install dev dependencies (typescript, @types/node)
-                   # if your npm registry is unreachable, use:
-                   #   npm install --registry=https://registry.npmjs.org
-npm run typecheck  # TypeScript strict typecheck, no emit
-npm run build      # compile src/ and tests/ to dist/
-npm test           # build, then run the unit tests with node --test
-npm run verify     # typecheck + tests (the full check for this task)
-npm run demo       # build, then run the demo work item IDEA -> DONE
+npm install          # install dev dependencies (typescript, @types/node)
+                     # if your npm registry is unreachable, use:
+                     #   npm install --registry=https://registry.npmjs.org
+npm run typecheck    # TypeScript strict typecheck, no emit
+npm run build        # compile src/ and tests/ to dist/
+npm test             # build, then run the unit tests with node --test
+npm run verify       # typecheck + tests (the full check for this task)
+npm run demo         # build, then run the in-memory demo work item IDEA -> DONE
+npm run demo:persistent   # build, then run (or resume) the SQLite-backed persistent demo
 node dist/src/cli/main.js transitions   # print the workflow table and gates
 ```
 
@@ -62,10 +65,12 @@ src/domain/              entities, statuses, gates, typed errors, trusted identi
 src/workflow/            transition table, snapshot resolver, preconditions, gate guard, WorkflowService
 src/ports/               repository (with unit of work), worker, worker-registry, human-identity, clock
 src/adapters/memory/     in-memory FactoryStore: staged transactions, append-only tables, frozen writes
+src/adapters/sqlite/     durable FactoryStore: node:sqlite, real transactions, schema + row validation
+src/adapters/shared/     logic shared by every adapter (single-read Run capture)
 src/adapters/workers/    deterministic mock worker
 src/adapters/security/   local human-identity gate and worker registry
 src/app/                 FactoryService use cases
-src/cli/                 `sf` CLI and the demo flow
+src/cli/                 `sf` CLI, the in-memory demo, and the persistent demo
 tests/                   node:test unit tests, including reproduced review exploits
 ```
 
@@ -152,3 +157,75 @@ locally-configured credential before minting a short-lived signed token;
 are documented in their adapters as bootstrap-scale boundaries, not as
 substitutes for real authentication or process isolation. Workers never
 receive the credential, the gate, or the registry.
+
+## Durable Persistence (TASK-002)
+
+Everything above described the in-memory adapter (`src/adapters/memory/`),
+which is still what `npm test` and `sf demo` use — fast, no disk I/O. TASK-002
+adds a second adapter, `src/adapters/sqlite/`, satisfying the exact same
+`FactoryStore` port so the domain and `FactoryService` needed **zero**
+changes.
+
+### Where data lives
+
+The persistent demo's database defaults to `.factory-data/factory.db` under
+the current working directory. Override with `FACTORY_DB_PATH` or by passing
+`dbPath` to `runPersistentDemo`. The whole `.factory-data/` directory (plus
+any stray `*.db`/`*.sqlite` files and their `-wal`/`-shm` siblings) is
+gitignored — runtime data is never committed.
+
+### Why SQLite via `node:sqlite`, no ORM
+
+`node:sqlite` has shipped in Node since 22.5 (still marked experimental
+upstream; exercised here on Node 22.23). It needed no new dependency and no
+query-builder/ORM layer — the adapter is ~450 lines of explicit SQL because
+the schema is eight small tables, one per repository.
+
+### How the same guarantees hold with a different mechanism
+
+| TASK-001 guarantee (in-memory) | TASK-002 mechanism (SQLite) |
+| --- | --- |
+| Staged overlay + revalidate at commit | Real `BEGIN IMMEDIATE` / `COMMIT` / `ROLLBACK`, serialized by an in-process FIFO mutex so two logical units of work never touch the one `DatabaseSync` connection at once (`node:sqlite` throws on nested transactions) |
+| `WorkItem.compareAndSave` rejects a stale `version` | A real `UPDATE work_items SET ... WHERE id = ? AND version = ?`; `changes = 0` means stale, and throws `ConcurrencyError` |
+| `Run.complete` only from `RUNNING`, exactly once | `UPDATE runs SET status = ?, data = ? WHERE id = ? AND status = 'RUNNING'`, `changes = 0` means already terminal |
+| Append-only Evidence/Review/Approval/Verification | The `id` `PRIMARY KEY`'s own `UNIQUE` constraint; the violation is translated to `AppendOnlyViolationError` |
+| Every returned value is frozen; no `Date` ever persisted | Same `deepFreeze` (`src/domain/freeze.ts`) applied to every row on the way in and on the way back out of JSON |
+| Insertion-order reads (`.at(-1)` semantics the resolver relies on) | SQLite's implicit `rowid`, `ORDER BY rowid ASC` |
+| Hostile getters can't validate-clean-store-dirty (`captureRun`/`captureCompletion`) | Extracted into `src/adapters/shared/runCapture.ts` and used by **both** adapters, so this guarantee cannot silently diverge between them |
+
+One genuine behavioral difference, not a regression: the in-memory adapter's
+`transaction()` opens an independent overlay per call, so two *concurrent*
+`transaction()` calls can each read the same pre-race snapshot and race on
+the final write (one wins, one gets `ConcurrencyError`). The SQLite adapter's
+mutex fully serializes transactions, so a second transaction's read always
+sees the first's already-committed result — closer to how a real database
+behaves under `BEGIN IMMEDIATE`. Concretely: two concurrent
+`FactoryService.advance()` calls against the in-memory store can produce one
+winner and one `ConcurrencyError` loser; against the SQLite store, the second
+call's fresh read may find a *different* legitimate transition and succeed
+too, rather than losing a race. Both behaviors are correct — races are still
+never allowed to corrupt state or double-apply a change, which is what
+`tests/persistenceRollback.test.ts` proves for SQLite specifically, alongside
+`tests/support/storeContract.ts`, which runs the same append-only/CAS/
+run-lifecycle/atomicity assertions against **both** adapters.
+
+### Restart proof
+
+`tests/persistenceRestart.test.ts` builds a fully-released work item through
+one store instance, closes it, opens a second instance against the same
+database file, and confirms identical status/version/specRevision/history
+plus every run/evidence/review/approval/criterion-verification — and that a
+brand-new `FactoryService` built on the reopened store still enforces every
+invariant (forged cancellation still refused, a new worker run still
+succeeds). `npm run demo:persistent` demonstrates the same thing from the
+CLI: run it once to seed and watch an in-process close+reopen; run it again
+(a genuinely new OS process) to see a previous process's data read back with
+no re-seeding.
+
+### Schema versioning
+
+`src/adapters/sqlite/schema.ts` stamps a `schema_meta.schema_version` row on
+a fresh database and refuses to open one written by a different version
+(`SchemaVersionError`) rather than guessing. TASK-002 ships no migration
+runner — only this detection — so a later migration mechanism has a safe
+failure mode to build on.

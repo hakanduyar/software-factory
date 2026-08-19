@@ -41,6 +41,7 @@ import type {
   FactoryStore,
   RunCompletion,
 } from "../../ports/repositories.js";
+import { captureCompletion, captureRun } from "../shared/runCapture.js";
 
 const TABLE_NAMES = [
   "projects",
@@ -186,54 +187,6 @@ function upsertOp<T extends Row>(table: TableName, entity: T): StagedOp {
       rows.set(frozen.id, frozen);
     },
   };
-}
-
-/**
- * Reads every caller-supplied Run field exactly once into a plain internal
- * value. A hostile object with getters/proxies whose answers change between
- * reads (validate clean, store dirty) is neutralised: validation and
- * persistence both operate on this captured copy, and identity fields cannot
- * be altered after capture.
- */
-function captureRun(run: Run): Run {
-  const id = String(run.id);
-  const workItemId = String(run.workItemId);
-  const specRevision = Number(run.specRevision);
-  const role = run.role;
-  const workerPrincipalId = String(run.workerPrincipalId);
-  const declaredWorkerId = String(run.declaredWorkerId);
-  const status = run.status;
-  const summary = run.summary;
-  const targetRunId = run.targetRunId;
-  const claimsAcceptanceMet = run.claimsAcceptanceMet === true;
-  const evidenceIds = [...run.evidenceIds].map(String);
-  const startedAt = Number(run.startedAt);
-  const finishedAt = run.finishedAt;
-  return {
-    id,
-    workItemId,
-    specRevision,
-    role,
-    workerPrincipalId,
-    declaredWorkerId,
-    status,
-    ...(summary === undefined ? {} : { summary: String(summary) }),
-    ...(targetRunId === undefined ? {} : { targetRunId: String(targetRunId) }),
-    claimsAcceptanceMet,
-    evidenceIds,
-    startedAt,
-    ...(finishedAt === undefined ? {} : { finishedAt: Number(finishedAt) }),
-  };
-}
-
-/** Same single-read capture for a completion object. Only completion fields exist here. */
-function captureCompletion(completion: RunCompletion): RunCompletion {
-  const status = completion.status;
-  const summary = String(completion.summary);
-  const claimsAcceptanceMet = completion.claimsAcceptanceMet === true;
-  const evidenceIds = [...completion.evidenceIds].map(String);
-  const finishedAt = Number(completion.finishedAt);
-  return { status, summary, claimsAcceptanceMet, evidenceIds, finishedAt };
 }
 
 function repositoriesFor(tx: TransactionScope): FactoryRepositories {

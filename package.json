@@ -2,10 +2,10 @@
   "name": "software-factory",
   "version": "0.1.0",
   "private": true,
-  "description": "Local Software Factory core skeleton (TASK-001)",
+  "description": "Local Software Factory core skeleton (TASK-001) with durable SQLite persistence (TASK-002)",
   "type": "module",
   "engines": {
-    "node": ">=20.11.0"
+    "node": ">=22.5.0"
   },
   "bin": {
     "sf": "./dist/src/cli/main.js"
@@ -15,6 +15,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --test \"dist/tests/**/*.test.js\"",
     "demo": "npm run build && node dist/src/cli/main.js demo",
+    "demo:persistent": "npm run build && node dist/src/cli/main.js demo:persistent",
     "verify": "npm run typecheck && npm run test"
   },
   "devDependencies": {

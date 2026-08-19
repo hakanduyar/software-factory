@@ -14,9 +14,10 @@ import { runDemo } from "./demo.js";
 const USAGE = `sf — Software Factory (bootstrap)
 
 Usage:
-  sf demo           Run the in-memory demo work item from IDEA to DONE
-  sf transitions    Print the workflow transition table and protected gates
-  sf help           Show this message
+  sf demo             Run the in-memory demo work item from IDEA to DONE
+  sf demo:persistent  Run (or resume) the SQLite-backed persistent demo
+  sf transitions      Print the workflow transition table and protected gates
+  sf help             Show this message
 `;
 
 function printTransitions(): void {
@@ -58,6 +59,14 @@ async function main(argv: readonly string[]): Promise<number> {
     case "demo":
       await runDemo({ log: (line) => console.log(line) });
       return 0;
+    case "demo:persistent": {
+      // Lazy-loaded: this is the only command that touches node:sqlite, so
+      // plain `sf demo`/`sf transitions` never trigger its experimental
+      // warning or pay its module-load cost.
+      const { runPersistentDemo } = await import("./persistentDemo.js");
+      await runPersistentDemo({ log: (line) => console.log(line) });
+      return 0;
+    }
     case "transitions":
       printTransitions();
       return 0;
