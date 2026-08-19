@@ -1,0 +1,24 @@
+{
+  "name": "software-factory",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local Software Factory core skeleton (TASK-001)",
+  "type": "module",
+  "engines": {
+    "node": ">=20.11.0"
+  },
+  "bin": {
+    "sf": "./dist/src/cli/main.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test \"dist/tests/**/*.test.js\"",
+    "demo": "npm run build && node dist/src/cli/main.js demo",
+    "verify": "npm run typecheck && npm run test"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2"
+  }
+}
