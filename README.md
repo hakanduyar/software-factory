@@ -229,3 +229,170 @@ a fresh database and refuses to open one written by a different version
 (`SchemaVersionError`) rather than guessing. TASK-002 ships no migration
 runner — only this detection — so a later migration mechanism has a safe
 failure mode to build on.
+
+## Worker Runner (TASK-003)
+
+TASK-001/002 could represent a worker run; nothing could actually launch a
+real AI CLI. TASK-003 adds that: the Factory can spawn a real, local,
+non-interactive Claude Code or Codex CLI process itself, feed it a prompt,
+and turn its process-level outcome into a normalized `WorkerOutcome` through
+the exact same `FactoryService.runWorker` three-phase lifecycle TASK-001/002
+already proved durable — no new persistence path, no weakened invariant.
+
+### Layout additions
+
+```
+src/ports/processRunner.ts       explicit process-execution contract (no shell, ever)
+src/adapters/process/            node:child_process implementation: timeout/cancel -> SIGTERM -> SIGKILL,
+                                  bounded output capture, exactly-once settlement
+src/adapters/workers/workspace.ts        explicit, validated workspace boundary
+src/adapters/workers/environmentPolicy.ts  env allowlist (default-deny) + best-effort output redaction
+src/adapters/workers/promptTemplates.ts    one small template per FactoryRole
+src/adapters/workers/workerModelConfig.ts  tool/model/effort/timeout as configuration, not code
+src/adapters/workers/cliWorker.ts          shared Worker-port engine used by both adapters
+src/adapters/workers/claudeCodeAdapter.ts  Claude Code CLI adapter (invocation independently verified)
+src/adapters/workers/codexCliAdapter.ts    Codex CLI adapter (invocation independently tested)
+src/cli/workerDoctor.ts, src/cli/workerSmoke.ts   `sf worker doctor` / `sf worker smoke <tool>`
+tests/fixtures/fake-clis/        fake executables (plain Node scripts) all offline tests spawn instead
+```
+
+### Process isolation
+
+`executable` and `argv` are always passed to `child_process.spawn` as
+separate values — `shell` is never `true`, so there is no shell-injection
+surface regardless of what a prompt or instruction string contains. Timeout
+and cancellation escalate SIGTERM → (grace period) → SIGKILL against the
+child's whole process group (`detached: true` + a negative-pid signal), so a
+CLI that shells out to git/ripgrep/etc. as grandchildren is terminated too.
+stdout/stderr are captured up to a configurable byte cap (default 5 MiB per
+stream); a chatty child is still drained past the cap so it can never
+deadlock the runner, and truncation is recorded rather than hidden.
+
+### Environment and workspace boundaries
+
+`process.env` is never forwarded wholesale to a worker child process. Only
+an explicit, default-deny allowlist (`PATH`, `HOME`, `CODEX_HOME`, and a
+handful of other locale/temp-dir variables — see
+`DEFAULT_WORKER_ENV_ALLOWLIST` in `environmentPolicy.ts`) is forwarded, so
+each CLI authenticates through its own already-configured local credential
+store rather than the Factory ever touching a secret. Captured process
+output additionally passes through a best-effort secret-pattern redactor
+before becoming Evidence — defense in depth, not a substitute for the
+allowlist.
+
+A worker's workspace (`resolveWorkspace` in `workspace.ts`) is trusted
+configuration supplied when an adapter is constructed — `WorkerRequest` (the
+data a `Worker.execute()` call actually receives) has no `cwd` field at all,
+so there is no path for a prompt or instruction string to choose a
+process's working directory. The resolved path must exist, be a directory,
+and (by default) be a git repository.
+
+### Claude Code and Codex CLI adapters
+
+Both implement the provider-neutral `Worker` port
+(`src/ports/worker.ts`) through a shared engine
+(`src/adapters/workers/cliWorker.ts`) that keeps two channels strictly
+separate: the **process execution result** (exit code / timeout / spawn
+failure — from the OS) decides `WorkerOutcome.status`, while the **tool's
+own reported text** (parsed from its stdout) is attached as informational
+evidence/summary only. A process that exits 0 while printing "I failed" is
+still `SUCCEEDED`; a process that exits non-zero while printing "PASS" is
+still `FAILED`. `claimsAcceptanceMet` is always `false` from a real CLI
+adapter in TASK-003 — no free-form model text is trusted as a claim
+(PASS/CHANGES_REQUIRED parsing is explicit TASK-004 scope).
+
+**Codex CLI** — invocation independently tested against the real `codex`
+binary (v0.147.0) on the development machine, not assumed from memory:
+
+```
+codex exec --json -C <workspaceRoot> -m <model> [-c model_reasoning_effort="<effort>"] \
+  --sandbox <read-only|workspace-write> "<prompt>"
+```
+
+`--sandbox workspace-write` only for the `IMPLEMENTER` role; every other
+role gets `read-only`. `--json` prints one JSON object per line
+(`item.completed` with the final `agent_message` text is the parsed
+"reported" channel). Full experiment log:
+`docs/tasks/TASK-003-worker-runner.md`.
+
+**Claude Code CLI** — the `claude` binary was not installed when this
+adapter was first built (only the VS Code extension was present, which is
+not a subprocess-invocable non-interactive CLI); it was implemented against
+the publicly documented flag surface only, with every capability the
+`--help` output couldn't confirm reported as honestly not-applied. Once a
+real binary (2.1.235) became available, the invocation was independently
+tested and corrected against it, not assumed from memory:
+
+```
+claude -p "<prompt>" --model <model> --output-format json \
+  [--effort <low|medium|high|xhigh|max>] --permission-mode <plan|acceptEdits>
+```
+
+`--output-format json` prints one JSON result object with a `.result`
+string field (confirmed — this matched the adapter's original guess).
+`--effort` turned out to be a real, working flag (the original assumption
+that none existed was wrong and has been corrected). `--permission-mode
+plan` is used for every role except `IMPLEMENTER`, which gets
+`acceptEdits` — the Claude-side equivalent of Codex's `read-only` /
+`workspace-write` split, added once `--help` confirmed the flag exists.
+Because the two-channel design above means a wrong flag assumption fails
+safe (a clean `FAILED` run with real stderr/stdout as evidence, never a
+false success), the originally-shipped unverified version was safe despite
+being wrong about effort — this is the corrected, verified version. Full
+experiment log and the preserved "originally unavailable" history:
+`docs/tasks/TASK-003-worker-runner.md`; file header of
+`claudeCodeAdapter.ts` for the code-level detail.
+
+Effort/reasoning level is `WorkerModelConfig` data, never hardcoded. Codex
+applies it via `-c model_reasoning_effort=...` (only for a plain-token
+value — anything else is refused with a recorded reason rather than risking
+an unescaped config override); Claude Code applies it via `--effort` (only
+for one of its five documented levels — anything else is refused the same
+way).
+
+### `sf worker doctor` / `sf worker smoke`
+
+```bash
+npm run worker:doctor        # reports found/not-found + version for claude and codex, no secrets printed
+npm run smoke:codex-worker   # REAL invocation of the installed Codex CLI — burns real usage
+npm run smoke:claude-worker  # REAL invocation of the installed Claude Code CLI — burns real usage
+npm run smoke:workers        # both smoke tests
+```
+
+Neither smoke command runs as part of `npm test`. Each drives a real
+`FactoryService.runWorker` call (proving the *Factory* launched the CLI, not
+just the adapter in isolation) with role `REVIEWER` against a zero-cost mock
+implementation run, in a brand-new throwaway git-initialized scratch
+directory under the OS temp dir — never this repository — with a short
+timeout and a read-only prompt ("list the files here and confirm you can
+see them; do not modify anything").
+
+### Tests never touch a real AI CLI
+
+Every automated test (`npm test`) spawns a **fake** CLI — a plain Node
+script under `tests/fixtures/fake-clis/`, run via `process.execPath` (or
+directly, via its own shebang) — never `claude`/`codex`. `fake-codex.mjs`
+mimics the independently-verified real `codex exec --json` contract exactly
+(JSONL events, exit codes, an env-var-controlled failure/timeout mode) so
+`codexCliAdapter.ts` is exercised against a faithful simulation. Argv
+construction and output parsing are pure functions
+(`buildCodexInvocation`/`buildClaudeInvocation`,
+`extractCodexFinalMessage`/`extractClaudeFinalMessage`) tested directly with
+no process spawned at all; `execute()` end-to-end behavior (success,
+non-zero exit, timeout, spawn failure) is tested against the fake
+executables. `tests/workerRunnerPersistence.test.ts` proves the SQLite
+durability chain specifically for a real spawned process: the RUNNING run is
+read back — through the same store instance — while a deliberately slow
+fake CLI is still mid-flight, then the run is finalized exactly once and
+survives a store close+reopen.
+
+### Known limitations (TASK-003)
+
+- No PASS/CHANGES_REQUIRED free-text parsing yet; `claimsAcceptanceMet` is
+  always `false` from a real CLI worker (explicit TASK-004 scope).
+- No autonomous implement → verify → review loop, no remediation loop, no
+  GitHub Issues/PR integration, no Telegram/n8n, no server deployment, no
+  full model router, no multi-machine scheduling — all later phases.
+- The environment allowlist and secret redaction are bootstrap-scale
+  defenses (an explicit list plus regex patterns), not a substitute for
+  running workers in a fully isolated credential boundary later.

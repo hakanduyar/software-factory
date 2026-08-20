@@ -17,6 +17,10 @@ Usage:
   sf demo             Run the in-memory demo work item from IDEA to DONE
   sf demo:persistent  Run (or resume) the SQLite-backed persistent demo
   sf transitions      Print the workflow transition table and protected gates
+  sf worker doctor    Report whether the claude/codex CLIs are found, and their version
+  sf worker smoke claude|codex
+                      Real, controlled, non-interactive smoke test of one installed
+                      CLI worker in a throwaway scratch workspace (burns real usage)
   sf help             Show this message
 `;
 
@@ -70,6 +74,26 @@ async function main(argv: readonly string[]): Promise<number> {
     case "transitions":
       printTransitions();
       return 0;
+    case "worker": {
+      const sub = argv[1];
+      if (sub === "doctor") {
+        const { runWorkerDoctor } = await import("./workerDoctor.js");
+        await runWorkerDoctor({ log: (line) => console.log(line) });
+        return 0;
+      }
+      if (sub === "smoke") {
+        const tool = argv[2];
+        if (tool !== "claude" && tool !== "codex") {
+          console.error(`Usage: sf worker smoke <claude|codex>`);
+          return 1;
+        }
+        const { runWorkerSmoke } = await import("./workerSmoke.js");
+        const result = await runWorkerSmoke(tool, { log: (line) => console.log(line) });
+        return result.run.status === "SUCCEEDED" ? 0 : 1;
+      }
+      console.error(`Usage: sf worker <doctor|smoke>`);
+      return 1;
+    }
     case "help":
     case "--help":
     case "-h":

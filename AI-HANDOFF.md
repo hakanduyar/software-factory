@@ -1,622 +1,785 @@
 # AI HANDOFF
 
 Status: IMPLEMENTED_AWAITING_VERIFICATION
-Current task: TASK-002
-Plan version: persistence-v1
+Current task: TASK-003
+Plan version: worker-runner-v1
 
-Prior task: TASK-001 (Local Factory Core Skeleton) shipped as commit
-`5071079` after six independent review rounds. Its full implementer/reviewer
-history is archived at `docs/tasks/archive/TASK-001-AI-HANDOFF.md`.
+Prior task: TASK-002 (Durable Persistence + Run Ledger) shipped as commit
+`29c1d61` after a three-round independent persistence review. Its full
+implementer/reviewer history is archived at
+`docs/tasks/archive/TASK-002-AI-HANDOFF.md`.
 
 ## Implementer output
 
 Worker: Claude Code (Sonnet 5), role IMPLEMENTATION ENGINEER.
 
-Wrote `docs/tasks/TASK-002-persistence.md` before implementation (per
-protocol), then added a second `FactoryStore` adapter — `src/adapters/sqlite/`
-— backed by `node:sqlite` (built into Node since 22.5; zero new npm
-dependencies, no ORM). It satisfies the exact same port
-(`src/ports/repositories.ts`) as the in-memory adapter, so **no line of
-`src/domain/`, `src/workflow/`, or `src/app/factoryService.ts` changed**. The
-port itself was not weakened.
+Wrote `docs/tasks/TASK-003-worker-runner.md` before implementation (per
+protocol), then added the worker-execution layer: a process-isolation
+abstraction, an environment/workspace boundary, and real Claude Code / Codex
+CLI adapters, all plugging into the **existing, unchanged**
+`FactoryService.runWorker` three-phase lifecycle from TASK-001/002. No line
+of `src/domain/`, `src/workflow/`, or `src/app/factoryService.ts` changed.
 
-### Design
+### 1. Environment finding, and how it was handled
 
-- **Schema** (`src/adapters/sqlite/schema.ts`): eight tables, one per
-  repository, each storing the full domain record as a JSON `data` column
-  (domain values are already JSON-safe — see TASK-001's `Timestamp`/
-  `deepFreeze` work) plus the columns each method needs to query or enforce
-  invariants on without parsing JSON first: `work_items.version` (CAS token),
-  `runs.status` (lifecycle guard), and `work_item_id` / `subject_type`+
-  `subject_id` indexes for the `listByX` queries. A `schema_meta` table
-  stamps a `schema_version`; opening a database written by a different
-  version throws `SchemaVersionError` rather than guessing (the "smallest
-  sensible" versioning baseline the task asked for — no migration runner).
-- **Serialization** (`src/adapters/sqlite/serialization.ts`): every row read
-  back from disk is validated field-by-field (enum membership, numeric
-  finiteness, array shape) before being trusted as a domain value, not cast.
-  A malformed row throws `PersistenceCorruptionError`.
-- **Transactions**: SQLite provides real ACID transactions, so unlike the
-  in-memory adapter's staged-overlay-plus-revalidation, this adapter writes
-  directly inside `BEGIN IMMEDIATE` / `COMMIT` / `ROLLBACK`. `node:sqlite`'s
-  `DatabaseSync` is one synchronous connection — two overlapping transactions
-  on it is a hard SQLite error, and letting one write slip into another's
-  open transaction would be worse than not atomic. A small FIFO in-process
-  mutex (`createMutex` in `sqliteStore.ts`) serializes every `transaction()`
-  call — including the single-operation ones each top-level repository
-  method opens, mirroring the in-memory adapter's `solo` helper — so exactly
-  one logical unit of work ever touches the connection at a time.
-- **CAS and run lifecycle**: real conditional SQL — `UPDATE work_items SET
-  ... WHERE id = ? AND version = ?` and `UPDATE runs SET ... WHERE id = ? AND
-  status = 'RUNNING'` — checked via `changes`, rather than comparing
-  separately-read values.
-- **Append-only tables**: SQLite's own `PRIMARY KEY` `UNIQUE` constraint; the
-  violation is translated to `AppendOnlyViolationError`.
-- **Shared logic, not duplicated**: `captureRun`/`captureCompletion` (the
-  Round-4/5 single-read-before-validate defense against hostile getters) were
-  extracted from the in-memory adapter into `src/adapters/shared/
-  runCapture.ts` and are now used by **both** adapters, so this guarantee
-  cannot silently diverge between them (the in-memory adapter's behavior is
-  unchanged — this was a pure extraction, re-verified by the full existing
-  suite staying green).
+The `claude` CLI binary is not installed on this machine — only the VS Code
+extension is present, which is not a subprocess-invocable non-interactive
+CLI. Confirmed by exhaustive search (PATH, `npm ls -g`, shell rc files,
+`/usr/local/bin`, `~/.claude/local`, a filesystem-wide search for
+`claude-code`/`cli.js`), and the configured npm registry (a corporate proxy,
+`registry.hmb.gov.tr`) is unreachable from this sandbox, so installing it
+would have required bypassing that registry — a global, persistent machine
+change outside this task's scope. Asked the user how to proceed
+(`AskUserQuestion`); they chose to handle installing/locating the real CLI
+separately. Consequence, carried through honestly rather than silently
+assumed: the Codex adapter's invocation was independently tested against the
+real `codex` binary (v0.147.0, authenticated); the Claude Code adapter is
+implemented against the CLI's publicly documented flag surface only,
+explicitly flagged UNVERIFIED everywhere it matters (file header, README,
+this report, acceptance criteria), and not real-smoke-tested. `sf worker
+doctor` reports this machine's actual state at any time.
 
-### One genuine, documented behavioral difference
+### 2. Real, tested Codex CLI invocation
 
-The in-memory adapter's `transaction()` opens an independent overlay per
-call, so two *concurrent* calls can each read the same pre-race snapshot and
-race on the final write (one wins, one gets `ConcurrencyError`). The SQLite
-adapter's mutex fully serializes transactions, so a second transaction's read
-always sees the first's already-committed result — closer to a real
-database's behavior under `BEGIN IMMEDIATE`. Concretely: two concurrent
-`FactoryService.advance()` calls can produce one CAS-rejected loser against
-the in-memory store; against SQLite, the second call's fresh read may find a
-*different* legitimate transition and succeed too, rather than losing a race.
-Neither is a bug — races are still never allowed to corrupt state or
-double-apply a change — but two of my first-draft rollback tests assumed the
-in-memory adapter's specific interleaving and had to be rewritten around a
-genuinely stale externally-held snapshot instead of a same-process race; see
-`tests/persistenceRollback.test.ts` for the corrected tests and the comments
-explaining why. This is documented in the README's persistence section.
+```
+codex exec --json -C <workspaceRoot> -m <model> [-c model_reasoning_effort="<effort>"] \
+  --sandbox <read-only|workspace-write> "<prompt>"
+```
 
-### Restart and rollback proof
+Verified by direct experiment (not memory): exit 0 on success, exit 1 with
+structured `ERROR` events on a bad model name; `--json` prints JSONL
+(`thread.started`/`turn.started`/`item.completed` with the final
+`agent_message` text/`turn.completed`); `-o/--output-last-message` writes
+just the final text to a file (not used — JSONL parsing keeps everything
+within captured stdout, no extra file lifecycle); `-c
+model_reasoning_effort="<level>"` genuinely overrides the configured effort
+per-invocation (config default `xhigh` → overridden to `low`, confirmed via
+the CLI's own printed banner); `codex exec` has no approval-prompt flag at
+all (rejected as unexpected), so sandbox alone governs safety with no
+interactive-hang risk; stdin is explicitly closed by the adapter (never left
+inherited). Full experiment transcript in
+`docs/tasks/TASK-003-worker-runner.md`.
 
-- `tests/persistenceRestart.test.ts`: builds a fully-released work item
-  through one store instance, closes it, opens a second instance against the
-  same file, and confirms identical status/version/specRevision/history plus
-  every run/evidence/review/approval/criterion-verification, and that a
-  brand-new `FactoryService` on the reopened store still enforces every
-  invariant (forged cancellation refused, a new worker run succeeds).
-- `tests/persistenceRollback.test.ts`: an append-only violation mid-
-  transaction, a thrown worker, a concurrent run-start race, and a
-  stale-snapshot write are each proven to leave no partial write.
-- `tests/support/storeContract.ts` + `tests/sqliteStore.test.ts`: the same
-  CAS/append-only/run-lifecycle/atomicity/frozen-return/Date-rejection/
-  insertion-order assertions run against **both** adapters from one shared
-  test body, proving parity (acceptance criterion 5).
-- `sf demo:persistent` / `npm run demo:persistent`: seeds a full lifecycle to
-  DONE, closes and reopens the store in-process, then — run a second time as
-  a genuinely new OS process — reads back the same state with no re-seeding.
-  Manually verified twice in a row from a clean `.factory-data/`; also
-  covered headlessly by `tests/persistentDemo.test.ts`.
+### 3. Claude Code CLI invocation — UNVERIFIED
 
-### Commands run (clean state)
+```
+claude -p "<prompt>" --model <model> --output-format json
+```
 
-- `rm -rf node_modules dist` → `npm install --registry=https://registry.npmjs.org` — OK (default registry unreachable from this machine, same as TASK-001)
+Documented, not tested. No permission-bypass flag is passed (which one would
+even be safe/correct cannot be confirmed without the real binary); effort is
+always reported as requested-but-not-applied (no verified flag). Because
+`WorkerOutcome.status` is derived only from the process's actual exit
+code/termination — never from parsed stdout (see design point 5) — a wrong
+flag assumption here fails safe: worst case is a clean `FAILED` run with
+real stderr/stdout as evidence, or a `TIMEOUT`-terminated `FAILED` run if
+the process hangs on something unanticipated (e.g. an interactive
+permission prompt) — never a false success. Must be re-verified for real
+(`npm run smoke:claude-worker`) once a `claude` binary is available.
+
+### 4. Process isolation / security controls
+
+- `src/ports/processRunner.ts` + `src/adapters/process/nodeProcessRunner.ts`:
+  `child_process.spawn(executable, argv, { cwd, env })` only — `argv` is
+  always an array, `shell` is never set, so there is no shell-interpolation
+  surface regardless of prompt/instruction content.
+- Timeout/cancellation escalate SIGTERM → (grace period) → SIGKILL against
+  the child's whole process group (`detached: true`, negative-pid signal),
+  so grandchildren (git, ripgrep, etc. a CLI shells out to) are terminated
+  too, not just the immediate child.
+- Exactly one `close` listener settles the result; a `settled` guard plus a
+  `requestedReason` flag (not a second racing listener) makes a timeout that
+  fires microseconds before a natural exit — or vice versa — resolve
+  deterministically to one outcome. Proven directly:
+  `tests/processRunner.test.ts` "exactly-once settlement" and the
+  does-not-report-TIMEOUT/CANCELLED-when-the-process-exits-first tests.
+- stdout/stderr are bounded (default 5 MiB/stream); a chatty child is still
+  drained past the cap rather than deadlocking the runner on backpressure,
+  and truncation is recorded (`stdoutTruncated`/`stderrTruncated`).
+- stdin is always explicitly ended (`child.stdin.end(input)`), never left
+  open/inherited; a child that closes its own stdin early cannot crash the
+  runner (stream `error` listeners are no-ops).
+- `src/adapters/workers/environmentPolicy.ts`: `process.env` is never
+  forwarded wholesale. `DEFAULT_WORKER_ENV_ALLOWLIST` names only
+  `PATH`/`HOME`/`CODEX_HOME`/locale/temp-dir variables — no API
+  key/token/secret name is ever on it (asserted directly by a test). A
+  best-effort `redactSecrets` regex pass runs on captured output before it
+  becomes Evidence, as defense in depth.
+- `src/adapters/workers/workspace.ts`: a worker's `cwd` is trusted
+  configuration supplied at adapter construction. `WorkerRequest` (the only
+  data `Worker.execute()` receives — see `src/ports/worker.ts`) has no `cwd`
+  field at all, so there is no path for model-generated text to choose a
+  process's working directory. `resolveWorkspace` requires the path to
+  exist, be a directory, and (by default) be a git repository.
+- Codex's `--sandbox` is role-derived: `workspace-write` only for
+  `IMPLEMENTER`, `read-only` for every other role.
+- The Codex effort override (`-c model_reasoning_effort=...`) only accepts a
+  plain token (`^[a-zA-Z0-9_-]+$`); anything else is refused with a recorded
+  reason rather than risking an unescaped Codex-side TOML override.
+
+### 5. Structured result / model-vs-process separation
+
+`src/adapters/workers/cliWorker.ts` is the one place both adapters share.
+Core discipline: `ProcessResult` (OS-level: exit code, termination reason)
+decides `WorkerOutcome.status`; the tool's own reported text
+(`CliReportedResult`, parsed from stdout by each adapter's
+`interpretOutput`) is attached as informational evidence/summary only and
+never influences status. Tested directly both ways: a process that exits 0
+while `FAKE_CODEX_MESSAGE="I failed"` still reports `SUCCEEDED`; a process
+that exits 1 while `FAKE_CODEX_MESSAGE="PASS"` still reports `FAILED`.
+`claimsAcceptanceMet` is always `false` from a real CLI adapter — no
+PASS/CHANGES_REQUIRED free-text parsing exists yet (explicit TASK-004
+scope), so no free-form model text is ever treated as a trusted claim.
+Process-level failure (non-zero exit, timeout, cancellation, spawn error)
+returns a `FAILED` `WorkerOutcome` with rich, adapter-supplied diagnostic
+evidence rather than throwing — a thrown exception is reserved for genuine
+adapter/programmer bugs (proven distinctly in
+`tests/workerRunnerIntegration.test.ts`).
+
+### 6. Model/effort configuration
+
+`src/adapters/workers/workerModelConfig.ts`: `WorkerModelConfig` (tool,
+model, effort, timeout) is plain configuration passed to
+`createClaudeCodeWorker`/`createCodexCliWorker` — nothing about which
+model/effort a run uses is hardcoded in workflow or adapter logic. `tool`
+(`"claude-code"`/`"codex-cli"`) and `model` are always distinct fields,
+never conflated (C9). `EffortApplication` makes honesty about capability
+explicit and structured rather than silently dropped: Codex reports
+`applied: true` for a safe token, `applied: false` with a reason for an
+unsafe one or when unset; Claude Code always reports `applied: false` with
+a reason (no verified flag).
+
+### 7. Same-run lifecycle / persistence
+
+Not reimplemented — reused. `FactoryService.runWorker`'s existing
+PHASE1(durable RUNNING)/PHASE2(execute)/PHASE3(finalize-exactly-once)
+transaction structure (TASK-001 Round-6, TASK-002-proved durable) already
+gives every CLI adapter: RUNNING persisted before the child process starts,
+the same run finalized exactly once regardless of success/non-zero
+exit/timeout/cancellation/spawn failure, and no work-item status change from
+a worker result. New proof this task adds is that a *real spawned process*
+(a fake CLI, never a real AI provider, in automated tests) goes through this
+identical path:
+
+- `tests/workerRunnerIntegration.test.ts` (in-memory store): Codex/Claude-
+  backed workers through the real three-phase lifecycle; FAILED-not-RUNNING
+  on non-zero exit/timeout/spawn failure; two distinct adapter `Worker`
+  objects get two distinct registry-issued principals even with the same
+  declared id; a Codex-backed IMPLEMENTER + Claude-backed REVIEWER complete
+  an independent `SEMANTIC` review (C4) with genuinely different tools
+  behind the two principals; a same-Claude-worker self-review is still
+  refused with `REVIEW_INTEGRITY`; a throwing adapter (a real bug, not a
+  process result) still leaves an honest `FAILED` run via
+  `WorkerExecutionError`.
+- `tests/workerRunnerPersistence.test.ts` (real SQLite file): starts a run
+  against a deliberately slow fake CLI, reads the `RUNNING` row back
+  through the *same store instance* while the child is still mid-flight
+  (proving PHASE 1 committed before PHASE 2 finished, not just before it
+  started), awaits completion, confirms `SUCCEEDED` and exactly one run
+  record, closes the store, reopens a new store instance against the same
+  file, and confirms the run and its evidence are still there, principal id
+  intact.
+
+### 8. Tests
+
+All new automated tests are fully offline — no real AI CLI is ever spawned
+by `npm test`. Fake CLIs live at `tests/fixtures/fake-clis/` as plain Node
+scripts, run either via `process.execPath <script>` (generic process-runner
+fixtures) or directly via their own shebang + exec bit (the two adapter
+fixtures, `fake-codex.mjs`/`fake-claude.mjs`, which must themselves act as
+"the executable" to exercise the adapters' real `executable`/`argv`
+plumbing). `fake-codex.mjs` mimics the independently-verified real `codex
+exec --json` contract (JSONL events, exit codes, env-var-controlled
+failure/timeout modes) so `codexCliAdapter.ts` is exercised against a
+faithful simulation, not a guess.
+
+New suites: `tests/processRunner.test.ts` (19 tests: argv/cwd/stdin/env
+exactness, clean/non-zero exit, spawn failure incl. bad executable and bad
+cwd, timeout incl. SIGKILL escalation against a SIGTERM-ignoring process,
+cancellation incl. already-aborted and races-against-natural-exit, bounded
+capture incl. large-output draining and truncation, hostile early-stdin-
+close, exactly-once settlement under a timeout/close race),
+`tests/environmentPolicy.test.ts`, `tests/workspace.test.ts`,
+`tests/promptTemplates.test.ts`, `tests/codexCliAdapter.test.ts` (pure argv/
+effort/output-parsing unit tests plus fake-CLI end-to-end execute() tests),
+`tests/claudeCodeAdapter.test.ts` (same shape, explicitly noting the
+UNVERIFIED-contract caveat in its own header),
+`tests/workerRunnerIntegration.test.ts`,
+`tests/workerRunnerPersistence.test.ts`.
+
+Two real fixture-timing bugs were found and fixed while stabilizing this
+suite (both about output flushing on POSIX pipes, not adapter logic): (a)
+several fixtures called `process.exit()` immediately after
+`process.stdout.write()`, which is asynchronous on a piped stdout on POSIX
+and can be truncated by an immediate exit — fixed by switching to
+synchronous `fs.writeSync(1, ...)` fd writes, or by not calling `exit()` at
+all where the fixture doesn't need a specific exit code; (b) the
+SIGKILL-escalation test used a 100 ms timeout that was occasionally too
+tight for a **fresh `node` child process's own startup** (module load,
+handler registration) under a loaded machine, killing it before it had run
+any of its code at all — fixed by widening that one test's margin to
+500 ms/300 ms grace, which is about the escalation actually working, not
+sub-100 ms responsiveness. Confirmed stable across 6 consecutive full-suite
+runs after both fixes (325/325 every time; before the fixes, 1/325 failed
+intermittently, always the same test).
+
+### 9. Real smoke-test results
+
+`npm run worker:doctor` on this machine:
+
+```
+claude-code (claude): NOT FOUND (tried "claude") — spawn claude ENOENT
+codex-cli (codex): found (codex), version: codex-cli 0.147.0
+```
+
+`npm run smoke:codex-worker` (real, controlled, one invocation — through
+`sf worker smoke codex`, i.e. through the actual `FactoryService.runWorker`
+path, not just the adapter in isolation):
+
+```
+scratch workspace: /tmp/sf-worker-smoke-codex-E32NK9
+launching codex (executable=codex, model=gpt-5.6-luna, timeoutMs=60000) against <scratch> ...
+run run-0002 status=SUCCEEDED
+summary: [codex-cli:gpt-5.6-luna] role=REVIEWER exit=0: I can see `.git/` and `README.md` in the workspace.
+evidence [NOTE] cli://codex-cli/run/run-0002: codex-cli model=gpt-5.6-luna role=REVIEWER exit=0 duration=17174ms
+evidence [NOTE] cli://codex-cli/run/run-0002/transcript: I can see `.git/` and `README.md` in the workspace.
+```
+
+Scratch workspace removed afterward. `npm run smoke:claude-worker` was
+**not** run at this point in the task — no `claude` binary existed on this
+machine to invoke. (It was run successfully in a later continuation once
+the CLI became available — see "Implementer follow-up" below.)
+
+### 10. Files changed
+
+Created: `docs/tasks/TASK-003-worker-runner.md`;
+`src/ports/processRunner.ts`; `src/adapters/process/nodeProcessRunner.ts`;
+`src/adapters/workers/{workspace,environmentPolicy,promptTemplates,
+workerModelConfig,cliWorker,claudeCodeAdapter,codexCliAdapter}.ts`;
+`src/cli/{workerDoctor,workerSmoke}.ts`;
+`tests/{processRunner,environmentPolicy,workspace,promptTemplates,
+codexCliAdapter,claudeCodeAdapter,workerRunnerIntegration,
+workerRunnerPersistence}.test.ts`;
+`tests/support/{fakeCli,tempWorkspace}.ts`;
+`tests/fixtures/fake-clis/*.mjs` (9 fixture scripts);
+`docs/tasks/archive/TASK-002-AI-HANDOFF.md` (this file's prior content,
+archived per protocol).
+
+Modified: `src/cli/main.ts` (added `worker doctor`/`worker smoke` dispatch,
+lazy-imported like `demo:persistent` so `sf demo`/`sf transitions` pay no
+extra cost); `package.json` (`worker:doctor`, `smoke:claude-worker`,
+`smoke:codex-worker`, `smoke:workers` scripts — none run by `test`);
+`README.md` (new "Worker Runner (TASK-003)" section); `AI-HANDOFF.md` (this
+file).
+
+Not touched: `src/domain/`, `src/workflow/`, `src/app/factoryService.ts`,
+`src/ports/{worker,workerRegistry,repositories}.ts`, either persistence
+adapter, any TASK-001/002 test.
+
+### 11. Exact verification results (clean state)
+
 - `npm run typecheck` — PASS
 - `npm run build` — PASS
-- `npm test` — **219 tests, 219 pass, 0 fail** (up from 188 at the end of TASK-001; +31 new tests across 6 new test files)
-- `npm run demo` (in-memory) — unchanged: DONE, 15 refusals
-- `npm run demo:persistent` — run twice from a clean `.factory-data/`: first run seeds to DONE and proves in-process restart; second run (new OS process) reads back identical state with no re-seeding
-- `git diff --check` — clean
-- `git status --short` — inspected; `.factory-data/` correctly absent (gitignored)
-
-### Files created/modified
-
-Created: `docs/tasks/TASK-002-persistence.md`, `docs/tasks/archive/TASK-001-AI-HANDOFF.md` (archival copy), `src/adapters/sqlite/{schema,serialization,sqliteStore}.ts`, `src/adapters/shared/runCapture.ts`, `src/cli/persistentDemo.ts`, `tests/{sqliteStore,persistenceRestart,persistenceRollback,persistentDemo}.test.ts`, `tests/support/storeContract.ts`.
-
-Modified: `package.json` (engines bumped to `>=22.5.0`, added `demo:persistent` script), `.gitignore` (runtime DB files), `src/adapters/memory/inMemoryStore.ts` (import shared `captureRun`/`captureCompletion` instead of local duplicates — no behavioral change), `src/cli/main.ts` (added `demo:persistent` command, lazy-imported so plain `sf demo` never loads `node:sqlite`), `src/domain/errors.ts` (added `PersistenceCorruptionError`, `SchemaVersionError`), `tests/support/factoryFixtures.ts` (added `newSqliteFactory`, `tempDbPath`), `README.md`, `LOOP.md`, `LOOP-PLANS.md`, `AI-HANDOFF.md` (reset for TASK-002; TASK-001's full record archived rather than deleted).
-
-Not done, by design: no commit, no push, no merge; TASK-003 not started; no Claude/Codex worker execution, model routing, GitHub, n8n, Telegram, server deployment or content pipeline added; no ORM/query-builder dependency; no migration-runner platform (only version detection); the Constitution was not modified.
-
-## Implementer remediation (Round 2)
-
-Worker: Claude Code (Sonnet 5), role IMPLEMENTATION ENGINEER, responding to
-the CHANGES_REQUIRED review below. Both HIGH findings are fixed. Scope was
-kept to `src/adapters/sqlite/{schema,serialization,sqliteStore}.ts`,
-`src/domain/errors.ts`, `tests/support/factoryFixtures.ts` (temp-dir
-cleanup), and one new test file — no TASK-003 work, no port changes, no
-weakening of any TASK-001/TASK-002 invariant.
-
-### 1. Root cause of both HIGH findings
-
-- **Finding 1 (schema masquerade):** `ensureSchema()` ran `CREATE TABLE IF
-  NOT EXISTS` unconditionally and only ever checked
-  `schema_meta.schema_version`. A table that kept the right name but lost its
-  `PRIMARY KEY` (or any other constraint/column/index) was never inspected,
-  so it silently passed as "version 1" — losing append-only protection
-  without any error.
-- **Finding 2 (deserialization trusts unchecked data):** the parsers checked
-  JSON shape and enum membership, but (a) never compared the indexed SQL
-  columns (`work_items.version`, `runs.status`, `approvals.subject_id`, ...)
-  against the JSON payload they're supposed to mirror, and (b) didn't
-  validate every domain lifecycle invariant — a WorkItem could carry a
-  negative `version`, and a Run could be RUNNING with `finishedAt` set, and
-  both would be returned as if trusted.
-
-### 2. Schema-open invariant introduced
-
-`ensureSchema()` (`src/adapters/sqlite/schema.ts`) now strictly orders its
-checks so no DDL that could change table structure ever runs against an
-existing database:
-
-1. Is there a `schema_meta` table at all?
-   - No, and no other Factory-named table exists either → genuinely fresh
-     database; this is the *only* path that runs `SCHEMA_DDL` and stamps the
-     version.
-   - No, but some Factory-named table *does* exist → `SchemaIntegrityError`
-     (a database with Factory tables but no version marker is neither fresh
-     nor trustworthy).
-2. Does `schema_meta` have a `schema_version` row? No → `SchemaIntegrityError`.
-3. Does the stored version match `SCHEMA_VERSION`? No → `SchemaVersionError`,
-   with zero DDL executed before the throw.
-4. Version matches → `validateSchema()` (see below) runs; any mismatch there
-   also throws before any table is used. An existing, version-matched
-   database is validated, never "repaired".
-
-### 3. Full-schema validation performed
-
-`validateSchema()` walks a fixed `EXPECTED_TABLES` spec (kept in sync with
-`SCHEMA_DDL` by hand — TASK-002 intentionally has no schema-derivation
-framework) and, per table, checks via `PRAGMA table_info(...)` and
-`sqlite_master`: the table exists; every expected column exists with the
-right type/`NOT NULL`/`PRIMARY KEY` flags (this is what catches the
-reviewer's exact repro — an `evidence` table missing `PRIMARY KEY` on `id`);
-and every index this adapter's queries rely on
-(`idx_work_items_project_id`, ..., `idx_approvals_subject`) exists. Table
-names interpolated into `PRAGMA table_info("...")` always come from the
-fixed constant, never from external input.
-
-### 4. Runtime persisted-record validation introduced
-
-`src/adapters/sqlite/serialization.ts` gained a `positiveInt` validator (used
-for `WorkItem.version`/`specRevision`, `Run.specRevision`,
-`Review.specRevision`, `AcceptanceCriterionVerification.specRevision`, and
-`ApprovalContext.specRevision` — confirmed always ≥1 by how
-`src/app/factoryService.ts`/`src/workflow/workflowService.ts` initialize and
-increment them) plus two lifecycle-coherence checks:
-- `WorkItem.blockedFrom` is now required iff `status === "BLOCKED"` (and
-  forbidden otherwise), matching `workflowService.ts`'s actual invariant.
-- `Run.finishedAt` is now required iff `status !== "RUNNING"` (terminal), and
-  forbidden while RUNNING, matching `run.ts`'s documented lifecycle.
-- `ApprovalContext.statusWhenDecided` is now validated against
-  `WORK_ITEM_STATUSES` (was a bare string before).
-
-### 5. SQL/JSON cross-checks introduced
-
-Every `parseX` function now takes an `expected` parameter carrying the
-row's indexed SQL columns and throws `PersistenceCorruptionError` (via a new
-shared `crossCheck` helper) on any mismatch against the decoded JSON:
-`Project.id`; `WorkItem.id`/`projectId`/`version`;
-`AcceptanceCriterion.id`/`workItemId`; `Run.id`/`workItemId`/`status`;
-`Review.id`/`workItemId`; `Evidence.id`/`workItemId`;
-`AcceptanceCriterionVerification.id`/`workItemId`;
-`Approval.id`/`subject.type`/`subject.id`. `sqliteStore.ts`'s `SELECT`
-statements were widened to fetch these columns alongside `data`, and every
-call site (`findById`, `listByX`, plus the CAS-conflict lookup inside
-`compareAndSave`) now passes them through. Neither the SQL column nor the
-JSON value is ever preferred silently — any disagreement is a hard refusal.
-
-### 6. Proof regression tests failed before fixes
-
-New `tests/persistenceCorruption.test.ts` (27 tests) was written and run
-against the pre-fix code first: **15 of 27 failed**, reproducing both HIGH
-findings exactly as described —
-- schema-shape tests (missing `PRIMARY KEY`, missing `version`/`status`
-  column, missing index, tables-without-marker) all failed to throw;
-- the `work_items.version=77` / JSON `version=-1` cross-check, `runs.status`
-  divergence, and `approvals.subject_id` divergence cases all failed to
-  throw;
-- `blockedFrom` incoherence, `Run` RUNNING-with-`finishedAt`,
-  terminal-without-`finishedAt`, and non-positive `specRevision` cases all
-  failed to throw;
-- the negative-version and non-integer-version WorkItem cases failed to
-  throw (the pre-fix `num()` validator accepted any finite number).
-
-After the fixes above, the same 27/27 pass. The "B" test (incompatible
-version must not mutate) already passed before the fix — `CREATE TABLE/INDEX
-IF NOT EXISTS` were already no-ops against an existing schema — but is kept
-as a permanent regression guard, proven via a full `sqlite_master` +
-row-count snapshot taken before and after the refused open.
-
-### 7. Files changed
-
-Modified: `src/domain/errors.ts` (added `SchemaIntegrityError`),
-`src/adapters/sqlite/schema.ts` (ordered version/shape validation before any
-DDL, added `EXPECTED_TABLES` + `validateSchema`),
-`src/adapters/sqlite/serialization.ts` (added `positiveInt`, `crossCheck`;
-every `parseX` now takes and checks `expected` metadata; added
-`blockedFrom`/`finishedAt`/`statusWhenDecided` coherence checks),
-`src/adapters/sqlite/sqliteStore.ts` (`SELECT`s widened to fetch indexed
-columns; every parse call site passes them through; added row-shape
-interfaces), `tests/support/factoryFixtures.ts` (added `cleanupTempDbs()`;
-`tempDbPath()` now tracks what it creates — Round-2 LOW finding),
-`tests/persistenceRestart.test.ts` and `tests/persistentDemo.test.ts`
-(wired `after(cleanupTempDbs)`).
-
-Created: `tests/persistenceCorruption.test.ts` (27 tests: schema integrity,
-SQL/JSON cross-checks, invalid-domain-value rejection).
-
-Not touched: the persistence port, the in-memory adapter, domain/workflow
-code, README (out of this round's stated scope), any TASK-003 work.
-
-### 8. Exact verification results (clean state)
-
-- `rm -rf node_modules dist` → `npm install --registry=https://registry.npmjs.org` — OK
-- `npm run typecheck` — PASS
-- `npm run build` — PASS
-- `npm test` — **246 tests, 246 pass, 0 fail** (up from 219; +27 from the new corruption suite)
-- `node --test dist/tests/persistenceCorruption.test.js` — 27/27 pass (run standalone to confirm in isolation)
+- `npm test` — **325 tests, 325 pass, 0 fail** (up from 260; +65 from this
+  task), confirmed stable across 6 consecutive full runs after the two
+  fixture-timing fixes above
 - `npm run demo` — DONE, 15 refusals, unchanged
-- `npm run demo:persistent` run twice (seed, then a second real OS process reading back) — unchanged behavior, version 12, runs=3, evidence=6 both times
+- `npm run demo:persistent` run twice (seed, then a second real OS process
+  reading back) — unchanged behavior
+- `npm run worker:doctor` — see section 9
+- `npm run smoke:codex-worker` — see section 9 (real invocation, SUCCEEDED)
 - `git diff --check` — clean
-- `git status --short` — matches the files listed above; confirmed no leftover temp directories under `/tmp` after the new/updated tests run (`ls /tmp | grep -E "factory-test-|factory-corrupt-|persistent-demo-"` → empty)
+- `git status --short` — matches the files listed above
 
-### 9. Remaining limitations
+### 12. Remaining limitations
 
-- `EXPECTED_TABLES` in `schema.ts` is hand-kept in sync with `SCHEMA_DDL`
-  rather than derived from one source — acceptable for TASK-002's "no schema
-  framework" scope, but a future migration mechanism should consider
-  generating one from the other.
-- Schema validation checks column name/type/`NOT NULL`/`PRIMARY KEY` and
-  index presence; it does not re-verify `STRICT`/`WITHOUT ROWID` table
-  options or foreign-key definitions (none are relied on for correctness
-  here — `PRAGMA foreign_keys = OFF` is set deliberately, see original
-  design notes above).
-- All prior TASK-002 limitations still apply unchanged (single-writer mutex,
-  no migration runner, local-file-only, `node:sqlite` still experimental
-  upstream).
+- No PASS/CHANGES_REQUIRED free-text parsing; `claimsAcceptanceMet` is
+  always `false` from a real CLI worker — explicit TASK-004 scope, not an
+  oversight.
+- No autonomous implement → verify → review loop, no remediation loop, no
+  GitHub Issues/Projects/PR integration, no Telegram/WhatsApp/n8n, no server
+  deployment, no full model router/benchmark engine, no multi-machine
+  worker scheduling.
+- The environment allowlist and secret redaction are bootstrap-scale
+  defenses (an explicit list plus regex patterns), not a substitute for a
+  fully isolated credential boundary a later phase may want.
+- Prompt templates (`promptTemplates.ts`) exist for all six `FactoryRole`s
+  but only `IMPLEMENTER`/`REVIEWER`/`VERIFIER` are exercised by real
+  tests/demo, matching what TASK-003 actually needed to execute.
+- All prior TASK-001/TASK-002 limitations still apply unchanged.
 
-### 10. Ready for independent re-review: YES
+### 13. Ready for independent review: YES (pending the follow-up below)
 
-## Implementer remediation (Round 3)
+## Implementer follow-up: Claude Code CLI verification
 
-Worker: Claude Code (Sonnet 5), role IMPLEMENTATION ENGINEER, responding to
-the Round-2 re-review's two HIGH and two MEDIUM findings below. All four are
-fixed. Scope stayed inside `src/adapters/sqlite/schema.ts` (the file every
-finding this round is about) plus two new test files and one new shared test
-helper — no other adapter file, port, or domain code changed.
+Worker: Claude Code (Sonnet 5), role IMPLEMENTATION ENGINEER. Continuation
+of the same TASK-003 work above, triggered by the human installing a real
+`claude` binary (via a one-command `npmjs.org` registry override for that
+one install only — no global npm registry configuration was changed) and
+asking for the previously-unverified adapter to be checked against it. This
+is a correction pass, not a restart: no code outside the Claude adapter and
+its tests changed.
 
-### 1. Root causes
+**1. Claude path/version**
 
-- **HIGH — failed opens still mutated the target DB:** `ensureSchema()` ran
-  `PRAGMA journal_mode = WAL` and `PRAGMA foreign_keys = OFF` unconditionally
-  as its first two statements, before any classification of the database had
-  happened. A refused open (unsupported version, corrupt schema, unrelated
-  DB) still left `journal_mode` changed from `DELETE` to `WAL` — a real,
-  persistent mutation of a database the store was about to reject.
-- **HIGH — unrelated non-empty DB treated as fresh:** the "is this a fresh
-  database" check only asked "does a Factory-named table exist?". A database
-  with unrelated user tables (no Factory tables, no `schema_meta`) has no
-  Factory-named table either, so it satisfied that check and had the full
-  Factory schema silently installed into someone else's database file.
-- **MEDIUM — malformed `schema_meta` could leak a raw SQLite error:** the
-  version lookup (`SELECT value FROM schema_meta WHERE key = ...`) ran
-  immediately once a table named `schema_meta` was found, with no check that
-  it actually had a `value` column. A `schema_meta` missing that column made
-  the query itself throw a raw `ERR_SQLITE_ERROR` ("no such column: value")
-  instead of a controlled `SchemaIntegrityError`.
-- **MEDIUM — index validation checked names, not definitions:** the index
-  check was `SELECT name FROM sqlite_master WHERE type='index' AND name=? AND
-  tbl_name=?` — proof an index with that name exists on that table, not proof
-  of what column(s) it actually indexes. An index recreated under the
-  expected name but over the wrong column (or a composite index with its
-  columns swapped) passed silently.
+```
+command -v claude   -> /home/hakan/.nvm/versions/node/v22.23.1/bin/claude
+claude --version    -> 2.1.235 (Claude Code)
+claude doctor       -> No installation issues found.
+```
 
-### 2. Read-only DB classification design
+**2. Actual tested Claude invocation**
 
-`ensureSchema()` now delegates to a new `classifyDatabase()` that performs
-*only* read-only introspection — `sqlite_master` queries, `PRAGMA
-table_info`/`index_list`/`index_info`, and plain `SELECT`s — and returns one
-of five classifications without ever executing DDL or a mutating `PRAGMA`:
-`EMPTY`, `CURRENT_FACTORY`, `UNSUPPORTED_FACTORY_VERSION` (carries the raw
-stored version string), `CORRUPT_OR_INCOMPLETE_FACTORY` (carries a reason),
-or `NON_FACTORY_NONEMPTY` (carries a reason). `ensureSchema()` then does a
-single `switch` on the result — the *only* place any mutating statement
-executes, and only in the `EMPTY` and `CURRENT_FACTORY` arms.
+```
+claude -p "<prompt>" --model <model> --output-format json \
+  [--effort <low|medium|high|xhigh|max>] --permission-mode <plan|acceptEdits>
+```
 
-### 3. When mutating PRAGMAs now execute
+Full experiment detail in `docs/tasks/TASK-003-worker-runner.md` ("Real,
+tested Claude Code CLI invocation"). Summary of what a real `claude --help`
+plus three minimal, harmless, non-tool-using probes actually showed:
 
-`PRAGMA journal_mode = WAL` and `PRAGMA foreign_keys = OFF` now execute in
-exactly two places, both *after* classification has already decided the
-database is safe: the `EMPTY` arm (immediately before the one-time
-`SCHEMA_DDL` + version-stamp insert), and the `CURRENT_FACTORY` arm (after
-`classifyDatabase` has already run full column/index validation on every
-table). Every other arm (`UNSUPPORTED_FACTORY_VERSION`,
-`CORRUPT_OR_INCOMPLETE_FACTORY`, `NON_FACTORY_NONEMPTY`) throws without
-executing a single statement beyond the read-only classification queries.
+- `-p`/`--print` + a positional prompt argument: confirmed correct.
+- `--output-format json` prints exactly one JSON object with a `.result`
+  string field: **confirmed correct** — this was already the adapter's
+  primary parsing path before the real binary was available, so no change
+  was needed there.
+- `--effort <level>` (choices: low, medium, high, xhigh, max): **real and
+  working** — accepted without error in a live call. The original
+  assumption that no such flag existed was wrong.
+- `--permission-mode <mode>` (choices: acceptEdits, auto, bypassPermissions,
+  manual, dontAsk, plan): real and documented; not previously used at all.
+- No `-C`/`--cwd`-equivalent flag exists: confirmed absent, matching the
+  original assumption that the child process's OS-level `cwd` (which
+  `ProcessRunner` always sets) is the only mechanism.
+- Authentication is file-based (`$HOME/.claude/.credentials.json`); a probe
+  run with `env -i HOME=$HOME PATH=$PATH` (i.e. shaped exactly like the
+  adapter's own restricted environment allowlist) succeeded, confirming
+  `DEFAULT_WORKER_ENV_ALLOWLIST` needs no changes for Claude to
+  authenticate.
 
-### 4. Empty vs non-Factory DB rule
+**3. Differences from previous adapter assumptions**
 
-`listUserSchemaObjects()` selects every `sqlite_master` row and filters out
-anything whose name starts with `sqlite_` (SQLite's own internal bookkeeping
-objects — `sqlite_sequence`, `sqlite_stat1`, etc.). A database is `EMPTY` iff
-that filtered list has zero rows — no tables, indexes, triggers, or views of
-any kind, Factory or otherwise. Anything else falls through to the
-Factory-marker check (`CORRUPT_OR_INCOMPLETE_FACTORY` if some Factory-named
-table exists without a marker, `NON_FACTORY_NONEMPTY` otherwise) — there is
-no longer a path where "no Factory-named table happens to exist yet" is
-treated as license to initialize.
+Two corrections, both narrowly scoped to `claudeCodeAdapter.ts`:
 
-### 5. `schema_meta` structural validation
+- Effort was previously always reported `applied: false` ("no verified
+  flag"). Now `resolveClaudeEffort` validates against the CLI's exact
+  five-value choice set and applies `--effort <level>` for a valid one,
+  honestly refusing (with a reason) anything else — mirroring how
+  `resolveCodexEffort` already validated its own TOML-override input.
+- Permission/sandbox control was previously entirely absent (deliberately —
+  "which flag is correct... cannot be confirmed without the real binary").
+  Added `permissionModeForRole`: `acceptEdits` for `IMPLEMENTER`, `plan` for
+  every other role — the direct Claude-side counterpart to
+  `codexCliAdapter.ts`'s `sandboxForRole` (`workspace-write` only for
+  `IMPLEMENTER`, `read-only` otherwise), now that the task explicitly asked
+  for permission/sandbox controls to be verified and the real `--help`
+  output confirmed the flag and its choices.
 
-`validateTableColumns()` (extracted from the combined column+index validator
-used in Round 2) is called against the `schema_meta` table's own shape
-*before* the version row is ever queried. Only if that structural check
-passes does `classifyDatabase` run `SELECT value FROM schema_meta WHERE key =
-'schema_version'` — wrapped in its own `try/catch` that converts any
-unexpected error into `CORRUPT_OR_INCOMPLETE_FACTORY` rather than letting it
-propagate raw. It also now checks the query returns exactly one row (not
-zero, not more than one — duplicate `schema_version` rows are only possible
-if `schema_meta`'s `PRIMARY KEY` was itself removed, which the structural
-check above would normally already have caught, but the row-count check is a
-second, independent guard). Finally, a `schema_version` value that fails
-`Number.isInteger` is classified `CORRUPT_OR_INCOMPLETE_FACTORY`, not
-`UNSUPPORTED_FACTORY_VERSION` — `SchemaVersionError` is now reserved
-specifically for "a structurally valid Factory schema declares a known,
-well-formed, but unsupported version number."
+Everything else (the `-p`/`--model`/`--output-format json` core, the
+process-exit-decides-status discipline, no `claimsAcceptanceMet` trust,
+environment allowlist, workspace-via-`cwd`) was already correct and is
+unchanged.
 
-### 6. Index-definition validation
+**4. Changes made**
 
-`ExpectedIndex` now carries `columns: readonly string[]` (in order) and
-`unique: boolean`, not just a bare name. `validateTableIndexes()` looks up
-each expected index via `PRAGMA index_list(table)` (checking existence and
-the `unique` flag), then `PRAGMA index_info(indexName)` — sorted by `seqno`
-— and compares the resulting column sequence element-by-element against the
-expected columns, in order. `idx_approvals_subject`'s expected columns are
-`["subject_type", "subject_id"]`, so a same-named index built as
-`(subject_id, subject_type)` now fails validation. Only the seven indexes
-this adapter's queries actually rely on are declared in `EXPECTED_TABLES`;
-no attempt is made to enumerate or reject indexes the implementation doesn't
-use.
+- `src/adapters/workers/claudeCodeAdapter.ts`: file header rewritten from
+  "UNVERIFIED" framing to the confirmed invocation, with the prior
+  unavailability preserved as an explicit historical note (not deleted);
+  `resolveClaudeEffort` now validates/applies a real flag; added
+  `permissionModeForRole`; `buildClaudeInvocation` now appends `--effort`
+  (when applicable) and always appends `--permission-mode`.
+- `tests/claudeCodeAdapter.test.ts`: updated the argv-shape and effort
+  tests for the corrected behavior; added a `permissionModeForRole` test
+  and an argv test covering the `--effort`+`--permission-mode plan` path.
+  No fake-CLI fixture changes were needed.
+- `docs/tasks/TASK-003-worker-runner.md`: added the "Real, tested Claude
+  Code CLI invocation" section; updated the environment-finding section to
+  preserve history while recording the update; marked acceptance criteria
+  2 and 15 satisfied for Claude.
+- `README.md`: replaced the "Claude Code CLI — UNVERIFIED" paragraph with
+  the verified one; removed the now-resolved bullet from "Known
+  limitations".
+- `AI-HANDOFF.md`: this section.
 
-### 7. Proof all four regression cases failed before fixes
+No file outside this list changed. No source file was modified by either
+real Claude invocation itself (both ran against a throwaway scratch
+directory, never this repository) — confirmed by `git status --short`
+before and after showing only the intentional edits above.
 
-New `tests/persistenceSchemaOpening.test.ts` (14 tests, plus a new shared
-`tests/support/dbSnapshot.ts` helper for the "before vs. after a refused
-open" comparisons) was run against the pre-fix code first: **6 of 14
-failed**, reproducing every finding —
-- the journal-mode/full-snapshot test failed (`journal_mode` became `wal`
-  after a refused open);
-- the unrelated-non-empty-database test failed (no throw at all — the
-  Factory schema was installed into it);
-- the "`schema_meta` missing its `value` column" case failed (a raw SQLite
-  error, not `SCHEMA_INTEGRITY_VIOLATION`, propagated);
-- the "non-integer `schema_version` value" case failed (it threw
-  `SCHEMA_VERSION_MISMATCH` instead of `SCHEMA_INTEGRITY_VIOLATION` — the
-  reserved-for-valid-version-only rule from finding 5 above);
-- both wrong-index-definition cases failed (wrong single column; swapped
-  composite-index column order) — the pre-fix code only checked the index
-  name existed.
+**5. Real Claude smoke result**
 
-The remaining 8 (already-empty DB still initializes; internal
-`sqlite_*`-only DB still initializes; missing-PK/no-version-row/duplicate-
-rows/wrong-column-type `schema_meta` cases; missing-index and
-correct-index-passes cases) already passed pre-fix, since Round 2's
-`validateSchema` already covered them as part of full post-version-check
-validation — they are kept as permanent regression guards for this round's
-restructuring. After the fixes above, all 14/14 pass.
+One minimal direct probe first (a trivial, tool-free prompt, run twice: once
+with the shell's ambient environment to learn the real output shape, once
+with an `env -i HOME=... PATH=...` environment to confirm the adapter's
+restricted allowlist is sufficient for authentication) — both exit 0,
+`result: "OK"`. Then exactly one real Factory-path smoke run through the
+implemented path (`sf worker smoke claude`, i.e.
+`FactoryService.runWorker` -> durable RUNNING Run -> `ClaudeCodeWorker` ->
+`ProcessRunner` -> real `claude` CLI -> normalized result/evidence -> same
+Run finalized terminally):
 
-### 8. Files changed
+```
+scratch workspace: /tmp/sf-worker-smoke-claude-qf1dgU
+launching claude (executable=claude, model=claude-sonnet-5, timeoutMs=60000) against <scratch> ...
+run run-0002 status=SUCCEEDED
+summary: [claude-code:claude-sonnet-5] role=REVIEWER exit=0: I can see the workspace contents: a `.git` directory and a `README.md` file.
+evidence [NOTE] cli://claude-code/run/run-0002: claude-code model=claude-sonnet-5 role=REVIEWER exit=0 duration=24477ms
+evidence [NOTE] cli://claude-code/run/run-0002/transcript: I can see the workspace contents: a `.git` directory and a `README.md` file.
+```
 
-Modified: `src/adapters/sqlite/schema.ts` (the entire classification/
-validation/`ensureSchema` design described above; `EXPECTED_TABLES`' index
-entries now carry `columns`/`unique`; `SCHEMA_DDL` exported for test use).
+Verified: the real CLI was genuinely launched (the model's answer correctly
+describes the scratch directory's actual contents, which only exist because
+`sf worker smoke claude` created them); `run-0002` (not `run-0001`, the
+zero-cost mock IMPLEMENTER placeholder the smoke harness seeds first) is the
+real-CLI run, meaning `runWorker`'s PHASE 1 durably attached it before
+execution — the same structural guarantee already proven exhaustively by
+`tests/workerRunnerPersistence.test.ts` for a process-backed worker, not
+re-derived per invocation here; process exit status (0) is what decided
+`SUCCEEDED`, not the printed text; evidence is short, contains no secrets,
+and used `plan` permission-mode (read-only intent) since role was
+`REVIEWER`; exactly one run record for the real CLI (`run-0002`, terminal);
+`git status --short` unchanged by the run; no commit/push occurred. Scratch
+workspace and probe directories removed afterward.
 
-Created: `tests/persistenceSchemaOpening.test.ts` (14 tests: read-only-
-refusal proof, unrelated-DB refusal, empty-DB precision, `schema_meta`
-structural validation, index-definition validation),
-`tests/support/dbSnapshot.ts` (reusable `snapshotDb`/`readJournalMode`
-before/after comparator).
+**6. Worker doctor result**
 
-Not touched: `src/adapters/sqlite/serialization.ts`, `sqliteStore.ts`, the
-persistence port, the in-memory adapter, domain/workflow code, README, any
-TASK-003 work. (The reviewer's report also notes stored-value payloads
-appearing in some `PersistenceCorruptionError` messages via `JSON.stringify`
-— this was not one of the four findings enumerated for this round's scope
-and was left untouched; flagged under Remaining limitations below for a
-follow-up round if wanted.)
+```
+claude-code (claude): found (claude), version: 2.1.235 (Claude Code)
+codex-cli (codex): found (codex), version: codex-cli 0.147.0
+```
 
-### 9. Exact verification results (clean state)
+No credentials printed.
 
-- `rm -rf node_modules dist` → `npm install --registry=https://registry.npmjs.org` — OK
+**7. Regression results**
+
 - `npm run typecheck` — PASS
 - `npm run build` — PASS
-- `npm test` — **260 tests, 260 pass, 0 fail** (up from 246; +14 from the new schema-opening suite)
-- `node --test dist/tests/persistenceSchemaOpening.test.js` — 14/14 pass standalone
-- `node --test dist/tests/persistenceCorruption.test.js` — 27/27 pass standalone (Round-2 suite unaffected)
+- `npm test` — **328 tests, 328 pass, 0 fail** (up from 325; +3 from the
+  new/updated Claude adapter tests), confirmed stable across 3 additional
+  consecutive full runs
 - `npm run demo` — DONE, 15 refusals, unchanged
-- `npm run demo:persistent` run twice (seed, then a second real OS process reading back) — unchanged: version 12, runs=3, evidence=6 both times
+- `npm run demo:persistent` run twice (seed, then a second real OS process
+  reading back) — unchanged behavior
 - `git diff --check` — clean
-- `git status --short` — matches the files listed above; no leftover temp directories under `/tmp` after the new tests run
+- `git status --short` — matches the files listed in section 4 above
 
-### 10. Remaining limitations
+The real Codex smoke was **not** re-run — no change touched the shared
+`cliWorker.ts` engine or `codexCliAdapter.ts`, only `claudeCodeAdapter.ts`
+and its own tests, so the prior Codex smoke result (section 9 above)
+remains current evidence.
 
-- The reviewer's Round-2 re-review also flagged that some
-  `PersistenceCorruptionError` messages echo `JSON.stringify` of stored
-  values; this round's explicit scope was the two HIGH findings plus the
-  two MEDIUM schema findings (malformed `schema_meta`, index-definition
-  validation) — the message-content concern was left unchanged pending
-  explicit instruction.
-- `EXPECTED_TABLES` remains hand-kept in sync with `SCHEMA_DDL` (unchanged
-  from Round 2's noted limitation — no schema-derivation framework, by
-  design).
-- Index validation checks column sequence and the `unique` flag; it does not
-  re-verify partial-index `WHERE` clauses or collation (none are used by any
-  Factory index).
-- All prior TASK-001/TASK-002 limitations still apply unchanged
-  (single-writer mutex, no migration runner, local-file-only, `node:sqlite`
-  still experimental upstream).
+**8. Remaining limitations (updated)**
 
-### 11. Ready for independent re-review: YES
+Unchanged from section 12 above, minus the now-resolved Claude-unverified
+item. No new limitation was introduced by this correction.
+
+**9. Ready for independent review: YES**
 
 ## Verification output
 Pending — an independent verification pass should re-run `npm run verify &&
-npm run demo && npm run demo:persistent` from a clean checkout.
+npm run demo && npm run demo:persistent && npm run worker:doctor` from a
+clean checkout, and (separately, deliberately, burning real usage) `npm run
+smoke:codex-worker` and `npm run smoke:claude-worker`.
 
 ## Reviewer output
+Independent defensive review (Codex, 2026-08-20): **CHANGES_REQUIRED**.
 
-Independent persistence review (Codex, 2026-08-19): **CHANGES_REQUIRED**.
+### HIGH — captured worker output bypasses redaction in the persisted Run summary
 
-### HIGH — incomplete/corrupt schema can masquerade as schema version 1 and remove append-only protection
+`src/adapters/workers/cliWorker.ts` redacts the parsed final message before
+creating transcript Evidence, but `buildSummary()` uses the raw parsed
+message. `FactoryService.runWorker()` persists that summary as
+`Run.summary`, and `workerSmoke.ts` also prints it directly.
 
-`ensureSchema()` uses `CREATE TABLE IF NOT EXISTS` and verifies only the
-`schema_meta.schema_version` value; it never verifies the existing table
-definitions, keys, or constraints before preparing/using them. Reproduction
-against a temporary SQLite file: initialize a valid store, replace `evidence`
-with `CREATE TABLE evidence (id TEXT, work_item_id TEXT NOT NULL, data TEXT
-NOT NULL) STRICT`, then reopen the store. Open succeeds and two writes with
-the same Evidence id both succeed (`listByWorkItem` returns two rows). This
-violates TASK-002's append-only requirement and the explicit requirement that
-a partially initialized schema cannot masquerade as valid. A database whose
-marker says an incompatible version is also modified with the current DDL
-before `SchemaVersionError` is thrown.
+Reproduction with the deterministic fake Codex executable and a synthetic
+token-shaped message: transcript Evidence was `[REDACTED]`, while the same
+Run summary contained the original value. The value remained present after
+closing and reopening the SQLite store. This violates C6 and TASK-003's
+requirement that captured output not be blindly persisted when redaction is
+claimed.
 
-Remediation: validate the full expected schema (including primary keys and
-required columns/indexes) before use; refuse any mismatch before mutating a
-version-mismatched database. Make fresh-schema creation/version stamping one
-safe, atomic initialization path.
+Smallest remediation: apply the same redaction (and existing summary bound)
+to the message before it enters `buildSummary()`/`Run.summary`, then add a
+Factory + SQLite regression assertion covering both Evidence and Run
+summary after reopen. Do not rely on Evidence redaction alone.
 
-### HIGH — deserialization accepts invalid persisted domain state and indexed/data divergence
+### MEDIUM — workspace validation accepts a false Git repository
 
-The parsers check JSON shape and enum membership but do not validate row
-metadata against serialized state or all domain lifecycle/value invariants.
-Reproduction against a temporary SQLite file: set
-`work_items.version = 77` while its JSON `data.version = -1`; reopening and
-`findById()` succeeds and returns version `-1`, rather than throwing
-`PERSISTENCE_CORRUPTION`. Likewise, adding `finishedAt` to the JSON for a
-`RUNNING` Run is accepted and returned. Neither `work_items.version` nor
-`runs.status` is selected/compared to serialized state, and WorkItem versions
-are accepted as arbitrary finite numbers. This fails the TASK-002 requirement
-to explicitly reject corrupted/incompatible data, invalid versions, and
-invalid Run lifecycle state; it can inject untrusted audit/workflow state into
-`FactoryService`.
+`src/adapters/workers/workspace.ts:45` accepts a workspace when
+`<root>/.git` merely exists. A temporary directory containing an empty `.git`
+directory was accepted by `resolveWorkspace()`, without being a usable Git
+repository. This fails the TASK-003 acceptance criterion requiring meaningful
+repository validation and can misroute a trusted configuration to an
+arbitrary directory that only has a marker with that name.
 
-Remediation: select and cross-check identity/query/CAS/lifecycle columns
-against decoded JSON, enforce WorkItem version constraints, and validate the
-complete Run lifecycle shape before returning a record. Any discrepancy must
-throw `PersistenceCorruptionError` without repairing or continuing from it.
+Smallest remediation: validate the repository using a non-shell Git probe
+with explicit argv/cwd (or equivalent strict filesystem validation), and add
+the empty/invalid `.git` regression case.
 
-All required automated checks passed on Node v22.23.1: `npm run typecheck`,
-`npm run build`, `npm test` (16 test files, 0 failures), `npm run demo` (DONE,
-15 refusals), and two separate `npm run demo:persistent` invocations (seed,
-then restart readback without re-seeding). Focused SQL checks also confirmed
-rollback/no residue for stale-CAS run attachment, invalid Run finalization,
-and multi-write append-only failure; normal two-store contention was safely
-refused as `SQLITE_BUSY` and succeeded after the first transaction committed.
+### Non-blocking notes
 
-### Round 2 independent persistence re-review (Codex, 2026-08-19): **CHANGES_REQUIRED**
+- `src/cli/workerSmoke.ts` creates a throwaway directory but has no
+  `finally` cleanup, so successful and failed smoke runs leave scratch trees
+  behind despite the handoff saying they are removed.
+- README/layout comments and the fake Claude fixture retain historical
+  `UNVERIFIED` wording after the real Claude CLI verification. This does not
+  change runtime behavior, but it is stale documentation.
 
-The two original HIGH findings are closed: a same-version `evidence` table
-without its primary key now fails with `SCHEMA_INTEGRITY_VIOLATION` and is not
-repaired; direct SQL/JSON disagreement for Project, WorkItem, Criterion, Run,
-Review, Evidence, Verification, and Approval now consistently fails with
-`PERSISTENCE_CORRUPTION`. Persisted invalid WorkItem version/lifecycle and Run
-lifecycle cases are also refused.
+### Verification performed
 
-### HIGH — failed incompatible opens still modify the target database
+- Installed tools: Node `v22.23.1`; Claude `2.1.235 (Claude Code)`;
+  Codex `codex-cli 0.147.0`. Direct `--help` inspection confirmed the
+  adapter argv families, Claude `--effort`/`--permission-mode`, and Codex
+  `exec --json`, `-C/--cd`, `-m`, `-c`, and `--sandbox` options.
+- Process tests covered argv/cwd/env separation, stdin closure, spawn
+  failure, non-zero exit, timeout, SIGTERM/SIGKILL escalation, cancellation,
+  natural-exit races, large-output draining, bounded capture, truncation, and
+  exactly-once settlement. No shell execution is used.
+- Worker integration covered success, non-zero exit, timeout, spawn failure,
+  process-result authority over printed PASS/failure text, trusted
+  principal binding, reviewer independence, and thrown-adapter failure.
+- SQLite integration observed a RUNNING process-backed Run before completion,
+  finalized the same Run once, and verified Run/evidence durability after
+  close/reopen.
+- `npm run typecheck` PASS; `npm run build` PASS; host-permission `npm test`
+  PASS (328/328); `npm run demo` PASS; `npm run demo:persistent` PASS on
+  initial seed and second-process readback; `npm run worker:doctor` PASS;
+  `git diff --check` PASS. Real AI smoke tests were not rerun because the
+  existing Claude and Codex smoke artifacts plus direct CLI inspection were
+  sufficient and the task explicitly limits repeated usage.
+- No automatic TASK-004 loop, commit, push, merge, release, publish,
+  external orchestration, or deployment path was found.
 
-`ensureSchema()` executes `PRAGMA journal_mode = WAL` before distinguishing a
-fresh database from a version-mismatched or malformed one. Reproduction using
-a temporary database containing only `schema_meta.schema_version = 999`:
-opening throws `SCHEMA_VERSION_MISMATCH`, no tables/rows change, but the
-persisted journal mode changes from `delete` to `wal`. This violates the
-re-review requirement that a failed open/validation leave the database
-unmodified.
+## Implementer remediation round 1
 
-Remediation: perform all existing-database classification, version checks,
-and structural validation before any persistent PRAGMA/DDL; close the newly
-opened connection on refusal. Set WAL only after successful validation (or on
-the confirmed fresh-initialization path).
+Worker: Claude Code (Sonnet 5), role IMPLEMENTATION ENGINEER. Responds to
+the independent Codex review directly above (preserved verbatim, not
+edited). Closes all three findings — HIGH, MEDIUM, LOW/CLEANUP — plus the
+two non-blocking documentation notes. No unrelated refactoring; no
+FACTORY_CONSTITUTION.md change; TASK-004 not started.
 
-### HIGH — an unrelated nonempty SQLite database is treated as fresh and altered
+### 1. HIGH — Run.summary redaction
 
-The "fresh" branch checks only for Factory-named tables. A temporary SQLite
-database containing an unrelated `user_records` table and data, but no
-Factory table, opened successfully and acquired all Factory tables plus a
-schema marker. This violates the required distinction between a genuinely
-new/empty database and an existing database, and can alter user data stores
-passed as the SQLite path.
+**Root cause:** `src/adapters/workers/cliWorker.ts`'s `buildEvidence()`
+redacted the tool's reported text before it became transcript Evidence, but
+`buildSummary()` read `reported.finalMessage` directly and unredacted —
+exactly as the reviewer found. `FactoryService.runWorker()` persists that
+string as `Run.summary` verbatim.
 
-Remediation: before fresh initialization, verify that `sqlite_master` has no
-non-internal user schema objects; otherwise refuse with
-`SchemaIntegrityError` without any persistent change. Add a regression test
-covering an unrelated nonempty SQLite file.
+**Reproduction first:** added `tests/workerOutputRedaction.test.ts`
+(SQLite, real close/reopen) and `tests/cliWorker.test.ts` (fast, no process
+spawned — a stub `ProcessRunner` stands in), both using the synthetic,
+clearly-fake secret `sk-ant-test-1234567890abcdefghijklmnop`. Run against
+the pre-fix code, both failed with the leak: `Run.summary` = `"...exit=0:
+sk-ant-test-1234567890abcdefghijklmnop"`, Evidence already redacted.
+Confirmed the exact asymmetry the review described.
 
-### MEDIUM — structural/error validation remains incomplete
+**Fix — one redaction boundary, not a patched string:** added
+`safeFinalMessage(reported)` in `cliWorker.ts`, the single place
+`reported.finalMessage` is ever read for display/persistence. `execute()`
+now calls it once and passes the *already-redacted* value into both
+`buildSummary` and `buildEvidence`; neither function accepts a raw
+`CliReportedResult` anymore — the type signature itself makes the bug
+impossible to reintroduce by accident (a caller literally cannot pass
+unredacted text to either builder without changing their signatures back).
+The separate raw-stdout/stderr fallback `buildEvidence` uses when nothing
+could be parsed was already being redacted at its own call site before this
+round and still is — scope stayed on the parsed-message field the review
+actually flagged, not a rewrite of Evidence's fallback semantics. Trusted
+fields (tool, model, effort, exit code, termination reason, duration,
+truncation flags) are Factory-supplied/OS-reported metadata, never
+externally-supplied text, and are untouched by redaction — proven by a
+dedicated test.
 
-`schema_meta` missing its `value` column fails with raw `ERR_SQLITE_ERROR`,
-not `SchemaIntegrityError`, because it is queried before shape validation.
-Also, validation accepts `idx_evidence_work_item_id` when that same-named
-index is recreated on `evidence(id)` rather than `work_item_id`; only index
-name/table presence is checked. Finally, several corruption messages include
-`JSON.stringify` of arbitrary values read from storage. Validate
-`schema_meta` before querying it, validate each index's columns, and report
-record/table context without echoing stored payloads.
+**Proof across SQLite restart:** `tests/workerOutputRedaction.test.ts`
+asserts, in order: the `WorkerOutcome`-derived Run/Evidence are clean → the
+live store's own `runs.findById` is clean → the store closes → a new store
+instance reopens the same file → `runs.findById` and `factory.listEvidence`
+are still clean. A second test proves ordinary non-secret output ("All 12
+tests passed, no issues found.") is not mangled. `tests/cliWorker.test.ts`
+additionally covers `sk-ant-`, `ghp_`, `Bearer`, and labeled `api_key:`
+shapes (the patterns `environmentPolicy.ts`'s `redactSecrets` already
+claims to detect — no new pattern was added, since the bug was the missing
+call, not a missing pattern), plus the raw-stdout-fallback path and the
+trusted-metadata-untouched case. 9 new tests total across the two files, all
+failing pre-fix and passing post-fix.
 
-Reviewer verification on Node v22.23.1: `npm run typecheck`, `npm run build`,
-`npm test` (17 test files, 0 failures), standalone
-`node --test dist/tests/persistenceCorruption.test.js`, `npm run demo` (DONE,
-15 refusals), and two `npm run demo:persistent` processes (seed then
-readback) all passed. Focused temporary-file probes confirmed atomic rollback,
-stale-CAS preservation, terminal-Run refusal, two-store `SQLITE_BUSY` safety,
-and cleanup of tracked test database directories.
+### 2. MEDIUM — workspace validation
 
-### Round 3 final focused independent re-review (Codex, 2026-08-19): **PASS_WITH_NON_BLOCKING_NOTES**
+**Root cause:** `resolveWorkspace()` accepted a workspace whenever
+`<root>/.git` existed on disk at all — a directory containing an empty
+`.git` file or directory passed, with no real repository behind it.
 
-All four Round-2 blockers are closed and independently reproduced as fixed:
+**Fix:** replaced the filesystem-marker check with a real Git probe run as
+a non-shell child process — `git -C <candidate> rev-parse --show-toplevel`
+via `node:child_process.spawnSync` (`shell` never set, executable and argv
+always separate, `candidate` only ever passed as an argv element / the
+child's own `cwd`). Bounded: 10s timeout, and any diagnostic text
+(`error.message` or `stderr`) is flattened to one line and capped at 300
+chars before it can appear in the thrown `ValidationError` — a test asserts
+the thrown message is single-line and bounded, so raw arbitrary Git stderr
+is never blindly persisted into Factory audit state.
 
-- An unsupported-version Factory database left `DELETE` journal mode,
-  `sqlite_master`, and application rows unchanged before
-  `SchemaVersionError`.
-- A nonempty unrelated database containing a table, and separate probes with
-  an index, trigger, or view, were refused with `SchemaIntegrityError`; no
-  Factory schema objects or marker were created.
-- Malformed `schema_meta` shape, missing/duplicate version rows, and invalid
-  version values were classified as `SchemaIntegrityError` before version
-  use, without raw SQLite schema-query errors or repair.
-- Same-name indexes with wrong columns, swapped composite order, missing
-  definitions, or wrong uniqueness were rejected with `SchemaIntegrityError`.
+**Policy decision (explicit, not silent):** `Workspace` gained a second
+field, `repositoryRoot` — the real repository root Git reports, distinct
+from `root` (the exact directory the caller configured and the one a worker
+process actually launches in). A configured workspace **may** be a
+subdirectory of an approved repository; `root` stays exactly what was
+configured, `repositoryRoot` is canonicalized so the execution boundary is
+unambiguous either way. This matches the task's stated preferred TASK-003
+behavior. The field is purely additive — nothing else in the codebase
+constructs a `Workspace` literal outside `resolveWorkspace()`, confirmed by
+a repo-wide search before making the change, so no other call site needed
+updating.
 
-Read-only classification now precedes all persistent PRAGMAs/DDL; only EMPTY
-databases initialize, and CURRENT_FACTORY databases enable WAL after complete
-validation. Round-2 SQL/JSON cross-checks and persisted WorkItem/Run lifecycle
-validation remain green. Normal restart, transactions, rollback, CAS,
-append-only records, workflow continuation, and all TASK-001 regression suites
-remain green.
+### 3. Adversarial workspace tests (A–I)
 
-### Non-blocking note (MEDIUM/LOW)
+All nine cases added to `tests/workspace.test.ts`: (A) no `.git` at all →
+reject; (B) empty `.git` **file** → reject; (C) empty `.git` **directory**
+→ reject (the exact reviewer reproduction); (D) a `.git` directory with
+plausible-looking but garbage `HEAD`/`config` content, no real object
+database → reject, proving Git's own validation is being used, not a
+filename check with a slightly longer checklist; (E) a real temporary repo
+root → accept, `repositoryRoot === root`; (F) a real subdirectory inside a
+real repo → accept, `root` stays the subdirectory, `repositoryRoot` is the
+real top-level; (G) nonexistent path → reject; (H) a file, not a directory
+→ reject; (I) a workspace path containing spaces, quotes, `$()`, backticks
+and semicolons → resolves correctly with no shell interpolation (proven by
+embedding a command substitution shape in the directory name itself and
+confirming it is treated as an inert literal path segment). Two more tests
+cover a missing `git` executable (controlled `ValidationError`, not a
+crash) and the bounded/flattened diagnostic text. All fixtures use `git
+init` only — no commit, no dependency on global Git user identity.
 
-Some `PersistenceCorruptionError` messages include `JSON.stringify` of an
-invalid persisted field (for example an invalid enum value). A focused probe
-confirmed that an arbitrary token stored in a corrupt Evidence `kind` appears
-in the thrown message. No automatic logging or new persistence of secrets was
-observed, so this is not a TASK-002 acceptance blocker; future cleanup should
-use table/record/field context without echoing arbitrary stored payloads.
+One environment note from building case (I): this sandbox's own filesystem
+policy independently refuses `mkdir` for a directory name containing an
+absolute-path-shaped substring (e.g. literally `/tmp/should-not-run` inside
+the name) — unrelated to this code, reproduced and confirmed in isolation
+with a standalone Node script before adjusting the test to avoid that
+specific shape while keeping every shell-metacharacter case (quotes, `$()`,
+backticks, semicolons, spaces) that actually matters for proving no shell
+interpolation occurs.
 
-Final verification on Node v22.23.1:
+### 4. LOW/CLEANUP — smoke scratch directory cleanup
+
+**Fix:** `src/cli/workerSmoke.ts` now creates the scratch directory, then
+runs the entire smoke body (workspace validation, Factory setup, the real
+worker run) inside a `try { … } finally { rmSync(scratchRoot, { recursive:
+true, force: true }) }`, extracted into a `runSmokeInWorkspace` helper so
+the cleanup wrapper stays trivially readable. Cleanup now runs on success,
+on a FAILED `WorkerOutcome` (non-zero exit, spawn failure — proven with a
+nonexistent executable), and on a thrown adapter error (proven with a
+`ProcessRunner` stub that rejects, simulating a genuine adapter bug rather
+than an ordinary process failure). Only the exact `mkdtemp`-created path is
+ever removed; no other directory is touched. `tests/workerSmoke.test.ts`
+(3 tests, using the fake Codex CLI, never a real one) proves all three
+paths.
+
+### 5. Non-blocking documentation notes
+
+Both addressed, cheaply, since they were flagged by the same review: the
+stale `(UNVERIFIED — see below)` annotation in README's file-layout block
+(the surrounding prose had already been corrected in the prior Claude
+verification round, this one inline comment was missed) and
+`fake-claude.mjs`'s header comment (said "documented (unverified...)",
+updated to say "confirmed real-CLI contract"). Runtime behavior unchanged
+either way — pure documentation accuracy.
+
+### 6. Files changed this round
+
+Modified: `src/adapters/workers/cliWorker.ts` (redaction boundary),
+`src/adapters/workers/workspace.ts` (real Git validation, new
+`repositoryRoot` field), `src/cli/workerSmoke.ts` (try/finally cleanup),
+`tests/workspace.test.ts` (rewritten with the A–I adversarial suite),
+`README.md` (stale wording), `tests/fixtures/fake-clis/fake-claude.mjs`
+(stale wording), `AI-HANDOFF.md` (this section).
+
+Created: `tests/workerOutputRedaction.test.ts`, `tests/cliWorker.test.ts`,
+`tests/workerSmoke.test.ts`.
+
+Not touched: `src/domain/`, `src/workflow/`, `src/app/factoryService.ts`,
+`src/ports/`, either persistence adapter, `codexCliAdapter.ts`,
+`claudeCodeAdapter.ts` (beyond what the stale-wording note above covers —
+no logic in either concrete adapter changed), any TASK-001/002 test,
+`docs/FACTORY_CONSTITUTION.md`.
+
+### 7. Exact verification results
 
 - `npm run typecheck` — PASS
 - `npm run build` — PASS
-- `npm test` — 260 tests, 260 pass, 0 fail (18 test files)
-- `node --test dist/tests/persistenceSchemaOpening.test.js` — PASS
-- `node --test dist/tests/persistenceCorruption.test.js` — PASS
-- `npm run demo` — DONE with 15 refusals
-- `npm run demo:persistent` — first process seeded and reopened; second
-  process read DONE state without re-seeding
-- `git diff --check` — PASS
-- `git status --short` — inspected; temporary test directories cleaned
+- `npm test` — **347 tests, 347 pass, 0 fail** (up from 328; +19 from this
+  round: 9 redaction, 8 workspace [3 new beyond the prior 5], 3 smoke
+  cleanup, minus overlap already counted — see individual suite counts
+  above), confirmed stable across 3 consecutive full runs
+- `npm run demo` — DONE, 15 refusals, unchanged
+- `npm run demo:persistent` run twice (seed, then a second real OS process
+  reading back) — unchanged behavior
+- `npm run worker:doctor` — unchanged: both CLIs still found with version
+- `git diff --check` — clean
+- `git status --short` — matches the files listed in section 6
 
-TASK-002 is safe for human acceptance and commit.
+### 8. Whether any real AI smoke was rerun: NO, deliberately
+
+`cliWorker.ts`'s change is entirely post-processing of already-captured
+output (`Run.summary`/Evidence construction) — it does not touch
+`buildInvocation`, argv, environment, stdin, or anything else that reaches
+the real CLI. `workspace.ts`'s change adds a real `git rev-parse` probe at
+workspace-resolution time, before any worker CLI is ever invoked, and does
+not alter what gets passed to Claude or Codex. Both are exhaustively proven
+by deterministic fake-CLI/fake-git tests. Per the task's explicit
+instruction not to burn usage repeating a real smoke unless a changed code
+path makes it genuinely necessary, neither `npm run smoke:codex-worker` nor
+`npm run smoke:claude-worker` was rerun; the results already on record
+above (both SUCCEEDED) remain current evidence.
+
+### 9. Remaining limitations
+
+Unchanged from the prior rounds' lists, plus: the environment sandbox this
+was built in has its own (unrelated) filesystem policy quirk noted in
+section 3 — worth knowing if a future contributor writes a similar
+special-character path test in this environment.
+
+### 10. Ready for independent re-review: YES
+
+## TASK-003 REVIEWER
+
+### Final focused re-review after remediation — 2026-08-20
+
+**Verdict: PASS**
+
+The three prior findings are closed and no new CRITICAL or HIGH TASK-003
+correctness issue was found.
+
+- The deterministic fake Codex path emits the synthetic
+  `sk-ant-test-1234567890abcdefghijklmnop` value. The returned Run.summary,
+  Evidence, live SQLite rows, and the same rows after close/reopen contain
+  `[REDACTED]` and never the original value. Ordinary model text remains
+  available.
+- `cliWorker.ts` has one `safeFinalMessage()` boundary for parsed
+  `reported.finalMessage`; both summary and evidence builders receive only
+  the safe value. Raw stdout/stderr fallback is redacted separately. Process
+  status and trusted metadata remain OS/config-derived.
+- `resolveWorkspace()` now validates repository membership with non-shell
+  `spawnSync(git, ["-C", candidate, "rev-parse", "--show-toplevel"])`, with
+  bounded diagnostics. Empty/fake `.git`, missing/file paths are rejected;
+  real repository roots and valid subdirectories are accepted, including
+  argv-special paths.
+- `workerSmoke.ts` removes only its own `mkdtemp` path in `finally` on
+  success, worker failure, and thrown adapter failure.
+- Existing worker process, adapter, lifecycle, SQLite durability, trust,
+  environment, and TASK-001/TASK-002 suites remain green. No real AI smoke
+  was rerun because the remediation did not change CLI invocation or
+  authentication paths; prior real Claude and Codex smoke results remain
+  applicable.
+
+Required verification: `npm run typecheck`, `npm run build`, `npm test`
+(347 passed, 0 failed), `npm run demo`, `npm run demo:persistent`,
+`npm run worker:doctor`, `git diff --check`, plus focused redaction,
+workspace, smoke-cleanup, adapter, process-runner, lifecycle, and persistence
+suites — all passed.
+
+**TASK-003 is safe for human acceptance and commit.**
 
 ## Human decision
 Pending.

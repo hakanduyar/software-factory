@@ -2,7 +2,7 @@
   "name": "software-factory",
   "version": "0.1.0",
   "private": true,
-  "description": "Local Software Factory core skeleton (TASK-001) with durable SQLite persistence (TASK-002)",
+  "description": "Local Software Factory core skeleton (TASK-001) with durable SQLite persistence (TASK-002) and a real worker runner (TASK-003)",
   "type": "module",
   "engines": {
     "node": ">=22.5.0"
@@ -16,7 +16,11 @@
     "test": "npm run build && node --test \"dist/tests/**/*.test.js\"",
     "demo": "npm run build && node dist/src/cli/main.js demo",
     "demo:persistent": "npm run build && node dist/src/cli/main.js demo:persistent",
-    "verify": "npm run typecheck && npm run test"
+    "verify": "npm run typecheck && npm run test",
+    "worker:doctor": "npm run build && node dist/src/cli/main.js worker doctor",
+    "smoke:claude-worker": "npm run build && node dist/src/cli/main.js worker smoke claude",
+    "smoke:codex-worker": "npm run build && node dist/src/cli/main.js worker smoke codex",
+    "smoke:workers": "npm run smoke:claude-worker && npm run smoke:codex-worker"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",
