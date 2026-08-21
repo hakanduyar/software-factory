@@ -1,785 +1,1702 @@
 # AI HANDOFF
 
 Status: IMPLEMENTED_AWAITING_VERIFICATION
-Current task: TASK-003
-Plan version: worker-runner-v1
+Current task: TASK-004
+Plan version: autonomous-loop-v1
 
-Prior task: TASK-002 (Durable Persistence + Run Ledger) shipped as commit
-`29c1d61` after a three-round independent persistence review. Its full
+Prior task: TASK-003 (Worker Runner) shipped as commit `61ba880` after
+independent review including one remediation round. Its full
 implementer/reviewer history is archived at
-`docs/tasks/archive/TASK-002-AI-HANDOFF.md`.
+`docs/tasks/archive/TASK-003-AI-HANDOFF.md`.
 
 ## Implementer output
 
 Worker: Claude Code (Sonnet 5), role IMPLEMENTATION ENGINEER.
 
-Wrote `docs/tasks/TASK-003-worker-runner.md` before implementation (per
-protocol), then added the worker-execution layer: a process-isolation
-abstraction, an environment/workspace boundary, and real Claude Code / Codex
-CLI adapters, all plugging into the **existing, unchanged**
-`FactoryService.runWorker` three-phase lifecycle from TASK-001/002. No line
-of `src/domain/`, `src/workflow/`, or `src/app/factoryService.ts` changed.
+Read the full accepted contract before writing any code: `AGENTS.md`,
+`CLAUDE.md`, `docs/FACTORY_CONSTITUTION.md`, `docs/PRODUCT.md`,
+`docs/ARCHITECTURE.md`, `docs/DOMAIN_MODEL.md`, `docs/MODEL_ROUTING.md`,
+`docs/ROADMAP.md`, `LOOP.md`, `LOOP-PLANS.md`, this file's TASK-003 history,
+`docs/tasks/TASK-003-worker-runner.md`, and every TASK-001/002/003 source
+file the orchestrator would need to call correctly
+(`src/app/factoryService.ts`, the whole `src/workflow/` transition/gate/
+precondition/snapshot machinery, `src/ports/`, the worker adapters, both
+persistence adapters, the CLI, and representative tests). Wrote
+`docs/tasks/TASK-004-autonomous-engineering-loop.md` before implementing, per
+protocol.
 
-### 1. Environment finding, and how it was handled
+### 1. The core discovery that shaped the whole design
 
-The `claude` CLI binary is not installed on this machine — only the VS Code
-extension is present, which is not a subprocess-invocable non-interactive
-CLI. Confirmed by exhaustive search (PATH, `npm ls -g`, shell rc files,
-`/usr/local/bin`, `~/.claude/local`, a filesystem-wide search for
-`claude-code`/`cli.js`), and the configured npm registry (a corporate proxy,
-`registry.hmb.gov.tr`) is unreachable from this sandbox, so installing it
-would have required bypassing that registry — a global, persistent machine
-change outside this task's scope. Asked the user how to proceed
-(`AskUserQuestion`); they chose to handle installing/locating the real CLI
-separately. Consequence, carried through honestly rather than silently
-assumed: the Codex adapter's invocation was independently tested against the
-real `codex` binary (v0.147.0, authenticated); the Claude Code adapter is
-implemented against the CLI's publicly documented flag surface only,
-explicitly flagged UNVERIFIED everywhere it matters (file header, README,
-this report, acceptance criteria), and not real-smoke-tested. `sf worker
-doctor` reports this machine's actual state at any time.
-
-### 2. Real, tested Codex CLI invocation
+`src/workflow/transitions.ts` and `src/workflow/releaseSnapshotResolver.ts`
+already encode almost the entire autonomous loop as accepted TASK-001 domain
+law:
 
 ```
-codex exec --json -C <workspaceRoot> -m <model> [-c model_reasoning_effort="<effort>"] \
-  --sandbox <read-only|workspace-write> "<prompt>"
+READY -------------> IMPLEMENTING        (no precondition)
+IMPLEMENTING -------> VERIFYING          (requireSuccessfulImplementationRun)
+VERIFYING -----------> IMPLEMENTING      (checks failed, back to implementation — free edge)
+VERIFYING -----------> REVIEW            (requireSuccessfulVerification: a SUCCEEDED VERIFIER
+                                            run + a DETERMINISTIC review PASS produced by it)
+REVIEW --------------> IMPLEMENTING      (reviewer requested changes — free edge)
+REVIEW --------------> WAITING_FOR_HUMAN (requireIndependentSemanticReview: a SUCCEEDED,
+                                            independent-principal REVIEWER run + a SEMANTIC
+                                            review PASS)
 ```
 
-Verified by direct experiment (not memory): exit 0 on success, exit 1 with
-structured `ERROR` events on a bad model name; `--json` prints JSONL
-(`thread.started`/`turn.started`/`item.completed` with the final
-`agent_message` text/`turn.completed`); `-o/--output-last-message` writes
-just the final text to a file (not used — JSONL parsing keeps everything
-within captured stdout, no extra file lifecycle); `-c
-model_reasoning_effort="<level>"` genuinely overrides the configured effort
-per-invocation (config default `xhigh` → overridden to `low`, confirmed via
-the CLI's own printed banner); `codex exec` has no approval-prompt flag at
-all (rejected as unexpected), so sandbox alone governs safety with no
-interactive-hang risk; stdin is explicitly closed by the adapter (never left
-inherited). Full experiment transcript in
-`docs/tasks/TASK-003-worker-runner.md`.
+`FactoryService.recordReview` already enforces C4 for `SEMANTIC` reviews and
+deliberately does **not** require independence for a `DETERMINISTIC` review
+(correct: deterministic verification is command exit codes, not opinion).
+TASK-004's job was therefore to call these existing, unmodified primitives in
+the right order with real workers, add its own persisted/resumable
+bookkeeping around that, and stop exactly where the domain model already
+stops (`WAITING_FOR_HUMAN`) — never a new domain rule, never a new bypass.
+**No line of `src/domain/`, `src/workflow/`, or `src/app/factoryService.ts`
+changed.**
 
-### 3. Claude Code CLI invocation — UNVERIFIED
+### 2. Autonomous-loop architecture
 
-```
-claude -p "<prompt>" --model <model> --output-format json
-```
-
-Documented, not tested. No permission-bypass flag is passed (which one would
-even be safe/correct cannot be confirmed without the real binary); effort is
-always reported as requested-but-not-applied (no verified flag). Because
-`WorkerOutcome.status` is derived only from the process's actual exit
-code/termination — never from parsed stdout (see design point 5) — a wrong
-flag assumption here fails safe: worst case is a clean `FAILED` run with
-real stderr/stdout as evidence, or a `TIMEOUT`-terminated `FAILED` run if
-the process hangs on something unanticipated (e.g. an interactive
-permission prompt) — never a false success. Must be re-verified for real
-(`npm run smoke:claude-worker`) once a `claude` binary is available.
-
-### 4. Process isolation / security controls
-
-- `src/ports/processRunner.ts` + `src/adapters/process/nodeProcessRunner.ts`:
-  `child_process.spawn(executable, argv, { cwd, env })` only — `argv` is
-  always an array, `shell` is never set, so there is no shell-interpolation
-  surface regardless of prompt/instruction content.
-- Timeout/cancellation escalate SIGTERM → (grace period) → SIGKILL against
-  the child's whole process group (`detached: true`, negative-pid signal),
-  so grandchildren (git, ripgrep, etc. a CLI shells out to) are terminated
-  too, not just the immediate child.
-- Exactly one `close` listener settles the result; a `settled` guard plus a
-  `requestedReason` flag (not a second racing listener) makes a timeout that
-  fires microseconds before a natural exit — or vice versa — resolve
-  deterministically to one outcome. Proven directly:
-  `tests/processRunner.test.ts` "exactly-once settlement" and the
-  does-not-report-TIMEOUT/CANCELLED-when-the-process-exits-first tests.
-- stdout/stderr are bounded (default 5 MiB/stream); a chatty child is still
-  drained past the cap rather than deadlocking the runner on backpressure,
-  and truncation is recorded (`stdoutTruncated`/`stderrTruncated`).
-- stdin is always explicitly ended (`child.stdin.end(input)`), never left
-  open/inherited; a child that closes its own stdin early cannot crash the
-  runner (stream `error` listeners are no-ops).
-- `src/adapters/workers/environmentPolicy.ts`: `process.env` is never
-  forwarded wholesale. `DEFAULT_WORKER_ENV_ALLOWLIST` names only
-  `PATH`/`HOME`/`CODEX_HOME`/locale/temp-dir variables — no API
-  key/token/secret name is ever on it (asserted directly by a test). A
-  best-effort `redactSecrets` regex pass runs on captured output before it
-  becomes Evidence, as defense in depth.
-- `src/adapters/workers/workspace.ts`: a worker's `cwd` is trusted
-  configuration supplied at adapter construction. `WorkerRequest` (the only
-  data `Worker.execute()` receives — see `src/ports/worker.ts`) has no `cwd`
-  field at all, so there is no path for model-generated text to choose a
-  process's working directory. `resolveWorkspace` requires the path to
-  exist, be a directory, and (by default) be a git repository.
-- Codex's `--sandbox` is role-derived: `workspace-write` only for
-  `IMPLEMENTER`, `read-only` for every other role.
-- The Codex effort override (`-c model_reasoning_effort=...`) only accepts a
-  plain token (`^[a-zA-Z0-9_-]+$`); anything else is refused with a recorded
-  reason rather than risking an unescaped Codex-side TOML override.
-
-### 5. Structured result / model-vs-process separation
-
-`src/adapters/workers/cliWorker.ts` is the one place both adapters share.
-Core discipline: `ProcessResult` (OS-level: exit code, termination reason)
-decides `WorkerOutcome.status`; the tool's own reported text
-(`CliReportedResult`, parsed from stdout by each adapter's
-`interpretOutput`) is attached as informational evidence/summary only and
-never influences status. Tested directly both ways: a process that exits 0
-while `FAKE_CODEX_MESSAGE="I failed"` still reports `SUCCEEDED`; a process
-that exits 1 while `FAKE_CODEX_MESSAGE="PASS"` still reports `FAILED`.
-`claimsAcceptanceMet` is always `false` from a real CLI adapter — no
-PASS/CHANGES_REQUIRED free-text parsing exists yet (explicit TASK-004
-scope), so no free-form model text is ever treated as a trusted claim.
-Process-level failure (non-zero exit, timeout, cancellation, spawn error)
-returns a `FAILED` `WorkerOutcome` with rich, adapter-supplied diagnostic
-evidence rather than throwing — a thrown exception is reserved for genuine
-adapter/programmer bugs (proven distinctly in
-`tests/workerRunnerIntegration.test.ts`).
-
-### 6. Model/effort configuration
-
-`src/adapters/workers/workerModelConfig.ts`: `WorkerModelConfig` (tool,
-model, effort, timeout) is plain configuration passed to
-`createClaudeCodeWorker`/`createCodexCliWorker` — nothing about which
-model/effort a run uses is hardcoded in workflow or adapter logic. `tool`
-(`"claude-code"`/`"codex-cli"`) and `model` are always distinct fields,
-never conflated (C9). `EffortApplication` makes honesty about capability
-explicit and structured rather than silently dropped: Codex reports
-`applied: true` for a safe token, `applied: false` with a reason for an
-unsafe one or when unset; Claude Code always reports `applied: false` with
-a reason (no verified flag).
-
-### 7. Same-run lifecycle / persistence
-
-Not reimplemented — reused. `FactoryService.runWorker`'s existing
-PHASE1(durable RUNNING)/PHASE2(execute)/PHASE3(finalize-exactly-once)
-transaction structure (TASK-001 Round-6, TASK-002-proved durable) already
-gives every CLI adapter: RUNNING persisted before the child process starts,
-the same run finalized exactly once regardless of success/non-zero
-exit/timeout/cancellation/spawn failure, and no work-item status change from
-a worker result. New proof this task adds is that a *real spawned process*
-(a fake CLI, never a real AI provider, in automated tests) goes through this
-identical path:
-
-- `tests/workerRunnerIntegration.test.ts` (in-memory store): Codex/Claude-
-  backed workers through the real three-phase lifecycle; FAILED-not-RUNNING
-  on non-zero exit/timeout/spawn failure; two distinct adapter `Worker`
-  objects get two distinct registry-issued principals even with the same
-  declared id; a Codex-backed IMPLEMENTER + Claude-backed REVIEWER complete
-  an independent `SEMANTIC` review (C4) with genuinely different tools
-  behind the two principals; a same-Claude-worker self-review is still
-  refused with `REVIEW_INTEGRITY`; a throwing adapter (a real bug, not a
-  process result) still leaves an honest `FAILED` run via
-  `WorkerExecutionError`.
-- `tests/workerRunnerPersistence.test.ts` (real SQLite file): starts a run
-  against a deliberately slow fake CLI, reads the `RUNNING` row back
-  through the *same store instance* while the child is still mid-flight
-  (proving PHASE 1 committed before PHASE 2 finished, not just before it
-  started), awaits completion, confirms `SUCCEEDED` and exactly one run
-  record, closes the store, reopens a new store instance against the same
-  file, and confirms the run and its evidence are still there, principal id
-  intact.
-
-### 8. Tests
-
-All new automated tests are fully offline — no real AI CLI is ever spawned
-by `npm test`. Fake CLIs live at `tests/fixtures/fake-clis/` as plain Node
-scripts, run either via `process.execPath <script>` (generic process-runner
-fixtures) or directly via their own shebang + exec bit (the two adapter
-fixtures, `fake-codex.mjs`/`fake-claude.mjs`, which must themselves act as
-"the executable" to exercise the adapters' real `executable`/`argv`
-plumbing). `fake-codex.mjs` mimics the independently-verified real `codex
-exec --json` contract (JSONL events, exit codes, env-var-controlled
-failure/timeout modes) so `codexCliAdapter.ts` is exercised against a
-faithful simulation, not a guess.
-
-New suites: `tests/processRunner.test.ts` (19 tests: argv/cwd/stdin/env
-exactness, clean/non-zero exit, spawn failure incl. bad executable and bad
-cwd, timeout incl. SIGKILL escalation against a SIGTERM-ignoring process,
-cancellation incl. already-aborted and races-against-natural-exit, bounded
-capture incl. large-output draining and truncation, hostile early-stdin-
-close, exactly-once settlement under a timeout/close race),
-`tests/environmentPolicy.test.ts`, `tests/workspace.test.ts`,
-`tests/promptTemplates.test.ts`, `tests/codexCliAdapter.test.ts` (pure argv/
-effort/output-parsing unit tests plus fake-CLI end-to-end execute() tests),
-`tests/claudeCodeAdapter.test.ts` (same shape, explicitly noting the
-UNVERIFIED-contract caveat in its own header),
-`tests/workerRunnerIntegration.test.ts`,
-`tests/workerRunnerPersistence.test.ts`.
-
-Two real fixture-timing bugs were found and fixed while stabilizing this
-suite (both about output flushing on POSIX pipes, not adapter logic): (a)
-several fixtures called `process.exit()` immediately after
-`process.stdout.write()`, which is asynchronous on a piped stdout on POSIX
-and can be truncated by an immediate exit — fixed by switching to
-synchronous `fs.writeSync(1, ...)` fd writes, or by not calling `exit()` at
-all where the fixture doesn't need a specific exit code; (b) the
-SIGKILL-escalation test used a 100 ms timeout that was occasionally too
-tight for a **fresh `node` child process's own startup** (module load,
-handler registration) under a loaded machine, killing it before it had run
-any of its code at all — fixed by widening that one test's margin to
-500 ms/300 ms grace, which is about the escalation actually working, not
-sub-100 ms responsiveness. Confirmed stable across 6 consecutive full-suite
-runs after both fixes (325/325 every time; before the fixes, 1/325 failed
-intermittently, always the same test).
-
-### 9. Real smoke-test results
-
-`npm run worker:doctor` on this machine:
+New top-level layer, `src/orchestration/` (+ `src/adapters/orchestration/`
+for persistence), calling only `FactoryService`'s existing public methods —
+`advance`, `runWorker`, `recordReview`, `registerWorker`, `getWorkItem`,
+`listRuns`, `listEvidence` — never a repository directly.
 
 ```
-claude-code (claude): NOT FOUND (tried "claude") — spawn claude ENOENT
-codex-cli (codex): found (codex), version: codex-cli 0.147.0
+src/orchestration/
+  loopTypes.ts              EngineeringLoop, LoopPhase, LoopIterationRecord,
+                             LoopBudget, LoopWorkerConfig, VerificationCommandConfig
+  loopRepository.ts         LoopRepository port (create/compareAndSave/findById/listByWorkItem)
+  engineeringLoopService.ts the orchestrator: start/resume/cancel/status + drive()
+  verificationWorker.ts     a Worker that runs trusted, configured commands — no AI
+  reviewVerdictParser.ts    strict PASS/PASS_WITH_NON_BLOCKING_NOTES/CHANGES_REQUIRED parser
+  loopWorkerFactory.ts      builds a real Claude Code/Codex CLI Worker from LoopWorkerConfig
+  loopPrompts.ts            bounded, iteration-aware instruction text (IMPLEMENTER/REVIEWER)
+  scriptedLoopWorkers.ts    deterministic scripted Workers for demo/tests (mockWorker.ts's peer)
+
+src/adapters/orchestration/
+  inMemoryLoopRepository.ts
+  sqliteLoopRepository.ts   its own SQLite file — see §4 below for why
+
+src/cli/loop.ts              sf loop start|status|resume|cancel
+src/cli/demoLoop.ts          npm run demo:loop (3 deterministic scenarios)
 ```
 
-`npm run smoke:codex-worker` (real, controlled, one invocation — through
-`sf worker smoke codex`, i.e. through the actual `FactoryService.runWorker`
-path, not just the adapter in isolation):
+Implementer/reviewer independence (C4) is never decided by comparing
+`tool`/`model` strings — that would reintroduce the exact "string-role
+trust" pattern Round-2 review eliminated. The orchestrator always constructs
+two separate `Worker` objects (one per role), asserts they are distinct by
+reference as a cheap sanity check, and lets `FactoryService.recordReview`'s
+existing principal-identity check be the only real enforcement point.
+
+### 3. Persisted loop state model
+
+`EngineeringLoop` (`src/orchestration/loopTypes.ts`): id, workItemId, an
+optimistic-concurrency `version`, a small `LoopPhase` (`READY →
+IMPLEMENTING → VERIFYING → REVIEWING → {WAITING_FOR_HUMAN | EXHAUSTED |
+FAILED | CANCELLED}`), budget, implementer/reviewer `LoopWorkerConfig`,
+`verificationCommands`, workspace root, task instructions, and an array of
+`LoopIterationRecord` — one per implement/verify/review attempt, each
+accumulating `implementerRunId`/`implementerOutcome` →
+`verificationRunId`/`verificationCommandResults`/`verificationReviewId`/
+`verificationPassed` → `reviewerRunId` → `reviewVerdict`/`reviewRecordId`/
+`reviewFindings`/`reviewParseError`, in that fixed order.
+
+`EXHAUSTED` reuses the existing `BLOCKED` WorkItem status (best-effort,
+non-fatal if it fails) rather than inventing a parallel "needs a human"
+signal — `BLOCKED` is already the domain's precondition-free, reachable-from-
+execution-states vocabulary for exactly this.
+
+### 4. Why a second SQLite file, not a shared connection
+
+`FactoryStore`'s SQLite adapter owns one `DatabaseSync` connection with its
+own mutex-serialized transactions. Loop writes and Factory writes never need
+to commit atomically with each other (the orchestrator always fully awaits
+one before starting the next), so `src/adapters/orchestration/
+sqliteLoopRepository.ts` opens its own small file (`.factory-data/loops.db`
+by default — same gitignored directory), with its own minimal
+`schema_meta`-versioned `engineering_loops` table and the same
+create/CAS-via-conditional-`UPDATE` discipline as the Factory's own SQLite
+adapter. Deliberately scoped down from `src/adapters/sqlite/serialization.ts`'s
+full adversarial rigor (this table has not been through multiple rounds of
+persistence-focused review yet) but still validates on the way out rather
+than casting.
+
+### 5. Deterministic verification runner
+
+`createVerificationWorker` implements the `Worker` port directly (no AI, no
+shell): `VerificationCommandConfig` is `{ id, executable, argv, cwd?,
+timeoutMs?, evidenceKind? }`, run via the existing `ProcessRunner` — argv
+array only, `shell` never used, same discipline as `cliWorker.ts`.
+
+The load-bearing design point: its own `WorkerOutcome.status` stays
+`SUCCEEDED` whenever every configured command actually ran and its result
+was captured, **regardless of individual exit codes** — a failing `npm test`
+is a successfully observed fact, not a harness failure. This is what makes a
+`DETERMINISTIC` review with verdict `FAIL` even legal to record:
+`FactoryService.recordReview` refuses to record *any* review — passing or
+failing — unless the reviewer run's own status is `SUCCEEDED`. Only a
+genuine bug in the harness itself would leave a `FAILED` run (via
+`FactoryService`'s existing thrown-exception catch), and that case is
+handled by remediating directly rather than trying to record a review that
+cannot legally exist.
+
+### 6. Reviewer output contract / strict parser
+
+The orchestrator never touches `src/adapters/workers/promptTemplates.ts` —
+it composes its own bounded `instructions` text
+(`src/orchestration/loopPrompts.ts`), passed through the existing
+`FactoryService.runWorker` `instructions` field. The REVIEWER is asked to
+put a single tag as the first line of its response:
 
 ```
-scratch workspace: /tmp/sf-worker-smoke-codex-E32NK9
-launching codex (executable=codex, model=gpt-5.6-luna, timeoutMs=60000) against <scratch> ...
-run run-0002 status=SUCCEEDED
-summary: [codex-cli:gpt-5.6-luna] role=REVIEWER exit=0: I can see `.git/` and `README.md` in the workspace.
-evidence [NOTE] cli://codex-cli/run/run-0002: codex-cli model=gpt-5.6-luna role=REVIEWER exit=0 duration=17174ms
-evidence [NOTE] cli://codex-cli/run/run-0002/transcript: I can see `.git/` and `README.md` in the workspace.
+FACTORY_REVIEW_VERDICT: PASS
+FACTORY_REVIEW_FINDINGS:
+- <finding>
 ```
 
-Scratch workspace removed afterward. `npm run smoke:claude-worker` was
-**not** run at this point in the task — no `claude` binary existed on this
-machine to invoke. (It was run successfully in a later continuation once
-the CLI became available — see "Implementer follow-up" below.)
+`src/orchestration/reviewVerdictParser.ts` (pure, no I/O) matches only a
+whole, anchored `^FACTORY_REVIEW_VERDICT:` line — never a bare substring —
+so "tests PASS but the verdict below is what counts" cannot be
+mistaken for a tag. Zero tags → reject ("no verdict"); more than one tag,
+even identical values → reject ("ambiguous", a strict superset of
+"conflicting"); an unrecognized value → reject ("invalid"). The parser is
+only ever invoked when the reviewer run's process-level status is
+`SUCCEEDED` — a non-zero-exit/timeout/spawn-failed run is treated purely as
+an execution failure and the parser is never even called on its output, so
+"PASS" printed by a crashed process can never become approval.
 
-### 10. Files changed
+**A real bug found and fixed while wiring this up, not merely designed
+around:** `cliWorker.ts` derives `Run.summary` as a truncated copy of the
+*same* message its transcript Evidence already carries in full. My first
+implementation pooled both as separate "source texts" for the parser, which
+made one real verdict tag get counted twice and misreported as ambiguous —
+caught by `tests/engineeringLoopService.test.ts`'s malformed-reviewer test,
+reproduced with a debug harness against the real code path, and fixed by
+preferring Evidence texts alone whenever any exist (falling back to
+`Run.summary` only for a worker that recorded no evidence at all).
 
-Created: `docs/tasks/TASK-003-worker-runner.md`;
-`src/ports/processRunner.ts`; `src/adapters/process/nodeProcessRunner.ts`;
-`src/adapters/workers/{workspace,environmentPolicy,promptTemplates,
-workerModelConfig,cliWorker,claudeCodeAdapter,codexCliAdapter}.ts`;
-`src/cli/{workerDoctor,workerSmoke}.ts`;
-`tests/{processRunner,environmentPolicy,workspace,promptTemplates,
-codexCliAdapter,claudeCodeAdapter,workerRunnerIntegration,
-workerRunnerPersistence}.test.ts`;
-`tests/support/{fakeCli,tempWorkspace}.ts`;
-`tests/fixtures/fake-clis/*.mjs` (9 fixture scripts);
-`docs/tasks/archive/TASK-002-AI-HANDOFF.md` (this file's prior content,
-archived per protocol).
+### 7. Remediation loop behavior
 
-Modified: `src/cli/main.ts` (added `worker doctor`/`worker smoke` dispatch,
-lazy-imported like `demo:persistent` so `sf demo`/`sf transitions` pay no
-extra cost); `package.json` (`worker:doctor`, `smoke:claude-worker`,
-`smoke:codex-worker`, `smoke:workers` scripts — none run by `test`);
-`README.md` (new "Worker Runner (TASK-003)" section); `AI-HANDOFF.md` (this
-file).
+`CHANGES_REQUIRED` (or a parse failure — fail-closed, treated identically for
+budget purposes) automatically triggers exactly one new IMPLEMENTER
+iteration, budget permitting: `VERIFYING → IMPLEMENTING` / `REVIEW →
+IMPLEMENTING` (both existing, precondition-free edges), then the loop opens
+a fresh `LoopIterationRecord` and re-runs the whole implement → verify →
+review chain. `PASS` and `PASS_WITH_NON_BLOCKING_NOTES` both advance to
+`WAITING_FOR_HUMAN` (findings from the latter are preserved on the
+iteration record, never discarded). Remediation prompts
+(`loopPrompts.ts`) are bounded to the *immediately preceding* iteration's
+verification failures/review findings — never the whole loop history.
+
+### 8. Crash/resume behavior
+
+Every external action (a worker run, `recordReview`, `advance`) is preceded
+by checking the already-persisted iteration record for the exact field that
+action is about to produce, and followed immediately (no other `await` in
+between) by persisting it — see `docs/tasks/TASK-004-autonomous-engineering-loop.md`
+§8 for the full per-phase table. `resume()` is not a special code path: it
+calls the same `drive()` that `start()` calls, which always re-reads current
+state from the store rather than trusting anything held in memory.
+
+All five crash cases from the task brief (A–E: implementer succeeded/crash
+before next transition; verification passed/crash before reviewer launch;
+CHANGES_REQUIRED recorded/crash before remediation launch; remediation
+complete/crash before re-verification; reviewer PASS persisted/crash before
+the WAITING_FOR_HUMAN transition) are proven in
+`tests/engineeringLoopService.test.ts` via fault injection — a
+`LoopRepository` wrapper that makes the (N+1)-th `compareAndSave` call throw,
+simulating the OS process dying at that exact persisted checkpoint (the
+`start()`/`resume()` call itself rejects, exactly as a real crash would never
+let it return cleanly) — then a **fresh** `EngineeringLoopService` instance
+is constructed against the same, real repository and `resume()`d, asserting
+no duplicated implementer/verifier/reviewer run and the correct eventual
+terminal state.
+
+**Documented, not silently narrowed, limitation:** the one crash window this
+cannot close is the external call itself being genuinely in-flight when the
+OS process dies (a real `claude`/`codex` child mid-execution) — resuming
+after *that* exact crash can re-attempt that one step (at-least-once, not
+exactly-once, for the in-flight call only). Every step that **completed and
+was recorded** before a crash is never redone, which is what the five test
+cases above actually prove.
+
+### 9. Cancellation behavior
+
+`cancel(loopId, actor)` durably sets `cancelRequested` and attempts to
+finalize to `CANCELLED` immediately; a losing race (another finalizer, e.g. a
+`drive()` loop noticing the flag first) is tolerated, not thrown. `drive()`
+re-reads the loop from the store at the top of every iteration — which is
+also how a cancellation issued by a *different process* (a separate `sf loop
+cancel` invocation, sharing only the SQLite file) is observed at all.
+
+**Real concurrency bug found and fixed during testing, not just
+theorized:** a cancellation racing an in-flight step's own completion-write
+on the same loop row produced a losing `ConcurrencyError` that `drive()`'s
+outer catch mistook for an orchestration `FAILED` — turning an ordinary
+cancellation race into a false failure. Fixed by making `save()` retry on a
+losing CAS, re-reading the current row and reapplying the same patch (bounded
+to 5 attempts) — safe because every patch a step ever applies touches only
+the fields that step decided to change. Proven by a test that gates an
+in-flight implementer call, requests cancellation concurrently, then releases
+the gate and asserts the loop settles to `CANCELLED` with the completed run's
+evidence preserved, not `FAILED`.
+
+**Documented limitation:** cancellation is cooperative between steps, not
+preemptive mid-step — the accepted `Worker` port has no abort channel, and
+extending it would touch TASK-003-accepted `cliWorker.ts` beyond this task's
+scope; stopped and documented rather than silently broadened (design doc
+§10, §15).
+
+### 10. Budget/exhaustion behavior
+
+`LoopBudget`: `maxIterations` (hard ceiling on IMPLEMENTER attempts, checked
+before opening each new iteration), optional `maxTotalRuns` and
+`maxWallClockMs` (both checked at the top of every `drive()` step, before any
+action), optional per-worker/per-verification timeout defaults. Exhausting
+any of these moves the loop to `EXHAUSTED` and best-effort transitions the
+WorkItem to `BLOCKED` (evidence/runs/reviews are all still fully preserved —
+nothing is deleted or rewritten). `FAILED` is reserved for the orchestration
+layer breaking in a way this state machine did not anticipate (an unexpected
+thrown error), distinct from `EXHAUSTED`'s "the work still isn't passing and
+the budget ran out."
+
+### 11. CLI / demo
+
+```
+sf loop start <work-item-id> --config <path>
+sf loop status <loop-id>
+sf loop resume <loop-id>
+sf loop cancel <loop-id>
+npm run demo:loop
+```
+
+`--config` is a trusted local JSON file; `workspace`/`taskInstructions` are
+required (no safe generic default), `implementer`/`reviewer`/
+`verificationCommands`/`budget` fall back to a small built-in default.
+`verificationCommands[].argv` is validated to be an array of strings at load
+time (never a shell string). `sf loop status` prints exactly: phase,
+iteration/max, last implementer run+outcome, last verification result (which
+commands failed), last review verdict, total runs, outcome/reason, and
+whether human action is required — no raw transcripts, no secrets.
+
+`npm run demo:loop` runs three fully offline scenarios (scripted
+`Worker`s from `scriptedLoopWorkers.ts` for IMPLEMENTER/REVIEWER — never a
+real CLI; real, trivial, deterministic `node -e process.exit(N)` processes
+for verification, exactly like TASK-003's own fake-CLI fixtures spawn a real
+Node process without ever calling that "AI"): clean PASS →
+`WAITING_FOR_HUMAN`; `CHANGES_REQUIRED` → one remediation → PASS →
+`WAITING_FOR_HUMAN`; repeated `CHANGES_REQUIRED` past budget → `EXHAUSTED` +
+WorkItem `BLOCKED`. Verified directly by running it — transcript matches the
+design doc's three scenarios exactly.
+
+### 12. Tests and exact results
+
+New suites (69 new tests): `tests/reviewVerdictParser.test.ts` (15,
+covering every adversarial case from the brief's §10 list),
+`tests/verificationWorker.test.ts` (7), `tests/inMemoryLoopRepository.test.ts`
+(6), `tests/sqliteLoopRepository.test.ts` (5, including a real close/reopen
+restart proof), `tests/loopPrompts.test.ts` (5), `tests/loopCli.test.ts` (10,
+config-validation and not-found paths), `tests/engineeringLoopService.test.ts`
+(21 — start-time legality, clean-PASS/PASS_WITH_NON_BLOCKING_NOTES/
+remediation/repeated-exhaustion scenarios, reviewer-integrity fail-closed
+cases, budget enforcement including a deterministic wall-clock test via a
+fast-forwarding fake clock, cooperative cancellation racing a gated in-flight
+run, all five crash/resume cases, and a status-view leak check).
+`tests/support/factoryFixtures.ts` gained one small additive helper
+(`toReady`, extracted from the existing `toImplementing`, itself unchanged
+in behavior) — no existing test file's assertions were touched.
+
+All new tests are fully deterministic and offline: scripted `Worker`s or
+real-but-trivial local `node`/`git` subprocesses only, never `claude`/`codex`.
+
+- `npm run typecheck` — PASS
+- `npm run build` — PASS
+- `npm test` — **416 tests, 416 pass, 0 fail** (up from 347; +69 from this
+  task), confirmed stable across 3 consecutive full runs
+- `npm run demo` — DONE, 15 refusals, unchanged
+- `npm run demo:persistent` run twice (seed, then a second real OS process
+  reading back) — unchanged behavior
+- `npm run worker:doctor` — both `claude` (2.1.235) and `codex` (0.147.0)
+  still found, unchanged
+- `npm run demo:loop` — all three scenarios match the design exactly
+  (`WAITING_FOR_HUMAN`, `WAITING_FOR_HUMAN` after one remediation,
+  `EXHAUSTED` + WorkItem `BLOCKED`)
+- `git diff --check` — clean
+- `git status --short` — matches the files listed below
+
+Two real bugs were found and fixed while stabilizing this suite, both
+described in sections 6 and 9 above (the evidence/`Run.summary` double-count
+in the verdict parser, and the cancellation/step-completion CAS race) — both
+via reproduction against the real orchestrator code, not hypothesized.
+
+### 13. Whether a real-loop smoke was run
+
+**Not run.** Per the task's own instruction, a controlled real smoke (actual
+Claude + Codex, one minimal harmless task in a scratch repo) is optional and
+should only be spent once the deterministic implementation is stable, and
+must never be repeated to save usage. The deterministic suite above
+(including the crash/resume, cancellation, and reviewer-parser adversarial
+cases) fully establishes the orchestration logic without spending any real
+model usage. `sf loop start` is wired to the real `createClaudeCodeWorker`/
+`createCodexCliWorker` adapters via `loopWorkerFactory.ts` exactly as
+`workerSmoke.ts` already does, so a real smoke — if the human wants one run
+— is a single `sf loop start <work-item-id> --config <path>` against a
+throwaway scratch repo with a trivial task; not run here to avoid spending
+real usage during an implementation/review cycle that may still need
+remediation rounds.
+
+### 14. Files changed
+
+Created: `docs/tasks/TASK-004-autonomous-engineering-loop.md`;
+`docs/tasks/archive/TASK-003-AI-HANDOFF.md` (prior `AI-HANDOFF.md` content,
+archived per protocol); `src/orchestration/{loopTypes,loopRepository,
+engineeringLoopService,verificationWorker,reviewVerdictParser,
+loopWorkerFactory,loopPrompts,scriptedLoopWorkers}.ts`;
+`src/adapters/orchestration/{inMemoryLoopRepository,sqliteLoopRepository}.ts`;
+`src/cli/{loop,demoLoop}.ts`; `tests/{reviewVerdictParser,verificationWorker,
+inMemoryLoopRepository,sqliteLoopRepository,loopPrompts,loopCli,
+engineeringLoopService}.test.ts`.
+
+Modified: `src/cli/main.ts` (`loop`/`demo:loop` dispatch, lazy-imported like
+every other TASK-003 command); `package.json` (`demo:loop` script);
+`tests/support/factoryFixtures.ts` (additive `toReady` helper);
+`README.md` (new TASK-004 section + command list); `LOOP.md`,
+`LOOP-PLANS.md` (status update); `AI-HANDOFF.md` (this file).
 
 Not touched: `src/domain/`, `src/workflow/`, `src/app/factoryService.ts`,
-`src/ports/{worker,workerRegistry,repositories}.ts`, either persistence
-adapter, any TASK-001/002 test.
+`src/ports/{worker,workerRegistry,repositories}.ts`, either existing
+`FactoryStore` adapter's internals, `src/adapters/workers/*` (Claude/Codex
+adapters, prompt templates, environment policy, workspace resolution — all
+reused exactly as TASK-003 shipped them), any TASK-001/002/003 test file,
+`docs/FACTORY_CONSTITUTION.md`, `docs/DOMAIN_MODEL.md`.
 
-### 11. Exact verification results (clean state)
+### 15. Remaining limitations
 
-- `npm run typecheck` — PASS
-- `npm run build` — PASS
-- `npm test` — **325 tests, 325 pass, 0 fail** (up from 260; +65 from this
-  task), confirmed stable across 6 consecutive full runs after the two
-  fixture-timing fixes above
-- `npm run demo` — DONE, 15 refusals, unchanged
-- `npm run demo:persistent` run twice (seed, then a second real OS process
-  reading back) — unchanged behavior
-- `npm run worker:doctor` — see section 9
-- `npm run smoke:codex-worker` — see section 9 (real invocation, SUCCEEDED)
-- `git diff --check` — clean
-- `git status --short` — matches the files listed above
+- Cancellation cannot interrupt an already-launched real CLI subprocess
+  mid-call (documented, §9 above) — a genuine limitation of the accepted
+  `Worker` port, not silently narrowed scope.
+- The loop repository is a second SQLite file, not a shared
+  connection/transaction with `FactoryStore` (§4 above) — a deliberate,
+  documented simplification; revisit only if a real cross-store atomicity
+  requirement appears.
+- `sqliteLoopRepository.ts`'s row validation is intentionally less
+  adversarially hardened than `src/adapters/sqlite/serialization.ts` (that
+  module earned its rigor through multiple rounds of persistence-focused
+  review this new table has not yet been through).
+- No real Claude/Codex smoke test was run this round (§13) — the wiring is
+  identical to TASK-003's already-verified adapters, invoked through the same
+  `FactoryService.runWorker` path `sf worker smoke` already proved works.
+- All prior TASK-001/002/003 limitations still apply unchanged.
+- TASK-005 (planning/intent→plan), GitHub Issues/Projects, Telegram/n8n,
+  server deployment, and a scored/benchmarked model router remain explicitly
+  out of scope, as instructed.
 
-### 12. Remaining limitations
-
-- No PASS/CHANGES_REQUIRED free-text parsing; `claimsAcceptanceMet` is
-  always `false` from a real CLI worker — explicit TASK-004 scope, not an
-  oversight.
-- No autonomous implement → verify → review loop, no remediation loop, no
-  GitHub Issues/Projects/PR integration, no Telegram/WhatsApp/n8n, no server
-  deployment, no full model router/benchmark engine, no multi-machine
-  worker scheduling.
-- The environment allowlist and secret redaction are bootstrap-scale
-  defenses (an explicit list plus regex patterns), not a substitute for a
-  fully isolated credential boundary a later phase may want.
-- Prompt templates (`promptTemplates.ts`) exist for all six `FactoryRole`s
-  but only `IMPLEMENTER`/`REVIEWER`/`VERIFIER` are exercised by real
-  tests/demo, matching what TASK-003 actually needed to execute.
-- All prior TASK-001/TASK-002 limitations still apply unchanged.
-
-### 13. Ready for independent review: YES (pending the follow-up below)
-
-## Implementer follow-up: Claude Code CLI verification
-
-Worker: Claude Code (Sonnet 5), role IMPLEMENTATION ENGINEER. Continuation
-of the same TASK-003 work above, triggered by the human installing a real
-`claude` binary (via a one-command `npmjs.org` registry override for that
-one install only — no global npm registry configuration was changed) and
-asking for the previously-unverified adapter to be checked against it. This
-is a correction pass, not a restart: no code outside the Claude adapter and
-its tests changed.
-
-**1. Claude path/version**
-
-```
-command -v claude   -> /home/hakan/.nvm/versions/node/v22.23.1/bin/claude
-claude --version    -> 2.1.235 (Claude Code)
-claude doctor       -> No installation issues found.
-```
-
-**2. Actual tested Claude invocation**
-
-```
-claude -p "<prompt>" --model <model> --output-format json \
-  [--effort <low|medium|high|xhigh|max>] --permission-mode <plan|acceptEdits>
-```
-
-Full experiment detail in `docs/tasks/TASK-003-worker-runner.md` ("Real,
-tested Claude Code CLI invocation"). Summary of what a real `claude --help`
-plus three minimal, harmless, non-tool-using probes actually showed:
-
-- `-p`/`--print` + a positional prompt argument: confirmed correct.
-- `--output-format json` prints exactly one JSON object with a `.result`
-  string field: **confirmed correct** — this was already the adapter's
-  primary parsing path before the real binary was available, so no change
-  was needed there.
-- `--effort <level>` (choices: low, medium, high, xhigh, max): **real and
-  working** — accepted without error in a live call. The original
-  assumption that no such flag existed was wrong.
-- `--permission-mode <mode>` (choices: acceptEdits, auto, bypassPermissions,
-  manual, dontAsk, plan): real and documented; not previously used at all.
-- No `-C`/`--cwd`-equivalent flag exists: confirmed absent, matching the
-  original assumption that the child process's OS-level `cwd` (which
-  `ProcessRunner` always sets) is the only mechanism.
-- Authentication is file-based (`$HOME/.claude/.credentials.json`); a probe
-  run with `env -i HOME=$HOME PATH=$PATH` (i.e. shaped exactly like the
-  adapter's own restricted environment allowlist) succeeded, confirming
-  `DEFAULT_WORKER_ENV_ALLOWLIST` needs no changes for Claude to
-  authenticate.
-
-**3. Differences from previous adapter assumptions**
-
-Two corrections, both narrowly scoped to `claudeCodeAdapter.ts`:
-
-- Effort was previously always reported `applied: false` ("no verified
-  flag"). Now `resolveClaudeEffort` validates against the CLI's exact
-  five-value choice set and applies `--effort <level>` for a valid one,
-  honestly refusing (with a reason) anything else — mirroring how
-  `resolveCodexEffort` already validated its own TOML-override input.
-- Permission/sandbox control was previously entirely absent (deliberately —
-  "which flag is correct... cannot be confirmed without the real binary").
-  Added `permissionModeForRole`: `acceptEdits` for `IMPLEMENTER`, `plan` for
-  every other role — the direct Claude-side counterpart to
-  `codexCliAdapter.ts`'s `sandboxForRole` (`workspace-write` only for
-  `IMPLEMENTER`, `read-only` otherwise), now that the task explicitly asked
-  for permission/sandbox controls to be verified and the real `--help`
-  output confirmed the flag and its choices.
-
-Everything else (the `-p`/`--model`/`--output-format json` core, the
-process-exit-decides-status discipline, no `claimsAcceptanceMet` trust,
-environment allowlist, workspace-via-`cwd`) was already correct and is
-unchanged.
-
-**4. Changes made**
-
-- `src/adapters/workers/claudeCodeAdapter.ts`: file header rewritten from
-  "UNVERIFIED" framing to the confirmed invocation, with the prior
-  unavailability preserved as an explicit historical note (not deleted);
-  `resolveClaudeEffort` now validates/applies a real flag; added
-  `permissionModeForRole`; `buildClaudeInvocation` now appends `--effort`
-  (when applicable) and always appends `--permission-mode`.
-- `tests/claudeCodeAdapter.test.ts`: updated the argv-shape and effort
-  tests for the corrected behavior; added a `permissionModeForRole` test
-  and an argv test covering the `--effort`+`--permission-mode plan` path.
-  No fake-CLI fixture changes were needed.
-- `docs/tasks/TASK-003-worker-runner.md`: added the "Real, tested Claude
-  Code CLI invocation" section; updated the environment-finding section to
-  preserve history while recording the update; marked acceptance criteria
-  2 and 15 satisfied for Claude.
-- `README.md`: replaced the "Claude Code CLI — UNVERIFIED" paragraph with
-  the verified one; removed the now-resolved bullet from "Known
-  limitations".
-- `AI-HANDOFF.md`: this section.
-
-No file outside this list changed. No source file was modified by either
-real Claude invocation itself (both ran against a throwaway scratch
-directory, never this repository) — confirmed by `git status --short`
-before and after showing only the intentional edits above.
-
-**5. Real Claude smoke result**
-
-One minimal direct probe first (a trivial, tool-free prompt, run twice: once
-with the shell's ambient environment to learn the real output shape, once
-with an `env -i HOME=... PATH=...` environment to confirm the adapter's
-restricted allowlist is sufficient for authentication) — both exit 0,
-`result: "OK"`. Then exactly one real Factory-path smoke run through the
-implemented path (`sf worker smoke claude`, i.e.
-`FactoryService.runWorker` -> durable RUNNING Run -> `ClaudeCodeWorker` ->
-`ProcessRunner` -> real `claude` CLI -> normalized result/evidence -> same
-Run finalized terminally):
-
-```
-scratch workspace: /tmp/sf-worker-smoke-claude-qf1dgU
-launching claude (executable=claude, model=claude-sonnet-5, timeoutMs=60000) against <scratch> ...
-run run-0002 status=SUCCEEDED
-summary: [claude-code:claude-sonnet-5] role=REVIEWER exit=0: I can see the workspace contents: a `.git` directory and a `README.md` file.
-evidence [NOTE] cli://claude-code/run/run-0002: claude-code model=claude-sonnet-5 role=REVIEWER exit=0 duration=24477ms
-evidence [NOTE] cli://claude-code/run/run-0002/transcript: I can see the workspace contents: a `.git` directory and a `README.md` file.
-```
-
-Verified: the real CLI was genuinely launched (the model's answer correctly
-describes the scratch directory's actual contents, which only exist because
-`sf worker smoke claude` created them); `run-0002` (not `run-0001`, the
-zero-cost mock IMPLEMENTER placeholder the smoke harness seeds first) is the
-real-CLI run, meaning `runWorker`'s PHASE 1 durably attached it before
-execution — the same structural guarantee already proven exhaustively by
-`tests/workerRunnerPersistence.test.ts` for a process-backed worker, not
-re-derived per invocation here; process exit status (0) is what decided
-`SUCCEEDED`, not the printed text; evidence is short, contains no secrets,
-and used `plan` permission-mode (read-only intent) since role was
-`REVIEWER`; exactly one run record for the real CLI (`run-0002`, terminal);
-`git status --short` unchanged by the run; no commit/push occurred. Scratch
-workspace and probe directories removed afterward.
-
-**6. Worker doctor result**
-
-```
-claude-code (claude): found (claude), version: 2.1.235 (Claude Code)
-codex-cli (codex): found (codex), version: codex-cli 0.147.0
-```
-
-No credentials printed.
-
-**7. Regression results**
-
-- `npm run typecheck` — PASS
-- `npm run build` — PASS
-- `npm test` — **328 tests, 328 pass, 0 fail** (up from 325; +3 from the
-  new/updated Claude adapter tests), confirmed stable across 3 additional
-  consecutive full runs
-- `npm run demo` — DONE, 15 refusals, unchanged
-- `npm run demo:persistent` run twice (seed, then a second real OS process
-  reading back) — unchanged behavior
-- `git diff --check` — clean
-- `git status --short` — matches the files listed in section 4 above
-
-The real Codex smoke was **not** re-run — no change touched the shared
-`cliWorker.ts` engine or `codexCliAdapter.ts`, only `claudeCodeAdapter.ts`
-and its own tests, so the prior Codex smoke result (section 9 above)
-remains current evidence.
-
-**8. Remaining limitations (updated)**
-
-Unchanged from section 12 above, minus the now-resolved Claude-unverified
-item. No new limitation was introduced by this correction.
-
-**9. Ready for independent review: YES**
+### 16. Ready for independent review: YES
 
 ## Verification output
 Pending — an independent verification pass should re-run `npm run verify &&
-npm run demo && npm run demo:persistent && npm run worker:doctor` from a
-clean checkout, and (separately, deliberately, burning real usage) `npm run
-smoke:codex-worker` and `npm run smoke:claude-worker`.
+npm run demo && npm run demo:persistent && npm run worker:doctor && npm run
+demo:loop` from a clean checkout, plus `git diff --check`.
 
-## Reviewer output
-Independent defensive review (Codex, 2026-08-20): **CHANGES_REQUIRED**.
+## TASK-004 REVIEWER
 
-### HIGH — captured worker output bypasses redaction in the persisted Run summary
+### Independent defensive review — 2026-08-20
 
-`src/adapters/workers/cliWorker.ts` redacts the parsed final message before
-creating transcript Evidence, but `buildSummary()` uses the raw parsed
-message. `FactoryService.runWorker()` persists that summary as
-`Run.summary`, and `workerSmoke.ts` also prints it directly.
+**Verdict: CHANGES_REQUIRED**
 
-Reproduction with the deterministic fake Codex executable and a synthetic
-token-shaped message: transcript Evidence was `[REDACTED]`, while the same
-Run summary contained the original value. The value remained present after
-closing and reopening the SQLite store. This violates C6 and TASK-003's
-requirement that captured output not be blindly persisted when redaction is
-claimed.
+TASK-004's ordinary deterministic scenarios and existing TASK-001/002/003
+regression suite pass, but the following reproducible correctness blockers
+prevent safe human acceptance or commit:
 
-Smallest remediation: apply the same redaction (and existing summary bound)
-to the message before it enters `buildSummary()`/`Run.summary`, then add a
-Factory + SQLite regression assertion covering both Evidence and Run
-summary after reopen. Do not rely on Evidence redaction alone.
+1. **HIGH — cross-database checkpoint loss duplicates work.**
+   `src/orchestration/engineeringLoopService.ts` records Factory worker runs
+   and reviews before saving their ids/outcomes in `loops.db`. If the process
+   dies after the Factory commit and before the loop CAS, resume does not
+   re-derive the committed run/review from Factory state and launches the
+   external step again. A focused probe observed one implementer run before
+   the simulated crash and two after resume. The same boundary exists for
+   verifier/reviewer runs and deterministic/semantic reviews. A crash while
+   `FactoryService.runWorker` has left a durable `RUNNING` run also has no
+   recovery/reconciliation path; the later duplicate cannot remove the
+   orphaned RUNNING record, which keeps release snapshots unresolved.
 
-### MEDIUM — workspace validation accepts a false Git repository
+2. **HIGH — loop persistence accepts unsafe valid-JSON corruption.**
+   `src/adapters/orchestration/sqliteLoopRepository.ts:141-180` validates only
+   shallow top-level fields. Probes showed acceptance of malformed iteration
+   records, impossible duplicate attempts, invalid negative timestamps,
+   malformed command/config shapes, `WAITING_FOR_HUMAN` without reviewer
+   authority, `EXHAUSTED` without exhausted budget, and SQL `phase`/JSON phase
+   divergence. Terminal corruption is trusted without Factory reconciliation;
+   active corruption can select an external worker step.
 
-`src/adapters/workers/workspace.ts:45` accepts a workspace when
-`<root>/.git` merely exists. A temporary directory containing an empty `.git`
-directory was accepted by `resolveWorkspace()`, without being a usable Git
-repository. This fails the TASK-003 acceptance criterion requiring meaningful
-repository validation and can misroute a trusted configuration to an
-arbitrary directory that only has a marker with that name.
+3. **HIGH — malformed reviewer protocol can become PASS.**
+   The CLI adapters ignore malformed JSON and `cliWorker.ts` falls back to raw
+   stdout as evidence. A successful process emitting `not-json` followed by
+   `FACTORY_REVIEW_VERDICT: PASS` was parsed as PASS. TASK-004 requires this
+   case to fail closed.
 
-Smallest remediation: validate the repository using a non-shell Git probe
-with explicit argv/cwd (or equivalent strict filesystem validation), and add
-the empty/invalid `.git` regression case.
+4. **HIGH — verification cwd is not confined to the approved workspace.**
+   `src/orchestration/verificationWorker.ts:59-60` resolves `cwd` without
+   checking containment; `../../outside` produced `/approved/outside` in a
+   focused probe. CLI validation does not close this boundary.
 
-### Non-blocking notes
+5. **HIGH — start/resume concurrency is not claimed atomically.**
+   `start()` performs list-then-create without a per-work-item CAS/lock, and
+   `resume()` has no per-loop action lease. Focused probes created two loop
+   rows for one concurrent start and two implementer runs for two concurrent
+   resumes; the latter ended in a failed loop.
 
-- `src/cli/workerSmoke.ts` creates a throwaway directory but has no
-  `finally` cleanup, so successful and failed smoke runs leave scratch trees
-  behind despite the handoff saying they are removed.
-- README/layout comments and the fake Claude fixture retain historical
-  `UNVERIFIED` wording after the real Claude CLI verification. This does not
-  change runtime behavior, but it is stale documentation.
+6. **HIGH — cancellation can race a new worker launch.**
+   A probe paused immediately before `FactoryService.runWorker`, durably
+   cancelled the loop, then released the call; an implementer run still
+   launched after cancellation. The loop ended CANCELLED, but the new Factory
+   run and WorkItem transition were already recorded, violating the required
+   no-further-autonomous-step guarantee.
 
-### Verification performed
+Smallest required remediation: add authoritative cross-store reconciliation or
+an equivalent durable action/lease protocol; reject unsafe loop rows before
+resume; make reviewer protocol parsing depend on validated adapter output;
+confine verification cwd; serialize start/resume actions; and make cancellation
+win before any new external action. No fixes were implemented during this
+review.
 
-- Installed tools: Node `v22.23.1`; Claude `2.1.235 (Claude Code)`;
-  Codex `codex-cli 0.147.0`. Direct `--help` inspection confirmed the
-  adapter argv families, Claude `--effort`/`--permission-mode`, and Codex
-  `exec --json`, `-C/--cd`, `-m`, `-c`, and `--sandbox` options.
-- Process tests covered argv/cwd/env separation, stdin closure, spawn
-  failure, non-zero exit, timeout, SIGTERM/SIGKILL escalation, cancellation,
-  natural-exit races, large-output draining, bounded capture, truncation, and
-  exactly-once settlement. No shell execution is used.
-- Worker integration covered success, non-zero exit, timeout, spawn failure,
-  process-result authority over printed PASS/failure text, trusted
-  principal binding, reviewer independence, and thrown-adapter failure.
-- SQLite integration observed a RUNNING process-backed Run before completion,
-  finalized the same Run once, and verified Run/evidence durability after
-  close/reopen.
-- `npm run typecheck` PASS; `npm run build` PASS; host-permission `npm test`
-  PASS (328/328); `npm run demo` PASS; `npm run demo:persistent` PASS on
-  initial seed and second-process readback; `npm run worker:doctor` PASS;
-  `git diff --check` PASS. Real AI smoke tests were not rerun because the
-  existing Claude and Codex smoke artifacts plus direct CLI inspection were
-  sufficient and the task explicitly limits repeated usage.
-- No automatic TASK-004 loop, commit, push, merge, release, publish,
-  external orchestration, or deployment path was found.
+Verification run locally: `node --version` v22.23.1, `npm run typecheck`,
+`npm run build`, `npm test` (416/416), focused TASK-004 suites (48/48),
+`npm run demo`, `npm run demo:persistent` twice, `npm run worker:doctor`,
+`npm run demo:loop`, and `git diff --check` all passed. No real Claude/Codex
+model was invoked. Host process permission was required only for deterministic
+local child-process/git fixtures.
+
+**TASK-004 is not safe for human acceptance or commit.**
+
+### Focused independent re-review after remediation round 1 — 2026-08-21
+
+**Verdict: CHANGES_REQUIRED**
+
+The original six HIGH reproductions are closed by the current permanent tests:
+`tests/remediationRound1Repro.test.ts` passes all 16 cases, and the expanded
+crash/reconciliation, concurrency, cancellation, structured-output, cwd, and
+authority suites also pass. The action-claim ordering, exact-tag reconciliation,
+unknown RUNNING fail-closed state, current Factory lineage checks, and offline
+loop demos were independently exercised.
+
+Two additional reproducible HIGH persistence/integrity blockers remain:
+
+1. **HIGH — the active-loop partial-index predicate is not validated.**
+   `src/adapters/orchestration/sqliteLoopRepository.ts:149-177` validates the
+   index name, uniqueness, partial flag, and indexed columns, but never checks
+   its `WHERE` expression. A v2 database with the expected index name and
+   columns but `WHERE phase = 'WAITING_FOR_HUMAN'` opens successfully. That
+   schema no longer enforces uniqueness for active `READY`/`IMPLEMENTING`/
+   `VERIFYING`/`REVIEWING` rows, so concurrent starts can bypass the claimed
+   invariant. Smallest remediation: validate the normalized `sqlite_master.sql`
+   predicate (or an equivalent structural representation) against the exact
+   active-phase predicate and refuse mismatches.
+
+2. **HIGH — corrupted action correlation can adopt a stale Factory Run and
+   continue autonomously.** `src/orchestration/loopSerialization.ts:215-229`
+   accepts any non-empty `correlationTag` and does not bind it to
+   `correlationTag(loopId, actionId, attempt)` or reject reused action identities.
+   `EngineeringLoopService.reconcile()` at
+   `src/orchestration/engineeringLoopService.ts:447-489` then adopts an exact
+   tag match. A temporary end-to-end probe inserted a valid JSON loop claim with
+   the exact tag of an earlier terminal implementer Run; `resume()` marked that
+   old Run recovered, launched a new verifier and reviewer, and reached
+   `WAITING_FOR_HUMAN`. This violates corrupted-loop fail-closed behavior and
+   stale generation/action isolation. Smallest remediation: validate the
+   canonical tag/claim identity, enforce action-id/tag uniqueness and
+   iteration/slot coherence, and refuse invalid or ambiguous references before
+   reconciliation.
+
+The narrow live-owner takeover race remains explicitly fail-closed: a duplicate
+child may be detected as a superseded non-FAILED Run and move the loop to
+`RECOVERY_REQUIRED`; no such duplicate was silently accepted as current
+authority. A concurrent semantic `recordReview` race can duplicate a Review
+record with the same reviewer Run, but it does not create a second model call or
+change current authority; this is non-blocking relative to the two findings
+above.
+
+Verification: host-permission `npm test` passed 458/458; focused remediation and
+reconciliation suites passed; required demos/doctor and `git diff --check`
+passed. No real Claude/Codex model was invoked. No implementation fix was made.
+
+**TASK-004 remains not safe for human acceptance or commit.**
 
 ## Implementer remediation round 1
 
-Worker: Claude Code (Sonnet 5), role IMPLEMENTATION ENGINEER. Responds to
-the independent Codex review directly above (preserved verbatim, not
-edited). Closes all three findings — HIGH, MEDIUM, LOW/CLEANUP — plus the
-two non-blocking documentation notes. No unrelated refactoring; no
-FACTORY_CONSTITUTION.md change; TASK-004 not started.
+Worker: Claude Code (Fable 5), role IMPLEMENTATION ENGINEER. Responds to the
+independent Codex review directly above (preserved verbatim, not edited).
+The six HIGH findings were treated as one root problem — external side
+effects had no durable identity, so nothing could be claimed before it
+happened or reconciled after a crash — and answered with one coherent
+crash-safe action protocol rather than six local patches. Full protocol
+specification: `docs/tasks/TASK-004-autonomous-engineering-loop.md`,
+"Remediation Round 1" section (R1–R10). No FACTORY_CONSTITUTION.md change;
+TASK-005 not started; nothing committed or pushed.
 
-### 1. HIGH — Run.summary redaction
+### 1. Root-cause map for the six HIGH findings
 
-**Root cause:** `src/adapters/workers/cliWorker.ts`'s `buildEvidence()`
-redacted the tool's reported text before it became transcript Evidence, but
-`buildSummary()` read `reported.finalMessage` directly and unredacted —
-exactly as the reviewer found. `FactoryService.runWorker()` persists that
-string as `Run.summary` verbatim.
+- **HIGH 1 (cross-DB duplication):** loop checkpoints were written only
+  AFTER `FactoryService` commits, with no pre-launch identity — resume could
+  not tell "crashed before the Run" from "crashed after it", so it
+  relaunched. Root cause: no durable action identity, no reconciliation.
+- **HIGH 2 (valid-JSON corruption accepted):** `sqliteLoopRepository`
+  validated only shallow top-level fields, then cast.
+- **HIGH 3 (raw-stdout PASS):** `cliWorker.ts` labeled its raw-stdout
+  fallback with the same `/transcript` evidence reference as a genuinely
+  parsed structured answer, and the loop parsed verdicts from all of it plus
+  `Run.summary`.
+- **HIGH 4 (cwd escape):** `resolve(workspace.root, cwd)` with no
+  containment check.
+- **HIGH 5 (unclaimed concurrency):** start was check-then-insert with no
+  persistence-level uniqueness; resume had no claim at all, so two drivers
+  both launched.
+- **HIGH 6 (cancel/launch race):** round 1's `save()` retried a lost CAS by
+  re-applying its patch onto the fresh row — which is precisely how a step
+  that lost its CAS **to a committed cancellation** still went on to launch.
+  The "fix things by retrying" convenience was itself the bug.
 
-**Reproduction first:** added `tests/workerOutputRedaction.test.ts`
-(SQLite, real close/reopen) and `tests/cliWorker.test.ts` (fast, no process
-spawned — a stub `ProcessRunner` stands in), both using the synthetic,
-clearly-fake secret `sk-ant-test-1234567890abcdefghijklmnop`. Run against
-the pre-fix code, both failed with the leak: `Run.summary` = `"...exit=0:
-sk-ant-test-1234567890abcdefghijklmnop"`, Evidence already redacted.
-Confirmed the exact asymmetry the review described.
+### 2. Crash-safe action / idempotency protocol
 
-**Fix — one redaction boundary, not a patched string:** added
-`safeFinalMessage(reported)` in `cliWorker.ts`, the single place
-`reported.finalMessage` is ever read for display/persistence. `execute()`
-now calls it once and passes the *already-redacted* value into both
-`buildSummary` and `buildEvidence`; neither function accepts a raw
-`CliReportedResult` anymore — the type signature itself makes the bug
-impossible to reintroduce by accident (a caller literally cannot pass
-unredacted text to either builder without changing their signatures back).
-The separate raw-stdout/stderr fallback `buildEvidence` uses when nothing
-could be parsed was already being redacted at its own call site before this
-round and still is — scope stayed on the parsed-message field the review
-actually flagged, not a rewrite of Evidence's fallback semantics. Trusted
-fields (tool, model, effort, exit code, termination reason, duration,
-truncation flags) are Factory-supplied/OS-reported metadata, never
-externally-supplied text, and are untouched by redaction — proven by a
-dedicated test.
+Every external side effect is now a **claimed action**: a `WorkerActionClaim`
+(`actionId`, `kind`, `attempt`, `ownerToken`, `claimedAt`, `correlationTag`)
+persisted onto the single loop row via CAS BEFORE the launch, with the two
+`recordReview` side effects claimed the same way
+(`deterministicReviewClaim`/`semanticReviewClaim`). The claim's
+`correlationTag` (`sf-loop:<loopId>:<actionId>:a<attempt>`) becomes the
+launched Worker object's `id`, which `runWorker` durably records as
+`Run.declaredWorkerId` in PHASE 1 — a stable, pre-execution,
+Factory-persisted identity for the side effect. Completions are written as
+FACTS (bounded re-read-and-merge touching only the completion's own fields,
+counting each attempt exactly once); claims and phase changes are STRICT
+single CAS writes with no retry. WorkItem transitions need no journal row:
+the WorkItem status is itself the authoritative durable record, observed
+idempotently ("advance only if still at X, accept if already at Y").
 
-**Proof across SQLite restart:** `tests/workerOutputRedaction.test.ts`
-asserts, in order: the `WorkerOutcome`-derived Run/Evidence are clean → the
-live store's own `runs.findById` is clean → the store closes → a new store
-instance reopens the same file → `runs.findById` and `factory.listEvidence`
-are still clean. A second test proves ordinary non-secret output ("All 12
-tests passed, no issues found.") is not mangled. `tests/cliWorker.test.ts`
-additionally covers `sk-ant-`, `ghp_`, `Bearer`, and labeled `api_key:`
-shapes (the patterns `environmentPolicy.ts`'s `redactSecrets` already
-claims to detect — no new pattern was added, since the bug was the missing
-call, not a missing pattern), plus the raw-stdout-fallback path and the
-trusted-metadata-untouched case. 9 new tests total across the two files, all
-failing pre-fix and passing post-fix.
+### 3. Cross-database reconciliation
 
-### 2. MEDIUM — workspace validation
+Kept factory.db + loops.db (option B) with a real reconciliation pass that
+runs at the top of every drive step, BEFORE budgets and before any new
+claim: the last incomplete claim is matched against `factory.listRuns` by
+exact tag (role cross-checked) — terminal Run → adopt (marked `recovered`,
+counted once, never relaunched); RUNNING Run → RECOVERY_REQUIRED (PART Q:
+never invent evidence, never relaunch — the RUNNING run also keeps release
+snapshots unresolvable by existing TASK-001 law); no Run → the crash
+preceded PHASE 1, relaunch exactly once (takeover re-claim, attempt+1, new
+tag); superseded-attempt Runs that are RUNNING/SUCCEEDED → RECOVERY_REQUIRED
+(post-hoc double-launch detection). Reviews reconcile through the new
+read-only `FactoryService.listReviews` matched by exact `reviewerRunId`.
+All seven PART B windows are covered by tests (see §9/§10). Recovery never
+guesses by role/latest/title/timestamp (PART C) — the previous latest-run
+guess in the WorkerExecutionError path was also replaced with exact-tag
+lookup.
 
-**Root cause:** `resolveWorkspace()` accepted a workspace whenever
-`<root>/.git` existed on disk at all — a directory containing an empty
-`.git` file or directory passed, with no real repository behind it.
+### 4. Durable start/resume concurrency control
 
-**Fix:** replaced the filesystem-marker check with a real Git probe run as
-a non-shell child process — `git -C <candidate> rev-parse --show-toplevel`
-via `node:child_process.spawnSync` (`shell` never set, executable and argv
-always separate, `candidate` only ever passed as an argv element / the
-child's own `cwd`). Bounded: 10s timeout, and any diagnostic text
-(`error.message` or `stderr`) is flattened to one line and capped at 300
-chars before it can appear in the thrown `ValidationError` — a test asserts
-the thrown message is single-line and bounded, so raw arbitrary Git stderr
-is never blindly persisted into Factory audit state.
+Start uniqueness is DB-enforced (PART E): a partial UNIQUE index on
+`engineering_loops(work_item_id) WHERE phase IN (active…)` in SQLite —
+validated structurally at open, including its partial-ness — and the
+equivalent check inside the in-memory adapter's synchronous (yield-free,
+atomic) `create()`. A losing concurrent `start()` dies at `create()` with
+`ConcurrencyError` before anything launches. Resume concurrency is decided
+at the claim CAS: exactly one process wins the claim; a loser re-reads once
+and backs off ("another process is driving"). Stale claims never expire by
+time (no lease-expiry double-worker risk, per the brief's warning); recovery
+is explicit reconciliation, with the crashed-owner takeover path and its one
+residual alive-but-stalled-owner interleaving documented and detected
+post-hoc rather than papered over.
 
-**Policy decision (explicit, not silent):** `Workspace` gained a second
-field, `repositoryRoot` — the real repository root Git reports, distinct
-from `root` (the exact directory the caller configured and the one a worker
-process actually launches in). A configured workspace **may** be a
-subdirectory of an approved repository; `root` stays exactly what was
-configured, `repositoryRoot` is canonicalized so the execution boundary is
-unambiguous either way. This matches the task's stated preferred TASK-003
-behavior. The field is purely additive — nothing else in the codebase
-constructs a `Workspace` literal outside `resolveWorkspace()`, confirmed by
-a repo-wide search before making the change, so no other call site needed
-updating.
+### 5. Cancellation / launch linearization
 
-### 3. Adversarial workspace tests (A–I)
+`cancel()` durably records `cancelRequested` (a fact write — durable
+immediately from the caller's perspective), then finalizes CANCELLED. The
+loop row's `version` is the single linearization point: CANCEL WON → the
+step's stale claim CAS loses, and the conflict handler sees the committed
+cancellation — no external action begins (repro R10 pins the exact
+read-then-cancel-then-launch interleaving with a deterministic snapshot
+hook: zero worker executions, zero Factory runs, loop CANCELLED). LAUNCH WON
+→ the already-claimed action may finish (TASK-003 workers expose no mid-call
+abort) and every subsequent action is refused; as a second layer, a
+pre-flight guard wrapped around every launched Worker re-reads the durable
+loop row inside `execute()` — after PHASE 1, before any process could
+spawn — and aborts with an honest FAILED outcome on committed cancellation,
+terminal loop, or lost ownership. Both race orderings are proven with
+deterministic barriers (R10; the launch-won ordering by the existing
+gated-worker cancellation test, which also proves the completed run's
+evidence is preserved).
 
-All nine cases added to `tests/workspace.test.ts`: (A) no `.git` at all →
-reject; (B) empty `.git` **file** → reject; (C) empty `.git` **directory**
-→ reject (the exact reviewer reproduction); (D) a `.git` directory with
-plausible-looking but garbage `HEAD`/`config` content, no real object
-database → reject, proving Git's own validation is being used, not a
-filename check with a slightly longer checklist; (E) a real temporary repo
-root → accept, `repositoryRoot === root`; (F) a real subdirectory inside a
-real repo → accept, `root` stays the subdirectory, `repositoryRoot` is the
-real top-level; (G) nonexistent path → reject; (H) a file, not a directory
-→ reject; (I) a workspace path containing spaces, quotes, `$()`, backticks
-and semicolons → resolves correctly with no shell interpolation (proven by
-embedding a command substitution shape in the directory name itself and
-confirming it is treated as an inert literal path segment). Two more tests
-cover a missing `git` executable (controlled `ValidationError`, not a
-crash) and the bounded/flattened diagnostic text. All fixtures use `git
-init` only — no commit, no dependency on global Git user identity.
+### 6. loops.db validation / schema hardening
 
-One environment note from building case (I): this sandbox's own filesystem
-policy independently refuses `mkdir` for a directory name containing an
-absolute-path-shaped substring (e.g. literally `/tmp/should-not-run` inside
-the name) — unrelated to this code, reproduced and confirmed in isolation
-with a standalone Node script before adjusting the test to avoid that
-specific shape while keeping every shell-metacharacter case (quotes, `$()`,
-backticks, semicolons, spaces) that actually matters for proving no shell
-interpolation occurs.
+New `src/orchestration/loopSerialization.ts` validates every row on read —
+shapes, enums, ranges, strict 1..n iteration numbering, claim coherence (no
+run id without its upstream claim, no verdict without its reviewer run,
+verdict+reviewRecordId atomic), terminal coherence (outcome equals the
+terminal phase; active loops carry no terminal fields; CANCELLED requires
+cancelRequested; WAITING_FOR_HUMAN requires an authoritative passing review
+reference; EXHAUSTED requires an `exhaustionKind` its stored numbers
+actually support), `totalRunCount` equal to the completed claimed-action
+runs on record, and cross-checks of every duplicated SQL column (id,
+work_item_id, phase, version) against the JSON payload. Violations throw
+`PersistenceCorruptionError`; a corrupted row kills `resume()` at
+`findById`, before any launch decision (proven). Schema integrity at open
+mirrors TASK-002: tables/columns/PKs and every relied-upon index — including
+the active-loop partial unique index's uniqueness, partial-ness and
+columns — are validated structurally; version markers alone prove nothing;
+nothing is silently repaired; non-loops databases are refused.
 
-### 4. LOW/CLEANUP — smoke scratch directory cleanup
+### 7. Reviewer structured-output fix
 
-**Fix:** `src/cli/workerSmoke.ts` now creates the scratch directory, then
-runs the entire smoke body (workspace validation, Factory setup, the real
-worker run) inside a `try { … } finally { rmSync(scratchRoot, { recursive:
-true, force: true }) }`, extracted into a `runSmokeInWorkspace` helper so
-the cleanup wrapper stays trivially readable. Cleanup now runs on success,
-on a FAILED `WorkerOutcome` (non-zero exit, spawn failure — proven with a
-nonexistent executable), and on a thrown adapter error (proven with a
-`ProcessRunner` stub that rejects, simulating a genuine adapter bug rather
-than an ordinary process failure). Only the exact `mkdtemp`-created path is
-ever removed; no other directory is touched. `tests/workerSmoke.test.ts`
-(3 tests, using the fake Codex CLI, never a real one) proves all three
-paths.
+`cliWorker.ts` now emits two distinct evidence channels: `/transcript` ONLY
+for a structured-parse-recovered tool answer, `/raw-output` (bounded,
+redacted, labeled "diagnostic only") when the structured contract was
+violated. The loop parses verdicts exclusively from the reviewer run's
+`/transcript` evidence — the `Run.summary` fallback is deleted. A clean-exit
+process printing a plain-text PASS tag now fails closed ("no structured
+reviewer output") into remediation/exhaustion (repro R6, driven through the
+real Codex adapter against a contract-violating fake CLI). Non-zero exit +
+valid PASS JSON still never reaches the parser (unchanged, still tested).
+References are adapter-authored code, not model text — the channel cannot be
+forged from inside a transcript.
 
-### 5. Non-blocking documentation notes
+### 8. Verification cwd containment fix
 
-Both addressed, cheaply, since they were flagged by the same review: the
-stale `(UNVERIFIED — see below)` annotation in README's file-layout block
-(the surrounding prose had already been corrected in the prior Claude
-verification round, this one inline comment was missed) and
-`fake-claude.mjs`'s header comment (said "documented (unverified...)",
-updated to say "confirmed real-CLI contract"). Runtime behavior unchanged
-either way — pure documentation accuracy.
+`resolveContainedCwd` confines every configured cwd to `workspace.root` (the
+narrower approved execution workspace of the TASK-003 contract;
+`repositoryRoot` may be broader and nothing authorizes executing outside the
+configured subdirectory — rule documented in the design doc R8). Real
+symlink-resolved paths on both sides; `../` escapes, absolute outside paths,
+symlink escapes (including a symlink created AFTER loop start — the check
+runs at `start()` and again per command at execution time), nonexistent
+paths, non-directories and lexical prefix cousins are all rejected; spaces
+are safe; no shell exists anywhere. An execution-time violation now fails
+the loop closed (`FAILED`) instead of remediating — remediation cannot fix a
+configuration problem.
 
-### 6. Files changed this round
+### 9. Crash/concurrency adversarial tests
 
-Modified: `src/adapters/workers/cliWorker.ts` (redaction boundary),
-`src/adapters/workers/workspace.ts` (real Git validation, new
-`repositoryRoot` field), `src/cli/workerSmoke.ts` (try/finally cleanup),
-`tests/workspace.test.ts` (rewritten with the A–I adversarial suite),
-`README.md` (stale wording), `tests/fixtures/fake-clis/fake-claude.mjs`
-(stale wording), `AI-HANDOFF.md` (this section).
+Three permanent suites beyond the reworked originals:
 
-Created: `tests/workerOutputRedaction.test.ts`, `tests/cliWorker.test.ts`,
-`tests/workerSmoke.test.ts`.
+- `tests/remediationRound1Repro.test.ts` — 16 tests, one per reviewer
+  reproduction (R1/R2a/R2b/R3 for HIGH 1; R4a–f/R5 for HIGH 2; R6–R10 for
+  HIGH 3–6).
+- `tests/loopReconciliationMatrix.test.ts` — 10 tests: PART M windows
+  M-A (claimed/no Run → relaunch exactly once under attempt 2, tag-exact),
+  M-D (verifier terminal → adopt, `recovered` telemetry), M-F
+  (DETERMINISTIC review persisted → adopt, exactly one review), M-H
+  (remediation run terminal → adopt with `totalRunCount === 6`, no budget
+  double-spend — PART O), M-J (WorkItem WAITING/loop stale → reconcile
+  forward, zero extra reviewer calls), M-K (EXHAUSTED durable/BLOCKED
+  missing → resume finishes the transition with zero worker spend,
+  exhaustion survives restart); PART K (a claimed-but-unlaunched remediation
+  action never adopts the previous iteration's run); PART L (a tampered
+  loop-local PASS with no authoritative Factory review fails closed to
+  FAILED at the advance's own precondition — Factory authority wins); PART N
+  (two independent SQLite connections racing one claim launch exactly one
+  run — DB-enforced CAS across real connections; corrupted row blocks resume
+  with zero runs).
+- Containment suite in `tests/verificationWorker.test.ts` (9 new tests,
+  including the late-symlink defense-in-depth case) and a CLI-level
+  containment rejection in `tests/loopCli.test.ts`.
 
-Not touched: `src/domain/`, `src/workflow/`, `src/app/factoryService.ts`,
-`src/ports/`, either persistence adapter, `codexCliAdapter.ts`,
-`claudeCodeAdapter.ts` (beyond what the stale-wording note above covers —
-no logic in either concrete adapter changed), any TASK-001/002 test,
-`docs/FACTORY_CONSTITUTION.md`.
+Crash simulation is condition-based fault injection pinned to durable-state
+shapes (never write counts) with full post-crash poisoning — after the
+simulated death, every repository operation throws, so the orchestrator's
+own failure bookkeeping cannot run through a "dead" store (and `drive()`'s
+failure path was restructured accordingly: if the loop store is unavailable,
+the original error propagates and the WorkItem is left untouched, exactly
+like a real crash). The five original A–E window tests in
+`tests/engineeringLoopService.test.ts` were reworked onto the same
+discipline and kept. All races use explicit barriers/hooks, and assertions
+count exact loop rows, implementer/verifier/reviewer runs, and Reviews.
 
-### 7. Exact verification results
+### 10. Proof each finding reproduced pre-fix
+
+Phase 0 was run before any fix, exactly as instructed: all 16 reproduction
+tests were written first and executed against the unfixed implementation —
+**16/16 failed** (`node --test dist/tests/remediationRound1Repro.test.js`:
+"tests 16, pass 0, fail 16"), reproducing every finding: duplicate
+implementer run after resume (R1), duplicate reviewer run/Review (R2a/R2b),
+duplicate launch beside a durable RUNNING run (R3), all six valid-JSON
+corruption shapes accepted (R4a–f), SQL/JSON phase divergence accepted (R5),
+raw-stdout PASS accepted end-to-end through the real Codex adapter (R6),
+`../outside` execution with a marker file written outside the workspace
+(R7), two active loops from two concurrent starts once non-colliding id
+generation is used (R8 — the first probe also exposed that the round-1 CLI
+wiring minted colliding sequential ids across OS processes, fixed via
+`createRandomIdGenerator`), two implementer runs from two concurrent resumes
+(R9), and a worker launching after a durably-committed cancellation (R10).
+Post-fix: 16/16 pass, unchanged assertions.
+
+### 11. Exact post-fix verification results
+
+From a clean build (`rm -rf dist .factory-data`):
 
 - `npm run typecheck` — PASS
 - `npm run build` — PASS
-- `npm test` — **347 tests, 347 pass, 0 fail** (up from 328; +19 from this
-  round: 9 redaction, 8 workspace [3 new beyond the prior 5], 3 smoke
-  cleanup, minus overlap already counted — see individual suite counts
-  above), confirmed stable across 3 consecutive full runs
+- `npm test` — **458 tests, 458 pass, 0 fail** (up from 416; +42 net from
+  this round), stable across 3 consecutive full runs
 - `npm run demo` — DONE, 15 refusals, unchanged
-- `npm run demo:persistent` run twice (seed, then a second real OS process
-  reading back) — unchanged behavior
-- `npm run worker:doctor` — unchanged: both CLIs still found with version
-- `git diff --check` — clean
-- `git status --short` — matches the files listed in section 6
+- `npm run demo:persistent` twice (seed, then a second OS process reading
+  back) — unchanged
+- `npm run worker:doctor` — claude 2.1.235 and codex-cli 0.147.0 still found
+- `npm run demo:loop` — all three scenarios unchanged
+  (WAITING_FOR_HUMAN / WAITING_FOR_HUMAN after one remediation / EXHAUSTED +
+  WorkItem BLOCKED)
+- `git diff --check` — clean; `git status --short` matches §12
+- Focused suites all green: remediationRound1Repro (16),
+  loopReconciliationMatrix (10), engineeringLoopService (21),
+  verificationWorker (16), sqliteLoopRepository (9), inMemoryLoopRepository
+  (8), loopCli (11), reviewVerdictParser (15), loopPrompts (5), cliWorker.
 
-### 8. Whether any real AI smoke was rerun: NO, deliberately
+No real Claude/Codex model was invoked: the changed TASK-003 surface
+(`cliWorker.ts`) alters only how already-captured output is labeled as
+evidence — argv construction, environment, workspace and authentication
+paths are untouched — so deterministic fake-CLI coverage suffices and no
+real smoke was re-burned, per the brief's instruction.
 
-`cliWorker.ts`'s change is entirely post-processing of already-captured
-output (`Run.summary`/Evidence construction) — it does not touch
-`buildInvocation`, argv, environment, stdin, or anything else that reaches
-the real CLI. `workspace.ts`'s change adds a real `git rev-parse` probe at
-workspace-resolution time, before any worker CLI is ever invoked, and does
-not alter what gets passed to Claude or Codex. Both are exhaustively proven
-by deterministic fake-CLI/fake-git tests. Per the task's explicit
-instruction not to burn usage repeating a real smoke unless a changed code
-path makes it genuinely necessary, neither `npm run smoke:codex-worker` nor
-`npm run smoke:claude-worker` was rerun; the results already on record
-above (both SUCCEEDED) remain current evidence.
+### 12. Files created/modified
 
-### 9. Remaining limitations
+Created: `src/orchestration/loopSerialization.ts`;
+`tests/remediationRound1Repro.test.ts`;
+`tests/loopReconciliationMatrix.test.ts`.
 
-Unchanged from the prior rounds' lists, plus: the environment sandbox this
-was built in has its own (unrelated) filesystem policy quirk noted in
-section 3 — worth knowing if a future contributor writes a similar
-special-character path test in this environment.
+Modified: `src/orchestration/{loopTypes,engineeringLoopService,
+verificationWorker}.ts` (protocol, guard, containment; `loopRepository.ts`
+contract docs unchanged in shape);
+`src/adapters/orchestration/{sqliteLoopRepository,inMemoryLoopRepository}.ts`
+(schema v2 + integrity validation + active-loop uniqueness);
+`src/adapters/workers/cliWorker.ts` (evidence-channel split only);
+`src/app/factoryService.ts` (additive read-only `listReviews`);
+`src/domain/ids.ts` (additive `createRandomIdGenerator`);
+`src/cli/loop.ts` (random ids); `tests/fixtures/fake-clis/fake-codex.mjs`
+(new `raw` mode); reworked tests:
+`tests/{engineeringLoopService,sqliteLoopRepository,inMemoryLoopRepository,
+verificationWorker,loopCli,cliWorker}.test.ts`;
+`docs/tasks/TASK-004-autonomous-engineering-loop.md` ("Remediation Round 1"
+section, R1–R10); `AI-HANDOFF.md` (this section);
+README updated where the changed behavior required it.
 
-### 10. Ready for independent re-review: YES
+Not touched: `src/domain/` (beyond the additive id generator),
+`src/workflow/`, `FactoryService` write paths, both factory.db persistence
+adapters, `src/adapters/workers/{claudeCodeAdapter,codexCliAdapter,
+promptTemplates,environmentPolicy,workspace}.ts`, `src/ports/`, any
+TASK-001/002/003 test, `docs/FACTORY_CONSTITUTION.md`.
 
-## TASK-003 REVIEWER
+### 13. Remaining limitations
 
-### Final focused re-review after remediation — 2026-08-20
+- Exactly-once under arbitrary LIVE-process interleavings is impossible
+  without process fencing; the protocol's guarantee is
+  exactly-once-or-fail-closed: the one residual window (an
+  alive-but-stalled prior owner spawning inside the microseconds between its
+  pre-flight ownership check and its spawn, concurrent with a takeover) is
+  detected post-hoc by the superseded-run rule and lands in
+  RECOVERY_REQUIRED, never silently double-counted. Documented in the design
+  doc R4.
+- `resume()` while another live process has a worker legitimately mid-flight
+  is indistinguishable from a crashed owner with a stuck RUNNING run and
+  fails closed to RECOVERY_REQUIRED — safe, but destructive to a healthy
+  concurrent run's loop; concurrent resumes against an actively-driven loop
+  are documented operator misuse.
+- RECOVERY_REQUIRED is terminal with no in-band operator workflow yet
+  (inspect + cancel or start a fresh loop after the WorkItem is resumed by a
+  human); an `sf loop recover` surface is future work.
+- Duplicate-review residual: two live processes racing the semantic-review
+  recording inside the narrow claim-steal window could still record two
+  identical Reviews in append-only factory.db (harmless to verdict
+  authority — latest-in-append-order wins — but a duplicate side effect);
+  narrowed by the claim + immediate listReviews re-check, not eliminated.
+- Mid-call worker abort remains unavailable (TASK-003 Worker port has no
+  abort channel) — cancellation stops every SUBSEQUENT action; the pre-flight
+  guard additionally stops claimed-but-not-yet-spawned launches.
+- All prior TASK-001/002/003 limitations still apply unchanged.
+
+### 14. Ready for independent re-review: YES
+
+## TASK-004 REVIEWER — Independent re-review round 2
+
+### Verbatim remediation brief (2026-08-21)
+
+> TASK-004 — Autonomous Engineering Loop Remediation Round 2
+>
+> Independent Codex re-review returned CHANGES_REQUIRED with TWO remaining HIGH
+> findings.
+>
+> Do NOT start TASK-005.
+> Do NOT commit or push.
+> Do NOT modify FACTORY_CONSTITUTION.md.
+> Do NOT perform unrelated refactoring.
+>
+> Preserve the latest independent reviewer report verbatim in AI-HANDOFF.md.
+>
+> The two blockers are:
+>
+> HIGH 1
+> sqliteLoopRepository validates the active-loop partial unique index's:
+> - name
+> - uniqueness
+> - partial flag
+> - indexed columns
+>
+> but NOT its WHERE predicate.
+>
+> A semantically wrong partial index can therefore pass schema validation while
+> allowing multiple active loops for one WorkItem.
+>
+> HIGH 2
+> Persisted action correlation metadata is not canonical enough.
+> loopSerialization accepts arbitrary/reused correlation tags/action identities.
+>
+> A corrupted claim was able to adopt an older terminal Factory Run, then launch
+> new verification/review work and reach WAITING_FOR_HUMAN.
+>
+> Both findings must be closed before TASK-004 can be committed.
+>
+> ==================================================
+> PHASE 0 — PERMANENT PRE-FIX REPRODUCTIONS
+> ==================================================
+>
+> Before implementation changes, add deterministic regressions for BOTH findings.
+>
+> Do not weaken them after fixing.
+>
+> --------------------------------------------------
+> A. WRONG PARTIAL-INDEX PREDICATE
+> --------------------------------------------------
+>
+> Create a loops.db whose active-loop index has:
+>
+> - expected name
+> - expected UNIQUE flag
+> - expected indexed column(s)
+> - partial = true
+>
+> BUT a semantically wrong WHERE predicate.
+>
+> Choose the wrong predicate so the schema demonstrably permits a state that the
+> real active-loop uniqueness rule must prohibit.
+>
+> Prove pre-fix:
+>
+> 1. SQLiteLoopRepository opens the malformed DB.
+> 2. The malformed predicate can permit more than one logically-active loop for
+>    the same WorkItem, or otherwise fails to enforce the expected invariant.
+>
+> Expected post-fix:
+>
+> - repository open fails explicitly with SchemaIntegrityError
+> - no autonomous action can run from that malformed DB
+> - DB is not silently repaired
+>
+> Also test harmless SQL formatting variations of the CORRECT predicate if the
+> validator is intended to tolerate them.
+>
+> --------------------------------------------------
+> B. CORRUPTED/REUSED ACTION CORRELATION
+> --------------------------------------------------
+>
+> Reproduce the exact reviewer authority failure.
+>
+> Create:
+>
+> - an older terminal Factory Run belonging to another historical action
+> - a current loop/action claim whose persisted action identity/correlation
+>   metadata is maliciously/corruptly changed to reference/adopt that older Run
+>
+> Prove pre-fix that reconciliation can:
+>
+> - adopt the old Run
+> - treat it as current action completion
+> - continue verification/review
+> - reach WAITING_FOR_HUMAN incorrectly
+>
+> Expected post-fix:
+>
+> - corrupted action/correlation state is rejected before reconciliation
+> - zero new verification/reviewer worker launches
+> - old Run is never adopted as current authority
+> - WAITING_FOR_HUMAN is unreachable through the corrupted state
+>
+> ==================================================
+> PART 1 — VALIDATE THE EXACT ACTIVE-INDEX PREDICATE
+> ==================================================
+>
+> Inspect the actual v2 loop schema DDL and derive the authoritative active-loop
+> predicate from the schema contract itself.
+>
+> Do NOT invent a new policy.
+>
+> The schema validator must verify the semantic WHERE predicate relied upon by
+> the active-loop uniqueness invariant.
+>
+> SQLite PRAGMA index_list only tells us that an index is partial; that is not
+> enough.
+>
+> Inspect sqlite_master / sqlite_schema SQL for the specific index as needed.
+>
+> Validation must establish:
+>
+> - correct table
+> - correct UNIQUE property
+> - exact indexed column sequence
+> - partial index expected
+> - correct logical predicate defining which phases count as active
+>
+> Do NOT accept:
+>
+> same index name
+> + same columns
+> + partial=true
+> + arbitrary WHERE expression
+>
+> as valid.
+>
+> Avoid fragile byte-for-byte SQL comparison if harmless:
+> - whitespace
+> - casing
+> - quoting
+>
+> differences can occur.
+>
+> Use the smallest robust normalization/parser appropriate to this ONE
+> Factory-owned predicate.
+>
+> Do not introduce a general SQL parser dependency unless absolutely necessary.
+>
+> Tests must include:
+>
+> 1. exact correct schema => accepted
+> 2. correct predicate with harmless formatting variation => accepted if intended
+> 3. missing WHERE => rejected
+> 4. inverted/wrong phase predicate => rejected
+> 5. predicate omitting one required phase => rejected
+> 6. predicate including a terminal phase as active, if contrary to contract =>
+>    rejected
+> 7. same name/columns/unique/partial but unrelated predicate => rejected
+>
+> The schema validator must fail closed.
+>
+> ==================================================
+> PART 2 — ONE CANONICAL ACTION IDENTITY FUNCTION
+> ==================================================
+>
+> The core rule must become:
+>
+> Persisted correlation metadata is NOT arbitrary trusted text.
+>
+> Define one canonical trusted action identity derivation used by:
+>
+> - action creation
+> - persistence validation
+> - reconciliation
+> - worker correlation
+>
+> Do not let each location construct IDs independently.
+>
+> Prefer a deterministic identity derived from immutable action coordinates,
+> conceptually including enough of:
+>
+> - loopId
+> - WorkItem association
+> - iteration
+> - action kind
+> - attempt
+>
+> The exact representation is an implementation choice.
+>
+> For example, a canonical tuple-derived identifier or hash is acceptable.
+>
+> Important properties:
+>
+> - same logical action/attempt => same expected identity after restart
+> - different loop => different identity
+> - different iteration => different identity
+> - different action kind => different identity
+> - different attempt => different identity
+> - value cannot be arbitrarily supplied by persisted JSON and trusted
+> - no model-controlled text contributes to identity
+>
+> Do NOT use:
+> - title
+> - prompt
+> - timestamps
+> - tool output
+> - latest Run
+> - role alone
+>
+> as identity.
+>
+> ==================================================
+> PART 3 — CANONICAL correlationTag
+> ==================================================
+>
+> correlationTag must be derived from trusted canonical action identity.
+>
+> Do not deserialize and trust:
+>
+> correlationTag: "whatever was stored"
+>
+> Instead, on read:
+>
+> 1. validate immutable action coordinates
+> 2. derive EXPECTED action identity
+> 3. derive EXPECTED correlation tag
+> 4. compare persisted values exactly to expected canonical values
+> 5. mismatch => PersistenceCorruptionError / appropriate orchestration
+>    corruption error
+>
+> Reconciliation must use the derived/validated canonical value.
+>
+> It must never use unchecked persisted arbitrary correlation text as a Factory
+> Run lookup key.
+>
+> ==================================================
+> PART 4 — ACTION IDENTITY UNIQUENESS / COHERENCE
+> ==================================================
+>
+> Validate the complete EngineeringLoop on read for identity collisions.
+>
+> Within one loop, reject:
+>
+> - duplicate actionId
+> - duplicate canonical correlationTag
+> - two different logical actions mapping to same identity
+> - reused identity across different iterations
+> - reused identity across IMPLEMENT / VERIFY / REVIEW / REMEDIATE
+> - attempt number inconsistent with identity
+> - claim coordinates inconsistent with containing iteration
+> - completion metadata referencing an action identity belonging to another
+>   action
+>
+> If historical/superseded attempts remain in the loop, their canonical
+> identities must remain unique and internally coherent.
+>
+> Do not reject legitimate recovery records simply because they are historical.
+>
+> ==================================================
+> PART 5 — CROSS-LOOP / OLD-RUN ADOPTION DEFENSE
+> ==================================================
+>
+> Add explicit adversarial tests proving that reconciliation cannot adopt:
+>
+> - an older IMPLEMENTER Run from a previous iteration
+> - an older Run from a different loop
+> - a Run with the same role/model but different canonical correlation
+> - an older REVIEWER Run
+> - a superseded attempt's Run as the current attempt
+>
+> even if corrupted persisted loop JSON tries to point at them.
+>
+> Factory Run matching must require exact current canonical correlation identity.
+>
+> No "closest match", latest-role match, title match, or timestamp inference.
+>
+> ==================================================
+> PART 6 — VALIDATE BEFORE ANY RECONCILIATION
+> ==================================================
+>
+> A corrupted loop row must die at the persistence trust boundary.
+>
+> Required ordering:
+>
+> SQLite row
+> ↓
+> parse JSON
+> ↓
+> full loop validation
+> ↓
+> canonical action identity validation
+> ↓
+> SQL/JSON metadata cross-check
+> ↓
+> ONLY THEN return EngineeringLoop
+> ↓
+> ONLY THEN reconciliation is allowed
+>
+> Do not make engineeringLoopService responsible for detecting arbitrary
+> persistence corruption after it has already received trusted-looking state.
+>
+> ==================================================
+> PART 7 — AUTHORITATIVE PASS DEFENSE
+> ==================================================
+>
+> Add a regression reproducing the reviewer's exact dangerous outcome.
+>
+> Corrupt correlation metadata so it attempts to reuse an old PASS-compatible
+> lineage.
+>
+> Then call resume.
+>
+> Assert:
+>
+> - PersistenceCorruptionError / explicit fail-closed result occurs
+> - no verification worker launches
+> - no semantic reviewer launches
+> - no new Review is recorded
+> - WorkItem does NOT transition to WAITING_FOR_HUMAN
+> - loop does not gain PASS authority
+> - old terminal Run remains historical only
+>
+> This should be a permanent TASK-004 regression.
+>
+> ==================================================
+> PART 8 — DO NOT BREAK CRASH RECOVERY
+> ==================================================
+>
+> Canonical identity must preserve the good Round-1 behavior.
+>
+> Re-run:
+>
+> claim durable
+> + crash
+> + no Run
+> => legitimate attempt recovery works according to documented protocol
+>
+> terminal matching Run
+> + missing loop checkpoint
+> => exact Run adopted once
+>
+> RUNNING matching Run
+> => RECOVERY_REQUIRED
+>
+> completed Review
+> + missing loop checkpoint
+> => exact Review adopted safely
+>
+> The new validation must not make legitimate crash recovery impossible.
+>
+> ==================================================
+> PART 9 — TAKEOVER / ATTEMPT BUMP
+> ==================================================
+>
+> Review the existing takeover semantics.
+>
+> If a new legitimate attempt is created:
+>
+> attempt N
+> => canonical identity N
+>
+> attempt N+1
+> => NEW canonical identity
+>
+> They must not collide.
+>
+> A takeover must never reuse the correlation identity of a superseded attempt.
+>
+> Regression:
+>
+> attempt 1 historical terminal Run exists
+> attempt 2 current
+> => attempt 2 cannot reconcile against attempt 1
+>
+> ==================================================
+> PART 10 — SCHEMA VALIDATION MUST REMAIN SIDE-EFFECT FREE
+> ==================================================
+>
+> A malformed active-loop index predicate must be detected before normal use.
+>
+> Do not silently:
+>
+> DROP INDEX
+> CREATE INDEX
+>
+> or otherwise repair the database during ordinary open.
+>
+> Existing incompatible/corrupt DB:
+> => refuse explicitly
+>
+> Fresh DB:
+> => create canonical v2 schema
+>
+> Preserve the schema-hardening principles already established in TASK-002/004.
+>
+> ==================================================
+> PART 11 — KEEP THE REMEDIATION SMALL
+> ==================================================
+>
+> Do NOT redesign the entire Round-1 action journal.
+>
+> The reviewer explicitly found the normal claim/reconciliation architecture
+> sound.
+>
+> This round should primarily touch:
+>
+> - canonical action identity helpers
+> - loopSerialization validation
+> - reconciliation lookup usage if necessary
+> - sqlite loop schema/index validation
+> - focused tests/docs
+>
+> Do not change real Claude/Codex invocation unless genuinely required.
+>
+> Do not rerun real AI models.
+>
+> ==================================================
+> PART 12 — REQUIRED REGRESSION SET
+> ==================================================
+>
+> Permanent tests must prove:
+>
+> INDEX:
+>
+> A. same index name + wrong predicate rejected
+> B. omitted predicate condition rejected
+> C. wrong active-phase set rejected
+> D. valid canonical index accepted
+>
+> CORRELATION:
+>
+> E. arbitrary correlation tag rejected
+> F. mismatched canonical actionId rejected
+> G. duplicate action identity rejected
+> H. duplicate correlation tag rejected
+> I. prior-iteration Run cannot be adopted
+> J. different-loop Run cannot be adopted
+> K. superseded-attempt Run cannot be adopted
+> L. corrupted claim cannot reach verification/review
+> M. corrupted claim cannot reach WAITING_FOR_HUMAN
+>
+> RECOVERY:
+>
+> N. legitimate exact current terminal Run still reconciles
+> O. legitimate exact current Review still reconciles
+> P. unknown matching RUNNING Run still reaches RECOVERY_REQUIRED
+>
+> ==================================================
+> PART 13 — PRESERVE ALL PRIOR FIXES
+> ==================================================
+>
+> Do not regress the six Round-1 HIGH fixes:
+>
+> - crash reconciliation
+> - loops.db runtime validation
+> - transcript-only reviewer authority
+> - verification cwd containment
+> - concurrent start/resume protection
+> - cancellation/launch ordering
+>
+> Also preserve TASK-001/002/003 invariants.
+>
+> ==================================================
+> FINAL VERIFICATION
+> ==================================================
+>
+> Run:
+>
+> npm run typecheck
+> npm run build
+> npm test
+> npm run demo
+> npm run demo:persistent
+> npm run worker:doctor
+> npm run demo:loop
+> git diff --check
+> git status --short
+>
+> Also run focused tests for:
+>
+> - malformed active index predicate
+> - canonical action/correlation validation
+> - historical Run adoption
+> - crash reconciliation
+>
+> Automated tests only.
+> Do NOT invoke real Claude/Codex models.
+>
+> Update:
+>
+> - TASK-004 design doc
+> - TASK-004 IMPLEMENTER remediation section in AI-HANDOFF.md
+>
+> Preserve all previous reviewer reports verbatim.
+>
+> Do NOT commit.
+> Do NOT push.
+> Do NOT start TASK-005.
+>
+> Final response only:
+>
+> 1. Root cause of the two remaining HIGH findings
+> 2. Active-index predicate validation design
+> 3. Canonical action identity design
+> 4. Correlation validation/reconciliation changes
+> 5. Historical/superseded Run adoption defenses
+> 6. Pre-fix reproduction results
+> 7. New permanent regression tests
+> 8. Exact full verification results
+> 9. Files changed
+> 10. Remaining limitations
+> 11. Ready for independent re-review: YES/NO
+>
+> STOP after TASK-004.
+
+
+## Implementer remediation round 2
+
+Worker: Claude Code (Sonnet 5), role IMPLEMENTATION ENGINEER. Responds to the
+independent Codex re-review directly above (preserved verbatim, not edited).
+No FACTORY_CONSTITUTION.md change; TASK-005 not started; nothing committed or
+pushed; no unrelated refactoring. Full protocol detail:
+`docs/tasks/TASK-004-autonomous-engineering-loop.md`, "Remediation Round 2"
+section (S1–S6).
+
+### 1. Root cause of the two remaining HIGH findings
+
+- **HIGH 1:** `PRAGMA index_list`/`index_info` prove an index is unique,
+  partial, and over the right column — they cannot show *which phases* a
+  partial condition restricts to. `sqliteLoopRepository`'s schema validation
+  stopped at that structural proof, so a same-name/same-columns/unique=true/
+  partial=true index with a semantically wrong `WHERE` clause (a phase
+  omitted, an inverted condition, an unrelated predicate) passed validation
+  while not actually enforcing "at most one active loop per work item."
+- **HIGH 2:** `actionId` was minted via `ids.next("act")` — an opaque random
+  token with no relationship to the claim's own position (loop, iteration,
+  kind). `loopSerialization.ts` checked that a claim's `actionId`/
+  `correlationTag` were present, non-empty strings — never that they were
+  the *correct* ones for that position — so a corrupted row could set them to
+  any string, including one copied from an older, unrelated, already-
+  terminal Run's real `declaredWorkerId`, which reconciliation's exact-tag
+  lookup would then dutifully adopt as the current action's completion.
+
+### 2. Active-index predicate validation design
+
+`validateActiveIndexPredicateSql(sql, indexName, requiredPhases)` — a small,
+hand-written parser scoped to exactly one predicate shape (`phase IN
+('P1', 'P2', ...)`), not a general SQL parser. It reads the index's real
+declared text from `sqlite_master.sql` (confirmed by direct experiment that
+SQLite stores DDL verbatim, not re-serialized), extracts the `WHERE` clause
+via one anchored regex, and compares the referenced phase set against
+`ACTIVE_LOOP_PHASES` as a **set** — so entry order, whitespace, and keyword
+casing never matter, while a missing/extra/wrong phase, an inverted
+condition, or an unrelated clause are all rejected. Wired into
+`validateTable`'s per-index loop as an additional check (a new
+`requiredWherePhases` field on `ExpectedIndex`), running only after the
+existing structural checks pass, and — per PART 10 — this is pure read-only
+introspection at open time: no DDL runs, nothing is auto-repaired, an
+incompatible database is refused outright with `SchemaIntegrityError`.
+
+### 3. Canonical action identity design
+
+One pure function, `canonicalActionId(loopId, iteration, kind) =
+"${loopId}:i${iteration}:${kind}"`, used everywhere an action identity is
+needed: action creation (`claimIfNeeded` computes it directly — `ids.next
+("act")` is gone from that path), persistence validation
+(`loopSerialization.ts` recomputes and requires an exact match),
+reconciliation (unchanged exact-tag lookup, now against a value that cannot
+be forged), and worker correlation (`guardedWorker`'s `id`, unchanged). The
+tuple is injective by construction — `iteration` is validated elsewhere to
+be strictly 1..n with no duplicates, `kind` is one of three fixed literals,
+the format is unambiguous — so no two claims anywhere in one loop can share
+a canonical `actionId`. `attempt` lives in the tag, not the actionId: a
+takeover keeps the same logical `actionId` (it is the same action) but gets
+a new tag, so attempt N+1 can structurally never satisfy attempt N's
+exact-tag lookup (closes PART 9 directly, no separate rule needed).
+
+**A real bug caught while wiring this up:** `correlationTag`'s original
+signature took a separate `loopId` parameter, which — once `actionId` itself
+started embedding the loop id — caused the loop id to appear twice in every
+tag (`sf-loop:loop-x:loop-x:i1:IMPLEMENT:a1`). Harmless but sloppy; fixed by
+dropping the now-redundant parameter, caught by a test asserting the exact
+expected tag string rather than merely "does not throw."
+
+### 4. Correlation validation / reconciliation changes
+
+`loopSerialization.ts`'s new `validateCanonicalClaim` recomputes the
+expected `actionId`/`correlationTag` for every `implementClaim`/
+`verifyClaim`/`reviewClaim` it parses and throws `PersistenceCorruptionError`
+on any deviation — inside `parseIteration`, strictly before
+`parseEngineeringLoop` ever returns, matching PART 6's required ordering
+exactly (`engineeringLoopService` is never asked to detect this class of
+corruption itself; it only ever receives an already-validated
+`EngineeringLoop`).
+
+PART 4's duplicate-actionId/duplicate-correlationTag requirement is
+satisfied structurally, not by a second scanning pass: since canonical
+derivation makes two claims sharing an identity impossible unless one of
+them is already non-canonical for its own position, the same per-claim check
+that closes E/F/I/J also closes G/H — proven directly by constructing a
+row that tries to duplicate iteration 1's identity onto iteration 2 and
+confirming rejection. PART 11 asked to keep this small; an emergent,
+provably-total guarantee is smaller than a second bookkeeping structure that
+could itself drift out of sync with the first.
+
+**Defense in depth added beyond the literal reproduction recipe:**
+`engineeringLoopService.reconcile()` now also re-verifies every *already-
+completed* slot on each reconciliation pass — looking up its stored run id
+in the (already-fetched) Factory run list and requiring
+`run.declaredWorkerId === claim.correlationTag`, routing to
+`RECOVERY_REQUIRED` on any mismatch or missing run. The brief's literal
+Phase-0 recipe corrupts an *incomplete* claim (no run id yet, matching
+reconciliation's lookup path); a row could instead corrupt an
+*already-completed* slot's run id field directly, bypassing the claim
+entirely — `loopSerialization.ts` alone cannot catch this (it has no Factory
+access), so this check closes that adjacent gap at the one extra cost of one
+`find()` per completed slot per reconciliation pass, reusing a `listRuns`
+call reconciliation already needed.
+
+### 5. Historical/superseded Run adoption defenses
+
+Directly tested (`tests/remediationRound2Repro.test.ts`): a claim cannot
+reference a prior iteration's canonical identity (I), a foreign loop's
+identity (J), or a duplicate of another claim's identity (G/H) — all three
+rejected by the same canonical-match check, never by role/latest/title/
+timestamp inference (PART 5's explicit prohibition — unchanged from round 1,
+now additionally impossible to route around via a forged claim). Superseded-
+attempt Run adoption (K) remains covered by round 1's `dangerousStale`
+detection in `reconcile()`, now operating on canonically-guaranteed tags
+rather than trusted-as-given ones; PART 9's specific attempt-bump regression
+is a direct test confirming attempt 2's tag can never equal attempt 1's.
+
+### 6. Pre-fix reproduction results
+
+Both fixes were **temporarily disabled in place** — the predicate-check call
+site in `sqliteLoopRepository.ts` and the three `validateCanonicalClaim`
+call sites in `loopSerialization.ts` were commented out (with a `void`
+no-op to keep the build green) — and the full round-2 suite was run against
+that pre-fix state:
+
+```
+# tests 18
+# pass 8
+# fail 10
+```
+
+The 8 passes are the 7 standalone unit tests of the predicate *parser*
+function itself (unaffected by disabling its *call site* — they test the
+function directly) plus one unrelated schema-round-trip sanity check. Every
+test that actually exercises a disabled protection failed: both index-wiring
+tests, the semantic-harm demonstration (proving via raw SQL that the
+malformed predicate really does let SQLite accept two "active" rows for one
+work item), all six correlation-identity tests, and the full end-to-end PART
+7 reproduction (which copies a real, observed `declaredWorkerId` from a
+genuinely-completed loop's implementer run onto a forged claim on an
+unrelated work item and confirms — pre-fix — that it is *not* rejected).
+
+One correction made mid-verification: two correlation tests (`I`, `G/H`)
+initially "passed" pre-fix for the wrong reason — an unrelated round-1
+`totalRunCount`-coherence rule incidentally caught the malformed fixture
+(a missing `totalRunCount: 1` to match iteration 1's one completed run)
+before the disabled identity check ever ran. Both fixtures were corrected to
+isolate the property actually under test, and the pre-fix run was repeated
+to confirm they then failed for the intended reason before being counted as
+valid regressions — exactly the kind of check Phase-0 discipline exists to
+catch.
+
+Both fixes were then restored exactly (confirmed via `grep` for the "TEMP
+PRE-FIX PROBE" markers finding nothing, and by `npm run typecheck` passing
+clean) and the same suite re-run: **18/18 pass.**
+
+### 7. New permanent regression tests
+
+`tests/remediationRound2Repro.test.ts` (18 tests):
+- **HIGH 1** (11): the 7 pure-parser cases from PART 1 (exact-match,
+  formatting-variant, missing-WHERE, inverted, phase-omitted, terminal-
+  phase-included, unrelated-clause) plus 4 end-to-end SQLite-repository
+  tests (PART 12 INDEX A–D: wrong predicate refused, inverted-set refused,
+  canonical schema round-trips, and the direct raw-SQL semantic-harm
+  demonstration).
+- **HIGH 2** (7): E (arbitrary tag), F (mismatched actionId), I (prior-
+  iteration adoption), J (cross-loop adoption), G/H (duplicate identity),
+  PART 9 (attempt-bump non-collision), and the full PART 7 end-to-end
+  authoritative-PASS-defense reproduction (asserts zero new runs, zero new
+  Reviews, WorkItem status untouched, and `PersistenceCorruptionError` on
+  `resume()`).
+
+All prior suites (round 1's `remediationRound1Repro.test.ts`,
+`loopReconciliationMatrix.test.ts`, and the full `engineeringLoopService`/
+`sqliteLoopRepository`/`inMemoryLoopRepository` suites) were re-run
+unmodified in intent (two test fixtures needed only mechanical updates —
+canonical actionId/correlationTag values instead of the old opaque-token
+shape) and remain green, satisfying PART 8 and PART 13's "do not regress"
+requirements directly.
+
+### 8. Exact full verification results
+
+From a clean build (`rm -rf dist .factory-data`):
+
+- `npm run typecheck` — PASS
+- `npm run build` — PASS
+- `npm test` — **476 tests, 476 pass, 0 fail** (up from 458; +18 from this
+  round), stable across 3 consecutive full runs
+- `npm run demo` — DONE, 15 refusals, unchanged
+- `npm run demo:persistent` twice (seed, then a second OS process reading
+  back) — unchanged
+- `npm run worker:doctor` — claude 2.1.235 and codex-cli 0.147.0 still found
+- `npm run demo:loop` — all three scenarios unchanged (WAITING_FOR_HUMAN /
+  WAITING_FOR_HUMAN after one remediation / EXHAUSTED + WorkItem BLOCKED)
+- `git diff --check` — clean; `git status --short` matches §9
+- Focused re-runs all green: `remediationRound2Repro` (18),
+  `remediationRound1Repro` (16), `loopReconciliationMatrix` (10),
+  `sqliteLoopRepository` (9), `engineeringLoopService` (21)
+
+No real Claude/Codex model was invoked — every change this round is
+persistence-layer validation and identity derivation; no worker invocation
+path changed.
+
+### 9. Files changed
+
+Modified: `src/orchestration/loopTypes.ts` (canonical `canonicalActionId`;
+`correlationTag`/`correlationPrefix` signatures simplified to drop the
+redundant `loopId` parameter); `src/orchestration/loopSerialization.ts`
+(`validateCanonicalClaim`, threaded `loopId` through `parseIteration`);
+`src/orchestration/engineeringLoopService.ts` (`claimIfNeeded` uses
+`canonicalActionId`; `reconcile()` adds the completed-slot consistency
+check, fetches `listRuns` once and reuses it); `src/adapters/orchestration/
+sqliteLoopRepository.ts` (`validateActiveIndexPredicateSql` + wiring);
+`tests/sqliteLoopRepository.test.ts` (fixture updated to canonical claim
+shape). Created: `tests/remediationRound2Repro.test.ts`;
+`docs/tasks/TASK-004-autonomous-engineering-loop.md` ("Remediation Round 2"
+section, S1–S6); `AI-HANDOFF.md` (this section).
+
+Not touched: `src/domain/`, `src/workflow/`, `FactoryService` write paths,
+both factory.db persistence adapters, `src/adapters/workers/*` (Claude/Codex
+adapters, prompt templates, environment policy, workspace resolution — all
+unchanged from round 1), `src/ports/`, any TASK-001/002/003 test,
+`docs/FACTORY_CONSTITUTION.md`, and every round-1 behavior not directly
+covered by S1–S4 above (cancellation linearization, budgets/exhaustion,
+verification cwd containment, transcript-only reviewer authority — all
+re-confirmed green, none modified).
+
+### 10. Remaining limitations
+
+- Everything listed in round 1's "Remaining limitations" (AI-HANDOFF.md,
+  Implementer remediation round 1, §13) still applies unchanged — this round
+  did not touch cancellation linearization, mid-call worker abort, or the
+  `RECOVERY_REQUIRED` operator-workflow gap.
+- The completed-slot consistency check (§4 above) adds one Factory
+  `listRuns` read's worth of `find()` calls to every reconciliation pass;
+  not a correctness concern, noted for completeness.
+- Canonical action identity is now string-derived and human-legible
+  (`sf-loop:loop-x:i2:REVIEW:a1`), which is a minor, deliberate departure
+  from "opaque random token" — nothing about it is secret or trust-bearing,
+  so this is not a new exposure, but it does mean loop ids are now visible
+  inside Factory `Run.declaredWorkerId` values wherever those are displayed
+  (already true before this round, since `declaredWorkerId` always echoed
+  the loop's chosen worker id).
+
+### 11. Ready for independent re-review: YES
+
+### Final focused independent re-review after remediation round 2 — 2026-08-21
 
 **Verdict: PASS**
 
-The three prior findings are closed and no new CRITICAL or HIGH TASK-003
-correctness issue was found.
+The two remaining HIGH findings are closed by the current implementation and
+permanent regression coverage:
 
-- The deterministic fake Codex path emits the synthetic
-  `sk-ant-test-1234567890abcdefghijklmnop` value. The returned Run.summary,
-  Evidence, live SQLite rows, and the same rows after close/reopen contain
-  `[REDACTED]` and never the original value. Ordinary model text remains
-  available.
-- `cliWorker.ts` has one `safeFinalMessage()` boundary for parsed
-  `reported.finalMessage`; both summary and evidence builders receive only
-  the safe value. Raw stdout/stderr fallback is redacted separately. Process
-  status and trusted metadata remain OS/config-derived.
-- `resolveWorkspace()` now validates repository membership with non-shell
-  `spawnSync(git, ["-C", candidate, "rev-parse", "--show-toplevel"])`, with
-  bounded diagnostics. Empty/fake `.git`, missing/file paths are rejected;
-  real repository roots and valid subdirectories are accepted, including
-  argv-special paths.
-- `workerSmoke.ts` removes only its own `mkdtemp` path in `finally` on
-  success, worker failure, and thrown adapter failure.
-- Existing worker process, adapter, lifecycle, SQLite durability, trust,
-  environment, and TASK-001/TASK-002 suites remain green. No real AI smoke
-  was rerun because the remediation did not change CLI invocation or
-  authentication paths; prior real Claude and Codex smoke results remain
-  applicable.
+1. `sqliteLoopRepository` reads the active index's actual `sqlite_master.sql`
+   and accepts only the narrow `phase IN (<required active phases>)` form. A
+   same-name/unique/partial/right-column index with a wrong predicate is
+   rejected with `SCHEMA_INTEGRITY_VIOLATION` before use, without schema repair.
+   The supported set policy tolerates order/spacing/casing and intentionally
+   treats duplicate literals as semantically equivalent only when the covered
+   active-phase set is unchanged; unrelated logic, comments, wrappers,
+   inverted operators, missing/extra phases, and non-literals fail closed.
+2. `canonicalActionId(loopId, iteration, kind)` and
+   `correlationTag(actionId, attempt)` are the single derived identity path.
+   Loop deserialization recomputes and compares both values before a trusted
+   `EngineeringLoop` reaches reconciliation. Cross-loop, cross-iteration,
+   cross-kind, arbitrary-tag, prior-attempt, and completed-slot old-Run
+   corruption probes fail closed; no historical Run, verifier, reviewer, or
+   Review is adopted from those rows.
 
-Required verification: `npm run typecheck`, `npm run build`, `npm test`
-(347 passed, 0 failed), `npm run demo`, `npm run demo:persistent`,
-`npm run worker:doctor`, `git diff --check`, plus focused redaction,
-workspace, smoke-cleanup, adapter, process-runner, lifecycle, and persistence
-suites — all passed.
+Round-1 recovery remains intact: exact terminal Run/Review matches are adopted
+once, unknown RUNNING Runs become durable `RECOVERY_REQUIRED`, stale loop PASS
+does not authorize the human gate, concurrent SQLite starts leave one active
+loop/one implementer, and cancellation prevents later autonomous progression.
+The narrow known live-owner duplicate-call race remains fail-closed or produces
+an auditable duplicate Review with the same current Factory lineage; it cannot
+change authoritative verdict/release state or progress after cancellation.
 
-**TASK-003 is safe for human acceptance and commit.**
+The additional unattended-execution acceptance invariant was verified and made
+explicit in `docs/tasks/TASK-004-autonomous-engineering-loop.md` (§12a and
+acceptance criteria): Claude/Codex use programmatic non-interactive modes,
+stdin is closed, permissions are bounded by trusted workspace/sandbox/config
+policy, and an interactive-looking child is bounded to `FAILED`/`TIMEOUT` with
+safe evidence rather than waiting for keyboard input. No unrestricted bypass
+or autonomous Git release action exists.
+
+Verification performed without real Claude/Codex model calls:
+
+- `node --version` — v22.23.1
+- `npm run typecheck` — PASS
+- `npm run build` — PASS
+- `npm test` — **476/476 PASS**
+- focused Round-2, Round-1, reconciliation, schema, authority, reviewer,
+  verifier, adapter, process, and CLI suites — **157/157 PASS**
+- `npm run demo` — PASS
+- `npm run demo:persistent` — PASS on seed and second-process readback
+- `npm run worker:doctor` — Claude 2.1.235 and Codex 0.147.0 found
+- `npm run demo:loop` — all three scenarios PASS
+- `git diff --check` — PASS
+
+**TASK-004 is safe for human acceptance and commit.**
+
+## Implementer addendum — Unattended Execution Invariant test coverage
+
+Worker: Claude Code (Sonnet 5), role IMPLEMENTATION ENGINEER. The final
+reviewer verdict above already confirmed the unattended-execution invariant
+on inspection (§12a, non-interactive Claude/Codex modes, closed stdin,
+bounded timeouts). This addendum adds the permanent, automated regression
+coverage the human owner separately requested before final sign-off, so the
+invariant is enforced going forward rather than only true today. No
+production code changed — this is test coverage only. No FACTORY_CONSTITUTION.md
+change; TASK-005 not started; nothing committed or pushed.
+
+New file: `tests/unattendedExecutionInvariant.test.ts` (15 tests, 5 groups):
+
+- **A — structural (5 tests):** every `.ts` file under `src/orchestration/`,
+  `src/cli/`, `src/adapters/workers/`, `src/adapters/process/`, and
+  `src/adapters/orchestration/` is scanned for interactive-I/O primitives
+  (`readline`, `inquirer`, `prompts`, `process.stdin`, `.question(`,
+  `setRawMode`, `confirm("...")`) — none found, and this now fails loudly if
+  one is ever introduced.
+- **B — structural (4 tests):** `permissionModeForRole`/`sandboxForRole` and
+  the actual argv `buildClaudeInvocation`/`buildCodexInvocation` produce are
+  directly asserted, for every `FactoryRole`, to never select an interactive
+  permission mode or emit an approval-prompt flag.
+- **C — dynamic (3 tests):** the three loop scenarios the brief specifically
+  named (clean PASS; reviewer `CHANGES_REQUIRED` → remediation → PASS;
+  deterministic-verification failure → remediation → PASS — the latter
+  driven by a real fixture command that fails once then passes, to force a
+  genuine verification-triggered remediation distinct from the reviewer-
+  triggered one) each run to `WAITING_FOR_HUMAN` while a counting spy on
+  `process.stdin.on`/`.once`/`.resume` proves zero listener registrations.
+- **D — dynamic (1 test):** the real Claude adapter, pointed at the existing
+  TASK-003 fixture `never-exits.mjs` (ignores SIGTERM, never exits — the
+  fixture already used to prove SIGKILL escalation works), simulating a
+  child stuck on an unanswerable interactive prompt. With a short worker
+  timeout, the loop resolves in well under a second: the run is recorded
+  `FAILED` via the existing timeout/SIGKILL mechanism, budget policy takes
+  over normally, and the loop reaches `EXHAUSTED` with the WorkItem left
+  `BLOCKED` for a human — never a hang, never a prompt, never a silent PASS.
+- **E — governance gates remain (2 tests):** re-affirms, as direct
+  assertions rather than incidental coverage, that `cancel()` still requires
+  an explicit actor call and stops an otherwise-healthy loop, and that a
+  durably `RUNNING` run with no provable outcome still resolves to
+  `RECOVERY_REQUIRED`, not silent success — proving the invariant narrows
+  only *routine* steps, not these two explicit human-actionable gates.
+
+All 15 passed on first run (the underlying mechanisms — closed stdin,
+non-interactive CLI flags, bounded timeout/SIGKILL — already existed from
+TASK-003 and were exercised piecemeal by earlier suites; this file is what
+makes the invariant itself, not just its ingredients, a named, permanent,
+directly-tested property). No real Claude/Codex model was invoked.
+
+### Exact verification results
+
+- `npm run typecheck` — PASS
+- `npm run build` — PASS
+- `npm test` — **491 tests, 491 pass, 0 fail** (up from 476; +15), stable
+  across 3 consecutive full runs
+- `npm run demo:loop` — all three scenarios unchanged
+- `git diff --check` — clean; `git status --short` matches the files below
+
+### Files changed
+
+Created: `tests/unattendedExecutionInvariant.test.ts`. Modified: this file
+(AI-HANDOFF.md, this addendum). No other file touched — `docs/tasks/TASK-004-autonomous-engineering-loop.md`'s
+§12a and acceptance criterion 21 were already in place from the prior pass
+this addendum verifies.
+
+### Ready for independent final re-review: YES
 
 ## Human decision
 Pending.

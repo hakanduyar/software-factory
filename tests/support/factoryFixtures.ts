@@ -156,8 +156,8 @@ export function registeredWorker(
   return worker;
 }
 
-/** Drives a seeded work item to IMPLEMENTING through the real gates. */
-export async function toImplementing(factory: FactoryService, itemId: string): Promise<void> {
+/** Drives a seeded work item to READY through the real gates (plan approved, not yet started). */
+export async function toReady(factory: FactoryService, itemId: string): Promise<void> {
   await factory.advance(itemId, "ANALYSIS", AGENT);
   await factory.advance(itemId, "PLAN_REVIEW", AGENT);
   await factory.recordApproval({
@@ -168,6 +168,11 @@ export async function toImplementing(factory: FactoryService, itemId: string): P
     authorization: authorize(factory),
   });
   await factory.advance(itemId, "READY", AGENT);
+}
+
+/** Drives a seeded work item to IMPLEMENTING through the real gates. */
+export async function toImplementing(factory: FactoryService, itemId: string): Promise<void> {
+  await toReady(factory, itemId);
   await factory.advance(itemId, "IMPLEMENTING", AGENT);
 }
 

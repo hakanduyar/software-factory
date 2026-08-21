@@ -120,10 +120,19 @@ describe("cliWorker: Run.summary redaction (regression for the HIGH finding)", (
 
     const outcome = await worker.execute(request());
 
-    const transcript = outcome.evidence.find((e) => e.reference.endsWith("/transcript"));
-    assert.ok(transcript !== undefined);
-    assert.ok(!transcript.summary.includes(secret), "raw stdout fallback evidence must be redacted too");
-    assert.match(transcript.summary, /\[REDACTED\]/);
+    // TASK-004 remediation round 1 (HIGH 3): unparsed raw stdout is a
+    // DIAGNOSTIC channel (`/raw-output`), never the structured `/transcript`
+    // channel — so a raw-output verdict tag can never be adopted downstream.
+    assert.equal(
+      outcome.evidence.find((e) => e.reference.endsWith("/transcript")),
+      undefined,
+      "no /transcript evidence may exist when the structured parse produced nothing",
+    );
+    const raw = outcome.evidence.find((e) => e.reference.endsWith("/raw-output"));
+    assert.ok(raw !== undefined);
+    assert.match(raw.summary, /UNPARSED RAW OUTPUT \(diagnostic only/);
+    assert.ok(!raw.summary.includes(secret), "raw stdout fallback evidence must be redacted too");
+    assert.match(raw.summary, /\[REDACTED\]/);
   });
 
   it("does not alter ordinary, non-secret worker output", async () => {

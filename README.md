@@ -50,6 +50,7 @@ npm test             # build, then run the unit tests with node --test
 npm run verify       # typecheck + tests (the full check for this task)
 npm run demo         # build, then run the in-memory demo work item IDEA -> DONE
 npm run demo:persistent   # build, then run (or resume) the SQLite-backed persistent demo
+npm run demo:loop    # build, then run the deterministic autonomous-loop demo (TASK-004)
 node dist/src/cli/main.js transitions   # print the workflow table and gates
 ```
 
@@ -396,3 +397,108 @@ survives a store close+reopen.
 - The environment allowlist and secret redaction are bootstrap-scale
   defenses (an explicit list plus regex patterns), not a substitute for
   running workers in a fully isolated credential boundary later.
+
+## Autonomous Engineering Loop (TASK-004)
+
+Drives an already-approved (`READY`) work item through IMPLEMENT →
+deterministic VERIFY → independent REVIEW → (remediate and repeat, or stop at
+`WAITING_FOR_HUMAN`), with no human copying prompts or results between Claude
+Code and Codex CLI by hand. Full design:
+`docs/tasks/TASK-004-autonomous-engineering-loop.md`.
+
+The orchestrator (`src/orchestration/engineeringLoopService.ts`) is a new
+layer that only calls `FactoryService`'s existing, unchanged public methods —
+`advance`, `runWorker`, `recordReview`, `registerWorker` — in the right
+order. It turns out TASK-001's transition table already encodes almost the
+whole loop (`IMPLEMENTING → VERIFYING → REVIEW → WAITING_FOR_HUMAN`, with
+precondition-gated forward edges and free backward edges for remediation);
+TASK-004 adds no new domain rule, no new bypass, and does not touch
+`src/domain/`, `src/workflow/`, or `src/app/factoryService.ts`.
+
+### Layout additions
+
+```
+src/orchestration/            loop types, LoopRepository port, the orchestrator,
+                               deterministic verification Worker, strict reviewer-
+                               verdict parser, bounded prompts, scripted test/demo workers
+src/adapters/orchestration/   in-memory and SQLite LoopRepository implementations
+src/cli/loop.ts               sf loop start|status|resume|cancel
+src/cli/demoLoop.ts           npm run demo:loop (3 deterministic scenarios)
+```
+
+### Deterministic verification, not free-form shell text
+
+`createVerificationWorker` (`src/orchestration/verificationWorker.ts`) runs a
+fixed list of trusted, explicitly configured commands
+(`executable`+`argv`+`cwd`+`timeoutMs`, never a shell string) through the
+existing `ProcessRunner` port — no AI, no invented commands. Its own
+`WorkerOutcome.status` stays `SUCCEEDED` whenever every configured command
+actually ran, regardless of individual exit codes (a failing `npm test` is a
+successfully observed fact, not a harness failure) — this is what lets the
+Factory record a `DETERMINISTIC` review with verdict `FAIL` at all
+(`FactoryService.recordReview` requires a `SUCCEEDED` reviewer run before it
+will record any review, including a failing one).
+
+### Strict, fail-closed reviewer verdict parsing
+
+The REVIEWER is asked to put a single `FACTORY_REVIEW_VERDICT: <PASS|
+PASS_WITH_NON_BLOCKING_NOTES|CHANGES_REQUIRED>` tag as the first line of its
+response. `src/orchestration/reviewVerdictParser.ts` (a pure function) only
+recognizes a whole-line, exact tag — zero tags, more than one tag (even
+identical ones), or an unrecognized value are all rejected — and is only ever
+invoked for a reviewer run whose process-level status was `SUCCEEDED`: a
+non-zero exit/timeout/spawn failure is treated purely as an execution
+failure, never approval, regardless of what its output says.
+
+### Crash-safe, resumable loop state (action-claim protocol)
+
+Every external side effect — a worker launch, a `recordReview` — is a
+durable **claimed action**: a claim with a stable identity and a correlation
+tag is CAS-written onto the loop row BEFORE the side effect starts, and the
+tag is recorded by `FactoryService.runWorker` as the Run's
+`declaredWorkerId` in PHASE 1, before execution. On `sf loop resume`,
+reconciliation matches incomplete claims against authoritative Factory
+state by exact tag: a completed Run/Review is adopted (never relaunched,
+counted once), a crash that preceded PHASE 1 relaunches exactly once, and a
+durably-RUNNING run whose outcome cannot be proven after a restart fails
+closed into a terminal `RECOVERY_REQUIRED` phase — never assumed
+successful, never silently retried. Start uniqueness (one active loop per
+work item) and claim mutual exclusion are enforced at the persistence layer
+(a partial UNIQUE index + single-row CAS), and a durably-committed
+cancellation always defeats a stale launch attempt. Loop rows are fully
+validated on read (shape, enums, cross-field coherence, SQL/JSON
+cross-checks) — a corrupted row throws before any launch decision.
+`EngineeringLoop` state lives in its own SQLite file
+(`.factory-data/loops.db` by default, independent of `factory.db`). Full
+protocol: the design doc's "Remediation Round 1" section.
+
+Deterministic verification cwds are confined to the approved workspace with
+real (symlink-resolved) paths, checked at start and again per command at
+execution time; and reviewer verdicts are parsed only from the structured
+`/transcript` evidence channel — raw stdout from a CLI that violated its
+output contract is diagnostic-only and can never become a PASS.
+
+### `sf loop` CLI
+
+```bash
+sf loop start <work-item-id> --config <path>   # start (work item must be READY)
+sf loop status <loop-id>                       # phase/iteration/budget, no secrets
+sf loop resume <loop-id>                       # resume after a crash/restart
+sf loop cancel <loop-id>                       # durable, cooperative cancellation
+npm run demo:loop                              # 3 deterministic offline scenarios
+```
+
+`--config` is a trusted local JSON file (`workspace`, `taskInstructions`
+required; `implementer`/`reviewer`/`verificationCommands`/`budget` fall back
+to a small built-in default). Cancellation is **cooperative between steps,
+not preemptive mid-step** — a documented limitation: the accepted `Worker`
+port has no abort channel, and extending it was judged out of this task's
+scope (design doc §10, §15).
+
+### Known limitations (TASK-004)
+
+- Cancellation cannot interrupt an already-launched real CLI subprocess mid-call (it stops every subsequent action, and a claimed-but-not-yet-spawned launch is aborted by the pre-flight guard).
+- The loop repository is a second SQLite file, not a shared connection/transaction with `FactoryStore` — reconciled by the action-claim protocol, not by atomicity.
+- Exactly-once holds against crashes; under arbitrary live-process interleavings the guarantee is exactly-once-or-fail-closed (`RECOVERY_REQUIRED`), and resuming a loop another live process is actively driving is documented operator misuse the system answers safely.
+- `RECOVERY_REQUIRED` has no in-band operator workflow yet (`sf loop recover` is future work).
+- No TASK-005 planning, GitHub Issues/Projects, Telegram/n8n, server deployment, or scored model router — all later phases.

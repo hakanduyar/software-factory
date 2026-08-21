@@ -653,6 +653,16 @@ export class FactoryService {
     return this.store.runs.listByWorkItem(workItemId);
   }
 
+  /**
+   * Read-only, like listRuns/listEvidence. Added in TASK-004 remediation
+   * round 1: crash reconciliation must recover an already-recorded Review
+   * from authoritative Factory state (matched by its reviewerRunId) instead
+   * of recording a duplicate; no public read for reviews existed before.
+   */
+  async listReviews(workItemId: WorkItemId): Promise<readonly Review[]> {
+    return this.store.reviews.listByWorkItem(workItemId);
+  }
+
   async listCriteria(workItemId: WorkItemId): Promise<readonly AcceptanceCriterion[]> {
     return this.store.criteria.listByWorkItem(workItemId);
   }

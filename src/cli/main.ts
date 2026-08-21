@@ -16,11 +16,18 @@ const USAGE = `sf — Software Factory (bootstrap)
 Usage:
   sf demo             Run the in-memory demo work item from IDEA to DONE
   sf demo:persistent  Run (or resume) the SQLite-backed persistent demo
+  sf demo:loop        Run the deterministic autonomous-loop demo (TASK-004)
   sf transitions      Print the workflow transition table and protected gates
   sf worker doctor    Report whether the claude/codex CLIs are found, and their version
   sf worker smoke claude|codex
                       Real, controlled, non-interactive smoke test of one installed
                       CLI worker in a throwaway scratch workspace (burns real usage)
+  sf loop start <work-item-id> --config <path>
+                      Start the autonomous engineering loop (TASK-004) for an
+                      already-approved (READY) work item
+  sf loop status <loop-id>   Show loop phase/iteration/budget (no secrets/transcripts)
+  sf loop resume <loop-id>   Resume a loop after a crash/restart
+  sf loop cancel <loop-id>   Durably cancel an active loop
   sf help             Show this message
 `;
 
@@ -71,6 +78,11 @@ async function main(argv: readonly string[]): Promise<number> {
       await runPersistentDemo({ log: (line) => console.log(line) });
       return 0;
     }
+    case "demo:loop": {
+      const { runLoopDemo } = await import("./demoLoop.js");
+      await runLoopDemo({ log: (line) => console.log(line) });
+      return 0;
+    }
     case "transitions":
       printTransitions();
       return 0;
@@ -92,6 +104,34 @@ async function main(argv: readonly string[]): Promise<number> {
         return result.run.status === "SUCCEEDED" ? 0 : 1;
       }
       console.error(`Usage: sf worker <doctor|smoke>`);
+      return 1;
+    }
+    case "loop": {
+      const sub = argv[1];
+      const { runLoopStart, runLoopStatus, runLoopResume, runLoopCancel } = await import("./loop.js");
+      const log = (line: string): void => console.log(line);
+      if (sub === "start") {
+        const workItemId = argv[2];
+        const configFlagIndex = argv.indexOf("--config");
+        const configPath = configFlagIndex === -1 ? undefined : argv[configFlagIndex + 1];
+        if (workItemId === undefined || configPath === undefined) {
+          console.error("Usage: sf loop start <work-item-id> --config <path>");
+          return 1;
+        }
+        const view = await runLoopStart(workItemId, configPath, { log });
+        return view.humanActionRequired && view.outcome !== "WAITING_FOR_HUMAN" ? 1 : 0;
+      }
+      if (sub === "status" || sub === "resume" || sub === "cancel") {
+        const loopId = argv[2];
+        if (loopId === undefined) {
+          console.error(`Usage: sf loop ${sub} <loop-id>`);
+          return 1;
+        }
+        const view =
+          sub === "status" ? await runLoopStatus(loopId, { log }) : sub === "resume" ? await runLoopResume(loopId, { log }) : await runLoopCancel(loopId, { log });
+        return view.outcome === "FAILED" || view.outcome === "EXHAUSTED" ? 1 : 0;
+      }
+      console.error(`Usage: sf loop <start|status|resume|cancel>`);
       return 1;
     }
     case "help":

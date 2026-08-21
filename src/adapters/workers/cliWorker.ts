@@ -132,19 +132,45 @@ function buildEvidence(
     },
   ];
 
-  // `safeMessage` (the parsed final message) is already redacted by the caller
-  // (see safeFinalMessage). The raw stdout/stderr fallback below — used only
-  // when nothing could be parsed — is NOT yet redacted, so redactSecrets still
-  // runs on the combined value; re-redacting an already-safe message is a
-  // harmless no-op (our patterns never match "[REDACTED]").
-  const rawTranscript = safeMessage ?? (processResult.stdout.length > 0 ? processResult.stdout : processResult.stderr);
-  if (rawTranscript.length > 0) {
-    const { text, truncated } = truncate(redactSecrets(rawTranscript), maxEvidenceChars);
+  // TWO DISTINCT EVIDENCE CHANNELS (TASK-004 remediation round 1, HIGH 3):
+  //
+  //   .../transcript   — the tool's final message as recovered by the
+  //                      adapter's STRUCTURED output parser (Claude's
+  //                      one-JSON-object contract, Codex's JSONL contract).
+  //                      Only this channel may ever be treated downstream as
+  //                      "what the model actually answered" — e.g. the
+  //                      TASK-004 reviewer-verdict parser consumes ONLY
+  //                      `/transcript` evidence.
+  //
+  //   .../raw-output   — bounded, redacted raw stdout/stderr, recorded ONLY
+  //                      when the structured parse produced nothing. Useful
+  //                      diagnostics for a tool that violated its own output
+  //                      contract, but never an authoritative model answer:
+  //                      a clean-exiting process printing plain text that
+  //                      merely LOOKS like a result (including a verdict tag)
+  //                      must fail closed downstream, not be adopted.
+  //
+  // `safeMessage` is already redacted by the caller (see safeFinalMessage);
+  // the raw fallback is redacted here.
+  if (safeMessage !== undefined && safeMessage.length > 0) {
+    const { text, truncated } = truncate(safeMessage, maxEvidenceChars);
     evidence.push({
       kind: "NOTE",
       summary: truncated ? `${text}\n(evidence text truncated to ${maxEvidenceChars} chars)` : text,
       reference: `cli://${tool}/run/${request.runId}/transcript`,
     });
+  } else {
+    const rawFallback = processResult.stdout.length > 0 ? processResult.stdout : processResult.stderr;
+    if (rawFallback.length > 0) {
+      const { text, truncated } = truncate(redactSecrets(rawFallback), maxEvidenceChars);
+      evidence.push({
+        kind: "NOTE",
+        summary:
+          `UNPARSED RAW OUTPUT (diagnostic only — the tool's structured output contract was not satisfied):\n` +
+          (truncated ? `${text}\n(evidence text truncated to ${maxEvidenceChars} chars)` : text),
+        reference: `cli://${tool}/run/${request.runId}/raw-output`,
+      });
+    }
   }
 
   if (processResult.stdoutTruncated || processResult.stderrTruncated) {
