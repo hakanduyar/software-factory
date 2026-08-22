@@ -27,6 +27,8 @@ import type { AcceptanceCriterionVerification } from "../domain/acceptanceCriter
 import type { Actor } from "../domain/actor.js";
 import {
   GATE_DECISION_STATUS,
+  derivedPlanApprovalId,
+  planSubject,
   workItemSubject,
   type Approval,
   type ApprovalContext,
@@ -35,6 +37,7 @@ import {
   type SubjectRef,
 } from "../domain/approval.js";
 import {
+  AppendOnlyViolationError,
   ApprovalIntegrityError,
   HumanIdentityError,
   NotFoundError,
@@ -46,7 +49,7 @@ import {
 import type { Evidence } from "../domain/evidence.js";
 import type { ReleaseSnapshot } from "../domain/executionSnapshot.js";
 import type { TrustedHumanToken } from "../domain/humanIdentity.js";
-import type { IdGenerator, ProjectId, RunId, WorkItemId } from "../domain/ids.js";
+import type { ApprovalId, IdGenerator, ProjectId, RunId, WorkItemId } from "../domain/ids.js";
 import type { Project } from "../domain/project.js";
 import type { Review, ReviewKind, ReviewVerdict } from "../domain/review.js";
 import type { FactoryRole } from "../domain/role.js";
@@ -56,6 +59,11 @@ import { principalSupportsRole } from "../domain/workerPrincipal.js";
 import type { Priority, WorkItem, WorkItemType } from "../domain/workItem.js";
 import type { Clock } from "../ports/clock.js";
 import type { HumanIdentityGate } from "../ports/humanIdentityGate.js";
+import {
+  compareMaterializedItemShape,
+  type MaterializedItemShape,
+  type PlanBindingResolver,
+} from "../ports/planBindingResolver.js";
 import type { FactoryRepositories, FactoryStore } from "../ports/repositories.js";
 import type { Worker, WorkerOutcome } from "../ports/worker.js";
 import type { WorkerRegistry } from "../ports/workerRegistry.js";
@@ -75,6 +83,12 @@ export interface FactoryServiceDeps {
   readonly ids: IdGenerator;
   readonly identityGate: HumanIdentityGate;
   readonly workerRegistry: WorkerRegistry;
+  /**
+   * TASK-005: supplies the live binding a PLAN-subject approval is stamped
+   * with. Optional because TASK-001..004 wiring has no plans at all; when it is
+   * absent, recording a PLAN approval is refused rather than recorded unbound.
+   */
+  readonly planBindingResolver?: PlanBindingResolver;
 }
 
 export interface CreateProjectInput {
@@ -135,12 +149,28 @@ export interface AdvanceOptions {
   readonly authorization?: TrustedHumanToken;
 }
 
+/**
+ * See FactoryService.recordDerivedPlanApproval.
+ *
+ * Deliberately only IDENTIFIERS. Remediation round 1 removed the caller-supplied
+ * `expectedPlanRevision`/`expectedContentDigest`: a caller that states what the
+ * approval covers is a caller that can widen it. Both are now resolved from
+ * durable plan state through `PlanBindingResolver`.
+ */
+export interface RecordDerivedPlanApprovalInput {
+  readonly workItemId: WorkItemId;
+  /** The human PLAN_APPROVAL this descends from; re-read by id, never trusted as an object. */
+  readonly sourceApprovalId: ApprovalId;
+  readonly planId: string;
+}
+
 export class FactoryService {
   private readonly store: FactoryStore;
   private readonly clock: Clock;
   private readonly ids: IdGenerator;
   private readonly identityGate: HumanIdentityGate;
   private readonly workerRegistry: WorkerRegistry;
+  private readonly planBindingResolver: PlanBindingResolver | undefined;
   readonly workflow: WorkflowService;
 
   constructor(deps: FactoryServiceDeps) {
@@ -149,6 +179,7 @@ export class FactoryService {
     this.ids = deps.ids;
     this.identityGate = deps.identityGate;
     this.workerRegistry = deps.workerRegistry;
+    this.planBindingResolver = deps.planBindingResolver;
     this.workflow = this.workflowFor(deps.store);
   }
 
@@ -230,6 +261,15 @@ export class FactoryService {
       throw new NotFoundError("WorkItem", id);
     }
     return item;
+  }
+
+  /** Throws NotFoundError if the project does not exist. Mirrors getWorkItem. */
+  async getProject(id: ProjectId): Promise<Project> {
+    const project = await this.store.projects.findById(id);
+    if (project === undefined) {
+      throw new NotFoundError("Project", id);
+    }
+    return project;
   }
 
   /**
@@ -382,6 +422,36 @@ export class FactoryService {
         }
       }
 
+      if (input.subject.type === "PLAN") {
+        // TASK-005. Same discipline as the WORK_ITEM branch above: the binding
+        // is read from live state here and stamped into the approval, so an
+        // approving caller cannot make an approval look current for a plan
+        // revision it never saw. `planContentDigest` is bound in addition to
+        // the revision number for the reason `snapshotId` exists — a counter
+        // cannot prove the approved content is still the current content.
+        if (input.gate !== "PLAN_APPROVAL") {
+          throw new ValidationError(
+            `a PLAN subject may only carry PLAN_APPROVAL, got ${input.gate}; release and publish are separate decisions about different subjects (C1)`,
+          );
+        }
+        if (this.planBindingResolver === undefined) {
+          throw new ValidationError(
+            "refusing to record a PLAN approval: no PlanBindingResolver is configured, so the approval could not be bound to an exact plan revision and content digest",
+          );
+        }
+        const binding = await this.planBindingResolver.resolveApprovalBinding(input.subject.id);
+        if (!binding.ok) {
+          throw new ValidationError(
+            `PLAN_APPROVAL requires a validated plan revision currently awaiting a human decision: ${binding.reason}`,
+          );
+        }
+        context = {
+          statusWhenDecided: "PLAN_REVIEW",
+          specRevision: binding.value.planRevision,
+          planContentDigest: binding.value.approvalDigest,
+        };
+      }
+
       return repos.approvals.save({
         id: this.ids.next("apr"),
         gate: input.gate,
@@ -395,8 +465,223 @@ export class FactoryService {
     });
   }
 
+  /**
+   * Materializes ONE human plan decision into the per-WorkItem PLAN_APPROVAL
+   * the accepted transition table requires to reach READY (TASK-005 §10).
+   *
+   * This exists because a single human approves a whole plan once, while the
+   * accepted gate is per work item — and because materialization must be
+   * unattended and crash-safe, so a live `TrustedHumanToken` cannot be held
+   * across it (tokens expire; workers never hold credentials).
+   *
+   * REMEDIATION ROUND 1 (independent review HIGH 1 + HIGH 2). The original
+   * version validated the source approval and the target's STATUS, and took the
+   * caller's word for everything connecting the two. Independent review used
+   * that to derive one plan's approval onto unrelated work items, including work
+   * items belonging to a different project, and to replay an approval that a
+   * later rejection had already superseded. The rule this now enforces is:
+   *
+   *   ONE HUMAN PLAN APPROVAL AUTHORIZES ONLY THE EXACT EXECUTION CONTENT THE
+   *   HUMAN APPROVED — and what that is, is answered by durable plan state, not
+   *   by the caller.
+   *
+   * Four independent things must therefore hold, none of them caller-supplied:
+   *
+   *   1. MEMBERSHIP — `PlanBindingResolver.resolveMaterializationTarget` proves
+   *      from the plan's own durable materialization mapping that this work
+   *      item is one of the approved revision's targets, and reports what that
+   *      target must contain.
+   *   2. LINEAGE — the source approval, re-read BY ID, is a real APPROVED
+   *      human PLAN_APPROVAL for this exact plan, bound to that same revision
+   *      and that same approval digest.
+   *   3. CURRENCY — the central gate, re-evaluated now, is still satisfied for
+   *      that binding. A historical approval is audit evidence, never current
+   *      authority: a later rejection, cancellation or superseding revision
+   *      revokes it.
+   *   4. CONTENT — what the Factory actually stored for that work item matches
+   *      the approved target field for field (project, tag, title, type,
+   *      priority, spec revision, dependencies, acceptance criteria).
+   *
+   * It is also idempotent: an identical derivation that already exists is
+   * returned as-is rather than appended again, so a retried or crash-resumed
+   * materialization cannot inflate the approval record.
+   *
+   * The result is fully auditable (C8): `derivedFromApprovalId` names the
+   * human decision it descends from, and `decidedBy` is copied from that
+   * decision rather than invented.
+   */
+  async recordDerivedPlanApproval(input: RecordDerivedPlanApprovalInput): Promise<Approval> {
+    if (this.planBindingResolver === undefined) {
+      throw new ValidationError(
+        "refusing to derive a plan approval: no PlanBindingResolver is configured, so plan membership could not be proven",
+      );
+    }
+    // Resolved OUTSIDE the transaction because it reads a different store (the
+    // plan repository). It is authoritative because it reads durable plan state
+    // only; the Factory-side checks below re-read everything they judge.
+    const target = await this.planBindingResolver.resolveMaterializationTarget(input.planId, input.workItemId);
+    if (!target.ok) {
+      throw new ApprovalIntegrityError(
+        `work item ${input.workItemId} is not covered by an approval of plan ${input.planId}: ${target.reason}`,
+      );
+    }
+    const { planRevision, approvalDigest, planItemKey, expected } = target.value;
+
+    try {
+      return await this.deriveApprovalTransaction(input, planRevision, approvalDigest, planItemKey, expected);
+    } catch (error) {
+      // Lost the append-only race with a concurrent identical derivation. The
+      // winner's record is the authority; both callers return the same one.
+      if (error instanceof AppendOnlyViolationError) {
+        const winner = await this.store.approvals.findById(
+          derivedPlanApprovalId({
+            planId: input.planId,
+            planRevision,
+            sourceApprovalId: input.sourceApprovalId,
+            workItemId: input.workItemId,
+            // A concurrent derivation can only have raced on the same spec
+            // revision; any other value produces a different id and no clash.
+            specRevision: (await this.getWorkItem(input.workItemId)).specRevision,
+          }),
+        );
+        if (winner !== undefined) {
+          return winner;
+        }
+      }
+      throw error;
+    }
+  }
+
+  private async deriveApprovalTransaction(
+    input: RecordDerivedPlanApprovalInput,
+    planRevision: number,
+    approvalDigest: string,
+    planItemKey: string,
+    expected: MaterializedItemShape,
+  ): Promise<Approval> {
+    return this.store.transaction(async (repos) => {
+      const source = await repos.approvals.findById(input.sourceApprovalId);
+      if (source === undefined) {
+        throw new NotFoundError("Approval", input.sourceApprovalId);
+      }
+      if (source.gate !== "PLAN_APPROVAL") {
+        throw new ApprovalIntegrityError(
+          `approval ${source.id} is a ${source.gate}, not a PLAN_APPROVAL; it cannot authorize planned work items`,
+        );
+      }
+      if (source.subject.type !== "PLAN" || source.subject.id !== input.planId) {
+        throw new ApprovalIntegrityError(
+          `approval ${source.id} decides ${source.subject.type} ${source.subject.id}, not PLAN ${input.planId}`,
+        );
+      }
+      if (source.decision !== "APPROVED") {
+        throw new ApprovalIntegrityError(`approval ${source.id} is ${source.decision}; a rejected plan authorizes nothing`);
+      }
+      if (source.decidedBy.kind !== "HUMAN") {
+        throw new ApprovalIntegrityError(
+          `approval ${source.id} was decided by actor kind ${source.decidedBy.kind}; only a human decision can authorize planned work (C1)`,
+        );
+      }
+      if (source.context?.specRevision !== planRevision) {
+        throw new ApprovalIntegrityError(
+          `approval ${source.id} was granted for plan revision ${String(source.context?.specRevision)}, not the approved ${planRevision}`,
+        );
+      }
+      if (source.context?.planContentDigest !== approvalDigest) {
+        throw new ApprovalIntegrityError(
+          `approval ${source.id} was granted for plan content ${String(source.context?.planContentDigest)}, not the approved ${approvalDigest}; approved content may not change without a new human decision`,
+        );
+      }
+
+      // CURRENCY. The same central gate every other protected operation asks,
+      // re-evaluated now against the same binding — so a superseded decision
+      // stays in the audit trail without still being able to authorize work.
+      const gate = await evaluateGate(repos.approvals, "PLAN_APPROVAL", planSubject(input.planId), {
+        specRevision: planRevision,
+        planContentDigest: approvalDigest,
+      });
+      if (!gate.satisfied) {
+        throw new ApprovalIntegrityError(
+          `approval ${source.id} is no longer the current decision for PLAN ${input.planId}: ${gate.reason}`,
+        );
+      }
+
+      const item = await this.requireOperableWorkItem(repos, input.workItemId, "recordDerivedPlanApproval");
+      if (item.status !== "PLAN_REVIEW") {
+        throw new ValidationError(
+          `PLAN_APPROVAL may only be decided while the work item is at PLAN_REVIEW; ${item.id} is currently ${item.status}`,
+        );
+      }
+
+      // CONTENT. What was actually stored, compared against what was approved.
+      const criteria = await repos.criteria.listByWorkItem(item.id);
+      const actual: MaterializedItemShape = {
+        projectId: item.projectId,
+        correlationTag: item.planVersion,
+        title: item.title,
+        type: item.type,
+        priority: item.priority,
+        specRevision: item.specRevision,
+        dependencyWorkItemIds: [...item.dependencies],
+        acceptanceCriteria: criteria.map((criterion) => ({
+          text: criterion.text,
+          verificationHint: criterion.verificationHint,
+        })),
+      };
+      const comparison = compareMaterializedItemShape(expected, actual);
+      if (!comparison.ok) {
+        throw new ApprovalIntegrityError(
+          `work item ${item.id} is not the approved content of plan ${input.planId} item "${planItemKey}": ${comparison.reason}`,
+        );
+      }
+
+      // IDEMPOTENCE. The id IS the identity of this derivation (see
+      // `derivedPlanApprovalId`), so an identical derivation already on record
+      // is the answer, not a reason to append another — and the append-only
+      // store, not a check-then-act read, is what settles a concurrent race.
+      const derivedId = derivedPlanApprovalId({
+        planId: input.planId,
+        planRevision,
+        sourceApprovalId: source.id,
+        workItemId: item.id,
+        specRevision: item.specRevision,
+      });
+      const existing = await repos.approvals.findById(derivedId);
+      if (existing !== undefined) {
+        return existing;
+      }
+
+      return repos.approvals.save({
+        id: derivedId,
+        gate: "PLAN_APPROVAL",
+        subject: workItemSubject(item.id),
+        decision: "APPROVED",
+        decidedBy: source.decidedBy,
+        context: {
+          statusWhenDecided: item.status,
+          specRevision: item.specRevision,
+          derivedFromApprovalId: source.id,
+          planId: input.planId,
+          planRevision,
+        },
+        note: `derived from plan approval ${source.id} for ${input.planId} revision ${planRevision} item "${planItemKey}"`,
+        decidedAt: this.clock.now(),
+      });
+    });
+  }
+
   async gateStatus(gate: ProtectedGate, subject: SubjectRef, expected: GateBinding = {}): Promise<GateStatus> {
     return evaluateGate(this.store.approvals, gate, subject, expected);
+  }
+
+  /**
+   * Read-only, like listRuns/listReviews. Added for TASK-005: re-deriving that
+   * a specific recorded approval is still a real, human, correctly-bound
+   * decision needs more than "is the latest one satisfied" — see
+   * PlanningService.verifyApprovalAuthority.
+   */
+  async listApprovals(subject: SubjectRef): Promise<readonly Approval[]> {
+    return this.store.approvals.listBySubject(subject);
   }
 
   /**
@@ -724,6 +1009,17 @@ export class FactoryService {
     }
     const resolved = await resolveSemanticReview(item, this.store);
     return resolved.ok ? { ok: true, value: resolved.value } : { ok: false, reason: resolved.reason };
+  }
+
+  /**
+   * Read-only, like listRuns/listReviews. Added for TASK-005: crash
+   * reconciliation of a materialization claim must find whether the WorkItem
+   * creation actually committed, by matching the exact `planVersion`
+   * correlation tag against authoritative Factory state — never by guessing
+   * from titles or timestamps.
+   */
+  async listWorkItemsByProject(projectId: ProjectId): Promise<readonly WorkItem[]> {
+    return this.store.workItems.listByProject(projectId);
   }
 
   async listCriteria(workItemId: WorkItemId): Promise<readonly AcceptanceCriterion[]> {

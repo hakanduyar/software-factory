@@ -2109,4 +2109,721 @@ principal cross-checks), `src/orchestration/engineeringLoopService.ts`
 ### 15. Ready for independent re-review: YES
 
 ## Human decision
+TASK-004 ACCEPTED. The final independent review (Codex CLI, GPT-5.6 Luna, Extra
+High) returned `PASS_WITH_NON_BLOCKING_NOTES` — zero CRITICAL/HIGH blockers, all
+14 historical HIGH findings closed, repository fingerprint unchanged by the
+reviewer. Committed as `aec067e` on `feat/autonomous-engineering-loop` and
+squash-merged to `main` as `1b32854` ("feat: add autonomous engineering loop").
+The three deferred non-blocking notes were preserved, not fixed.
+
+---
+
+# TASK-005 — Durable Planner / Task Generator
+
+**TOOL:** Claude Code · **MODEL:** Opus 5 · **EFFORT:** Extra High ·
+**BRANCH:** `feat/planner-task-generator` (from `main` @ `1b32854`)
+**STATUS:** implementation complete, awaiting independent review. Nothing
+committed, pushed or merged.
+
+## 1. What was built
+The planning layer above WorkItems: natural-language intent → durable, validated
+plan revision → trusted-human approval bound to exact content → idempotent,
+crash-safe materialization into real Factory work items → dependency-ordered
+dispatch into the accepted TASK-004 loop. Full design and the 16 acceptance
+criteria: `docs/tasks/TASK-005-planner-task-generator.md`.
+
+TASK-005 implements **no** second engineering loop. Implement/verify/review/
+remediate stays entirely in TASK-004, reached through one narrow port
+(`src/planning/loopDispatcher.ts`), so that boundary is structural rather than a
+matter of discipline.
+
+## 2. The load-bearing decisions
+1. **A persisted phase is a checkpoint, never authority.** `phase = "APPROVED"`
+   in `plans.db` does not mean a human approved anything — it means the last
+   writer believed so. Every operation that creates, readies or dispatches work
+   re-derives the approval from the Factory's own append-only records through
+   the accepted central gate. This is the TASK-004 round 3–5 lesson applied from
+   the start rather than after fourteen HIGH findings.
+2. **The approval binds to content, not a counter.** `(planId, revision,
+   contentDigest)` — the same reasoning that made `RELEASE_APPROVAL` bind a
+   snapshot id. `planSerialization` recomputes every revision's digest on read,
+   so edited approved content cannot load at all.
+3. **One human approval, materialized — never manufactured.**
+   `FactoryService.recordDerivedPlanApproval` re-reads the source approval BY ID
+   and requires a real, `APPROVED`, human-decided `PLAN_APPROVAL` whose stamped
+   revision and digest match the live plan. No combination of arguments produces
+   an approval a human did not make; each derived approval records
+   `derivedFromApprovalId`.
+4. **Asking is not planning.** A clarification-only planner response persists no
+   revision, preserving the invariant that every persisted revision is
+   approvable.
+5. **Prerequisite satisfied = execution finished, not released.** A dependency
+   is met when the item is `DONE`, or is at `WAITING_FOR_HUMAN` *and*
+   `resolveWaitingForHumanAuthority` currently proves it. A status field alone
+   satisfies nothing.
+
+## 3. Changes to accepted TASK-001 code (small, additive, each mirroring an existing mechanism)
+- `ApprovalContext` gains optional `planContentDigest`, `derivedFromApprovalId`,
+  `planId`, `planRevision`; `GateBinding` gains `planContentDigest`, checked by
+  `evaluateGate` exactly the way it already checks `snapshotId`.
+- `FactoryService`: a `PLAN`-subject branch in `recordApproval` that stamps the
+  binding from live state via an injected `PlanBindingResolver` port (with no
+  resolver configured, a PLAN approval is refused rather than recorded unbound);
+  plus `recordDerivedPlanApproval` and read-only `getProject`,
+  `listWorkItemsByProject`, `listApprovals`.
+- `tests/unattendedExecutionInvariant.test.ts`: SCAN_ROOTS **extended** with
+  `src/planning` and `src/adapters/planning` — a strengthening, not a weakening.
+
+No existing test was weakened and no accepted behaviour was changed.
+
+## 4. Self-audit findings, found and fixed during implementation
+Each has a permanent regression test in `tests/planHardening.test.ts`:
+1. `start()` claimed to fail fast on an unknown project but inferred existence
+   from an empty work-item list — which is also exactly what a real, empty
+   project looks like. A typo'd project id would have created a plan row and
+   charged a real model invocation. Now uses `getProject`.
+2. Persisted clarification answers had no lineage validation at all, while every
+   other reference in the same file is rigorously checked. Modelling it properly
+   surfaced that question ids are only unique *within a round*, so
+   `(questionId, askedAtCycle)` is the real key — id-only uniqueness would have
+   rejected a perfectly valid multi-round history.
+3. `dispatches` enforced uniqueness on `planItemKey` but not on `loopId`.
+4. The duplicate-id vs duplicate-request-key diagnosis depended on SQLite's
+   internal index-check order when an insert violated both; now determined by
+   reading, not by parsing an error message.
+5. `status()` re-derived authority for `APPROVED`/`MATERIALIZING`/`EXECUTING`
+   but not for `WAITING_FOR_HUMAN` — the exact class of the TASK-004 round-4
+   finding. `BLOCKED` is deliberately excluded, since planner-budget exhaustion
+   blocks a plan long before any approval exists.
+6. `planningService` built a planner prompt it never used; prompt rendering
+   belongs to the adapter, so `previousRejection` moved into `PlannerRequest`.
+
+## 5. Verification (native WSL, `node v22.22.3`, `npm 10.9.8`)
+typecheck PASS · build PASS · `npm test` **822/822, run 3× consecutively**
+(549 accepted baseline + 273 new) · `demo` PASS · `demo:persistent` PASS ·
+`worker:doctor` PASS · `demo:loop` PASS · `demo:plan` PASS ·
+`git diff --check` clean. No real AI CLI is invoked by any test or demo.
+
+## 6. Known limitations / deferred
+Sequential (not parallel) dispatch; a rejected plan is terminal; the real CLI
+planner has no automated end-to-end test because it would launch a real model
+and `sf plan start` intentionally has no injection seam; no `sf plan recover`
+workflow yet; the planner is assumed to be read-only in the workspace. The three
+TASK-004 deferred non-blocking notes remain untouched.
+
+## 7. Ready for independent TASK-005 review: YES
+
+## Human decision
 Pending.
+
+# TASK-005 INDEPENDENT ACCEPTANCE REVIEW — Codex CLI (GPT-5.6 Luna, Extra High), 2026-08-21
+
+Reviewer: native `codex` 0.149.0, model `gpt-5.6-luna`, effort `xhigh`, sandbox
+`danger-full-access` (empirically re-confirmed: `bwrap` absent, so
+`workspace-write` reports spurious `EPERM` while the operation actually
+succeeds). Repository fingerprint identical before and after the run
+(`d523225008693e7577a667ec5def30d85346d1ee4e7668d343b2dff5e17d0e40`); no commit,
+push, merge or TASK-006 work occurred.
+
+**Verdict: `CHANGES_REQUIRED`. Safe to commit: NO.** The reviewer independently
+reproduced the implementer's numbers — typecheck PASS, build PASS, `npm test`
+825/825 three consecutive times, all five demos PASS — and then observed the
+finding that matters: *"the green suite does not cover the adversarial cases
+reproduced above."* Seven HIGH findings, all acceptance blockers:
+
+1. **`recordDerivedPlanApproval` authorized arbitrary work items.** It validated
+   the source approval and the target's STATUS, not plan membership, project,
+   tag, title, type, criteria or dependencies. One plan's approval was derived
+   onto unrelated same-project AND different-project work items; both reached
+   `READY`.
+2. **Stale approval replay.** The derived API never re-checked that the source
+   approval was still the current live PLAN gate; after approval-then-rejection
+   the gate was false but the old approval still derived authority. Repeated
+   calls also appended duplicate derived approvals.
+3. **Materialization adopted caller-created wrong content** on the canonical
+   `planVersion` tag alone — different title, type, priority and criteria were
+   adopted and readied.
+4. **`projectId` and `execution` configuration sat outside the approval
+   digest.** Switching project A→B preserved the approval and materialized into
+   B; rewriting verification commands to `sh -c ...` preserved `EXECUTING`
+   authority, and CLI restart uses the persisted configuration.
+5. **Concurrent planner resumes launched duplicate external planner actions** —
+   `PLANNING` was treated as generically recoverable, and a blocked-worker probe
+   observed two planner calls in flight at once.
+6. **The production CLI planner rejected its own valid output.** The adapter
+   pooled transcript evidence with the run summary, which already embeds the
+   first 200 characters of that transcript, so a valid answer carried two
+   `FACTORY_PLAN_V1` markers and the strict parser refused it.
+7. **Dangling work item mappings loaded as executable state** — `status()`
+   reported `EXECUTING` while `resume()` threw `NotFoundError`.
+
+Confirmed sound: normal PLAN approval recording, revision digest coverage and
+read-time recomputation, the planner output parser, planner run lineage and
+worker configuration, clarification lineage, trusted-human governance (zero
+mutation on refusal), the dependency DAG including the `WAITING_FOR_HUMAN`
+prerequisite rule, TASK-004 dispatch (no second loop), completion semantics,
+planner budgets, unattended execution, CLI wiring, the prompt/security boundary,
+and all TASK-001..004 regressions.
+
+## Human decision
+Remediate all seven HIGH findings (round 1). Do not fix the six non-blocking
+notes unless a HIGH fix requires it.
+
+# TASK-005 — Implementer remediation round 1
+
+Every finding was reproduced against a byte-exact pre-fix copy of the working
+tree BEFORE any fix was written: **10/10 reproductions of the broken behaviour
+passed**. Re-run against the fixed tree, **0/10 pass** — every reproduction is
+closed. The reproductions are now permanent, in
+`tests/task005RemediationRound1Repro.test.ts`.
+
+## 1. HIGH 1 — a plan approval may authorize only its own approved items
+**Root cause.** `recordDerivedPlanApproval` accepted a bare `workItemId` plus a
+caller-stated `expectedPlanRevision`/`expectedContentDigest`. Nothing connected
+the target to the approval: a caller that named any work item at `PLAN_REVIEW`
+got a real, human-attributed `PLAN_APPROVAL` for it.
+
+**Remediation.** Membership became a question answered by durable plan state.
+`PlanBindingResolver` gained `resolveMaterializationTarget(planId, workItemId)`,
+which proves from the plan's own materialization mapping that the work item is
+one of the approved revision's targets and returns the complete content that
+target must have (`MaterializedItemShape`). `RecordDerivedPlanApprovalInput` now
+carries only identifiers — the removed parameters were the vulnerability, since
+a caller that states what an approval covers is a caller that can widen it.
+FactoryService then proves four independent things, none caller-supplied:
+membership, lineage (source approval re-read by id, bound to the resolved
+revision and digest), currency (see HIGH 2), and content (project, tag, title,
+type, priority, spec revision, dependencies and acceptance criteria compared
+field for field, with a whole-shape fingerprint as the backstop).
+
+**Pre/post.** Pre-fix, derivation onto an unrelated same-project item and onto a
+project-B item both succeeded and both reached `READY`. Post-fix both are
+refused, and the refusal is proven inert: no approval row, no status change, no
+satisfied gate. Eleven adversarial cases cover unrelated/cross-project/other-plan
+targets, substituted mappings, wrong title/type/priority/criteria, a spec revised
+outside the plan, an unmapped squatter holding the canonical tag, and the
+legitimate path still succeeding.
+
+## 2. HIGH 2 — historical approval evidence is not current authority
+**Root cause.** Two defects with one cause: the derived API read the source
+approval by id and never asked the central gate whether that decision was still
+current, and idempotence was a check-then-act read that concurrent callers all
+lost.
+
+**Remediation.** Derivation now re-evaluates the accepted central gate for the
+PLAN subject against the resolved binding, so a later rejection, a superseding
+revision or a durable cancellation revokes it while the record stays in the
+audit trail. Idempotence became structural: `derivedPlanApprovalId()` derives the
+approval's id from `(planId, revision, sourceApprovalId, workItemId,
+specRevision)`, so a duplicate is refused by the append-only store itself — in
+memory and in SQLite alike — rather than by a racing read. A lost race re-reads
+the winner's record and returns it.
+
+**Pre/post.** Pre-fix, an approval followed by a rejection still derived
+authority, and two identical calls produced two approval rows. Post-fix both are
+refused/collapsed; three concurrent identical derivations yield exactly one row,
+as does a derivation repeated after restart.
+
+## 3. HIGH 3 — a correlation tag identifies a candidate, it does not prove one
+**Root cause.** Both adoption paths trusted `planVersion`. The tag is a pure
+function of public coordinates, so anyone who can create a work item can mint a
+candidate.
+
+**Remediation.** `adoptIfApproved` compares the candidate's complete
+authoritative content against the approved item through the same
+`MaterializedItemShape` definition used by creation and derived approval. A
+mismatch fails closed to `RECOVERY_REQUIRED`; it deliberately does not create a
+second work item behind the impostor and does not edit the impostor into
+compliance, because both would be the service deciding unattended what a human
+approved.
+
+**Pre/post.** Pre-fix, a work item with the canonical tag and a completely
+different title, type, priority and criteria was adopted and advanced past
+`PLAN_REVIEW`. Post-fix every variant fails closed with the impostor left at
+`IDEA`, untouched, and no second work item created — while a genuine
+crash-orphaned item is still adopted exactly once, across a SQLite restart and
+under concurrent materialization.
+
+## 4. HIGH 4 — the approval digest covers everything that decides execution
+**Root cause.** The digest covered `PlanRevision` fields only. `projectId` and
+`execution` are plan-level, so both could change while the approval survived —
+the review changed the project and rewrote verification commands to `sh -c ...`.
+
+**Digest authority-field audit.** Every persisted plan field is now classified,
+by a deliberately blunt rule (persisted plan CONFIGURATION is
+approval-authoritative; only provenance, append-only audit and runtime
+checkpoints are excluded), because a subtle rule is what produced the finding:
+
+| class | fields |
+| --- | --- |
+| APPROVAL-AUTHORITATIVE (hashed) | `projectId`, `intent`, `declaredConstraints`, `budget`, `planner`, `execution` (implementer, reviewer, every verification command's id/executable/argv/cwd/timeout, `workspaceRoot`, `loopBudget`), and the full revision content (`revision`, `summary`, `assumptions`, `constraints`, `risks`, and each item's key/title/type/priority/spec/acceptance criteria/dependencies) |
+| AUDIT / METADATA ONLY | `events`, `startedBy`, `startedAt`, `lastTransitionAt`, `openQuestions`, `answers`, `revision.generatedAt`, `revision.plannerRunRef` |
+| RUNTIME CHECKPOINT ONLY | `phase`, `version`, `plannerAction`, `attemptsForCurrentRevision`, `clarificationCycles`, `totalPlannerRuns`, `materializationClaim`, `materialized`, `dispatchClaim`, `dispatches`, `outcome`, `failureReason`, `exhaustionKind`, `cancelRequested`, `approvalId`/`approvedRevision`/`approvedDigest` |
+| DERIVED / NON-PERSISTED | `requestKey` (from hashed inputs), `revision.contentDigest` (recomputed on read), correlation and lease tags (recomputed), `PlanStatusView` |
+
+`budget` and `planner` are hashed although both are spent before approval:
+including them costs nothing, and "this field cannot matter after approval" is
+exactly the reasoning that left `execution` unbound.
+
+**Remediation.** `computePlanApprovalDigest` / `approvalDigestOfPlan` produce the
+`papr-` digest a human approval is bound to; the revision digest keeps its own
+independent read-time check. The digest is recomputed from live state at every
+decision point — recording the approval, `status()`, materialization, dispatch —
+and `planSerialization` recomputes it too, so a tampered plan no longer loads at
+all.
+
+**Pre/post.** Pre-fix, switching the project preserved the approval and
+materialized into the unapproved project, and `sh -c ...` verification commands
+preserved `EXECUTING` authority. Post-fix ten mutations (project, four execution
+variants, loop budget, constraints, intent, an item's spec, an item's
+dependencies) each invalidate the approval on both the read and write paths,
+nothing is created in the unapproved project, and audit/checkpoint changes
+correctly do NOT invalidate it.
+
+## 5. HIGH 5 — one logical planning action, one external planner run
+**Root cause.** `PLANNING` meant "retryable", so a second caller claimed another
+attempt while the first planner was still in flight.
+
+**Planner action claim/reconciliation design.** A durable `PlannerAction` lease
+is written by CAS before anything external happens, with two states that
+preserve safe retry without ever risking a duplicate: `CLAIMED` (written before
+the launch — finding it proves no planner ran, so a bounded budgeted retry is
+safe) and `RUNNING` (written immediately before invoking the planner — finding it
+under a lost owner means the outcome is unknowable, so the plan fails closed).
+Liveness within a process is tracked in memory and combined with the durable
+owner id: an in-flight lease is never stolen, a lease belonging to a vanished
+owner is reconciled by state, and a second live instance over the same database
+lands in the conservative branch by design. `commit()` enforces "a lease exists
+exactly while PLANNING" in one place, and `planSerialization` re-proves it on
+read; a `PLANNING` row with no lease now fails closed instead of silently
+retrying.
+
+**Pre/post.** Pre-fix, two concurrent drives produced two planner calls. Post-fix
+two and three concurrent drives produce exactly one, the budget is charged once,
+a second service instance over a `RUNNING` lease launches nothing and reports
+`RECOVERY_REQUIRED`, a `CLAIMED` lease is audibly retried, a committed
+cancellation launches no planner at all, and a cancellation racing a live action
+lets it finish while starting nothing new.
+
+## 6. HIGH 6 — the production CLI planner must accept its own valid output
+**Root cause.** A boundary error, not a parser error. `cliPlannerWorker` pooled
+transcript evidence with the run summary, and `cliWorker.buildSummary` embeds the
+transcript's first 200 characters — so pooling a channel with a truncated copy of
+itself manufactured the ambiguity the parser then correctly refused.
+
+**Remediation.** The parser's exactly-one-marker rule was NOT weakened. The
+adapter now consumes only the structured `/transcript` evidence channel, the same
+constant and the same rule the accepted TASK-004 reviewer-verdict path uses;
+`/raw-output` and the bounded run summary remain diagnostics that can never
+create authority.
+
+**Pre/post.** Pre-fix, a valid answer arrived with two markers and was rejected.
+Post-fix it parses to exactly one proposal — proven through the REAL composition
+(`createCliPlannerWorker` → `createLoopWorker` → `createCliWorker` → a fake
+`ProcessRunner` emitting Claude Code's documented `--output-format json`
+contract), and a plan drives all the way to `PLAN_REVIEW` on that wiring. Genuine
+ambiguity, malformed transcripts, marker-bearing stderr and unstructured stdout
+are all still refused. This closes the previously documented "no automated test
+for a successful real CLI planner start" gap for the production composition. No
+real model is invoked.
+
+## 7. HIGH 7 — a mapping is a reference, never proof
+**Root cause.** Persistence validated mapping keys and tags but could not check
+work item EXISTENCE (a cross-store question), and the service never re-derived
+it, so `status()` and `resume()` disagreed.
+
+**Mapping authority/recovery design.** `verifyMaterializationIntegrity` re-derives
+every mapping against authoritative Factory state before a plan is exposed or
+acted on, using the same shape comparison as adoption and derived approval. A
+missing work item is reported as a reason, never propagated as `NotFoundError`.
+`status()` returns a read-only `RECOVERY_REQUIRED` projection and writes nothing;
+`resume()` records it durably.
+
+**Pre/post.** Pre-fix, `status()` reported `EXECUTING` and `resume()` threw.
+Post-fix `MATERIALIZING`, `EXECUTING`, `WAITING_FOR_HUMAN` and `COMPLETED` all
+fail closed on a dangling mapping, as do mappings pointing at another project or
+at unapproved content; `status()` starts no worker and mutates nothing; `resume()`
+starts no replacement loop; valid mappings keep working across a SQLite restart.
+
+## 8. Systematic authority-surface audit (post-fix)
+Every public planning operation and the internal paths they reach were re-read
+against the twelve anti-patterns. Findings:
+
+- **One new defect, introduced by this round's own refactor and fixed here.**
+  Routing the write-path checks through the same phase list as the read
+  projection would have let a `BLOCKED` plan reach `stepExecute` with fewer
+  questions asked, because `BLOCKED` also routes into the execution step.
+  `authorityProblem(plan, mode)` now checks EVERYTHING on the act path whatever
+  the phase claims, and only phase-appropriate assertions on the read path. A
+  regression test covers it.
+- `COMPLETED` was added to the approval-asserting read set: it is terminal, but
+  it is still a claim about an approval.
+- No remaining instance of: historical approval as current authority; a caller
+  target trusted without membership; a tag trusted without content; an
+  execution-authoritative field outside the digest; `PLANNING` relaunching model
+  work; duplicated structured output; a trusted dangling mapping; a cached
+  phase exposed without revalidation; a copied identity string as authority;
+  latest-record selection before lineage filtering; raw stdout as control
+  authority; or cross-project authority transfer.
+
+## 9. Tests added
+`tests/task005RemediationRound1Repro.test.ts` — 64 permanent adversarial tests,
+one group per HIGH plus the audit regression. Lower-layer suites were tightened
+where the shared invariant changed: `planSerialization.test.ts` gained six
+digest-tampering cases (project switched in the payload and in both payload and
+column, `sh -c` verification commands, moved workspace root, swapped implementer
+config, superseded revision); `planMaterialization.test.ts` split crash boundary
+2/3 into the two states the lease now distinguishes; `planningService.test.ts`
+AC-8 was re-pointed at the strengthened API (a caller can no longer state the
+binding at all, so the tests now attack the binding the service derives for
+itself). No accepted test was weakened.
+
+## 10. TASK-001 authority regression
+Proven, all NO: arbitrary work item derivation; cross-project widening; stale
+replay; fake HUMAN; AGENT/SYSTEM derivation; expired/forged/mismatched
+authorization; a derived approval not bound to an exact approved plan item;
+`PLAN_APPROVAL` implying release or publish. Existing TASK-001 approval behaviour
+for non-planner callers is unchanged — `recordApproval`, `evaluateGate`,
+`GateBinding` and `ApprovalContext` keep their accepted semantics, and the round-1
+work is additive plus one removed caller-supplied parameter.
+
+## 11. Verification (native WSL, `node v22.22.3`, `npm 10.9.8`)
+typecheck PASS · build PASS · `npm test` **896/896, three consecutive runs, zero
+flakes** (825 pre-round-1 → 896) · `demo` PASS · `demo:persistent` PASS ·
+`worker:doctor` PASS (only `claude --version` / `codex --version`) · `demo:loop`
+PASS · `demo:plan` PASS (all five scenarios) · `git diff --check` clean. No real
+AI CLI is invoked by any test or demo.
+
+## 12. Deferred non-blocking notes
+Two of the six were required by a HIGH and are now fixed: derived-approval
+idempotence (HIGH 2) and the CLI planner start test gap (HIGH 6, for the
+production composition). Still deferred by instruction: duplicate JSON keys in
+planner output, pre-approval `BLOCKED` resuming into recovery, deferred cycle
+rejection timing, and the CLI's fixture-scale local operator credential. The
+three TASK-004 deferred notes remain untouched.
+
+## 13. Ready for independent TASK-005 re-review: YES
+
+# TASK-005 INDEPENDENT ACCEPTANCE RE-REVIEW (round 1) — Codex CLI (GPT-5.6 Luna, Extra High), 2026-08-22
+
+Reviewer: native `codex` 0.149.0, `gpt-5.6-luna`, effort `xhigh`, sandbox
+`danger-full-access`. Repository fingerprint identical before and after
+(`a4598f134bc3ffdb1b4a87f7ea0c34b18416118ed3da87880f3030377a538135`); no commit,
+push, merge or TASK-006 work.
+
+**Verdict: `CHANGES_REQUIRED`. Safe to commit: NO.** No CRITICAL findings.
+
+Independently CLOSED: all seven first-review HIGHs, and the
+remediation-introduced BLOCKED-phase defect. Also confirmed: the TASK-001
+authority extension is sound; TASK-002/003/004 regressions intact; typecheck,
+build, 896/896 ×3 with no flakes, 534/534 focused, all demos PASS.
+
+**One remaining HIGH — dangling dispatch → EngineeringLoop.** The reviewer
+mutated a dispatched plan's `loopId` to `loop-missing` and observed
+`status → EXECUTING` with `resume → Error("no scripted loop loop-missing")`.
+Same class as the round-1 dangling-mapping fix, in the sibling `plan.dispatches`
+collection.
+
+The **RUNNING-lease multi-process trade-off was judged NON-BLOCKING**:
+`docs/ARCHITECTURE.md` starts the Factory as a local application and promises no
+multi-process coordination, so conservative fail-closed behaviour there preserves
+the stronger no-duplicate-external-work invariant.
+
+Non-blocking notes added: a narrow cancellation TOCTOU where an already-created
+item became READY after cancellation — no new WorkItem or loop launched, so not a
+violation of the "no new work after durable cancellation" invariant.
+
+## Human decision
+Remediate the single remaining HIGH (round 2). Do not redesign, do not reopen
+accepted fixes, do not fix unrelated deferred notes.
+
+# TASK-005 — Implementer remediation round 2
+
+Reproduced on a byte-exact copy of the round-1 tree BEFORE fixing: **3/3
+reproductions of the broken behaviour passed**. Re-run unmodified against the
+fixed tree: **0/3 pass**. The reproductions are permanent in
+`tests/task005RemediationRound2Repro.test.ts`.
+
+## 1. Root cause
+Round 1 established "a persisted reference is a checkpoint, never proof" and
+applied it to `plan.materialized` only. `plan.dispatches` holds foreign
+references too, and nothing re-derived them: `status()` trusted the stored phase,
+and `stepExecute` called `dispatcher.status(dispatch.loopId)` — a lookup BY THE
+UNVERIFIED ID — so a missing loop surfaced as a raw adapter error thrown out of
+the middle of a drive step rather than as a classified recovery state.
+
+## 2. Dispatch integrity architecture
+One central resolver, `PlanningService.resolveDispatchViews`, called from the
+same `authorityProblem` that already governs approval and materialization
+integrity — so the two sibling collections can never drift apart again. It
+verifies **lineage, not existence**, through the accepted TASK-004 read API:
+`LoopDispatcher.find(workItemId)` answers "which loop does this work item
+actually have", so one comparison covers both a missing loop and a substituted
+one. No new TASK-004 API was added and no second authority model was created.
+
+Per dispatch it proves: the plan item is in the approved revision; a mapping
+exists and names the same work item; the loop id is present, non-empty, and
+claimed by no other plan item; a loop exists for that work item; its id is
+exactly the dispatched one; and it targets that work item.
+
+The resolved views are RETURNED, so `stepExecute` reads each loop's phase from
+the view already proven to belong to that dispatch instead of looking the id up
+again. That removes the raw-throw path rather than catching it.
+
+A missing loop is treated as **ambiguous** — never as proof nothing ran — so the
+plan fails closed and no replacement loop is launched.
+
+## 3. Pre-fix exact reproduction
+1. `status()` → `EXECUTING`; `resume()` → `Error("no scripted loop loop-missing")`.
+2. Same after a SQLite close/reopen: the row loads and is still exposed as
+   `EXECUTING`.
+3. **Stronger case the review did not test:** two dispatches with their
+   `loopId`s SWAPPED — every reference resolves to a real, live loop, just the
+   wrong one — was fully accepted by both `status()` and `resume()`.
+
+## 4. Post-fix exact result
+All three now fail (i.e. the vulnerabilities are gone). Missing loop and
+cross-wired loop both produce `RECOVERY_REQUIRED` on the read path and a durable
+`RECOVERY_REQUIRED` on the write path, with zero replacement launches.
+
+## 5. Wrong-loop lineage result
+Closed. Existence alone is never accepted: a dispatch is sound only if the loop
+`find(workItemId)` returns IS the dispatched loop. Cross-wired lineage,
+mapping/dispatch work-item disagreement, two items claiming one loop, and a
+dispatch naming a plan item outside the approved revision all fail closed.
+
+## 6. `status()` behaviour
+Read-only fail-closed projection, as for dangling mappings. Proven by test to
+perform zero plan writes, zero work-item writes, zero loop launches and zero
+planner runs, and to leave the stored checkpoint untouched.
+
+## 7. `resume()` behaviour
+Durably records `RECOVERY_REQUIRED` and launches nothing — no replacement loop,
+no redispatch, no second work item, no raw `NotFoundError`/`no scripted loop`
+escaping as the externally meaningful result. Repeated resumes stay in recovery.
+
+**A second defect found by the required status/resume matrix, and fixed here:**
+`drive()` returned terminal plans verbatim, so `resume()` reported `COMPLETED`
+for a plan whose dispatch no longer resolved while `status()` reported
+`RECOVERY_REQUIRED` for the same row. Both now share one projection
+(`projectFailClosed`). The paths may differ in whether they PERSIST a conclusion;
+they may never differ in what it is. A terminal record is still not rewritten —
+history is reported as unsound, not edited.
+
+## 8. Persistence/serialization boundary
+Deliberate and documented. `planSerialization` proves everything decidable from
+the row itself (key coherence, dispatch/mapping agreement, loop-id shape and
+uniqueness — an empty loop id is now corruption, legal phase/state relationships)
+and does NOT reach across stores: a decoder that did would make "can this row be
+read" depend on live external state, so a transient outage would be
+indistinguishable from corruption. Cross-store lineage is proved at USE time and
+fails closed to recovery rather than refusing to load. Pinned by two tests.
+
+## 9. Foreign-reference inventory
+Every persisted Plan → external object reference was swept and classified (full
+table in the design doc §9.3). Authority-relevant and live-proved:
+`materialized[].workItemId`, `dispatches[].loopId`, `dispatches[].workItemId`,
+`approvalId`. Authority-relevant but **transitively** proved: `projectId` — a
+Factory store without the project is a store without the approval, and approval
+authority is re-derived before anything is created, so it fails closed first.
+That was probed as a possible third sibling bug and proven not to be one; two
+tests pin the reasoning so a future reader neither "fixes" it nor assumes another
+reference is equally safe without checking. Checkpoint and structure-only
+references (claims, planner-action tag, `plannerRunRef`, `dependsOn`,
+`questionId`) are deliberately NOT turned into live lookups.
+
+## 10. Status/resume consistency matrix
+Verified across `MATERIALIZING`, `EXECUTING`, `WAITING_FOR_HUMAN`, `COMPLETED`
+and `BLOCKED` with an unsound dispatch, plus the sound path. Both paths reach the
+same authority conclusion everywhere. The single deliberate asymmetry is
+`BLOCKED`, which claims no authority and is therefore reported verbatim by the
+read path — the same pre-approval-BLOCKED reasoning already documented and
+deferred.
+
+## 11. Tests added
+`tests/task005RemediationRound2Repro.test.ts` — 38 permanent tests: missing loop
+across four phases, durable recovery on resume, BLOCKED cannot act on an unproven
+dispatch, no blind relaunch, cross-wired loops, mapping/dispatch disagreement,
+duplicate loop claim, unknown plan item, read-path inertness (plan, work item,
+loop, planner), the status/resume matrix, SQLite restart for missing and
+cross-wired loops plus the sound case, the persistence/runtime boundary, the
+foreign-reference sweep, and five preserved-behaviour tests (EXECUTING,
+WAITING_FOR_HUMAN on live authority, COMPLETED on release, blocking on a real
+failed loop, dependent dispatch after a prerequisite finishes).
+
+One round-1 test was corrected, not weakened: its "survives a SQLite restart"
+case handed the restarted service a fresh EMPTY dispatcher, which models a wiped
+loop database rather than a restart. It now carries the loop store across, as a
+real restart does — and round 2 correctly reports the wiped-database case as
+`RECOVERY_REQUIRED`.
+
+## 12. Verification (native WSL, `node v22.22.3`, `npm 10.9.8`)
+typecheck PASS · build PASS · `npm test` **928/928, three consecutive runs, zero
+flakes** (896 → 928) · all five demos PASS · `git diff --check` clean.
+
+## 13. Deferred, unchanged
+The RUNNING-lease multi-process limitation (reviewer-classified non-blocking) is
+deliberately untouched. Still deferred: the cancellation TOCTOU, duplicate
+planner JSON keys, pre-approval `BLOCKED` recovery behaviour, cycle rejection
+timing, the fixture credential, and TASK-004's three notes.
+
+## 14. Ready for independent TASK-005 re-review: YES
+
+# TASK-005 INDEPENDENT ACCEPTANCE RE-REVIEW (round 2) — Codex CLI (GPT-5.6 Luna, Extra High), 2026-08-22
+
+Reviewer: native `codex` 0.149.0, `gpt-5.6-luna`, effort `xhigh`, sandbox
+`danger-full-access`. Fingerprint identical before and after
+(`657bb98abd38ab22718ebaa48a7b8eaf211f77c142ce5ebda9d428856786a8ce`); no commit,
+push, merge or TASK-006 work.
+
+**Verdict: `CHANGES_REQUIRED`. Safe to commit: NO.** No CRITICAL findings; one
+HIGH.
+
+Independently CLOSED: the round-2 dispatch-loop HIGH, the cross-wired-loop
+sibling, the terminal status/resume disagreement, all seven round-1 HIGHs, and
+the BLOCKED-phase defect. The foreign-reference inventory was re-derived against
+the code and **no fourth ID-only authority bypass was found**; the `projectId`
+reasoning was upheld. RUNNING-lease limitation and cancellation TOCTOU remain
+non-blocking. Verified independently: 928/928 ×3, focused 679/679, all demos,
+`git diff --check` clean. Non-vacuity was proven by mutating a `/tmp` copy —
+16 round-2 tests failed.
+
+**HIGH — SQLite drops TASK-005 approval bindings.**
+`src/adapters/sqlite/serialization.ts` reconstructed `ApprovalContext` from a
+whitelist of `statusWhenDecided`, `specRevision`, `snapshotId`, omitting
+`planContentDigest`, `derivedFromApprovalId`, `planId` and `planRevision`.
+Reproduced with real SQLite Factory + real SQLite plan repositories: a valid PLAN
+approval was recorded, `gateStatus` returned `satisfied:false` immediately and
+after close/reopen because the approval lacked a plan content digest. Durable
+SQLite-backed plans could never materialize or dispatch — the production
+`sf plan approve` path was broken. The reviewer classified it as fail-closed
+binding LOSS, not authority substitution.
+
+## Human decision
+Remediate the single remaining HIGH (round 3). Narrow scope: fix persistence, do
+not weaken authority, do not reopen closed findings.
+
+# TASK-005 — Implementer remediation round 3
+
+## 1. Root cause
+A domain type evolved and one of its production adapters did not. `ApprovalContext`
+gained four TASK-005 authority fields; `parseApprovalContext` kept its original
+three-field whitelist. The loss was silent: no error, no corruption, no insecure
+acceptance — the evidence an approval carries was deleted between write and read,
+and `gateGuard` then correctly refused an approval with no digest.
+
+It passed 928 tests because every TASK-005 test used the in-memory Factory store,
+which holds objects directly and therefore cannot lose a field. **This is the
+third finding in a row traced to testing a substitute instead of the composition
+production builds** (round 1: a pooled output channel; round 2: a fresh
+dispatcher standing in for a persisted loop store).
+
+## 2. Remediation
+`src/adapters/sqlite/serialization.ts` only. `parseApprovalContext` reconstructs
+every declared field, with the same strict discipline as the rest of the file:
+`optionalStr` for the three string fields, and a new `optionalPositiveInt` for
+`planRevision` (a revision is a positive integer, not merely a number). Absent
+stays absent; malformed is refused with `PersistenceCorruptionError`; nothing is
+coerced. The authority checks were NOT relaxed — persistence was dropping
+required evidence, so persistence was fixed.
+
+## 3. Field-by-field round-trip
+`statusWhenDecided`, `specRevision`, `snapshotId`, `planContentDigest`,
+`derivedFromApprovalId`, `planId`, `planRevision` — all preserved exactly, proven
+individually rather than by whole-object equality alone. A minimal context gains
+no invented fields; a RELEASE approval is unaffected.
+
+## 4. Pre-fix reproduction (real production stack, recorded)
+- context after SQLite read: `{"statusWhenDecided":"PLAN_REVIEW","specRevision":1}`
+  — four fields gone
+- `gateStatus` → `false`, "approval is not bound to a plan content digest and
+  cannot authorise planned work"
+- `resume()` → `RECOVERY_REQUIRED`, "refusing to materialize: PLAN_APPROVAL gate
+  is not satisfied"; zero work items created
+- same after close/reopen
+- a derived approval lost `derivedFromApprovalId`, `planId` and `planRevision`
+
+## 5-7. Post-fix, restart, derived approval
+The identical scenario now succeeds: the stored approval carries the digest, the
+gate is satisfied, and the plan materializes and dispatches. Across a real
+close/reopen of BOTH databases the gate stays satisfied with no re-approval, the
+work item is READY-or-beyond, and the derived per-item approval still carries
+`planId`, `planRevision` and `derivedFromApprovalId` and still satisfies its own
+gate. Exactly one plan approval and one derived approval exist after restart, and
+exactly one loop was ever dispatched.
+
+## 8-9. Production composition and the CLI approve path
+`tests/task005RemediationRound3Repro.test.ts` builds the same chain
+`src/cli/plan.ts` builds — real SQLite Factory store, real SQLite plan
+repository, real `FactoryService` with its real `HumanIdentityGate` and
+`PlanBindingResolver`, real `PlanningService` — scripting only the planner and
+the TASK-004 loop seam, so no model is invoked. It covers approve → materialize
+→ derived approval → dispatch → close → reopen → continue, plus a rejected plan
+and a post-approval content change, both of which must stay non-authoritative
+after reopen. The CLI's own wiring was read and mirrored; the test names it so a
+future change to that composition is re-questioned deliberately.
+
+## 10-11. Parity audit and siblings
+Every persisted domain type was compared field-for-field against its SQLite
+parser: `Project` 4/4, `WorkItem` 17/17, `AcceptanceCriterion` 5/5, `Run` 13/13,
+`Review` 11/11, `Evidence` 8/8, `AcceptanceCriterionVerification` 10/10,
+`Approval` 8/8, `ApprovalContext` 7/7, `Actor` 3/3, `SubjectRef` 2/2,
+`StatusChange` 5/5. **No other field-loss of this class exists.** The SQLite
+adapter is the only production serializer for `Approval`; the in-memory store
+persists object references and cannot drop a field.
+
+`tests/approvalContextRoundTrip.test.ts` makes the class permanently visible: its
+field list is typed `Record<keyof Required<ApprovalContext>, true>`, so a new
+domain field that is not listed fails to COMPILE, and a listed field the adapter
+drops fails at RUNTIME.
+
+## 12. Tests added
+Two files, 9 tests: the parity guard (maximal round-trip, minimal round-trip,
+release-context round-trip, declared-field coverage, ten malformed-value
+refusals) and the production-composition suite (gate after approval, full
+restart drive, rejected plan after reopen, post-approval content change after
+reopen).
+
+## 13. Non-vacuity
+The four fields were reverted in a `/tmp` copy of the tree. `approvalContextRoundTrip`
+failed 1/5 and `task005RemediationRound3Repro` failed 2/4 — the maximal
+round-trip and both production-composition drives. The authoritative tree was
+never modified.
+
+## 14-18. Regressions
+TASK-001: approval semantics unchanged — HUMAN verification, forged/mismatched/
+expired rejection, immutability, exact gate binding, no PLAN→RELEASE/PUBLISH
+widening. Approvals without TASK-005 fields remain valid where their gate does
+not require them (optional semantics preserved, proven by the minimal- and
+release-context tests). TASK-002: schema validation, transactions, CAS,
+append-only, corruption handling and restart durability all still pass; the
+change adds validation and removes none. TASK-003/004 untouched. All round-1 and
+round-2 TASK-005 adversarial suites pass unchanged, including that a stale or
+rejected approval is still not applicable after reopen. Unattended execution
+preserved.
+
+## 19-22. Verification (native WSL, `node v22.22.3`, `npm 10.9.8`)
+typecheck PASS · build PASS · `npm test` **937/937, FIVE consecutive runs, zero
+flakes** (928 → 937) · all five demos PASS · `git diff --check` clean.
+
+### A real flake, found and fixed rather than averaged away
+The first stability attempt failed once in three runs: `planningService.test.ts`
+"refuses a forged token" forged a token by replacing the last two characters of
+the signature with `"00"`. The signature is a random-keyed HMAC, so roughly once
+in 256 runs the "forged" value WAS the genuine signature — the token verified,
+the approval succeeded, and the test failed for the wrong reason.
+
+Measured, not assumed: over 20,000 minted tokens the old idiom collided **83
+times (~1/241**, against a theoretical 1/256) and the replacement idiom —
+changing the final character to a guaranteed-different one, the same pattern the
+accepted TASK-004 forgery tests already use — collided **0 times**, and cannot by
+construction. The governance suite then ran 40 consecutive times with zero
+failures, and the full suite five consecutive times.
+
+This was a defect in a TASK-005 test I wrote, not in the product and not in any
+accepted test; the two accepted TASK-004 forgery tests were already correct.
+
+## 23. Deferred, unchanged
+All nine previously deferred notes remain deferred and untouched.
+
+## 24. Ready for independent TASK-005 re-review: YES

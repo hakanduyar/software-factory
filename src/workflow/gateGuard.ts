@@ -28,6 +28,13 @@ export interface ApprovalReader {
 export interface GateBinding {
   readonly specRevision?: number;
   readonly snapshotId?: string;
+  /**
+   * TASK-005: a PLAN-subject PLAN_APPROVAL binds the content digest of the
+   * exact plan revision approved. Checked identically to `snapshotId` and for
+   * the same reason — a revision counter cannot prove the approved content is
+   * still the current content.
+   */
+  readonly planContentDigest?: string;
 }
 
 export interface GateStatus {
@@ -83,6 +90,24 @@ export async function evaluateGate(
       return {
         satisfied: false,
         reason: `approval is stale: granted for release snapshot ${approved}, current release snapshot is ${expected.snapshotId}`,
+        approval: latest,
+      };
+    }
+  }
+
+  if (expected.planContentDigest !== undefined) {
+    const approved = latest.context?.planContentDigest;
+    if (approved === undefined) {
+      return {
+        satisfied: false,
+        reason: "approval is not bound to a plan content digest and cannot authorise planned work",
+        approval: latest,
+      };
+    }
+    if (approved !== expected.planContentDigest) {
+      return {
+        satisfied: false,
+        reason: `approval is stale: granted for plan content ${approved}, current plan content is ${expected.planContentDigest}`,
         approval: latest,
       };
     }

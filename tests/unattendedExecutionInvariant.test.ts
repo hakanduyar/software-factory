@@ -95,7 +95,18 @@ function makeService(
 }
 
 describe("A. structural — no interactive-I/O primitive exists in the autonomous-execution source tree", () => {
-  const SCAN_ROOTS = ["src/orchestration", "src/cli", "src/adapters/workers", "src/adapters/process", "src/adapters/orchestration"];
+  // TASK-005 extends this scan to the planning layer: once a plan revision is
+  // approved, materialization and dispatch are part of the same unattended
+  // execution path, so the same structural guarantee must hold there.
+  const SCAN_ROOTS = [
+    "src/orchestration",
+    "src/cli",
+    "src/adapters/workers",
+    "src/adapters/process",
+    "src/adapters/orchestration",
+    "src/planning",
+    "src/adapters/planning",
+  ];
   // Anything that could pause a process waiting for a human at a keyboard.
   // "prompt(" deliberately excluded as a bare token — this codebase's own
   // buildWorkerPrompt/promptTemplates.ts naming would false-positive; the

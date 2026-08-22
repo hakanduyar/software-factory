@@ -17,6 +17,7 @@ Usage:
   sf demo             Run the in-memory demo work item from IDEA to DONE
   sf demo:persistent  Run (or resume) the SQLite-backed persistent demo
   sf demo:loop        Run the deterministic autonomous-loop demo (TASK-004)
+  sf demo:plan        Run the deterministic durable-planner demo (TASK-005)
   sf transitions      Print the workflow transition table and protected gates
   sf worker doctor    Report whether the claude/codex CLIs are found, and their version
   sf worker smoke claude|codex
@@ -28,6 +29,16 @@ Usage:
   sf loop status <loop-id>   Show loop phase/iteration/budget (no secrets/transcripts)
   sf loop resume <loop-id>   Resume a loop after a crash/restart
   sf loop cancel <loop-id>   Durably cancel an active loop
+  sf plan start <project-id> --intent <path> [--config <path>]
+                      Plan a natural-language goal into a reviewable, durable plan (TASK-005)
+  sf plan status <plan-id>   Show plan phase/revision/progress (read-only, no secrets)
+  sf plan answer <plan-id> --answers <path>
+                      Answer the plan's blocking clarification questions
+  sf plan approve <plan-id>  Approve the current plan revision (trusted human)
+  sf plan reject <plan-id> [--note <text>]
+                      Reject the current plan revision (trusted human)
+  sf plan resume <plan-id>   Resume planning/materialization/dispatch after a restart
+  sf plan cancel <plan-id>   Durably cancel a plan (trusted human)
   sf help             Show this message
 `;
 
@@ -83,6 +94,11 @@ async function main(argv: readonly string[]): Promise<number> {
       await runLoopDemo({ log: (line) => console.log(line) });
       return 0;
     }
+    case "demo:plan": {
+      const { runPlanDemo } = await import("./demoPlan.js");
+      await runPlanDemo({ log: (line) => console.log(line) });
+      return 0;
+    }
     case "transitions":
       printTransitions();
       return 0;
@@ -132,6 +148,57 @@ async function main(argv: readonly string[]): Promise<number> {
         return view.outcome === "FAILED" || view.outcome === "EXHAUSTED" ? 1 : 0;
       }
       console.error(`Usage: sf loop <start|status|resume|cancel>`);
+      return 1;
+    }
+    case "plan": {
+      const sub = argv[1];
+      const { runPlanStart, runPlanStatus, runPlanAnswer, runPlanApprove, runPlanReject, runPlanResume, runPlanCancel } =
+        await import("./plan.js");
+      const log = (line: string): void => console.log(line);
+      const flag = (name: string): string | undefined => {
+        const index = argv.indexOf(name);
+        return index === -1 ? undefined : argv[index + 1];
+      };
+
+      if (sub === "start") {
+        const projectId = argv[2];
+        const intentPath = flag("--intent");
+        if (projectId === undefined || intentPath === undefined) {
+          console.error("Usage: sf plan start <project-id> --intent <path> [--config <path>]");
+          return 1;
+        }
+        const view = await runPlanStart(projectId, intentPath, flag("--config"), { log });
+        return view.phase === "BLOCKED" || view.phase === "RECOVERY_REQUIRED" ? 1 : 0;
+      }
+      if (sub === "answer") {
+        const planId = argv[2];
+        const answersPath = flag("--answers");
+        if (planId === undefined || answersPath === undefined) {
+          console.error("Usage: sf plan answer <plan-id> --answers <path>");
+          return 1;
+        }
+        const view = await runPlanAnswer(planId, answersPath, { log });
+        return view.phase === "BLOCKED" || view.phase === "RECOVERY_REQUIRED" ? 1 : 0;
+      }
+      if (sub === "status" || sub === "approve" || sub === "reject" || sub === "resume" || sub === "cancel") {
+        const planId = argv[2];
+        if (planId === undefined) {
+          console.error(`Usage: sf plan ${sub} <plan-id>`);
+          return 1;
+        }
+        const view =
+          sub === "status"
+            ? await runPlanStatus(planId, { log })
+            : sub === "approve"
+              ? await runPlanApprove(planId, { log })
+              : sub === "reject"
+                ? await runPlanReject(planId, flag("--note"), { log })
+                : sub === "resume"
+                  ? await runPlanResume(planId, { log })
+                  : await runPlanCancel(planId, { log });
+        return view.phase === "BLOCKED" || view.phase === "RECOVERY_REQUIRED" ? 1 : 0;
+      }
+      console.error(`Usage: sf plan <start|status|answer|approve|reject|resume|cancel>`);
       return 1;
     }
     case "help":

@@ -17,6 +17,7 @@
     "demo": "npm run build && node dist/src/cli/main.js demo",
     "demo:persistent": "npm run build && node dist/src/cli/main.js demo:persistent",
     "demo:loop": "npm run build && node dist/src/cli/main.js demo:loop",
+    "demo:plan": "npm run build && node dist/src/cli/main.js demo:plan",
     "verify": "npm run typecheck && npm run test",
     "worker:doctor": "npm run build && node dist/src/cli/main.js worker doctor",
     "smoke:claude-worker": "npm run build && node dist/src/cli/main.js worker smoke claude",
