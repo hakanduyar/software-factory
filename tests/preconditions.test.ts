@@ -87,6 +87,20 @@ const DETERMINISTIC = review({
   reviewerRunId: "run-verify",
   reviewerPrincipalId: "wp-verify",
 });
+/**
+ * The REVIEWER attempt backing SEMANTIC. Round-5 HIGH 2: a semantic review is
+ * only as authoritative as the run that produced it, so the resolver now
+ * dereferences `reviewerRunId` — these fixtures therefore carry the real run,
+ * exactly as `recordReview` requires in production.
+ */
+const REVIEWER = run({
+  id: "run-review",
+  role: "REVIEWER",
+  status: "SUCCEEDED",
+  specRevision: 1,
+  workerPrincipalId: "wp-reviewer",
+  targetRunId: "run-impl",
+});
 const SEMANTIC = review({
   id: "rev-sem",
   kind: "SEMANTIC",
@@ -202,19 +216,28 @@ describe("requireSuccessfulVerification", () => {
 
 describe("requireIndependentSemanticReview", () => {
   it("fails when the semantic reviewer is the same principal as the implementer", async () => {
+    // C4 modelled where it actually lives: on the RUN records. The reviewer
+    // attempt was executed by the implementer's principal.
+    const selfReviewRun = { ...REVIEWER, workerPrincipalId: "wp-impl" };
     const selfReview = { ...SEMANTIC, reviewerPrincipalId: "wp-impl" };
-    const ctx = contextWith({ runs: [IMPL, VERIFIER], reviews: [DETERMINISTIC, selfReview] });
+    const ctx = contextWith({ runs: [IMPL, VERIFIER, selfReviewRun], reviews: [DETERMINISTIC, selfReview] });
     assert.equal((await requireIndependentSemanticReview(workItemAt("REVIEW"), ctx)).satisfied, false);
   });
 
   it("fails when the semantic review is of a different implementation run", async () => {
     const otherReview = { ...SEMANTIC, reviewedRunId: "run-other" };
-    const ctx = contextWith({ runs: [IMPL, VERIFIER], reviews: [DETERMINISTIC, otherReview] });
+    const ctx = contextWith({ runs: [IMPL, VERIFIER, REVIEWER], reviews: [DETERMINISTIC, otherReview] });
+    assert.equal((await requireIndependentSemanticReview(workItemAt("REVIEW"), ctx)).satisfied, false);
+  });
+
+  it("fails when the semantic review names a reviewer run that does not exist (round-5 HIGH 2)", async () => {
+    const danglingReview = { ...SEMANTIC, reviewerRunId: "run-never-existed" };
+    const ctx = contextWith({ runs: [IMPL, VERIFIER, REVIEWER], reviews: [DETERMINISTIC, danglingReview] });
     assert.equal((await requireIndependentSemanticReview(workItemAt("REVIEW"), ctx)).satisfied, false);
   });
 
   it("succeeds with an independent passing semantic review of the current implementation", async () => {
-    const ctx = contextWith({ runs: [IMPL, VERIFIER], reviews: [DETERMINISTIC, SEMANTIC] });
+    const ctx = contextWith({ runs: [IMPL, VERIFIER, REVIEWER], reviews: [DETERMINISTIC, SEMANTIC] });
     assert.equal((await requireIndependentSemanticReview(workItemAt("REVIEW"), ctx)).satisfied, true);
   });
 });
@@ -222,7 +245,7 @@ describe("requireIndependentSemanticReview", () => {
 describe("requireReleasableSnapshot", () => {
   const fullContext = (over: Partial<Fixtures> = {}): WorkflowReadContext =>
     contextWith({
-      runs: [IMPL, VERIFIER],
+      runs: [IMPL, VERIFIER, REVIEWER],
       reviews: [DETERMINISTIC, SEMANTIC],
       criteria: CRITERIA,
       verifications: verificationsFor("run-impl"),
@@ -260,7 +283,7 @@ describe("requireReleasableSnapshot", () => {
 describe("release snapshot identity", () => {
   const base = (): WorkflowReadContext =>
     contextWith({
-      runs: [IMPL, VERIFIER],
+      runs: [IMPL, VERIFIER, REVIEWER],
       reviews: [DETERMINISTIC, SEMANTIC],
       criteria: CRITERIA,
       verifications: verificationsFor("run-impl"),
@@ -283,7 +306,7 @@ describe("release snapshot identity", () => {
     const after = await resolveReleaseSnapshot(
       item,
       contextWith({
-        runs: [IMPL, VERIFIER, newer],
+        runs: [IMPL, VERIFIER, REVIEWER, newer],
         reviews: [DETERMINISTIC, SEMANTIC],
         criteria: CRITERIA,
         verifications: verificationsFor("run-impl"),

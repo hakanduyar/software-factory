@@ -23,7 +23,7 @@ import {
   createScriptedReviewerWorker,
 } from "../src/orchestration/scriptedLoopWorkers.js";
 import { createFixedClock } from "../src/ports/clock.js";
-import { newFactory, seedWorkItem, toReady } from "./support/factoryFixtures.js";
+import { authorize, newFactory, seedWorkItem, toReady } from "./support/factoryFixtures.js";
 import { cleanupTempWorkspaces, createTempWorkspace } from "./support/tempWorkspace.js";
 
 after(cleanupTempWorkspaces);
@@ -340,7 +340,8 @@ describe("EngineeringLoopService — cancellation", () => {
 
     const loopsForItem = await loops.listByWorkItem(item.id);
     const loopId = loopsForItem[0]!.id;
-    const cancelPromise = service.cancel(loopId, human("user:test", "Test Operator"));
+    const canceller = human("user:test", "Test Operator");
+    const cancelPromise = service.cancel(loopId, canceller, authorize(factory, canceller));
     releaseImplementer!();
 
     const [startResult, cancelResult] = await Promise.all([startPromise, cancelPromise]);
@@ -362,7 +363,8 @@ describe("EngineeringLoopService — cancellation", () => {
     const loop = await service.start(baseInput(item.id));
     assert.equal(loop.phase, "WAITING_FOR_HUMAN");
 
-    const afterCancel = await service.cancel(loop.id, human("user:test", "Test Operator"));
+    const canceller = human("user:test", "Test Operator");
+    const afterCancel = await service.cancel(loop.id, canceller, authorize(factory, canceller));
     assert.equal(afterCancel.phase, "WAITING_FOR_HUMAN", "cancelling an already-terminal loop must not change its outcome");
   });
 });

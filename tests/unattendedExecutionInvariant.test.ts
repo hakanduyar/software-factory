@@ -54,7 +54,7 @@ import {
   createScriptedImplementerWorker,
   createScriptedReviewerWorker,
 } from "../src/orchestration/scriptedLoopWorkers.js";
-import { newFactory, seedWorkItem, toReady, type TestFactory } from "./support/factoryFixtures.js";
+import { authorize, newFactory, seedWorkItem, toReady, type TestFactory } from "./support/factoryFixtures.js";
 import { fakeCliPath } from "./support/fakeCli.js";
 import { cleanupTempWorkspaces, createTempWorkspace } from "./support/tempWorkspace.js";
 
@@ -366,7 +366,8 @@ describe("E. explicit governance/recovery gates remain — the invariant narrows
     });
     const loopId = (await loops.listByWorkItem(item.id))[0]!.id;
 
-    const cancelled = await service.cancel(loopId, human("user:operator", "Operator"));
+    const operator = human("user:operator", "Operator");
+    const cancelled = await service.cancel(loopId, operator, authorize(fx.factory, operator));
     releaseImplementer();
     const settled = await startPromise;
 

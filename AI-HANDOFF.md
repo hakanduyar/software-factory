@@ -1698,5 +1698,415 @@ this addendum verifies.
 
 ### Ready for independent final re-review: YES
 
+## TASK-004 FINAL INDEPENDENT REVIEW — Codex CLI (GPT-5.6 Luna, effort Extra High), 2026-08-21
+
+Run non-interactively in the native WSL Linux checkout via
+`codex exec -m gpt-5.6-luna -c model_reasoning_effort=xhigh -s workspace-write`.
+The reviewer independently re-verified the repository (not prior reports),
+reran the deterministic suite/demos, and confirmed all eight prior HIGH
+findings (rounds 1 & 2) remain closed. It returned:
+
+**Verdict: CHANGES_REQUIRED** — two reproducible HIGH findings. No repository
+files were changed by the review (git clean before/after, HEAD `126157d`).
+
+1. **HIGH — Untrusted cancellation.** `EngineeringLoopService.cancel(loopId,
+   actor)` accepted any `Actor` and durably cancelled a healthy loop; the CLI
+   passed a tokenless actor. Reproduced live with an `AGENT` actor. Bypassed
+   the trusted-human boundary enforced for WorkItem cancellation/approvals.
+2. **HIGH — Cached WAITING_FOR_HUMAN authority.** `drive()` returned a terminal
+   WAITING_FOR_HUMAN loop, and `stepReviewing()` accepted a cached PASS at an
+   already-WAITING WorkItem, without re-deriving Factory authority. A
+   valid-serialization SQLite loop with a nonexistent review id resumed to
+   WAITING_FOR_HUMAN with zero authoritative reads.
+
+The review's "16 failed / demo:loop failed" test numbers were an artifact of
+Codex's own `workspace-write` sandbox blocking nested `git` subprocess spawns
+(`spawnSync git EPERM`), NOT a repository regression — the direct native-WSL
+run outside that sandbox was 491/491.
+
+## Implementer remediation round 3
+
+Worker: Claude Code, role IMPLEMENTATION ENGINEER.
+Execution record (model traceability):
+- Requested model: Fable 5.
+- Actual model used: Opus 4.8. Claude Code's UI reported that Fable 5's
+  safeguards flagged the Round-3 remediation prompt and it automatically
+  switched execution to Opus 4.8 (an automatic safeguard/model fallback, not an
+  operator choice). All of Round 3 was therefore implemented by Opus 4.8.
+- Test/verification results are unaffected by the fallback and remain exactly as
+  reported below (510/510, 3× consecutive; demos PASS).
+
+### 1. HIGH 1 root cause
+`EngineeringLoopService.cancel` checked only phase terminality, never actor
+identity; `Actor` is untrusted caller data (`src/domain/humanIdentity.ts`), and
+`src/cli/loop.ts` supplied a bare `human(…)`. Cancellation (a C1 governance
+operation) therefore bypassed the trusted-human boundary that already guards
+WorkItem cancellation (`WorkflowService.verifyHumanAuthorization`) and every
+approval (`FactoryService.recordApproval`).
+
+### 2. Trusted-human cancellation design
+Reused the accepted TASK-001 mechanism — no second/weaker identity system. New
+read-only `FactoryService.verifyHumanAuthorization(actor, authorization)`
+composes the existing `HumanIdentityGate.verify`. `cancel(loopId, actor,
+authorization?)` calls it first, before any read/write, throwing
+`HumanIdentityError` on failure (non-HUMAN actor, missing/forged/expired/
+mismatched token). The loop never sees the credential or the gate. The CLI's
+`sf loop cancel` mints a `TrustedHumanToken` (`factory.authorizeHuman`) and
+presents it — the operator's explicit governance action.
+
+### 3. HIGH 1 pre-fix reproduction / post-fix
+Pre-fix (built at `126157d`): `AGENT` actor `cancel()` ACCEPTED → durable
+`CANCELLED`, `cancelRequested=true`. Post-fix: AGENT, SYSTEM, tokenless-HUMAN,
+forged token, another human's token, and expired token are each refused with
+`HUMAN_IDENTITY`; a valid authorized human still cancels; the loop otherwise
+proceeds to WAITING_FOR_HUMAN. A refused cancel leaves phase + version + intent
+unchanged.
+
+### 4. HIGH 2 root cause
+Persisted `phase = WAITING_FOR_HUMAN` and cached `reviewVerdict = PASS` were
+trusted as authority: `drive()`'s terminal early-return and `stepReviewing()`'s
+already-WAITING branch exposed/accepted WAITING_FOR_HUMAN without re-consulting
+the Factory.
+
+### 5. Factory-authority revalidation design
+The Factory Core stays authoritative. New read-only
+`FactoryService.resolveWaitingForHumanAuthority(workItemId)` composes the
+existing accepted `resolveSemanticReview` (current implementation at the
+current spec revision → current passing deterministic verification with
+evidence → independent passing semantic review of that exact implementation,
+newest attempt/review authoritative). `reconcileTerminal` (both `drive()`
+terminal returns) and `stepReviewing`'s already-WAITING branch call it before
+exposing/accepting WAITING_FOR_HUMAN; `ok:false` demotes via
+`failClosedToRecovery` (the one write allowed to move a terminal
+WAITING_FOR_HUMAN loop) to **RECOVERY_REQUIRED** — structurally-valid but
+unprovable-authority is a recovery condition, not `PersistenceCorruptionError`.
+Zero new worker/model work on the fail-closed path. The fresh
+`REVIEW -> WAITING_FOR_HUMAN` advance is unchanged (advance already re-derives
+via the same resolver). Legitimate crash recovery (case E; valid persisted
+WAITING_FOR_HUMAN resume) is preserved with no duplicate model call.
+
+### 6. HIGH 2 pre-fix reproduction / post-fix
+Pre-fix: a fabricated valid-serialization WAITING_FOR_HUMAN loop for an absent
+work item RETURNED WAITING_FOR_HUMAN with zero authoritative reads / zero
+workers. Post-fix: same row resumes to RECOVERY_REQUIRED (still zero workers).
+
+### 7. New permanent regression tests
+`tests/remediationRound3Repro.test.ts` — 19 tests (11 HIGH 1 + 8 HIGH 2),
+including CLI-path authorization and stale-REVIEWING reconcile-with-zero-extra-
+reviewer-calls. Each fail-closed case asserts zero worker/model construction.
+Existing cancellation call sites (CLI + 3 tests) updated for the new signature;
+their behavioral assertions are unchanged.
+
+### 8. Exact native-WSL full verification results (outside Codex sandbox)
+`node v22.22.3`, `npm 10.9.8`. typecheck PASS · build PASS. `npm test`
+**510/510 pass, run 3× consecutively** (491 prior baseline + 19 new). demo PASS
+· demo:persistent PASS · worker:doctor PASS (claude 2.1.238, codex 0.149.0) ·
+demo:loop PASS (WAITING_FOR_HUMAN / WAITING_FOR_HUMAN / EXHAUSTED). `git diff
+--check` clean.
+
+### 9. All eight prior HIGH findings + unattended invariant
+Re-confirmed closed by the full suite (remediationRound1Repro,
+remediationRound2Repro, unattendedExecutionInvariant, loopReconciliationMatrix,
+reviewVerdictParser all green). The trusted-human requirement applies only to
+the explicit `cancel()` governance operation; no approval prompt was introduced
+into implement → verify → review → remediate → re-review.
+
+### 10. Deferred non-blocking notes (NOT fixed, by instruction)
+(1) `LoopBudget.workerTimeoutMs` not threaded through; (2) verification
+evidence redacts output but not the executable/argv label; (3) general worker
+workspace launch path has weaker realpath timing than the verification worker.
+
+### 11. Files changed
+`src/app/factoryService.ts`, `src/orchestration/engineeringLoopService.ts`,
+`src/cli/loop.ts`, `tests/engineeringLoopService.test.ts`,
+`tests/unattendedExecutionInvariant.test.ts`,
+`tests/remediationRound1Repro.test.ts`, and new
+`tests/remediationRound3Repro.test.ts`, plus docs
+(`docs/tasks/TASK-004-autonomous-engineering-loop.md`, this file).
+
+### 12. Ready for independent re-review: YES
+
+## TASK-004 INDEPENDENT RE-REVIEW (round 2) — Codex CLI (GPT-5.6 Luna, effort Extra High), 2026-08-22
+
+Run non-interactively in the native WSL Linux checkout via
+`codex exec -m gpt-5.6-luna -c model_reasoning_effort=xhigh -s workspace-write`.
+No tracked files were changed by the review (git status identical before/after,
+HEAD `126157d`).
+
+**Verdict: CHANGES_REQUIRED** — round-3's two blockers were independently
+verified **CLOSED**, and all eight earlier HIGH findings (rounds 1 & 2) remain
+closed, but two NEW reproducible HIGH findings were reported:
+
+1. **HIGH — `EngineeringLoopService.status()` exposes persisted
+   `WAITING_FOR_HUMAN` without authority re-derivation.** Round 3 fixed
+   `drive()`/`resume()`/`stepReviewing()` but not the read path; a strict
+   SQLite-parseable fabricated row returned `WAITING_FOR_HUMAN` with
+   `resolverCalls: 0` (CLI path `src/cli/loop.ts` inherits it).
+2. **HIGH — `resolveSemanticReview()`/`resolveVerification()` accept reviews
+   with the wrong `specRevision`** because the filters omit a revision check. A
+   probe appending deterministic + semantic reviews at `specRevision: 999`
+   yielded `{"ok":true,"deterministic":"rev-wrong-det","semantic":"rev-wrong-sem"}`.
+
+The review's `npm test` numbers (24 passed / 17 failed) were again the
+`spawnSync git EPERM` artifact of Codex's own `workspace-write` sandbox blocking
+nested subprocess spawns, explicitly attributed as such by the reviewer — NOT a
+repository regression. The authoritative native-WSL run outside that sandbox was
+510/510 at the time.
+
+## Implementer remediation round 4
+
+Worker: Claude Code, role IMPLEMENTATION ENGINEER.
+Execution record (model traceability):
+- TOOL: Claude Code · MODEL: Opus 5 · EFFORT: Extra High.
+- Prior rounds' implementation-model history is unchanged (round 3 was Opus 4.8
+  after an automatic safeguard fallback from the requested Fable 5; rounds 1–2
+  and the TASK-004 build were Sonnet 5 / Fable 5 as already recorded above).
+
+### 1. HIGH 1 root cause
+`status()` was literally `return this.requireLoop(loopId)`. `WAITING_FOR_HUMAN`
+is an authority RESULT, not a display state, so any read client (CLI, UI,
+Telegram, Control Room, future orchestration client) could treat a stale or
+corrupted checkpoint as a live human/release gate. Round 3 had hardened only the
+drive paths.
+
+### 2. status() authority design
+`status()` stays READ-ONLY (its established contract). When the persisted phase
+is `WAITING_FOR_HUMAN` it calls the SAME round-3 resolver
+(`FactoryService.resolveWaitingForHumanAuthority`) — no second, weaker copy of
+the lineage rules. Provable → the loop is returned unchanged. Not provable →
+it returns a **non-persisted** `RECOVERY_REQUIRED` projection (phase + outcome +
+`failureReason`), touching nothing durable: no loop version bump, no WorkItem
+change, no Run/Review/Evidence, no budget consumption, no worker construction.
+`resume()`/`drive()` remain the operations that durably demote (via
+`failClosedToRecovery`) — reading must never be what changes state. The public
+surface was audited: `start`/`resume`/`status`/`cancel` are the only external
+entry points and `toStatusView` is a pure projection over them, so the CLI and
+any future client are covered.
+
+### 3. HIGH 1 pre-fix reproduction / post-fix
+Pre-fix: `status()` on a fabricated valid-serialization loop for a nonexistent
+work item returned `phase=WAITING_FOR_HUMAN outcome=WAITING_FOR_HUMAN`
+(`toStatusView` likewise). Post-fix: `RECOVERY_REQUIRED`, while the durable row
+is left untouched at `WAITING_FOR_HUMAN`; a later `resume()` durably demotes it.
+
+### 4. HIGH 2 root cause
+`resolveVerification()`/`resolveSemanticReview()` filtered reviews by `kind` and
+`reviewedRunId` only. Runs were revision-checked; the Review record's OWN
+`specRevision` (stamped by `recordReview`) was not — so an off-revision Review
+could be selected as authoritative, both to authorize and, worse, to MASK a
+current-revision blocking review.
+
+### 5. Review.specRevision authority design
+Smallest central fix: the review's own revision is now part of *applicability*
+in the lowest shared resolver (`src/workflow/releaseSnapshotResolver.ts`), i.e.
+`review.specRevision === item.specRevision` in both filters. Filtering (rather
+than inspecting-then-rejecting the latest record) makes an off-revision review
+invisible — unable to authorize and unable to mask — exactly like the older
+criterion-verification generations already are in `resolveReleaseSnapshot`. Every
+consumer inherits it: `requireSuccessfulVerification`,
+`requireIndependentSemanticReview`, `resolveReleaseSnapshot`, and the round-3
+`resolveWaitingForHumanAuthority`. No isolated revision check was added inside
+`EngineeringLoopService`. Newest-generation semantics preserved. One coherent
+revision is now required across WorkItem, IMPLEMENTER run, VERIFIER run,
+DETERMINISTIC review, REVIEWER run, SEMANTIC review.
+
+### 6. HIGH 2 pre-fix reproduction / post-fix
+Pre-fix form 1: resolver returned
+`{"ok":true,"deterministic":"rev-wrong-det","deterministicRev":999,"semantic":"rev-wrong-sem","semanticRev":999}`.
+Pre-fix form 2 (harmful shape): a current-revision `CHANGES_REQUESTED` masked by
+a later off-revision PASS returned `ok:true`. Post-fix: form 1 selects the
+genuine current-revision records (revision 1); form 2 returns
+`ok:false — the authoritative semantic review rev-current-fail is CHANGES_REQUESTED`.
+
+### 7. Phase 0 — new tests proven non-vacuous
+Both fixes were temporarily reverted in place (byte-exact backups; restore
+verified with `cmp`) and the new suite run against that pre-fix state:
+**17 of 20 failed**. The 3 that passed are deliberate positive controls that
+must pass in both states. Fixes restored, re-run: **20/20**.
+
+### 8. Tests added
+`tests/remediationRound4Repro.test.ts` — 20 tests (9 HIGH 1 + 11 HIGH 2),
+covering every case in the remediation brief including status() read-only
+proof (no loop/WorkItem version change, no Run/Review/Evidence created, no
+budget consumed, zero workers constructed), the CLI `sf loop status` path, the
+release-snapshot path, and SQLite restart durability.
+
+### 9. Exact native-WSL full verification (outside Codex's sandbox)
+`node v22.22.3` (`/home/hakanduyar/.nvm/...`), `npm 10.9.8`. typecheck PASS ·
+build PASS · `npm test` **530/530 pass, run 3× consecutively** (510 prior
+baseline + 20 new) · focused suites 185/185 · Factory authority / release
+snapshot / workflow suites 68/68 · demo PASS · demo:persistent PASS ·
+worker:doctor PASS (claude 2.1.238, codex 0.149.0) · demo:loop PASS
+(WAITING_FOR_HUMAN / WAITING_FOR_HUMAN / EXHAUSTED) · `git diff --check` clean.
+
+### 10. All prior HIGH findings + unattended execution
+All ten previously-fixed HIGH findings (round 1 ×6, round 2 ×2, round 3 ×2)
+re-verified green by the full suite. The unattended-execution invariant is
+unchanged: `status()`'s authority check is read-path current-state validation,
+not a user approval gate, and adds no prompt to
+implement → verify → review → remediate → re-review.
+
+### 11. Deferred non-blocking notes (still NOT fixed, by instruction)
+(1) `LoopBudget.workerTimeoutMs` not threaded through; (2) verification evidence
+redacts output but not the executable/argv label; (3) general worker workspace
+launch path has weaker realpath timing than the verification worker.
+
+### 12. Files changed (round 4)
+`src/workflow/releaseSnapshotResolver.ts` (both review filters + lineage doc),
+`src/orchestration/engineeringLoopService.ts` (`status()`), new
+`tests/remediationRound4Repro.test.ts`, plus docs
+(`docs/tasks/TASK-004-autonomous-engineering-loop.md`, this file). Round-3
+changes remain in the same uncommitted working tree.
+
+### 13. Ready for independent re-review: YES
+
+## TASK-004 FINAL INDEPENDENT ACCEPTANCE REVIEW — Codex CLI (GPT-5.6 Luna, Extra High), 2026-08-22
+
+Run non-interactively in the native WSL Linux checkout. **Sandbox note:** the two
+previous reviews' `spawnSync git EPERM` failures were diagnosed as a Codex
+sandbox artifact — system `bubblewrap` is absent, so Codex fell back to its
+bundled copy, under which `spawnSync` reports a spurious `error.code = EPERM`
+even when the child succeeds (probe: `{"status":0,"err":"EPERM","out":"git
+version 2.43.0"}`). Measured per policy against the real fixtures: native WSL
+10/10, `workspace-write` 0/10, `danger-full-access` 10/10. The review therefore
+ran with `-s danger-full-access` (least-permissive supported mode that works;
+installing bubblewrap needs a sudo password). Result: **zero sandbox artifacts**
+and the implementer's baseline independently confirmed at 530/530.
+
+**Verdict: CHANGES_REQUIRED.** Both round-4 fixes independently VERIFIED CLOSED
+(`status()` authority; `Review.specRevision` central filtering), all ten earlier
+HIGH findings still closed, TASK-001/002/003 intact, unattended execution
+15/15 — but the systematic authority-surface audit found two NEW HIGH bypasses:
+
+1. **HIGH — `cancel()` exposes cached `WAITING_FOR_HUMAN`.** Its terminal early
+   return precedes any authority revalidation. Probe:
+   `statusPhase=RECOVERY_REQUIRED` but authorized `cancelPhase=WAITING_FOR_HUMAN`.
+   CLI reproduces via `cli/loop.ts`.
+2. **HIGH — semantic Reviews do not validate their reviewer Run.**
+   `resolveSemanticReview` checks only copied principal strings; it never
+   verifies `reviewerRunId` exists, is current, successful, REVIEWER-role or
+   target-aligned. Probe (surviving SQLite close/reopen): `authorityOk=true`,
+   `reviewerRun="run-wrong-revision"`, `snapshotQualified=true`.
+
+Reviewer changed no repository files (verified by sha256 fingerprint of
+`git status --porcelain` + `git diff` before/after: `REPO_UNCHANGED_BY_REVIEW=YES`).
+
+## Implementer remediation round 5
+
+Worker: Claude Code, role IMPLEMENTATION ENGINEER.
+Execution record — TOOL: Claude Code · MODEL: Opus 5 · EFFORT: Extra High.
+(Prior rounds' model history is unchanged: round 4 Opus 5; round 3 Opus 4.8
+after an automatic safeguard fallback from the requested Fable 5; rounds 1–2 and
+the original build as already recorded above.)
+
+### 1. HIGH 1 root cause
+Round 3 made cancellation require trusted-human authorization and round 4 made
+`status()` re-derive authority, but `cancel()`'s terminal early return still
+returned the persisted row. **Authentication and authority are separate
+invariants**: proving *who* may cancel says nothing about whether a cached
+terminal WAITING_FOR_HUMAN is still authoritative.
+
+### 2. cancel() authority design
+Extracted the WAITING revalidation from `reconcileTerminal` into
+`reconcileWaitingAuthority` — now THE single durable answer, shared by
+`drive()`/`resume()` and by BOTH of `cancel()`'s terminal returns (initial read
+and the concurrent-terminality case). `status()` asks the same Factory resolver
+but keeps its read-only projection. Only WAITING_FOR_HUMAN is revalidated; the
+other terminal phases claim no authority and keep their no-op semantics. As a
+mutating governance command, `cancel()`'s fail-closed path demotes durably via
+`failClosedToRecovery`, launching zero workers and creating no replacement
+Run/Review/Evidence. Trusted-human authentication still runs FIRST, unchanged.
+
+### 3. HIGH 1 pre-fix / post-fix
+Pre-fix: `status() => RECOVERY_REQUIRED` while authorized
+`cancel() => WAITING_FOR_HUMAN` (durable row unchanged). Post-fix:
+`cancel() => RECOVERY_REQUIRED` with the demotion recorded durably.
+
+### 4. HIGH 2 root cause
+`resolveSemanticReview` never dereferenced `reviewerRunId`; C4 was judged from
+strings copied onto the Review row. `recordReview` validates the backing run at
+creation, but a resolver reading durable state must re-prove it — persistence
+can be corrupted or written directly.
+
+### 5. Reviewer-Run authority design
+`resolveSemanticReview` now resolves the authoritative REVIEWER *attempt* from
+the runs themselves (role, current specRevision, targeting the current
+implementation, newest attempt authoritative, must be SUCCEEDED), derives C4
+independence from those Run records, and **pins** the review to that run
+(`review.reviewerRunId === reviewerRun.id`). Copied principal fields are demoted
+to audit data that must agree with the runs they describe. Fixed in the lowest
+shared resolver, so `requireIndependentSemanticReview`,
+`resolveWaitingForHumanAuthority`, `resolveReleaseSnapshot`, the
+REVIEW -> WAITING_FOR_HUMAN transition, `status()` authority and crash
+reconciliation all inherit it. No isolated check inside EngineeringLoopService.
+
+### 6. Deterministic sibling audit — ALREADY SAFE, no change required
+`resolveVerification` already resolves the verifier run independently
+(role/revision/target/SUCCEEDED/evidence) and pins the deterministic review to
+it, so a corrupt deterministic review must name the genuine current verifier
+attempt to count; its copied principal fields are never consulted for an
+authority decision. No analogous bypass exists, so nothing was changed there.
+The semantic path simply lacked this pinning and now has the same shape.
+
+### 7. HIGH 2 pre-fix / post-fix
+Pre-fix: `{"ok":true,"semantic":"rev-corrupt-sem","reviewerRun":"run-does-not-exist"}`,
+`releaseSnapshot qualified => true`; SQLite close/reopen: `authorityOk=true`,
+`reviewerRun="run-wrong-revision"`, `snapshotQualified=true`. Post-fix: rejected
+in every case (`… was produced by run-does-not-exist, not the current reviewer
+attempt run-0003`), snapshot not qualified, restart case rejected.
+
+### 8. Phase 0 — new tests proven non-vacuous
+Both fixes temporarily reverted in place (byte-exact backups; restore verified
+with `cmp`); the new suite then failed **14 of 18**. The 4 passing are positive
+controls that must pass in both states. Restored, re-run: **18/18**.
+
+### 9. Tests added / fixtures modernized
+`tests/remediationRound5Repro.test.ts` — 18 tests (7 HIGH 1 + 11 HIGH 2)
+covering every case in the brief, including CLI cancel, zero-worker/zero-record
+proof, canonical recovery, SQLite restart, masking attempts, and the valid
+lineage still authorizing. `tests/preconditions.test.ts` fixtures were
+**modernized, not weakened**: they built a SEMANTIC review whose `reviewerRunId`
+named a run absent from the fixture — passing only because the old resolver
+never dereferenced it (the defect itself). They now carry the real REVIEWER run
+as production requires; all assertions unchanged, the C4 case models the
+violation on the Run records, and a dangling-reviewer-run case was added.
+
+### 10. Focused authority-surface audit (post-fix)
+`start()`/`resume()` → `drive()`; `drive()`'s terminal returns →
+`reconcileTerminal` → `reconcileWaitingAuthority`; `status()` → same resolver,
+read-only; `cancel()` → both terminal returns → `reconcileWaitingAuthority`;
+`stepReviewing()` → re-derives before accepting cached PASS; `toStatusView` is a
+pure projection. No remaining path exposes WAITING_FOR_HUMAN without current
+Factory authority, accepts caller-created human identity, trusts copied
+principal strings over backing Run authority, or lets corrupted persisted
+authority survive a restart.
+
+### 11. Exact native-WSL verification (outside any nested sandbox)
+`node v22.22.3`, `npm 10.9.8`. typecheck PASS · build PASS · `npm test`
+**549/549 pass, run 3× consecutively** (530 prior baseline + 18 round-5 + 1 new
+preconditions case) · focused suites 203/203 · Factory authority / release
+snapshot / workflow / persistence / concurrency suites 101/101 · demo PASS ·
+demo:persistent PASS · worker:doctor PASS · demo:loop PASS · `git diff --check`
+clean.
+
+### 12. All prior HIGH findings + unattended execution
+All twelve previously-fixed HIGH findings (rounds 1–4) remain closed, and the
+unattended-execution invariant is unchanged — authority revalidation is
+internal deterministic validation on read/governance paths, never a human gate,
+and adds no prompt to implement → verify → review → remediate → re-review.
+
+### 13. Deferred non-blocking notes (still NOT fixed, by instruction)
+(1) `LoopBudget.workerTimeoutMs` threading; (2) verification executable/argv
+labels; (3) general worker workspace realpath timing.
+
+### 14. Files changed (round 5)
+`src/workflow/releaseSnapshotResolver.ts` (reviewer-run resolution + pinning +
+principal cross-checks), `src/orchestration/engineeringLoopService.ts`
+(`cancel()` terminal returns + `reconcileWaitingAuthority` extraction),
+`tests/preconditions.test.ts` (fixture modernization + new case), new
+`tests/remediationRound5Repro.test.ts`, plus docs.
+
+### 15. Ready for independent re-review: YES
+
 ## Human decision
 Pending.

@@ -40,7 +40,7 @@ import {
   createScriptedImplementerWorker,
   createScriptedReviewerWorker,
 } from "../src/orchestration/scriptedLoopWorkers.js";
-import { newFactory, seedWorkItem, tempDbPath, cleanupTempDbs, toReady, type TestFactory } from "./support/factoryFixtures.js";
+import { authorize, newFactory, seedWorkItem, tempDbPath, cleanupTempDbs, toReady, type TestFactory } from "./support/factoryFixtures.js";
 import { fakeCliPath } from "./support/fakeCli.js";
 import { cleanupTempWorkspaces, createTempWorkspace } from "./support/tempWorkspace.js";
 
@@ -579,7 +579,8 @@ describe("remediation round 1 — HIGH 6: a durably-committed cancellation must 
           (await runsByRole(fx, item.id, "IMPLEMENTER")).length === 0
         ) {
           fired = true;
-          await cancelService.cancel(snapshot.id, human("user:test", "Test Operator"));
+          const canceller = human("user:test", "Test Operator");
+          await cancelService.cancel(snapshot.id, canceller, authorize(fx.factory, canceller));
         }
         return snapshot; // stale pre-cancel snapshot, exactly as a racing reader would hold
       },

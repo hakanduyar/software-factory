@@ -77,7 +77,8 @@ import type { LoopRepository } from "./loopRepository.js";
 import type { Workspace } from "../adapters/workers/workspace.js";
 import { resolveWorkspace } from "../adapters/workers/workspace.js";
 import { agent, type Actor } from "../domain/actor.js";
-import { ConcurrencyError, NotFoundError, ValidationError } from "../domain/errors.js";
+import { ConcurrencyError, HumanIdentityError, NotFoundError, ValidationError } from "../domain/errors.js";
+import type { TrustedHumanToken } from "../domain/humanIdentity.js";
 import type { IdGenerator, RunId, WorkItemId } from "../domain/ids.js";
 import type { Review } from "../domain/review.js";
 import type { Run } from "../domain/run.js";
@@ -276,8 +277,44 @@ export class EngineeringLoopService {
     return this.drive(loopId);
   }
 
+  /**
+   * Read-only status.
+   *
+   * HIGH 1 (remediation round 4): `WAITING_FOR_HUMAN` is an AUTHORITY RESULT,
+   * not merely a persisted display state — no public read path may present it
+   * as authoritative just because loops.db says so. A UI, Telegram layer,
+   * Control Room or future orchestration client reading this would otherwise
+   * treat a stale or corrupted checkpoint as a live human/release gate. So
+   * when the persisted phase is `WAITING_FOR_HUMAN`, this asks the Factory
+   * Core to prove the current independent-review lineage — the same
+   * `resolveWaitingForHumanAuthority` resolver `drive()`/`resume()` use, never
+   * a second weaker copy of those rules.
+   *
+   * When authority cannot currently be proven this FAILS CLOSED by returning a
+   * non-authoritative `RECOVERY_REQUIRED` projection. That projection is
+   * computed in memory and deliberately NOT persisted: `status` is a read
+   * operation and must stay free of durable side effects (no version bump, no
+   * WorkItem change, no Run/Review/Evidence, no budget consumption, no worker
+   * launch). Durably demoting the invalid cached authority to
+   * `RECOVERY_REQUIRED` is `resume()`/`drive()`'s job (see
+   * `reconcileTerminal`/`failClosedToRecovery`) — reading the loop must never
+   * be what changes it.
+   */
   async status(loopId: string): Promise<EngineeringLoop> {
-    return this.requireLoop(loopId);
+    const loop = await this.requireLoop(loopId);
+    if (loop.phase !== "WAITING_FOR_HUMAN") {
+      return loop;
+    }
+    const authority = await this.factory.resolveWaitingForHumanAuthority(loop.workItemId);
+    if (authority.ok) {
+      return loop;
+    }
+    return {
+      ...loop,
+      phase: "RECOVERY_REQUIRED",
+      outcome: "RECOVERY_REQUIRED",
+      failureReason: `persisted WAITING_FOR_HUMAN is not backed by current Factory authority: ${authority.reason} (reported read-only; run \`sf loop resume\` to durably record RECOVERY_REQUIRED)`,
+    };
   }
 
   /**
@@ -286,18 +323,46 @@ export class EngineeringLoopService {
    * perspective cancellation is durable as soon as this method's first write
    * lands, and every claim attempt with a stale version thereafter loses its
    * CAS — no new external action can begin (PART F).
+   *
+   * HIGH 1 (remediation round 3): cancelling a loop is an explicit HUMAN
+   * governance operation, held to the SAME trusted-human boundary as WorkItem
+   * cancellation and every protected approval (C1/C5). A caller-constructed
+   * `{ kind: "HUMAN" }` object, an AGENT/SYSTEM actor, or a forged, expired or
+   * mismatched token is refused BEFORE any durable state is read or written —
+   * no phase change, no version bump, no worker-suppression side effect. The
+   * `TrustedHumanToken` is verified by the Factory Core against the same
+   * `HumanIdentityGate` that mints it (the loop never receives the credential
+   * or a reference to the gate — the accepted TASK-001 trust model), so this
+   * reuses one authoritative boundary rather than inventing a weaker one.
+   *
+   * HIGH 1 (remediation round 5): authentication and authority are SEPARATE
+   * invariants. Verifying the trusted human answers "who may cancel?"; it says
+   * nothing about whether a cached terminal `WAITING_FOR_HUMAN` row is still
+   * backed by current Factory authority. The terminal early return below
+   * therefore revalidates that one phase through the same shared path
+   * `drive()`/`resume()` use, so no public entry point can present an
+   * unbacked WAITING_FOR_HUMAN — not even to a properly authenticated human.
+   * The other terminal phases (CANCELLED/EXHAUSTED/FAILED/RECOVERY_REQUIRED)
+   * claim no current authority, so their existing no-op semantics are kept
+   * exactly as they were.
    */
-  async cancel(loopId: string, actor: Actor): Promise<EngineeringLoop> {
+  async cancel(loopId: string, actor: Actor, authorization?: TrustedHumanToken): Promise<EngineeringLoop> {
+    const problem = this.factory.verifyHumanAuthorization(actor, authorization);
+    if (problem !== undefined) {
+      throw new HumanIdentityError(`refusing to cancel loop ${loopId}: ${problem}`);
+    }
+
     let loop = await this.requireLoop(loopId);
     if (isTerminalLoopPhase(loop.phase)) {
-      return loop;
+      return loop.phase === "WAITING_FOR_HUMAN" ? this.reconcileWaitingAuthority(loop) : loop;
     }
     this.log(`[loop ${loop.id}] cancellation requested by ${actor.displayName}`);
     loop = await this.factSave(loopId, (fresh) =>
       isTerminalLoopPhase(fresh.phase) || fresh.cancelRequested ? null : { cancelRequested: true },
     );
     if (isTerminalLoopPhase(loop.phase)) {
-      return loop;
+      // The loop reached a terminal phase concurrently; same rule as above.
+      return loop.phase === "WAITING_FOR_HUMAN" ? this.reconcileWaitingAuthority(loop) : loop;
     }
     return this.finalize(loopId, { phase: "CANCELLED", outcome: "CANCELLED" });
   }
@@ -312,8 +377,7 @@ export class EngineeringLoopService {
       let loop = await this.requireLoop(loopId);
 
       if (isTerminalLoopPhase(loop.phase)) {
-        await this.reconcileTerminal(loop);
-        return loop;
+        return this.reconcileTerminal(loop);
       }
 
       const workspace = resolveWorkspace(loop.workspaceRoot);
@@ -343,8 +407,7 @@ export class EngineeringLoopService {
 
         loop = await this.requireLoop(loopId);
         if (isTerminalLoopPhase(loop.phase)) {
-          await this.reconcileTerminal(loop);
-          return loop;
+          return this.reconcileTerminal(loop);
         }
         if (loop.cancelRequested) {
           loop = await this.finalize(loopId, { phase: "CANCELLED", outcome: "CANCELLED" });
@@ -548,11 +611,73 @@ export class EngineeringLoopService {
     return { kind: "clean" };
   }
 
-  /** Terminal-phase housekeeping a crash may have left unfinished (PART B window 7). */
-  private async reconcileTerminal(loop: EngineeringLoop): Promise<void> {
+  /**
+   * Terminal-phase housekeeping a crash may have left unfinished (PART B
+   * window 7), plus the HIGH 2 (round 3) authority re-derivation for a
+   * reloaded WAITING_FOR_HUMAN loop. Returns the loop to expose — unchanged
+   * when it is legitimately authoritative, or the demoted RECOVERY_REQUIRED
+   * loop when a persisted WAITING_FOR_HUMAN can no longer prove current
+   * Factory authority.
+   */
+  private async reconcileTerminal(loop: EngineeringLoop): Promise<EngineeringLoop> {
+    if (loop.phase === "WAITING_FOR_HUMAN") {
+      return this.reconcileWaitingAuthority(loop);
+    }
     if (loop.phase === "EXHAUSTED" || loop.phase === "FAILED" || loop.phase === "RECOVERY_REQUIRED") {
       await this.tryBlockWorkItem(loop.workItemId, loop.failureReason ?? loop.phase);
     }
+    return loop;
+  }
+
+  /**
+   * THE single durable answer to "may this persisted WAITING_FOR_HUMAN be
+   * exposed as authoritative?" — shared by every mutating entry point that can
+   * surface a terminal loop (`drive()`/`resume()` via `reconcileTerminal`, and
+   * `cancel()`); `status()` asks the same Factory resolver but keeps its
+   * read-only projection instead of writing.
+   *
+   * A persisted `phase = WAITING_FOR_HUMAN` (and the cached PASS verdict on the
+   * last iteration) is orchestration checkpoint state, NEVER authority. Before
+   * exposing it as a valid current outcome, the Factory Core must prove the
+   * independent-review lineage still holds RIGHT NOW — current implementation
+   * at the current spec revision, its current passing deterministic
+   * verification, and an independent passing semantic review of that exact
+   * implementation backed by a real, current, successful reviewer run. A
+   * missing WorkItem, a superseded implementation/verifier/reviewer generation,
+   * a newer blocking review, or a non-independent reviewer all fail closed. No
+   * new worker/model work is launched on this path.
+   */
+  private async reconcileWaitingAuthority(loop: EngineeringLoop): Promise<EngineeringLoop> {
+    const authority = await this.factory.resolveWaitingForHumanAuthority(loop.workItemId);
+    if (authority.ok) {
+      return loop;
+    }
+    return this.failClosedToRecovery(
+      loop,
+      `persisted WAITING_FOR_HUMAN is not backed by current Factory authority: ${authority.reason}`,
+    );
+  }
+
+  /**
+   * Fail-closed demotion to RECOVERY_REQUIRED (HIGH 2, round 3) from the
+   * authority-bearing REVIEWING/WAITING_FOR_HUMAN states — the one place that
+   * may move a WAITING_FOR_HUMAN loop out of its terminal phase, because it is
+   * recovering from a state whose durable authority can no longer be proven
+   * (`finalize`, by contrast, refuses to touch any terminal loop). Never
+   * overrides an unrelated terminal outcome (CANCELLED/EXHAUSTED/FAILED). The
+   * WorkItem is moved to BLOCKED for human attention, exactly like every other
+   * recovery/exhaustion path.
+   */
+  private async failClosedToRecovery(loop: EngineeringLoop, reason: string): Promise<EngineeringLoop> {
+    this.log(`[loop ${loop.id}] RECOVERY_REQUIRED: ${reason}`);
+    const demoted = await this.factSave(loop.id, (fresh) => {
+      if (fresh.phase !== "REVIEWING" && fresh.phase !== "WAITING_FOR_HUMAN") {
+        return null;
+      }
+      return { phase: "RECOVERY_REQUIRED", outcome: "RECOVERY_REQUIRED", failureReason: reason };
+    });
+    await this.tryBlockWorkItem(demoted.workItemId, reason);
+    return demoted;
   }
 
   // =====================================================================
@@ -730,7 +855,26 @@ export class EngineeringLoopService {
       const item = await this.factory.getWorkItem(loop.workItemId);
       if (item.status === "REVIEW") {
         await this.factory.advance(loop.workItemId, "WAITING_FOR_HUMAN", this.orchestratorActor);
-      } else if (item.status !== "WAITING_FOR_HUMAN") {
+      } else if (item.status === "WAITING_FOR_HUMAN") {
+        // HIGH 2 (round 3): the WorkItem already advanced (through the same
+        // precondition) before this loop's phase caught up — a legitimate
+        // crash-reconciliation window. The cached PASS verdict + the item's
+        // current status are NOT sufficient authority on their own: re-derive
+        // the current independent-review lineage before accepting. If it can
+        // no longer be proven (a superseded implementation, a stale/missing
+        // review, a non-independent reviewer), fail closed rather than exposing
+        // an unauthorized WAITING_FOR_HUMAN.
+        const authority = await this.factory.resolveWaitingForHumanAuthority(loop.workItemId);
+        if (!authority.ok) {
+          return {
+            kind: "advanced",
+            loop: await this.failClosedToRecovery(
+              loop,
+              `cached PASS at WAITING_FOR_HUMAN is not backed by current Factory authority: ${authority.reason}`,
+            ),
+          };
+        }
+      } else {
         throw new Error(`unexpected work item status ${item.status} while advancing REVIEW -> WAITING_FOR_HUMAN`);
       }
       return this.strictStep(loop, { phase: "WAITING_FOR_HUMAN", outcome: "WAITING_FOR_HUMAN" });

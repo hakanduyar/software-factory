@@ -223,9 +223,17 @@ export async function runLoopResume(loopId: string, options: LoopCliOptions = {}
 
 export async function runLoopCancel(loopId: string, options: LoopCliOptions = {}): Promise<LoopStatusView> {
   const log = options.log ?? ((): void => {});
-  const { store, loops, service } = openStores(options);
+  const { store, loops, factory, service } = openStores(options);
   try {
-    const view = toStatusView(await service.cancel(loopId, human("user:cli-operator", "CLI Operator")));
+    // HIGH 1 (remediation round 3): loop cancellation is a protected human
+    // governance operation. The CLI operator mints a TrustedHumanToken from
+    // the same local identity gate the FactoryService uses (the exact
+    // mechanism behind every `sf` approval), then presents it — the loop
+    // service refuses cancellation without it. This is the interactive
+    // operator's own governance action, not a routine unattended loop step.
+    const operator = human("user:cli-operator", "CLI Operator");
+    const authorization = factory.authorizeHuman(operator, CLI_CREDENTIAL);
+    const view = toStatusView(await service.cancel(loopId, operator, authorization));
     printStatus(view, log);
     return view;
   } finally {
