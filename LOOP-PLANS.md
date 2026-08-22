@@ -6,4 +6,5 @@ For bootstrap, GitHub Issues will become the durable work queue. This file exist
 
 - TASK-001 — Local Factory Core Skeleton (done, committed 5071079)
 - TASK-002 — Durable Persistence + Run Ledger (done, committed 29c1d61)
-- TASK-003 — Worker Runner (implemented, awaiting review/acceptance)
+- TASK-003 — Worker Runner (done, committed 61ba880)
+- TASK-004 — Autonomous Engineering Loop (implemented, awaiting review/acceptance)

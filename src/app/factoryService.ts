@@ -60,7 +60,12 @@ import type { FactoryRepositories, FactoryStore } from "../ports/repositories.js
 import type { Worker, WorkerOutcome } from "../ports/worker.js";
 import type { WorkerRegistry } from "../ports/workerRegistry.js";
 import { evaluateGate, requireGate, type GateBinding, type GateStatus } from "../workflow/gateGuard.js";
-import { resolveCurrentImplementation, resolveReleaseSnapshot } from "../workflow/releaseSnapshotResolver.js";
+import {
+  resolveCurrentImplementation,
+  resolveReleaseSnapshot,
+  resolveSemanticReview,
+  type ResolvedReview,
+} from "../workflow/releaseSnapshotResolver.js";
 import { assertRoleStartable } from "../workflow/rolePolicy.js";
 import { WorkflowService, type TransitionCheck } from "../workflow/workflowService.js";
 
@@ -292,6 +297,29 @@ export class FactoryService {
    */
   authorizeHuman(actor: Actor, credential: string): TrustedHumanToken {
     return this.identityGate.authorize(actor, credential);
+  }
+
+  /**
+   * Read-only re-check of the SAME trusted-human boundary `recordApproval`
+   * and `WorkflowService` enforce (C1/C5): the actor must be HUMAN and must
+   * present a `TrustedHumanToken` that verifies for it. Returns a reason
+   * string on failure, `undefined` when the authorization holds. Exposed so
+   * protected orchestration operations that are not WorkItem transitions —
+   * e.g. TASK-004 loop cancellation — can require the same evidence of a
+   * trusted human without reimplementing token verification or being handed a
+   * reference to the identity gate/credential.
+   */
+  verifyHumanAuthorization(actor: Actor, authorization: TrustedHumanToken | undefined): string | undefined {
+    if (actor.kind !== "HUMAN") {
+      return `requires a trusted HUMAN decision, got actor kind ${actor.kind}`;
+    }
+    if (authorization === undefined) {
+      return "requires a TrustedHumanToken; a caller-supplied HUMAN actor is not sufficient";
+    }
+    if (!this.identityGate.verify(authorization, actor)) {
+      return `authorization token is invalid, expired, or was not issued to actor ${actor.id}`;
+    }
+    return undefined;
   }
 
   /** Registers a Worker and returns its immutable, registry-issued principal. */
@@ -651,6 +679,51 @@ export class FactoryService {
 
   async listRuns(workItemId: WorkItemId): Promise<readonly Run[]> {
     return this.store.runs.listByWorkItem(workItemId);
+  }
+
+  /**
+   * Read-only, like listRuns/listEvidence. Added in TASK-004 remediation
+   * round 1: crash reconciliation must recover an already-recorded Review
+   * from authoritative Factory state (matched by its reviewerRunId) instead
+   * of recording a duplicate; no public read for reviews existed before.
+   */
+  async listReviews(workItemId: WorkItemId): Promise<readonly Review[]> {
+    return this.store.reviews.listByWorkItem(workItemId);
+  }
+
+  /**
+   * Read-only re-derivation of the authority that guards
+   * REVIEW -> WAITING_FOR_HUMAN, from live authoritative records — the SAME
+   * lineage the `requireIndependentSemanticReview` precondition enforces
+   * (current implementation at the current spec revision, its current passing
+   * deterministic verification with evidence, and an independent, passing
+   * semantic review of that exact implementation by a distinct principal; a
+   * newer attempt or blocking review supersedes any of it).
+   *
+   * Added in TASK-004 remediation round 3 (independent review HIGH 2): a
+   * loop's persisted `phase = WAITING_FOR_HUMAN` / cached `lastVerdict = PASS`
+   * is orchestration checkpoint state, never authority. Before the loop
+   * exposes or accepts a WAITING_FOR_HUMAN outcome from a reloaded row, it
+   * asks the Factory Core to prove that authority currently holds — composing
+   * the existing accepted resolver rather than reimplementing any of its
+   * rules. `ok: false` means fail closed (the WorkItem may be genuinely
+   * absent, or the referenced lineage may be stale/missing/superseded).
+   */
+  async resolveWaitingForHumanAuthority(
+    workItemId: WorkItemId,
+  ): Promise<{ ok: true; value: ResolvedReview } | { ok: false; reason: string }> {
+    const item = await this.store.workItems.findById(workItemId);
+    if (item === undefined) {
+      return { ok: false, reason: `work item ${workItemId} does not exist` };
+    }
+    if (item.status !== "WAITING_FOR_HUMAN" && item.status !== "REVIEW") {
+      return {
+        ok: false,
+        reason: `work item ${workItemId} is ${item.status}, not at REVIEW/WAITING_FOR_HUMAN where an independent passing review is the current authority`,
+      };
+    }
+    const resolved = await resolveSemanticReview(item, this.store);
+    return resolved.ok ? { ok: true, value: resolved.value } : { ok: false, reason: resolved.reason };
   }
 
   async listCriteria(workItemId: WorkItemId): Promise<readonly AcceptanceCriterion[]> {

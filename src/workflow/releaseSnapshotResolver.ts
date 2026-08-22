@@ -33,6 +33,15 @@
  *    happened to PASS". A newer FAIL supersedes an older PASS; a still-newer
  *    PASS may supersede the FAIL.
  *
+ *    "Applicable" is decided by the review's own recorded identity, not only
+ *    by what it points at: kind, the exact implementation run reviewed, AND
+ *    the review's own `specRevision` (round-4 HIGH 2 — previously a Review
+ *    stamped at another revision could be selected as authoritative, letting
+ *    an off-revision PASS both authorize a transition and mask a
+ *    current-revision blocking review). Every artifact in a lineage must
+ *    belong to the same current revision: WorkItem, implementer run, verifier
+ *    run, deterministic review, reviewer run, semantic review.
+ *
  * Each stage depends on the id produced by the stage before it, so running a
  * new implementer immediately orphans all prior proof — not because anything
  * bumps a counter, but because the thing the proof points at is no longer
@@ -130,8 +139,19 @@ export async function resolveVerification(
   const reviews = await ctx.reviews.listByWorkItem(item.id);
   // Authoritative = the LATEST applicable deterministic review, in append
   // order — not the latest one that happened to pass.
+  //
+  // "Applicable" includes the review's OWN specRevision (round-4 HIGH 2): a
+  // Review record carries the revision it was recorded at, and a record from
+  // another revision belongs to another generation entirely. Filtering it out
+  // here — rather than merely inspecting the latest record's revision — is
+  // what makes an off-revision review unable to authorize anything AND unable
+  // to mask a current failure: it is invisible, exactly like the older
+  // criterion-verification generations in resolveReleaseSnapshot.
   const applicableDeterministic = reviews.filter(
-    (review) => review.kind === "DETERMINISTIC" && review.reviewedRunId === implementation.value.id,
+    (review) =>
+      review.kind === "DETERMINISTIC" &&
+      review.reviewedRunId === implementation.value.id &&
+      review.specRevision === item.specRevision,
   );
   const deterministicReview = applicableDeterministic.at(-1);
   if (deterministicReview === undefined) {
@@ -165,12 +185,50 @@ export async function resolveSemanticReview(
     return fail(verification.reason);
   }
 
+  const runs = await ctx.runs.listByWorkItem(item.id);
+  // ROUND-5 HIGH 2: resolve the authoritative REVIEWER *attempt* from the runs
+  // themselves first, exactly as resolveVerification does for the verifier —
+  // then require the review to have been produced by that run. `recordReview`
+  // validates the backing run at creation time, but a resolver reading durable
+  // state must re-prove it: a directly-written or corrupted Review row can
+  // carry entirely plausible copied fields (current revision, the right
+  // reviewedRunId, distinct-looking principal strings) while pointing at a
+  // reviewer run that does not exist, failed, is still running, has the wrong
+  // role/revision, or examined something else. Copied principal strings are
+  // never trusted as identity; identity is derived from the Run record, which
+  // carries the registry-issued principal.
+  const reviewerAttempts = runs.filter(
+    (run) =>
+      run.role === "REVIEWER" &&
+      run.specRevision === item.specRevision &&
+      run.targetRunId === verification.value.implementation.id,
+  );
+  const reviewerRun = reviewerAttempts.at(-1);
+  if (reviewerRun === undefined) {
+    return fail(`no REVIEWER run targeting implementation run ${verification.value.implementation.id}`);
+  }
+  if (reviewerRun.status !== "SUCCEEDED") {
+    return fail(`the current reviewer attempt ${reviewerRun.id} is ${reviewerRun.status}`);
+  }
+  if (reviewerRun.workerPrincipalId === verification.value.implementation.workerPrincipalId) {
+    // C4, proven from the Run records rather than from anything the Review copied.
+    return fail(
+      `reviewer run ${reviewerRun.id} was executed by the same worker principal as implementation run ${verification.value.implementation.id}; a worker may not be the sole semantic reviewer of its own work (C4)`,
+    );
+  }
+
   const reviews = await ctx.reviews.listByWorkItem(item.id);
   // Authoritative = the LATEST applicable semantic review, in append order.
   // A newer FAIL supersedes an older PASS; a still-newer PASS may supersede
   // the FAIL. Never "find a PASS that matches".
+  //
+  // The review's own specRevision is part of applicability (round-4 HIGH 2) —
+  // see the equivalent filter in resolveVerification.
   const applicableSemantic = reviews.filter(
-    (review) => review.kind === "SEMANTIC" && review.reviewedRunId === verification.value.implementation.id,
+    (review) =>
+      review.kind === "SEMANTIC" &&
+      review.reviewedRunId === verification.value.implementation.id &&
+      review.specRevision === item.specRevision,
   );
   const semanticReview = applicableSemantic.at(-1);
   if (semanticReview === undefined) {
@@ -181,9 +239,27 @@ export async function resolveSemanticReview(
       `the authoritative semantic review ${semanticReview.id} is ${semanticReview.verdict}; a newer blocking review supersedes any earlier pass`,
     );
   }
-  if (semanticReview.reviewerPrincipalId === semanticReview.implementerPrincipalId) {
-    // Defence in depth: recordReview refuses to create such a review.
-    return fail(`the authoritative semantic review ${semanticReview.id} is not independent (C4)`);
+  // The review must have been produced by the authoritative reviewer attempt
+  // resolved above — the same pinning resolveVerification applies to the
+  // deterministic review. A newer reviewer attempt supersedes an older
+  // review's verdict, so nothing is authoritative until that attempt's own
+  // review is recorded.
+  if (semanticReview.reviewerRunId !== reviewerRun.id) {
+    return fail(
+      `the authoritative semantic review ${semanticReview.id} was produced by ${semanticReview.reviewerRunId}, not the current reviewer attempt ${reviewerRun.id}`,
+    );
+  }
+  // Copied principal fields are audit/display data: they must agree with the
+  // Run records they claim to describe, and may never substitute for them.
+  if (semanticReview.reviewerPrincipalId !== reviewerRun.workerPrincipalId) {
+    return fail(
+      `semantic review ${semanticReview.id} records reviewer principal ${semanticReview.reviewerPrincipalId}, but reviewer run ${reviewerRun.id} was executed by ${reviewerRun.workerPrincipalId}`,
+    );
+  }
+  if (semanticReview.implementerPrincipalId !== verification.value.implementation.workerPrincipalId) {
+    return fail(
+      `semantic review ${semanticReview.id} records implementer principal ${semanticReview.implementerPrincipalId}, but implementation run ${verification.value.implementation.id} was executed by ${verification.value.implementation.workerPrincipalId}`,
+    );
   }
 
   return ok({ ...verification.value, semanticReview });

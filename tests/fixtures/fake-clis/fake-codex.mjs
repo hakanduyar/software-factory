@@ -3,8 +3,10 @@
 // docs/tasks/TASK-003-worker-runner.md, so codexCliAdapter can be tested
 // offline. Debug info (argv/cwd/env) goes to stderr as a side channel so it
 // never interferes with the stdout JSONL the adapter actually parses.
-// Controlled via env vars: FAKE_CODEX_MODE=success|fail, FAKE_CODEX_MESSAGE,
-// FAKE_CODEX_SLEEP_MS.
+// Controlled via env vars: FAKE_CODEX_MODE=success|fail|raw, FAKE_CODEX_MESSAGE,
+// FAKE_CODEX_SLEEP_MS. `raw` prints FAKE_CODEX_MESSAGE as plain (non-JSONL)
+// text and exits 0 — simulating a CLI that violated its structured-output
+// contract while still exiting cleanly (TASK-004 remediation round 1, HIGH 3).
 const mode = process.env.FAKE_CODEX_MODE ?? "success";
 const message = process.env.FAKE_CODEX_MESSAGE ?? "OK";
 const sleepMs = Number(process.env.FAKE_CODEX_SLEEP_MS ?? "0");
@@ -20,6 +22,10 @@ function emit(obj) {
 async function main() {
   if (sleepMs > 0) {
     await new Promise((resolveDelay) => setTimeout(resolveDelay, sleepMs));
+  }
+  if (mode === "raw") {
+    process.stdout.write(`${message}\n`);
+    return; // exit 0, structured JSONL contract violated on purpose
   }
   emit({ type: "thread.started", thread_id: "fake-thread-0" });
   emit({ type: "turn.started" });
