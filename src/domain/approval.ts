@@ -2,6 +2,8 @@
  * Protected gates and human approvals (C1, C5, docs/DOMAIN_MODEL.md).
  */
 
+import { createHash } from "node:crypto";
+
 import type { Actor } from "./actor.js";
 import type { ApprovalId } from "./ids.js";
 import type { Timestamp } from "./time.js";
@@ -30,11 +32,10 @@ export interface SubjectRef {
 }
 
 /**
- * What a WORK_ITEM approval was actually granted for, captured by
- * FactoryService from live state at decision time — never supplied by the
- * caller.
+ * What an approval was actually granted for, captured by FactoryService from
+ * live state at decision time — never supplied by the caller.
  *
- * `statusWhenDecided` records that the item really was at the status where
+ * `statusWhenDecided` records that the subject really was at the state where
  * that gate is meaningful; FactoryService refuses to record the approval
  * otherwise, so an approval cannot be pre-recorded at IDEA and cashed in
  * later.
@@ -43,11 +44,30 @@ export interface SubjectRef {
  * `snapshotId` binds a RELEASE_APPROVAL to the exact implementation +
  * verification + criterion-verification + review combination reviewed; see
  * src/domain/executionSnapshot.ts.
+ *
+ * The remaining fields exist for TASK-005 (durable planner). A PLAN-subject
+ * approval additionally binds `planContentDigest` — the content hash of the
+ * exact plan revision reviewed — for the same reason a RELEASE_APPROVAL binds
+ * `snapshotId` rather than a counter: revision numbers alone cannot prove the
+ * content did not change. A per-WorkItem approval *derived* from such a plan
+ * approval records `derivedFromApprovalId`/`planId`/`planRevision`, so the
+ * human decision it descends from is always auditable (C8) and never
+ * inventable — see FactoryService.recordDerivedPlanApproval.
  */
 export interface ApprovalContext {
   readonly statusWhenDecided: string;
   readonly specRevision: number;
   readonly snapshotId?: string;
+  /** PLAN subjects: content hash of the exact approved plan revision. */
+  readonly planContentDigest?: string;
+  /** Derived WORK_ITEM approvals: the human PLAN approval this descends from. */
+  readonly derivedFromApprovalId?: ApprovalId;
+  readonly planId?: string;
+  readonly planRevision?: number;
+}
+
+export function planSubject(id: string): SubjectRef {
+  return { type: "PLAN", id };
 }
 
 export interface Approval {
@@ -69,6 +89,39 @@ export function sameSubject(a: SubjectRef, b: SubjectRef): boolean {
 
 export function workItemSubject(id: string): SubjectRef {
   return { type: "WORK_ITEM", id };
+}
+
+/**
+ * The canonical id of a DERIVED plan approval (TASK-005 remediation round 1,
+ * HIGH 2).
+ *
+ * Derived rather than generated, for the same reason a materialization
+ * correlation tag is: it makes idempotence a property of the record's IDENTITY
+ * instead of a check-then-act race. Two callers deriving the same approval for
+ * the same work item compute the same id, so the second insert is refused by
+ * the store's own append-only rule — in memory and in SQLite alike — rather
+ * than appending a second grant of the same authority.
+ *
+ * Every coordinate that would make this a genuinely DIFFERENT authorization is
+ * in the hash: another plan, revision, source decision, target work item or
+ * spec revision all produce a different id, and therefore a separate record.
+ */
+export function derivedPlanApprovalId(input: {
+  readonly planId: string;
+  readonly planRevision: number;
+  readonly sourceApprovalId: string;
+  readonly workItemId: string;
+  readonly specRevision: number;
+}): ApprovalId {
+  const canonical = [
+    "derived-plan-approval-v1",
+    `plan:${input.planId.length}:${input.planId}`,
+    `rev:${input.planRevision}`,
+    `src:${input.sourceApprovalId.length}:${input.sourceApprovalId}`,
+    `wi:${input.workItemId.length}:${input.workItemId}`,
+    `spec:${input.specRevision}`,
+  ].join("|");
+  return `apr-d-${createHash("sha256").update(canonical).digest("hex").slice(0, 24)}`;
 }
 
 /** The work item status at which each work-item gate may legitimately be decided. */

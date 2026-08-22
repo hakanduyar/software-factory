@@ -97,6 +97,19 @@ function positiveInt(row: Record<string, unknown>, field: string, context: strin
   return value;
 }
 
+function optionalPositiveInt(row: Record<string, unknown>, field: string, context: string): number | undefined {
+  const value = row[field];
+  if (value === undefined) {
+    return undefined;
+  }
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
+    throw new PersistenceCorruptionError(
+      `${context}: field "${field}" must be a positive integer when present, got ${JSON.stringify(value)}`,
+    );
+  }
+  return value;
+}
+
 /** Throws unless `actual === expected`, for indexed SQL columns that must agree with the JSON payload. */
 function crossCheck(context: string, field: string, expected: string | number, actual: string | number): void {
   if (expected !== actual) {
@@ -379,16 +392,48 @@ function parseSubject(value: unknown, context: string): SubjectRef {
   };
 }
 
+/**
+ * EVERY field of `ApprovalContext` is reconstructed here, and this list must be
+ * kept in step with `src/domain/approval.ts`.
+ *
+ * TASK-005 remediation round 3 exists because it was not. `ApprovalContext`
+ * gained four TASK-005 authority fields while this function kept an older
+ * three-field whitelist, so a PLAN approval recorded WITH a content digest came
+ * back from SQLite WITHOUT one — and `gateGuard`, correctly, then refused to
+ * treat it as authority. Nothing was corrupted and nothing was insecure; the
+ * evidence was simply deleted in transit, which made every durable
+ * SQLite-backed plan permanently unable to leave approval. The production
+ * `sf plan approve` path was dead while every in-memory-backed test passed.
+ *
+ * The rule this encodes: an authority field that does not round-trip is an
+ * authority field that does not exist. Silent field loss is never acceptable —
+ * failing closed on corruption is.
+ *
+ * `tests/approvalContextRoundTrip.test.ts` asserts a maximal context survives
+ * this function unchanged, so the next field added to the domain type fails
+ * loudly here instead of silently disappearing in production.
+ */
 function parseApprovalContext(value: unknown, context: string): ApprovalContext {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new PersistenceCorruptionError(`${context}: must be an object, got ${JSON.stringify(value)}`);
   }
   const row = value as Record<string, unknown>;
   const snapshotId = optionalStr(row, "snapshotId", context);
+  // TASK-005: the bindings that make a PLAN approval mean one exact plan
+  // revision, one exact approved content+configuration digest, and — for a
+  // derived per-work-item approval — the human decision it descends from.
+  const planContentDigest = optionalStr(row, "planContentDigest", context);
+  const derivedFromApprovalId = optionalStr(row, "derivedFromApprovalId", context);
+  const planId = optionalStr(row, "planId", context);
+  const planRevision = optionalPositiveInt(row, "planRevision", context);
   return {
     statusWhenDecided: oneOf(row, "statusWhenDecided", WORK_ITEM_STATUSES, context),
     specRevision: positiveInt(row, "specRevision", context),
     ...(snapshotId === undefined ? {} : { snapshotId }),
+    ...(planContentDigest === undefined ? {} : { planContentDigest }),
+    ...(derivedFromApprovalId === undefined ? {} : { derivedFromApprovalId }),
+    ...(planId === undefined ? {} : { planId }),
+    ...(planRevision === undefined ? {} : { planRevision }),
   };
 }
 

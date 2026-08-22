@@ -501,4 +501,109 @@ scope (design doc §10, §15).
 - The loop repository is a second SQLite file, not a shared connection/transaction with `FactoryStore` — reconciled by the action-claim protocol, not by atomicity.
 - Exactly-once holds against crashes; under arbitrary live-process interleavings the guarantee is exactly-once-or-fail-closed (`RECOVERY_REQUIRED`), and resuming a loop another live process is actively driving is documented operator misuse the system answers safely.
 - `RECOVERY_REQUIRED` has no in-band operator workflow yet (`sf loop recover` is future work).
-- No TASK-005 planning, GitHub Issues/Projects, Telegram/n8n, server deployment, or scored model router — all later phases.
+- No GitHub Issues/Projects, Telegram/n8n, server deployment, or scored model router — all later phases. (Planning arrived in TASK-005, below.)
+
+## Durable Planner / Task Generator (TASK-005)
+
+Turns a human's natural-language goal into an explicit, reviewable,
+**immutable-after-approval** plan, and — only after a trusted human approves
+that exact revision — materializes it into real Factory work items and hands
+them, dependency-ordered, to the TASK-004 loop. Full design:
+`docs/tasks/TASK-005-planner-task-generator.md`.
+
+```
+NATURAL-LANGUAGE INTENT
+        |  planner worker (an untrusted proposal)
+DURABLE PLAN REVISION
+        |  deterministic validation
+PLAN_REVIEW
+        |  trusted-human approval, bound to revision + content digest
+APPROVED (frozen)
+        |  idempotent, crash-safe materialization
+WORK ITEMS (READY)
+        |  dependency-ordered dispatch
+TASK-004 AUTONOMOUS ENGINEERING LOOPS
+```
+
+TASK-005 owns planning and dispatch only. It implements no second engineering
+loop: implement/verify/review/remediate stays entirely in TASK-004, reached
+through one narrow port (`src/planning/loopDispatcher.ts`).
+
+### Layout additions
+
+```
+src/planning/                 plan types, content digest, strict planner-output
+                              contract, deterministic validation (DAG), strict
+                              row parsing, the PlanRepository / PlannerWorker /
+                              LoopDispatcher ports, the orchestrator, and
+                              scripted test/demo collaborators
+src/adapters/planning/        in-memory and SQLite PlanRepository, the real
+                              EngineeringLoopService dispatcher, the CLI planner
+src/ports/planBindingResolver.ts   supplies a PLAN approval's live binding
+src/cli/plan.ts               sf plan start|status|answer|approve|reject|resume|cancel
+src/cli/demoPlan.ts           npm run demo:plan (5 deterministic scenarios)
+```
+
+### A plan is not authority; an approved revision's content is
+
+An approval binds to plan id **plus exact revision plus exact approval digest**,
+for the same reason a `RELEASE_APPROVAL` binds a snapshot id rather than a
+counter: content can change without a counter moving. The digest covers the
+revision **and** every persisted field that decides what runs and where —
+`projectId`, verification commands, workspace root, worker configuration — so
+moving approved work to another project, or rewriting its verification commands,
+revokes the approval instead of surviving it. It is recomputed on every read, so
+edited plan content or configuration cannot even load, let alone execute.
+Approval of revision N never authorizes N+1.
+
+Because the accepted transition table requires a `PLAN_APPROVAL` on each **work
+item** to reach `READY`, one human plan approval is materialized into per-item
+approvals by `FactoryService.recordDerivedPlanApproval` — which cannot
+manufacture authority, and cannot widen it. It takes only identifiers, and
+proves four things from durable state: that the plan's own mapping names this
+work item as an approved target, that the source approval is a real `APPROVED`
+human decision for that revision and digest, that it is **still** the current
+decision at the central gate, and that what the Factory actually stored matches
+the approved content field for field. Each derived approval records
+`derivedFromApprovalId`, so the human decision it descends from stays auditable,
+and its id is derived from that lineage, so deriving twice cannot grant twice.
+
+### Asking is not planning
+
+The planner is instructed to classify every unknown as blocking ambiguity, safe
+assumption, or implementation detail, and to prefer a documented assumption over
+interrupting a human. A clarification-only response persists **no** revision, so
+every persisted revision is approvable, and a plan that asks once and then plans
+holds exactly one revision.
+
+### Prerequisite satisfied means execution finished, not released
+
+A dependent work item waits until each prerequisite is `DONE`, **or** is at
+`WAITING_FOR_HUMAN` *and* `resolveWaitingForHumanAuthority` currently proves it.
+A status field alone satisfies nothing. This keeps three things distinct:
+execution finished, release approved (`DONE`), and published.
+
+### `sf plan` CLI
+
+```
+sf plan start <project-id> --intent <path> [--config <path>]
+sf plan status <plan-id>            read-only; never manufactures authority
+sf plan answer <plan-id> --answers <path>
+sf plan approve <plan-id>           trusted human
+sf plan reject <plan-id> [--note <text>]
+sf plan resume <plan-id>            restart / reconciliation
+sf plan cancel <plan-id>            trusted human
+```
+
+`npm run demo:plan` runs all five scenarios offline and deterministically: clear
+intent, clarification cycle, dependency ordering, malformed planner output
+failing closed, and a crash mid-materialization reconciling with no duplicates.
+
+### Known limitations (TASK-005)
+
+- Execution is sequential and dependency-ordered; parallel dispatch of independent items is deliberately out of scope (correctness over concurrency).
+- A rejected plan is terminal: re-planning means starting a new plan rather than continuing the rejected one.
+- The real CLI planner cannot be exercised end to end by an automated test, because it launches a real `claude`/`codex` process and `sf plan start` intentionally has no injection seam; every other CLI path is covered.
+- `RECOVERY_REQUIRED` has no in-band operator workflow yet (`sf plan recover` is future work), matching TASK-004.
+- The planner is assumed to be a read-only consultation of the workspace. That assumption is what makes retrying an interrupted planner attempt safe, and enforcing it is a configuration responsibility of the underlying tool's sandbox.
+- No GitHub Issues/Projects, Telegram/n8n, Control Room UI, server deployment, or scored model router — all later phases.
