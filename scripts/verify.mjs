@@ -30,12 +30,53 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { readFileSync, readdirSync, realpathSync, rmSync, statSync } from "node:fs";
+import { lstatSync, readFileSync, readdirSync, realpathSync, rmSync, statSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const OUTPUT_DIR = "dist";
+const CHECKER_PATH = join(REPO_ROOT, OUTPUT_DIR, "src/verification/testArtifacts.js");
+
+function isSymlink(path) {
+  try {
+    return lstatSync(path).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+function deviceOf(path) {
+  try {
+    return statSync(path).dev;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Symlinked entries anywhere beneath a directory, as repo-relative paths. */
+function findSymlinks(directory, keep = () => true) {
+  const found = [];
+  const walk = (current) => {
+    let entries;
+    try {
+      entries = readdirSync(current, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const full = join(current, entry.name);
+      const rel = relative(REPO_ROOT, full).replace(/\\/g, "/");
+      if (entry.isSymbolicLink()) {
+        if (keep(rel)) found.push(rel);
+      } else if (entry.isDirectory()) {
+        walk(full);
+      }
+    }
+  };
+  walk(join(REPO_ROOT, directory));
+  return found.sort();
+}
 
 function fail(message) {
   console.error(`\n${message}\n`);
@@ -106,13 +147,48 @@ if (declared !== OUTPUT_DIR) {
   );
 }
 
-// --- 2. build, so the tested checker exists ----------------------------------
-build();
-const checker = await import(
-  `file://${join(REPO_ROOT, OUTPUT_DIR, "src/verification/testArtifacts.js")}`
-);
+// --- 2. refuse an unreasonable tree BEFORE building --------------------------
+// Building is itself a write through whatever these paths resolve to, so the
+// structural checks that do not need the compiled checker happen first. A
+// symlinked output directory was previously refused only AFTER the build had
+// already written into the external target.
+const tsconfigRaw = readFileSync(join(REPO_ROOT, "tsconfig.json"), "utf8");
+const noEmit = /"noEmit"\s*:\s*true/.test(tsconfigRaw);
+if (isSymlink(join(REPO_ROOT, "tests"))) {
+  fail("verification refused: the tests directory is a symlink; an external suite would be compiled and executed as though it belonged to this tree");
+}
+if (isSymlink(join(REPO_ROOT, OUTPUT_DIR))) {
+  fail("verification refused: the build output directory is a symlink; the build would write outside the repository");
+}
+const rootDevice = deviceOf(REPO_ROOT);
+const outputDevice = deviceOf(join(REPO_ROOT, OUTPUT_DIR));
+if (outputDevice !== undefined && rootDevice !== undefined && outputDevice !== rootDevice) {
+  fail("verification refused: the build output directory is on a different device (a mount or bind mount); a recursive delete could reach outside the repository");
+}
+if (noEmit) {
+  fail("verification refused: tsconfig sets noEmit, so the build produces nothing and any audit would run against whatever was already there");
+}
 
-// --- 2. is the output directory trustworthy at all? --------------------------
+// --- 3. build, and prove it actually emitted the checker ---------------------
+const buildStartedAt = Date.now();
+build();
+const checkerStat = (() => {
+  try {
+    return statSync(CHECKER_PATH);
+  } catch {
+    return undefined;
+  }
+})();
+const checkerFreshlyEmitted = checkerStat !== undefined && checkerStat.mtimeMs + 1000 >= buildStartedAt;
+if (!checkerFreshlyEmitted) {
+  // The checker is imported from the very tree it audits, so a build that did
+  // not rewrite it would leave a stale — possibly poisoned — auditor in charge
+  // of detecting exactly that.
+  fail("verification refused: the build did not emit the verification checker; refusing to audit this tree using a stale copy of the auditor");
+}
+const checker = await import(`file://${CHECKER_PATH}?t=${buildStartedAt}`);
+
+// --- 3b. the realpath-based output check, now that the checker exists -------
 // A path is judged by what it RESOLVES to, not by its name. `rmSync` does not
 // follow a symlinked `dist`, which looked safe — but `tsc`, this import and the
 // test runner all do.
@@ -128,12 +204,30 @@ if (!outputVerdict.trusted) {
   fail(`verification refused: ${outputVerdict.reason}`);
 }
 
-// --- 3. audit every artifact that could RUN, anywhere in the output ----------
+// --- 4. the full tested safety judgement, now that the checker exists --------
+const safety = checker.assessTreeSafety({
+  testsRootIsSymlink: isSymlink(join(REPO_ROOT, "tests")),
+  outputIsSymlink: isSymlink(join(REPO_ROOT, OUTPUT_DIR)),
+  outputOnDifferentDevice:
+    outputDevice !== undefined && rootDevice !== undefined && outputDevice !== rootDevice,
+  // A symlinked artifact is neither `isFile()` nor `isDirectory()` to `readdir`,
+  // so the ordinary walk cannot see it — which made a symlinked stale test
+  // invisible to the audit while still being runnable.
+  symlinkedArtifacts: findSymlinks(OUTPUT_DIR, (path) => checker.isTestArtifact(path)),
+  symlinkedSources: findSymlinks("tests"),
+  buildEmitsNothing: noEmit,
+  checkerFreshlyEmitted,
+});
+if (!safety.safe) {
+  fail(`verification refused: ${safety.reason}`);
+}
+
+// --- 5. audit every artifact that could RUN, anywhere in the output ----------
 const sourceTests = listFiles("tests").filter((path) => path.endsWith(".test.ts"));
 const compiledTests = listFiles(OUTPUT_DIR).filter((path) => checker.isTestArtifact(path));
 const audit = checker.auditTestArtifacts({ sourceTests, compiledTests });
 
-// --- 4. contaminated? clean so the next run is honest, then FAIL -------------
+// --- 6. contaminated? clean so the next run is honest, then FAIL ------------
 if (!audit.clean) {
   const diagnosis = checker.describeContamination(audit);
   const cleanVerdict = checker.assessCleanTarget({
@@ -148,13 +242,13 @@ if (!audit.clean) {
   fail(`${diagnosis}\n\nThe stale output has been removed. Re-run to verify a clean tree.`);
 }
 
-// --- 5. refuse a run that would prove nothing --------------------------------
+// --- 7. refuse a run that would prove nothing -------------------------------
 const emptiness = checker.assertRunnableSuite(audit.expected);
 if (emptiness !== undefined) {
   fail(emptiness);
 }
 
-// --- 6. run exactly the tests this tree declares ------------------------------
+// --- 8. run exactly the tests this tree declares ----------------------------
 for (const path of audit.expected) {
   statSync(join(REPO_ROOT, path));
 }

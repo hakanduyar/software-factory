@@ -17,6 +17,7 @@ import { describe, it } from "node:test";
 
 import {
   assessCleanTarget,
+  assessTreeSafety,
   auditTestArtifacts,
   compiledPathForSourceTest,
   describeContamination,
@@ -143,6 +144,63 @@ describe("TASK-010 AC-5: the clean step cannot destroy anything that matters", (
   it("refuses a directory that merely looks like the output", () => {
     for (const lookalike of ["dist-backup", "distribution", "dist/tests"]) {
       assert.equal(ok(`${root}/${lookalike}`).safe, false, `${lookalike} must be refused`);
+    }
+  });
+});
+
+describe("TASK-010 round 2: every tree-safety clause, judged directly", () => {
+  const SAFE = {
+    testsRootIsSymlink: false,
+    outputIsSymlink: false,
+    outputOnDifferentDevice: false,
+    symlinkedArtifacts: [] as readonly string[],
+    symlinkedSources: [] as readonly string[],
+    buildEmitsNothing: false,
+    checkerFreshlyEmitted: true,
+  };
+
+  it("accepts an ordinary tree", () => {
+    assert.equal(assessTreeSafety(SAFE).safe, true);
+  });
+
+  /**
+   * Each clause is asserted HERE as well as through the end-to-end harness,
+   * because mutation testing showed the two layers masking each other: removing
+   * the script's pre-build check left the tested judgement to catch it, and
+   * removing the tested judgement left the pre-build check — so neither was
+   * individually load-bearing and the mutation run reported "0 failures" for
+   * four real guards.
+   *
+   * Two layers is still the right design: one must run BEFORE the build to
+   * avoid writing through a hostile path, the other is the reviewable rule. But
+   * each needs its own test, or "it is covered" quietly comes to mean "something
+   * covers it, I think".
+   */
+  const clauses: readonly [string, Partial<typeof SAFE>, RegExp][] = [
+    ["a symlinked tests root", { testsRootIsSymlink: true }, /tests directory is a symlink/],
+    ["a symlinked output directory", { outputIsSymlink: true }, /output directory is a symlink/],
+    ["output on another device", { outputOnDifferentDevice: true }, /different device/],
+    ["a noEmit build", { buildEmitsNothing: true }, /noEmit/],
+    ["a stale auditor", { checkerFreshlyEmitted: false }, /stale copy of the auditor/],
+    ["symlinked sources", { symlinkedSources: ["tests/linked.test.ts"] }, /symlinked entries under tests/],
+    ["symlinked artifacts", { symlinkedArtifacts: ["dist/tests/g.test.js"] }, /symlinked test artifacts/],
+  ];
+
+  for (const [label, override, expected] of clauses) {
+    it(`refuses ${label}`, () => {
+      const verdict = assessTreeSafety({ ...SAFE, ...override });
+      assert.equal(verdict.safe, false, `${label} was accepted`);
+      if (!verdict.safe) {
+        assert.match(verdict.reason, expected);
+      }
+    });
+  }
+
+  it("names the offending paths so an operator can act on them", () => {
+    const verdict = assessTreeSafety({ ...SAFE, symlinkedArtifacts: ["dist/tests/ghost.test.js"] });
+    assert.equal(verdict.safe, false);
+    if (!verdict.safe) {
+      assert.match(verdict.reason, /ghost\.test\.js/);
     }
   });
 });

@@ -16,7 +16,7 @@
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { cpSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
@@ -173,5 +173,92 @@ describe("TASK-010 remediation: the harness itself, end to end", () => {
     const { status, output } = runHarness(root);
     assert.notEqual(status, 0, "a redirected outDir was accepted");
     assert.match(output, /tsconfig builds into/);
+  });
+});
+
+/**
+ * Round-2 review findings. Each is a demonstrated escape, not a hypothetical —
+ * the reviewer executed external code through three of them and showed the
+ * fourth was accepted by the checker.
+ */
+describe("TASK-010 round 2: paths are judged by what they resolve to", () => {
+  /** B5 — a symlinked `tests/` compiled and ran an EXTERNAL suite. */
+  it("REFUSES a symlinked tests directory", () => {
+    const root = makeFixtureRepo();
+    const external = mkdtempSync(join(tmpdir(), "sf-external-tests-"));
+    created.push(external);
+    writeFileSync(
+      join(external, "outsider.test.ts"),
+      [
+        'import assert from "node:assert/strict";',
+        'import { it } from "node:test";',
+        'it("outsider", () => { assert.ok(true); });',
+        "",
+      ].join("\n"),
+    );
+    rmSync(join(root, "tests"), { recursive: true, force: true });
+    symlinkSync(external, join(root, "tests"), "dir");
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, "an external suite was compiled and executed");
+    assert.match(output, /tests directory is a symlink/);
+  });
+
+  /** B5 — an individual symlinked source test is source from somewhere else. */
+  it("REFUSES a symlinked individual test source", () => {
+    const root = makeFixtureRepo();
+    const external = mkdtempSync(join(tmpdir(), "sf-external-src-"));
+    created.push(external);
+    const outsider = join(external, "outsider.test.ts");
+    writeFileSync(
+      outsider,
+      ['import { it } from "node:test";', 'it("outsider", () => {});', ""].join("\n"),
+    );
+    symlinkSync(outsider, join(root, "tests/linked.test.ts"), "file");
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, "a symlinked source test was accepted");
+    assert.match(output, /symlinked entries under tests/);
+  });
+
+  /**
+   * B7 — a symlinked artifact is neither `isFile()` nor `isDirectory()` to
+   * `readdir`, so the ordinary walk could not see it while `node --test` could
+   * still run it.
+   */
+  it("REFUSES a symlinked stale artifact the ordinary walk cannot see", () => {
+    const root = makeFixtureRepo();
+    assert.equal(runHarness(root).status, 0);
+
+    const external = mkdtempSync(join(tmpdir(), "sf-external-art-"));
+    created.push(external);
+    const ghost = join(external, "linkedGhost.test.js");
+    writeFileSync(ghost, "// stale\n");
+    symlinkSync(ghost, join(root, "dist/tests/linkedGhost.test.js"), "file");
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, "an invisible-but-runnable artifact was tolerated");
+    assert.match(output, /symlinked test artifacts|linkedGhost/);
+  });
+
+  /**
+   * B6 — the checker is imported from the very tree it audits. With `noEmit`,
+   * the build wrote nothing, a poisoned stale checker stayed in charge, and the
+   * run reported `0 test files, tree-consistent` having executed nothing.
+   */
+  it("REFUSES a noEmit build rather than auditing with a stale auditor", () => {
+    const root = makeFixtureRepo();
+    assert.equal(runHarness(root).status, 0, "fixture must pass first");
+
+    const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as {
+      compilerOptions: Record<string, unknown>;
+    };
+    tsconfig.compilerOptions["noEmit"] = true;
+    writeFileSync(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, "a noEmit build produced a passing verification");
+    assert.match(output, /noEmit/);
+    assert.ok(!output.includes("tree-consistent"), "it must not claim consistency");
   });
 });

@@ -137,6 +137,98 @@ export function assertRunnableSuite(expected: readonly string[]): string | undef
 // Output-directory trust
 // =====================================================================
 
+/**
+ * Filesystem facts the runner observes before it builds or deletes anything.
+ *
+ * Gathered by the script (which can call `lstat`) and judged here (which can be
+ * tested). Round-2 review findings B5, B7 and B8 were all the same mistake in
+ * different clothes: a path was trusted because of what it was CALLED, while
+ * `tsc`, the module loader, the test runner and `rmSync` each resolved it
+ * differently.
+ */
+export interface TreeFacts {
+  /** `tests/` is itself a symlink — an external suite would be compiled and run. */
+  readonly testsRootIsSymlink: boolean;
+  /** The output directory is a symlink — the build writes outside the repo. */
+  readonly outputIsSymlink: boolean;
+  /**
+   * The output directory sits on a different device from the repository root.
+   *
+   * A BIND MOUNT has the same lexical path AND the same realpath as the
+   * directory it replaces, so neither string comparison nor `realpath` can see
+   * it — but `rmSync(recursive)` will happily delete through it into whatever
+   * was mounted. The device number is the one signal that differs.
+   */
+  readonly outputOnDifferentDevice: boolean;
+  /** Symlinked test artifacts found under the output directory. */
+  readonly symlinkedArtifacts: readonly string[];
+  /** Symlinked entries found under `tests/`. */
+  readonly symlinkedSources: readonly string[];
+  /** True when tsconfig sets `noEmit`, so a build would emit nothing. */
+  readonly buildEmitsNothing: boolean;
+  /** True when the compiled checker was (re)written by the build just run. */
+  readonly checkerFreshlyEmitted: boolean;
+}
+
+export type TreeSafetyVerdict =
+  | { readonly safe: true }
+  | { readonly safe: false; readonly reason: string };
+
+/**
+ * Refuses any tree the verifier cannot honestly reason about.
+ *
+ * Each clause corresponds to a demonstrated escape, not a hypothetical:
+ * an external suite executed through a symlinked `tests/`; a symlinked artifact
+ * rendered invisible because it is neither a file nor a directory to `readdir`;
+ * a `noEmit` build leaving a poisoned checker in place to audit itself; and a
+ * bind mount that no path comparison can distinguish.
+ */
+export function assessTreeSafety(facts: TreeFacts): TreeSafetyVerdict {
+  if (facts.testsRootIsSymlink) {
+    return {
+      safe: false,
+      reason: "the tests directory is a symlink; an external suite would be compiled and executed as though it belonged to this tree",
+    };
+  }
+  if (facts.outputIsSymlink) {
+    return {
+      safe: false,
+      reason: "the build output directory is a symlink; the build would write outside the repository",
+    };
+  }
+  if (facts.outputOnDifferentDevice) {
+    return {
+      safe: false,
+      reason: "the build output directory is on a different device (a mount or bind mount); a recursive delete could reach outside the repository",
+    };
+  }
+  if (facts.buildEmitsNothing) {
+    return {
+      safe: false,
+      reason: "tsconfig sets noEmit, so the build produces nothing and any audit would run against whatever was already there",
+    };
+  }
+  if (!facts.checkerFreshlyEmitted) {
+    return {
+      safe: false,
+      reason: "the build did not emit the verification checker; refusing to audit this tree using a stale copy of the auditor",
+    };
+  }
+  if (facts.symlinkedSources.length > 0) {
+    return {
+      safe: false,
+      reason: `symlinked entries under tests/: ${facts.symlinkedSources.join(", ")}; source must live in this repository`,
+    };
+  }
+  if (facts.symlinkedArtifacts.length > 0) {
+    return {
+      safe: false,
+      reason: `symlinked test artifacts under the build output: ${facts.symlinkedArtifacts.join(", ")}; these are invisible to an ordinary file walk and must not remain`,
+    };
+  }
+  return { safe: true };
+}
+
 export type OutputDirectoryVerdict =
   | { readonly trusted: true; readonly directory: string }
   | { readonly trusted: false; readonly reason: string };
