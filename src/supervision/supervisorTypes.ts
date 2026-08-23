@@ -216,6 +216,23 @@ export const ESCALATION_REASONS = [
    * need to write a document is a wrong answer even when the refusal is right.
    */
   "HUMAN_DECISION_REQUIRED",
+  /**
+   * The work is correct and approved, and the available TOOLING refuses to
+   * perform it (TASK-009).
+   *
+   * Distinct from `HUMAN_DECISION_REQUIRED`, where a person must decide
+   * something, and from `AUTH_REQUIRED`, where a credential is missing. Here the
+   * decision is made and the credentials are present; a platform boundary has to
+   * be lifted or satisfied.
+   *
+   * The case that produced it: implementing `LOCAL_24_7_RUNTIME` requires
+   * generating systemd autostart units, and a safety classifier refuses
+   * agent-written persistence code — a correct default, not a bug to route
+   * around. Without a reason code for that, durable state kept asserting the
+   * item merely "needs an approved plan" long after the plan existed, and the
+   * real blocker survived only in a chat transcript.
+   */
+  "PLATFORM_CAPABILITY_BLOCKED",
   "RECOVERY_REQUIRED",
 ] as const;
 

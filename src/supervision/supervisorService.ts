@@ -187,6 +187,51 @@ export class SupervisorService {
     return sanitizeTickResult(result);
   }
 
+  /**
+   * Records a durable blocker against one roadmap item (TASK-009).
+   *
+   * The item is left in a fail-closed state the scheduler will not select, and
+   * everything needed to resume — why it stopped, and where to pick it up — goes
+   * into durable state rather than into whatever conversation happened to be
+   * open at the time.
+   *
+   * Routed through `escalate` rather than writing state directly, because a
+   * second way to mutate durable state is a second thing to get wrong: this way
+   * the text is bounded and redacted, and the write is CAS-protected, by the
+   * same code every other escalation already uses.
+   *
+   * This can ONLY restrict (AC-7). There is deliberately no counterpart that
+   * clears a blocker, marks an item DONE, edits dependencies or touches the
+   * financial policy — an operator unblocks by fixing the cause and letting the
+   * supervisor re-derive, not by asserting that it is fine now.
+   */
+  async recordBlocker(input: {
+    readonly roadmapKey: string;
+    readonly reason: EscalationReason;
+    readonly humanActionRequired: string;
+    readonly detail: string;
+  }): Promise<{ readonly ok: true } | { readonly ok: false; readonly reason: string }> {
+    const state = await this.ensureInitialized();
+    if (!state.roadmap.some((item) => item.key === input.roadmapKey)) {
+      // AC-3: never invent an item. A typo must fail loudly, not create a ghost
+      // entry that quietly never runs.
+      return {
+        ok: false,
+        reason: `no roadmap item named ${JSON.stringify(input.roadmapKey)}; known keys: ${state.roadmap
+          .map((item) => item.key)
+          .join(", ")}`,
+      };
+    }
+    await this.escalate(
+      state,
+      input.roadmapKey,
+      input.reason,
+      input.humanActionRequired,
+      input.detail,
+    );
+    return { ok: true };
+  }
+
   private async publishWake(): Promise<void> {
     const state = await this.deps.repository.load();
     if (state === undefined) {
@@ -1248,6 +1293,21 @@ export class SupervisorService {
     };
     const status = reason === "RECOVERY_REQUIRED" ? "BLOCKED" : "WAITING_FOR_HUMAN_REQUIRED";
     this.log(`[supervisor] ${roadmapKey} needs a human (${reason}): ${humanActionRequired}`);
+    /**
+     * SUPERSEDE, do not accumulate (TASK-009 AC-5).
+     *
+     * This appended unconditionally, so an item that escalates on every tick —
+     * which is exactly what a permanently blocked item does — grew the
+     * escalations array without bound, one entry per tick, forever. Latent in
+     * TASK-006 because nothing had yet stayed blocked across many ticks.
+     *
+     * An OPEN escalation for the same item is a statement about the item's
+     * current condition, so a newer one replaces it rather than queueing behind
+     * it. Resolved escalations are history and are kept.
+     */
+    const superseded = state.escalations.filter(
+      (entry) => entry.resolved || entry.roadmapKey !== roadmapKey,
+    );
     return this.commit(state, {
       ...state,
       roadmap: setStatus(
@@ -1257,7 +1317,7 @@ export class SupervisorService {
         boundedDiagnostic(detail),
         boundedDiagnostic(humanActionRequired),
       ),
-      escalations: [...state.escalations, escalation],
+      escalations: [...superseded, escalation],
     });
   }
 

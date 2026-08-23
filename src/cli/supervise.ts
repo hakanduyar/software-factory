@@ -26,7 +26,7 @@ import { parseFinancialPolicy } from "../supervision/financialSafety.js";
 import { boundedDiagnostic } from "../supervision/resourceClassifier.js";
 import { SupervisorService, type TickResult } from "../supervision/supervisorService.js";
 import type { WorkExecutionInput, WorkExecutor, WorkOutcome } from "../supervision/supervisorPorts.js";
-import type { SupervisorState } from "../supervision/supervisorTypes.js";
+import { ESCALATION_REASONS, type EscalationReason, type SupervisorState } from "../supervision/supervisorTypes.js";
 import { systemClock } from "../ports/clock.js";
 
 const DEFAULT_SUPERVISOR_DB_PATH = ".factory/supervisor.db";
@@ -200,6 +200,51 @@ function describeTick(result: TickResult, log: (line: string) => void): number {
     case "RECOVERY_REQUIRED":
       log(`RECOVERY REQUIRED: ${safe(result.reason)}`);
       return 1;
+  }
+}
+
+export interface SuperviseBlockOptions extends SuperviseCliOptions {
+  readonly roadmapKey: string;
+  readonly reason: string;
+  readonly humanActionRequired: string;
+  readonly detail: string;
+}
+
+/**
+ * Records a durable blocker (TASK-009).
+ *
+ * The one write command besides `tick`, and deliberately the narrowest possible
+ * one: it can only ever move an item INTO a fail-closed state. There is no
+ * counterpart that clears a blocker, because unblocking is done by fixing the
+ * cause and letting the supervisor re-derive — not by asserting it is fine now.
+ */
+export async function runSuperviseBlock(options: SuperviseBlockOptions): Promise<number> {
+  const log = options.log ?? ((line: string): void => console.log(line));
+
+  if (!(ESCALATION_REASONS as readonly string[]).includes(options.reason)) {
+    log(`unknown reason ${JSON.stringify(options.reason)}; expected one of: ${ESCALATION_REASONS.join(", ")}`);
+    return 1;
+  }
+
+  const repository = openRepository(options);
+  try {
+    const service = buildService(repository, log);
+    const result = await service.recordBlocker({
+      roadmapKey: options.roadmapKey,
+      reason: options.reason as EscalationReason,
+      humanActionRequired: options.humanActionRequired,
+      detail: options.detail,
+    });
+    if (!result.ok) {
+      log(safe(result.reason));
+      return 1;
+    }
+    log(`blocked    : ${safe(options.roadmapKey)} (${options.reason})`);
+    log(`action     : ${safe(options.humanActionRequired)}`);
+    log(`detail     : ${safe(options.detail)}`);
+    return 0;
+  } finally {
+    repository.close();
   }
 }
 

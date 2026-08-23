@@ -210,9 +210,13 @@ async function main(argv: readonly string[]): Promise<number> {
     }
     case "supervise": {
       const sub = argv[1];
-      const { runSuperviseTick, runSuperviseStatus, runSuperviseResources, runSuperviseRoadmap } = await import(
-        "./supervise.js"
-      );
+      const {
+        runSuperviseTick,
+        runSuperviseStatus,
+        runSuperviseResources,
+        runSuperviseRoadmap,
+        runSuperviseBlock,
+      } = await import("./supervise.js");
       const log = (line: string): void => console.log(line);
 
       if (sub === "tick") {
@@ -233,7 +237,19 @@ async function main(argv: readonly string[]): Promise<number> {
         await runSuperviseRoadmap({ log });
         return 0;
       }
-      console.error(`Usage: sf supervise <tick|status|resources|roadmap>`);
+      if (sub === "block") {
+        // sf supervise block <KEY> <REASON> <ACTION> [DETAIL]
+        const roadmapKey = argv[2];
+        const reason = argv[3];
+        const humanActionRequired = argv[4];
+        const detail = argv[5] ?? "";
+        if (roadmapKey === undefined || reason === undefined || humanActionRequired === undefined) {
+          console.error(`Usage: sf supervise block <ROADMAP_KEY> <REASON> <HUMAN_ACTION> [DETAIL]`);
+          return 1;
+        }
+        return runSuperviseBlock({ roadmapKey, reason, humanActionRequired, detail, log });
+      }
+      console.error(`Usage: sf supervise <tick|status|resources|roadmap|block>`);
       return 1;
     }
     case "help":
