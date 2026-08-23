@@ -307,11 +307,30 @@ export class SupervisorService {
     void _dropped;
 
     if (claim.state === "CLAIMED") {
-      // Proves the external launch never happened: a bounded retry is safe.
-      this.log(`[supervisor] clearing an unlaunched claim ${claim.actionId}`);
+      /**
+       * Proves the external launch never happened: a bounded retry is safe.
+       *
+       * REVIEW FINDING (TASK-009, CRITICAL). "Safe to retry" was applied
+       * unconditionally, so this promoted the item to ELIGIBLE even when
+       * something had SINCE decided it must not run. A blocker recorded against
+       * an item that happened to hold a CLAIMED action was therefore erased by
+       * the next tick's housekeeping, after which the item ran and reached DONE.
+       *
+       * Clearing a claim says only that the ACTION did not happen. It says
+       * nothing about whether the ITEM may still proceed, and conflating the two
+       * let a deliberate restriction be undone by an unrelated mechanism. A
+       * human-required or blocked status outranks a retry.
+       */
+      const item = state.roadmap.find((entry) => entry.key === claim.roadmapKey);
+      const restricted = item?.status === "WAITING_FOR_HUMAN_REQUIRED" || item?.status === "BLOCKED";
+      this.log(
+        restricted
+          ? `[supervisor] clearing an unlaunched claim ${claim.actionId}; ${claim.roadmapKey} stays ${item?.status ?? "restricted"}`
+          : `[supervisor] clearing an unlaunched claim ${claim.actionId}`,
+      );
       const cleared = await this.commit(state, {
         ...withoutClaim,
-        roadmap: setStatus(state.roadmap, claim.roadmapKey, "ELIGIBLE"),
+        roadmap: restricted ? state.roadmap : setStatus(state.roadmap, claim.roadmapKey, "ELIGIBLE"),
       });
       return { state: cleared };
     }

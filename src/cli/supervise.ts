@@ -343,6 +343,22 @@ export async function runSuperviseRoadmap(options: SuperviseCliOptions = {}): Pr
       if (item.humanActionRequired !== undefined) {
         log(`    human: ${safe(item.humanActionRequired)}`);
       }
+      /**
+       * The blocker's REASON and DETAIL, from the open escalation.
+       *
+       * TASK-009 AC-10 claims the information needed to resume a blocked item is
+       * recoverable from this command alone. It was not: the detail — spec path,
+       * branch, commit — lived only in the escalation record, which `roadmap`
+       * never printed. The information was durable but invisible, which is not
+       * the same thing as recoverable. The independent review caught the claim.
+       */
+      const open = state.escalations.find((entry) => entry.roadmapKey === item.key && !entry.resolved);
+      if (open !== undefined) {
+        log(`    reason: ${open.reason}`);
+        if (open.detail.length > 0) {
+          log(`    detail: ${safe(open.detail)}`);
+        }
+      }
     }
     return state;
   } finally {

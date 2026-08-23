@@ -75,6 +75,17 @@ export function buildWorkerEnvironment(
  */
 const SECRET_PATTERNS: readonly RegExp[] = [
   /sk-ant-[A-Za-z0-9_-]{10,}/g,
+  /**
+   * OpenAI's project-scoped keys (`sk-proj-…`) contain `-` and `_`, which the
+   * `sk-[A-Za-z0-9]{20,}` rule below does NOT match — it stops at the first
+   * hyphen. Found by the TASK-009 independent review, which put one through a
+   * blocker detail and watched it reach durable state intact.
+   *
+   * The lesson generalises past this one prefix: a redactor is only as current
+   * as the credential formats it has been taught, so the safe direction is a
+   * broad token-shaped rule for known vendor prefixes rather than an exact one.
+   */
+  /sk-(?:proj|svcacct|admin)-[A-Za-z0-9_-]{10,}/g,
   /sk-[A-Za-z0-9]{20,}/g,
   /ghp_[A-Za-z0-9]{20,}/g,
   /gho_[A-Za-z0-9]{20,}/g,
