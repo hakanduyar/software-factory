@@ -16,7 +16,16 @@
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  cpSync,
+  linkSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
@@ -246,6 +255,68 @@ describe("TASK-010 round 2: paths are judged by what they resolve to", () => {
    * the build wrote nothing, a poisoned stale checker stayed in charge, and the
    * run reported `0 test files, tree-consistent` having executed nothing.
    */
+  /**
+   * B11 — a symlinked DIRECTORY under the output was neither walked into nor
+   * reported, because the symlink filter only kept entries whose own name ended
+   * in `.test.js`. The check caught the shape of the escape already
+   * demonstrated, and nothing more.
+   */
+  it("REFUSES a symlinked directory under the output, not just symlinked files", () => {
+    const root = makeFixtureRepo();
+    assert.equal(runHarness(root).status, 0);
+
+    const external = mkdtempSync(join(tmpdir(), "sf-foreign-out-"));
+    created.push(external);
+    writeFileSync(join(external, "ghost.test.js"), "// stale\n");
+    symlinkSync(external, join(root, "dist/foreign-output"), "dir");
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, "a symlinked output subdirectory was invisible");
+    assert.match(output, /symlinked test artifacts|foreign-output/);
+  });
+
+  /**
+   * B9 — a hardlink is indistinguishable from an ordinary file by name, type or
+   * realpath. Link count is the ordinary signal, and it catches the accidental
+   * case; see the threat-model note for what it does not catch.
+   */
+  it("REFUSES a hardlinked external test source", () => {
+    const root = makeFixtureRepo();
+    const external = mkdtempSync(join(tmpdir(), "sf-hardlink-"));
+    created.push(external);
+    const outsider = join(external, "outsider.test.ts");
+    writeFileSync(
+      outsider,
+      ['import { it } from "node:test";', 'it("outsider", () => {});', ""].join("\n"),
+    );
+    linkSync(outsider, join(root, "tests/hardlinked.test.ts"));
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, "a hardlinked external source was compiled and executed");
+    assert.match(output, /symlinked entries under tests|hardlinked/);
+  });
+
+  /** B12 — `extends` can carry noEmit in without the root file mentioning it. */
+  it("REFUSES an INHERITED noEmit, not just one written in the root tsconfig", () => {
+    const root = makeFixtureRepo();
+    assert.equal(runHarness(root).status, 0, "fixture must pass first");
+
+    writeFileSync(
+      join(root, "tsconfig.base.json"),
+      JSON.stringify({ compilerOptions: { noEmit: true } }, null, 2),
+    );
+    const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as Record<
+      string,
+      unknown
+    >;
+    tsconfig["extends"] = "./tsconfig.base.json";
+    writeFileSync(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, "an inherited noEmit produced a passing verification");
+    assert.ok(!output.includes("tree-consistent"), "it must not claim consistency");
+  });
+
   it("REFUSES a noEmit build rather than auditing with a stale auditor", () => {
     const root = makeFixtureRepo();
     assert.equal(runHarness(root).status, 0, "fixture must pass first");

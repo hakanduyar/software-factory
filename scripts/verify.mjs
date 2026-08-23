@@ -27,6 +27,31 @@
  * condition it exists to detect teaches everyone that contamination is normal.
  * It still cleans, so the NEXT run is honest; but this run names the problem and
  * exits non-zero.
+ *
+ * ================================================================
+ * THREAT MODEL — what this defends against, and what it does not
+ * ================================================================
+ * DEFENDS AGAINST (the observed, real problem): gitignored build output that git
+ * does not clean on checkout; stale artifacts from another branch; a partial or
+ * redirected build; a misconfigured `outDir`; an inherited `noEmit`; symlinks
+ * and hardlinks that pull code in from outside the tree; a bind-mounted output
+ * directory that a recursive delete would reach through; and a run that would
+ * report success having executed nothing.
+ *
+ * DOES NOT DEFEND AGAINST an adversary with concurrent write access to this
+ * working tree, or control of `PATH`, during the run. Round-3 review
+ * demonstrated two such escapes: pausing the compiler and swapping `tests/`
+ * between the check and the build, and shadowing `npx` so no compilation
+ * happened while the stale checker's mtime was touched.
+ *
+ * Those are real, and they are NOT closed. The honest reason is that such an
+ * adversary can already edit `src/` directly, replace `node`, or rewrite this
+ * file — so no verifier running inside the tree it audits can defend against
+ * them. Claiming otherwise would be the same overstatement this task exists to
+ * remove. Time-of-check/time-of-use gaps here are bounded by that boundary, not
+ * by cleverness, and closing them needs the verification to run somewhere the
+ * adversary is not: a clean checkout in an isolated environment, which is the
+ * `CLEAN_ROOM_CI` roadmap item.
  */
 
 import { execFileSync } from "node:child_process";
@@ -52,6 +77,27 @@ function deviceOf(path) {
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Test sources that are hardlinks to a file living somewhere else (B9).
+ *
+ * A hardlink is indistinguishable from an ordinary file by name, type or
+ * `realpath` — the only ordinary signal is a link count above one. That catches
+ * the accidental and casual cases; see the threat-model note at the top of this
+ * file for what it does not catch.
+ */
+function findHardlinkedSources(directory) {
+  const found = [];
+  for (const rel of listFiles(directory)) {
+    if (!rel.endsWith(".test.ts")) continue;
+    try {
+      if (lstatSync(join(REPO_ROOT, rel)).nlink > 1) found.push(rel);
+    } catch {
+      /* unreadable entries are reported by the walk itself */
+    }
+  }
+  return found.sort();
 }
 
 /** Symlinked entries anywhere beneath a directory, as repo-relative paths. */
@@ -152,8 +198,24 @@ if (declared !== OUTPUT_DIR) {
 // structural checks that do not need the compiled checker happen first. A
 // symlinked output directory was previously refused only AFTER the build had
 // already written into the external target.
-const tsconfigRaw = readFileSync(join(REPO_ROOT, "tsconfig.json"), "utf8");
-const noEmit = /"noEmit"\s*:\s*true/.test(tsconfigRaw);
+// EFFECTIVE config, not the raw root file (round-3 finding B12). `extends` means
+// a root tsconfig that mentions nothing can still inherit `noEmit`, and scanning
+// the raw text would miss it entirely — a silent pass with no attacker involved.
+const effectiveConfig = (() => {
+  try {
+    const shown = execFileSync("npx", ["tsc", "-p", "tsconfig.json", "--showConfig"], {
+      cwd: REPO_ROOT,
+      encoding: "utf8",
+    });
+    return JSON.parse(shown);
+  } catch {
+    return undefined;
+  }
+})();
+if (effectiveConfig === undefined) {
+  fail("verification refused: could not resolve the effective tsconfig; refusing to build a configuration it cannot read");
+}
+const noEmit = effectiveConfig?.compilerOptions?.noEmit === true;
 if (isSymlink(join(REPO_ROOT, "tests"))) {
   fail("verification refused: the tests directory is a symlink; an external suite would be compiled and executed as though it belonged to this tree");
 }
@@ -210,11 +272,14 @@ const safety = checker.assessTreeSafety({
   outputIsSymlink: isSymlink(join(REPO_ROOT, OUTPUT_DIR)),
   outputOnDifferentDevice:
     outputDevice !== undefined && rootDevice !== undefined && outputDevice !== rootDevice,
-  // A symlinked artifact is neither `isFile()` nor `isDirectory()` to `readdir`,
-  // so the ordinary walk cannot see it — which made a symlinked stale test
-  // invisible to the audit while still being runnable.
-  symlinkedArtifacts: findSymlinks(OUTPUT_DIR, (path) => checker.isTestArtifact(path)),
-  symlinkedSources: findSymlinks("tests"),
+  // EVERY symlink under the output, not only those whose own name ends in
+  // `.test.js` (round-3 finding B11). A symlinked DIRECTORY called
+  // `foreign-output` was neither walked into nor reported, so an external
+  // `ghost.test.js` inside it was invisible and the run reported a consistent
+  // tree. Filtering by name meant the check only caught the shape of the escape
+  // that had already been demonstrated.
+  symlinkedArtifacts: findSymlinks(OUTPUT_DIR),
+  symlinkedSources: [...findSymlinks("tests"), ...findHardlinkedSources("tests")].sort(),
   buildEmitsNothing: noEmit,
   checkerFreshlyEmitted,
 });

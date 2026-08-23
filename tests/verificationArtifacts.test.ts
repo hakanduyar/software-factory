@@ -217,4 +217,23 @@ describe("TASK-010 AC-8: the invariant is stated where it will be found", () => 
       );
     }
   });
+
+  /**
+   * Round 3 demonstrated two escapes that are NOT closed: swapping `tests/`
+   * between the check and the build, and shadowing `npx` so nothing compiled.
+   * Both need an adversary with concurrent write access to the tree or control
+   * of PATH — who can equally edit `src/` or replace `node`, which is why no
+   * verifier running inside the tree it audits can defend against them.
+   *
+   * The limit is therefore STATED rather than fixed. This test exists so the
+   * statement cannot quietly disappear in a later edit, leaving a verifier that
+   * silently implies more assurance than it has.
+   */
+  it("states the threat-model boundary it does NOT cover", async () => {
+    const fs = await import("node:fs/promises");
+    const source = await fs.readFile("scripts/verify.mjs", "utf8");
+    assert.match(source, /DOES NOT DEFEND AGAINST/, "the boundary must be stated explicitly");
+    assert.match(source, /concurrent write access/, "the adversary must be named");
+    assert.match(source, /CLEAN_ROOM_CI/, "the item that would close it must be named");
+  });
 });
