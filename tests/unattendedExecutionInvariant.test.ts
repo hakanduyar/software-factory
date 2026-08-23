@@ -106,6 +106,12 @@ describe("A. structural — no interactive-I/O primitive exists in the autonomou
     "src/adapters/orchestration",
     "src/planning",
     "src/adapters/planning",
+    // TASK-006 extends it again to the supervisor, which is the one component
+    // that MUST run with nobody watching: under a systemd timer there is no
+    // terminal to answer a prompt, so one here would deadlock the entire
+    // autonomous loop rather than merely annoy an operator.
+    "src/supervision",
+    "src/adapters/supervision",
   ];
   // Anything that could pause a process waiting for a human at a keyboard.
   // "prompt(" deliberately excluded as a bare token — this codebase's own

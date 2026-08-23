@@ -7,6 +7,7 @@
  */
 
 import { PROTECTED_GATES } from "../domain/approval.js";
+import { boundedDiagnostic } from "../supervision/resourceClassifier.js";
 import { WORK_ITEM_STATUSES } from "../domain/status.js";
 import { TRANSITION_RULES, allowedTargets, gatedTransitions } from "../workflow/transitions.js";
 import { runDemo } from "./demo.js";
@@ -39,6 +40,12 @@ Usage:
                       Reject the current plan revision (trusted human)
   sf plan resume <plan-id>   Resume planning/materialization/dispatch after a restart
   sf plan cancel <plan-id>   Durably cancel a plan (trusted human)
+  sf supervise tick   Run ONE bounded autonomous-completion pass and exit (TASK-006).
+                      Designed for a systemd timer/cron: between ticks no process
+                      runs, so waiting for a provider costs nothing.
+  sf supervise status     Show supervisor state, spending policy and open escalations
+  sf supervise resources  Show per-resource availability, retry times and backoff
+  sf supervise roadmap    Show the durable roadmap queue and what it is waiting on
   sf help             Show this message
 `;
 
@@ -201,6 +208,34 @@ async function main(argv: readonly string[]): Promise<number> {
       console.error(`Usage: sf plan <start|status|answer|approve|reject|resume|cancel>`);
       return 1;
     }
+    case "supervise": {
+      const sub = argv[1];
+      const { runSuperviseTick, runSuperviseStatus, runSuperviseResources, runSuperviseRoadmap } = await import(
+        "./supervise.js"
+      );
+      const log = (line: string): void => console.log(line);
+
+      if (sub === "tick") {
+        const result = await runSuperviseTick({ log });
+        // A resource shortage or a human-only boundary is an expected outcome,
+        // not a failure; only unrecoverable state is a non-zero exit.
+        return result.kind === "RECOVERY_REQUIRED" ? 1 : 0;
+      }
+      if (sub === "status") {
+        await runSuperviseStatus({ log });
+        return 0;
+      }
+      if (sub === "resources") {
+        await runSuperviseResources({ log });
+        return 0;
+      }
+      if (sub === "roadmap") {
+        await runSuperviseRoadmap({ log });
+        return 0;
+      }
+      console.error(`Usage: sf supervise <tick|status|resources|roadmap>`);
+      return 1;
+    }
     case "help":
     case "--help":
     case "-h":
@@ -218,6 +253,17 @@ main(process.argv.slice(2))
     process.exitCode = code;
   })
   .catch((error: unknown) => {
-    console.error(error instanceof Error ? error.message : String(error));
+    /**
+     * R10-SEC-2: the LAST unguarded output path.
+     *
+     * A parse failure quotes the offending value back — that is what makes the
+     * message useful — and the offending value comes from a database that may
+     * have been edited, restored, or written by an older build. So the final
+     * error boundary gets the same bounded redaction as every other place text
+     * leaves this process. An error handler is the one place it is easiest to
+     * forget and worst to get wrong, because it runs precisely when something
+     * has already gone strange.
+     */
+    console.error(boundedDiagnostic(error instanceof Error ? error.message : String(error)));
     process.exitCode = 1;
   });

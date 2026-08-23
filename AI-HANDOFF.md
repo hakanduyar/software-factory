@@ -2827,3 +2827,382 @@ accepted test; the two accepted TASK-004 forgery tests were already correct.
 All nine previously deferred notes remain deferred and untouched.
 
 ## 24. Ready for independent TASK-005 re-review: YES
+
+# TASK-005 FINAL INDEPENDENT ACCEPTANCE — Codex CLI (GPT-5.6 Luna, Extra High), 2026-08-23
+
+**Verdict: `PASS_WITH_NON_BLOCKING_NOTES`. "TASK-005 is safe for human acceptance
+and commit." Safe to commit: YES.** Zero CRITICAL/HIGH findings.
+
+Independently closed: all seven round-1 HIGHs, the round-1 BLOCKED-phase defect,
+the round-2 dispatch-loop HIGH, the cross-wired-loop sibling, the terminal
+status/resume disagreement, and the round-3 SQLite `ApprovalContext` field-loss
+HIGH. The reviewer re-derived the domain/adapter parity audit against the code
+(all twelve types), confirmed the `Record<keyof Required<ApprovalContext>, true>`
+guard is non-vacuous including its compile-time claim, and independently proved
+non-vacuity by mutating a `/tmp` copy (1/5 parity-guard and 2/4 round-3 tests
+failed). 937/937 across three consecutive runs; focused groups 386/386 and
+259/259; all demos PASS; repository unchanged by review.
+
+## Human decision
+"TASK-005'i kabul ediyorum." — accepted, integrated, and merged to `main` as
+`01f9e5d` (squash), with feature branch `feat/planner-task-generator` retained at
+`562d15c`.
+
+# TASK-006 — Autonomous Completion & Resource Supervisor
+
+Branch: `feat/autonomous-completion-supervisor`, based on `01f9e5d`.
+
+## 1. What it is for
+After TASK-005 the Factory could take intent → plan → approval → work items →
+the TASK-004 loop, but every step still needed a live AI session with a human
+relaying prompts. TASK-006 moves the Factory's memory and scheduling into
+deterministic infrastructure — SQLite, Git, and a one-shot supervisor process —
+so a model session becomes a disposable worker rather than the seat of the
+Factory's mind.
+
+Two rules govern the design:
+
+- **AI must never be used to wait for AI.** `sf supervise tick` does ONE bounded
+  pass and exits. Between ticks no process runs at all, so waiting for a
+  provider costs zero tokens and zero CPU. There is no loop in which a model
+  could be held open to ask "is the limit reset yet?".
+- **The Factory has exactly zero autonomous financial authority.** Enforced by a
+  gate that structurally cannot be overridden (§3 below).
+
+## 2. Everything was measured, nothing invented
+No CLI flag, output string or exit code in this task was assumed. Measured on
+this machine before use: Claude Code `2.1.238` (`--model`, `--effort`,
+`--fallback-model`, `-p`, `--output-format json`); codex-cli `0.149.0` (`-m`,
+`-c model_reasoning_effort=`, `-s`, `--json`, `-o`); zero-token probes
+`claude auth status` (JSON with `loggedIn`) and `codex doctor --json`
+(`checks["auth.credentials"].status`); systemd 255 with the **user instance
+running**, `systemd-run` and `crontab` present, `at` absent.
+
+**What could NOT be measured is not claimed.** Neither CLI documents its
+rate-limit or usage-exhaustion output, and observing a real one would mean
+deliberately exhausting a paid quota. So no rate-limit signature ships as
+`MEASURED`: provisional patterns are listed, clearly labelled, and **inert**. A
+real limit therefore classifies as `UNKNOWN_FAILURE` — which is safe, because an
+unclassified failure gets bounded backoff, exactly the right treatment for a
+suspected transient limit. When a genuine response is captured its fixture is
+added and behaviour sharpens from "back off" to "wait until the stated reset".
+
+## 3. FinancialSafetyGate — the blocking invariant
+`AUTONOMOUS_SPEND_LIMIT = 0`, `autonomousSpendAllowed = false`.
+
+The gate's signature is `evaluateFinancialSafety(action, policy)` — **no Actor,
+no TrustedHumanToken, no Approval, no plan, no model output**. There is no
+parameter through which authorization could be passed, so a caller holding
+genuine authority for something else cannot pass it. A PLAN_APPROVAL, a
+RELEASE_APPROVAL, task acceptance, the completion mandate itself and a model
+announcing "purchase approved" therefore have exactly zero effect, because none
+of them can reach the function. Same discipline as TASK-001's `Worker`, which
+never receives the identity credential.
+
+Classification is **derived, not declared**: a caller may state a class, and the
+gate takes the most restrictive of declared and derived — TASK-005 round 1's
+"a caller that describes its own target favourably widens its own authority",
+applied to money. An **unknown action kind is FINANCIAL_ACTION**; the supervisor
+executes a closed set, so an unrecognised kind is suspicious, not merely
+unlisted. A "free tier" requiring a card, metering usage, or auto-converting is
+financial. Missing/malformed/self-contradictory policy **denies**. There is no
+de minimis exception.
+
+Using an already-paid subscription within its included quota is
+`FREE_REMOTE_ACTION`; every action that would ENLARGE spend — overage, top-up,
+credits, plan upgrade, payment method — is separately registered and financial.
+
+Defence in depth is documented as: this gate, then least-privilege provider
+credentials that technically cannot manage billing (a requirement recorded for
+the later server task, since prompt-level prohibition is insufficient where
+provider-level permission separation exists), then human-only transactions.
+
+## 4. Resource state machine and zero-token recovery
+Eight durable states (`AVAILABLE`, `BUSY`, `RATE_LIMITED`,
+`USAGE_LIMIT_REACHED`, `MODEL_UNAVAILABLE`, `PROVIDER_UNAVAILABLE`,
+`AUTH_REQUIRED`, `UNKNOWN_FAILURE`). `WAITING_FOR_RESOURCE` is deliberately NOT
+a resource state — a resource is exhausted, a TASK waits; a shortage is not
+`FAILED` and not `RECOVERY_REQUIRED`.
+
+Classification consults, in strict priority: process facts from the accepted
+TASK-003 `ProcessRunner`; structured zero-token probe output parsed by FIELD not
+by prose; the signature table; then `UNKNOWN_FAILURE`. **No model is ever
+invoked to classify a provider error.**
+
+Recovery prefers a provider-stated reset time, then a zero-token probe, then a
+scheduled wake, then bounded backoff `5m → 15m → 30m → 60m` (deterministic, no
+jitter, persisted so a restart continues the ladder rather than hammering the
+provider at the first rung forever). **A resource with a known `retryAt` in the
+future is not probed at all.** `AUTH_REQUIRED` schedules no retry, because no
+timer can supply a credential.
+
+## 5. Model/effort enforcement, honestly
+Requested model and effort become real argv built by the same pure builders the
+accepted adapters use. Every run records requested/effective/verification. The
+verification status is `UNVERIFIED` unless the provider itself echoes the
+identity back — recording an unverified claim as verified is the exact defect
+this task exists to remove. The argv is captured as evidence (prompt redacted),
+which is a genuinely stronger proof of intent than prompt text. An effort the
+installed CLI cannot apply is **refused, not silently downgraded**.
+
+## 6. Reviewer independence and no unsuitable substitution
+A routing whose reviewer resource equals the implementer's is refused, not
+deprioritised; absent an independent reviewer the item WAITS. Each work class
+carries a quality floor, and a resource below it is not a fallback but a
+different, worse answer — so the work waits instead. An equally-qualified
+alternative IS a legitimate fallback.
+
+## 7. Session rollover vs. quota exhaustion
+Different problems, different answers: a full context checkpoints and rolls the
+session over; an exhausted quota waits for `retryAt`. `SessionCheckpoint` is
+bounded and structured (project, work item, plan/revision, branch, base commit,
+action identity, iteration, completed/pending verification, findings, next
+action, required work class). Raw transcripts are never the authoritative
+memory — if resuming needed the previous chat, the Factory would still be
+hostage to a session.
+
+## 8. A defect found by running it, not by testing it
+The first live `sf supervise tick` reported that a roadmap item needing a PLAN
+required "a human to personally perform this transaction". The refusal was
+correct — `PLAN_ROADMAP_ITEM` was an unregistered kind, and uncertainty is
+financial — but telling an operator to make a PAYMENT when they need to write a
+document is a wrong answer even when the refusal is right. Fixed by registering
+`AUTHOR_PLAN` as free/local and adding `HUMAN_DECISION_REQUIRED`, so a free
+action that still needs a person is reported as a decision rather than a
+transaction. A regression test asserts the advice never mentions
+payment/purchase for a zero-cost action.
+
+## 9. What TASK-006 deliberately does NOT do
+It schedules work; it does not perform it. Turning a roadmap item into an
+approved plan and driving TASK-004 belongs to the next roadmap task, and
+inventing it here would be exactly the "second engineering loop" every previous
+task refused to build. The shipped executor therefore reports honestly that an
+approved plan is required. Every other part — resource states, waiting, backoff,
+gating, routing, checkpointing, escalation, persistence, CLI — is fully live and
+was exercised end-to-end against real probes and a real SQLite file.
+
+No deployment, no systemd unit file: TASK-006 publishes `nextWakeAt` and ships
+the one-shot tick, which is what a timer needs. Wiring it to a timer belongs to
+`LOCAL_24_7_RUNTIME`, the first roadmap item — which, per the amendment, means
+making the always-on Windows PC + WSL2 a reliable Factory host. **No VPS and no
+paid infrastructure of any kind is in scope.**
+
+## 10. Remediation rounds 1–10
+Ten independent reviews, fifty-six findings closed and two ADJUDICATED as
+architectural boundaries and tracked as roadmap items rather than claimed closed.
+Full record in
+`docs/tasks/TASK-006-autonomous-completion-resource-supervisor.md`. The
+condensed version:
+
+- **Round 1 (F-1…F-9).** A persisted row could grant a spending budget (F-1); a
+  persisted row could assert a provider was healthy (F-8); a VERB asserted that
+  running a model was free (F-2).
+- **Round 2 (N-1…N-4).** N-1 was a CRITICAL **the round-1 remediation itself
+  introduced**: fixing F-2 by letting `action.effects` replace the registry
+  reopened the "declared, not derived" hole in the same commit that closed a
+  different one. Recorded plainly rather than buried, because it is the most
+  instructive event in the task.
+- **Round 3 (NEW-FIN-1, NEW-FIN-2, NEW-SEC-1, NEW-MODEL-1).** Billing mode is
+  now OBSERVED from the provider rather than declared in configuration; the
+  effects registry is deeply frozen; executor-authored text is redacted and
+  bounded at a single chokepoint (`setStatus`), not per call site; and only
+  allowlisted models reach argv.
+
+- **Round 4 (F4-1…F4-9).** The same sentence aimed at four things nobody had
+  filed under "data": the ORDER of an exported array decided which class was
+  stricter; the authoritative billing facts for a model launch were a FIELD on
+  the caller's own object; a fresh-looking TIMESTAMP was accepted instead of a
+  probe; and `RUN_VERIFICATION_COMMAND` was free while naming no command, which
+  made `gcloud compute instances create` free verification. Plus: C4 walked one
+  edge of the lineage instead of the whole ancestry, two allowlists were mutable,
+  "verified" was reported for dimensions nothing had verified, and the run
+  configuration existed only for the length of one call.
+
+- **Round 5 (F5-*).** Four CRITICAL, seven HIGH — **two of the CRITICALs
+  introduced by round 4's own fixes.** The mint bound effects to an object but
+  not to its KIND, so mutating `kind` laundered "this model is on a subscription"
+  into a verdict about a shell command. The round-4 executable allowlist could
+  not constrain what those executables did: `npm run charge`, `npx anything`,
+  `node --import`, `sh -c` and `git push` all passed it — `sh` on an allowlist is
+  not a command, it is permission to run any command. Plus:
+  `subscriptionType: "free"` classified as an included subscription, deterministic
+  work could decline to declare its actions and was therefore never asked, an
+  effort-only identity report was ignored, provider was not a verified dimension
+  at all, and `GIT_PUSH` was claimed free on no evidence.
+
+- **Round 6 (F6-*).** Two CRITICAL, five HIGH — and the first round whose
+  findings were mostly not self-inflicted: the reviewer ran its own
+  delete-the-fix experiments across sixteen earlier fixes and confirmed most held.
+  The mint said HOW an action was billed but never WHAT it was billed for, so an
+  "included" verdict for one resource authorized launching another. An unreadable
+  policy still permitted local work. An AI worker could omit its identity
+  entirely and reach DONE on an honest-looking `UNVERIFIED`. "Append-only"
+  implementer history evicted the OLDEST entry at 32. Unknown lineage failed
+  closed only for DONE ancestors. And round 5's own `resumedFromActionId` was
+  executor-supplied, unsanitized and forgeable.
+
+- **Round 7 (R7-*).** No CRITICAL, five HIGH, and the reviewer endorsed the
+  `EXECUTOR_ISOLATION` deferral instead of re-reporting it. `reportedIdentity: {}`
+  satisfied "did the worker say what it ran?" because the check asked only
+  whether a container existed. A fabricated `["not-a-resource"]` implementer
+  satisfied "do we know who built this?" while excluding nobody. A row persisted
+  as `ELIGIBLE` ran while its prerequisite was still `PENDING`. The SQLite
+  repository returned mutable state while the in-memory one returned frozen
+  state — so an executor could mutate `input.item.key` and settle the wrong item,
+  in production only. And the F6-FIN-1 regression could not fail: deleting its
+  guard left all 1292 tests green, because the mutation that "verified" it had
+  broken the guard's INPUT rather than the guard.
+
+- **Round 8 (R8-*).** One CRITICAL, three HIGH — two introduced by round 7. A
+  Claude payload with a recognised plan and provider but NO `authMethod`
+  classified as an included subscription, and a tick launched a worker on it:
+  three fields agreeing about the PLAN taken as evidence about who pays for the
+  CALLS. Validating a reported identity and reconciling it were two reads, so
+  getters could answer differently each time. The set of "recognised
+  implementers" included PERSISTED resource rows — the anti-forgery check
+  validated against forgeable data. And `sanitizeCheckpoint` spread the
+  executor's object, so an undeclared `secret:` property reached the raw SQLite
+  JSON.
+
+- **Round 9 (R9-*).** No CRITICAL, three HIGH, and **the first clean financial
+  assessment**: the reviewer could find no path through the gate that classified
+  a chargeable action as free or executed one autonomously, after trying
+  confusable auth methods, saved-card and subscription claims, malformed
+  policies, forged billing observations, exhaustion paths and model-output
+  claims. The findings: the CLI printed persisted text unbounded and unredacted
+  (every prior sanitization fix guarded a WRITE; a database is also an INPUT); a
+  forged implementer history naming a REAL catalog resource is recognised; and
+  two of my own round-8 regressions passed for the wrong reason — one asserted
+  against parsed state, where the parser drops the very field under test.
+
+- **Round 10 (R10-*).** One CRITICAL, three HIGH, all narrow — and the round that
+  ADJUDICATED both open boundaries as legitimate deferrals. The public minter
+  still took `billingMode` as a bare string, so any caller could declare a
+  metered resource free; a billing mode must now arrive inside an observation
+  bound to the resource it describes. `describeTick` printed persisted
+  identifiers raw, and the top-level CLI `catch` printed parse errors raw — and
+  a parse error quotes the offending persisted value back by design. Plus the
+  R8-ID getter test, wrong for the third time.
+
+Every finding is the same sentence: **a safety property that depends on data the
+system itself can write is not a safety property.** Configuration, an in-process
+object, executor output, a caller-supplied string, an array's order and a
+timestamp are all data the system can write.
+
+**And the meta-pattern, stated plainly because it is the useful one:** five of the
+six rounds found a defect that the PREVIOUS round's remediation introduced. A fix
+that moves an invariant to a new place needs the same adversarial attention the
+old place got, and nothing in a single session reliably supplies that. C4 is not
+overhead on this task; it is the only thing that has caught any of it.
+
+**Two things NOT closed, deliberately not claimed, and tracked as roadmap items
+that both block `EXECUTOR_WIRING`:**
+
+1. **`EXECUTOR_ISOLATION`** — the in-process `WorkExecutor` can act outside what
+   it declared (F5-FIN-3 / F6-FIN-2). Uncloseable from inside the process: an
+   in-process function cannot restrain code that can already call `fetch`. Same
+   boundary TASK-003's `Worker` has. Round 7 reviewed the deferral itself and
+   endorsed it.
+2. **`STATE_INTEGRITY`** — implementer lineage and audit records are recorded
+   historical facts living in a database, with no key on this machine to
+   authenticate them (R9-C4-1, F5-AUDIT-1). The supervisor raises the cost
+   (catalog recognition, a cross-check against a field a different path writes,
+   fail-closed on anything missing or contradictory) but cannot make the record
+   self-proving. **The supervisor database is part of the trusted computing
+   base.**
+
+Regression tests assert both dependencies so the ordering cannot be quietly
+dropped, and one test deliberately PINS the remaining lineage gap so that closing
+it will fail the test and force the claim to be revisited.
+
+Note the contrast that makes these honest rather than excuses: spending authority
+has no such gap, because F-1 made it impossible to express in data at all. No row
+can grant it, so no row has to be trusted. Lineage cannot be handled that way —
+"who ran this last week" is inherently a record.
+
+The structural answers now in place, in escalating order of how hard they are to
+get around: freeze it (allowlists, the effects registry, the class list); derive
+it rather than read it (rank map, not `indexOf`); sanitize at a chokepoint rather
+than per call site (`setStatus`, `sanitizeCheckpoint`); make the signature unable
+to reach the tempting value (`billingModeFor` takes the observation as a
+parameter); and make the authoritative value unforgeable by putting it somewhere
+the caller cannot address at all (the `WeakMap` mint).
+
+### The round-3 bug the round-3 fix caused
+`ResourceRecord.observedBillingMode` was added to the domain type and not to the
+SQLite parser, so a restart erased what the supervisor had learned about billing
+and every subsequent AI action silently became financial — the identical failure
+that caused TASK-005 remediation round 3, one layer over. The restart test
+caught it; that it was catchable only behaviourally is the problem, so
+`tests/supervisorStateRoundTrip.test.ts` now makes a missing serializer field a
+COMPILE error for every durable supervisor type.
+
+## 11. Verification (native WSL, `node v22.22.3`, `npm 10.9.8`)
+typecheck PASS · build PASS · `npm test` **1347/1347** (937 → 1347, +410) ·
+`git diff --check` clean · `demo`, `demo:persistent`, `demo:loop`, `demo:plan`
+all PASS · `sf supervise tick|status|resources|roadmap` exercised against real
+zero-token probes and a real SQLite database.
+
+The live run confirms the billing change end-to-end rather than only in tests:
+all three catalogued resources report `billing=INCLUDED_SUBSCRIPTION` derived
+from the real probes, and `sf supervise tick` escalates `LOCAL_24_7_RUNTIME` as
+`HUMAN_DECISION_REQUIRED` — a decision, not a transaction. A read command on a
+fresh machine now prints "not initialized" and leaves no database behind.
+
+**Mutation-checked, and it earned its keep.** Each round-4 and round-5 fix was
+reverted in the built output and the suite re-run. Most failed as they should.
+Two did not, which was the useful result:
+
+- `sanitizeTickResult` could be deleted with its test still green, because the
+  probe reason was redundantly bounded at the construction site too — and the
+  test never even reached the path it claimed to cover, since its poisoned probe
+  fired during the scheduled refresh and routing failed first. The redundant
+  bounding was removed so the chokepoint is load-bearing, and the test now
+  asserts it got to `WAITING_FOR_RESOURCE` before looking for the credential.
+- The F5-SEC-1 kind binding is genuinely redundant while the freeze holds. It is
+  kept against a future refactor, and the test is documented as proving the
+  outcome rather than which of the two mechanisms produced it.
+
+A green regression that cannot fail is worth less than no regression, because it
+also stops anyone from looking.
+
+**And the round-7 refinement of that lesson: mutating the wrong line proves the
+wrong thing.** The round-6 F6-FIN-1 result was reported as verified because the
+mutation broke `mintedResourceKey` — the guard's INPUT, which trips the guard
+rather than removing it. The guard itself was deletable with all 1292 tests
+green. Round-7 mutations therefore remove each guard itself, and where a guard is
+genuinely unreachable through the public path (`resourceBindingHolds`) it is
+tested as a function and its reachability is stated in the code instead of being
+implied by a green test.
+
+**That lesson then had to be learned twice.** The first round-8 mutation of the
+R8-FIN-1 auth-method guard matched `typeof authMethod === "string" &&` — which is
+also the API-key check earlier in the same function — and reported 0 failures.
+Same mistake, one round later, same day. Retargeted at the unique
+`INCLUDED_CLAUDE_AUTH_METHODS` clause it fails 5 tests.
+
+**And a claim that was simply false.** Round 7's comment asserted R7-SEC-1 was
+"two independent fixes"; the eighth review showed one of them was untested,
+because both names pointed at the same object. The reviewer caught the CLAIM, not
+the code. The repair that re-asserts independence would have been the same error
+again — while the freeze holds, the separation protects against nothing — so the
+comment now says what is measured: freeze load-bearing, separation defence in
+depth, both-removed fails two tests.
+
+## 12. Independent review status: TEN ROUNDS COMPLETE
+
+The tenth review's readiness section, after the four items it named were fixed:
+
+> *"After the four immediate findings are fixed, TASK-006 is acceptable as a
+> scheduler that executes no autonomous work."*
+
+All four are fixed and mutation-verified. Round 9 produced the first clean
+financial assessment — no path found to autonomous spend or to a chargeable
+action classified as free — and round 10 found none either, with its one
+CRITICAL being a public-API shape rather than a reachable supervisor path.
+
+**Awaiting human acceptance (C1).** Not merged. `CLAUDE.md` reserves merging for
+the user, and the two adjudicated boundaries are conditions on what may be built
+NEXT rather than on this merge: nothing in TASK-006 executes autonomous work, and
+`EXECUTOR_WIRING` cannot proceed until `EXECUTOR_ISOLATION` and `STATE_INTEGRITY`
+do.
