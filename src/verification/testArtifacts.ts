@@ -35,6 +35,25 @@
 export const SOURCE_TEST_ROOT = "tests";
 export const COMPILED_TEST_ROOT = "dist/tests";
 
+/**
+ * Every suffix node's test runner will execute (review finding B4).
+ *
+ * The first version audited only `.test.js` beneath `dist/tests`, so a stale
+ * `dist/ghost.test.js`, `dist/nested-dist/ghost.test.js` or
+ * `dist/tests/ghost.test.mjs` sat untouched while verification still declared
+ * the tree consistent. An audit that inspects a subset of what can RUN is not an
+ * audit; it is a filter that resembles one.
+ */
+export const TEST_ARTIFACT_SUFFIXES: readonly string[] = Object.freeze([
+  ".test.js",
+  ".test.mjs",
+  ".test.cjs",
+]);
+
+export function isTestArtifact(path: string): boolean {
+  return TEST_ARTIFACT_SUFFIXES.some((suffix) => path.endsWith(suffix));
+}
+
 /** Normalises a path so Windows and POSIX separators compare equal. */
 function normalise(path: string): string {
   return path.replace(/\\/g, "/").replace(/^\.\//, "");
@@ -78,7 +97,9 @@ export function auditTestArtifacts(input: {
   readonly compiledTests: readonly string[];
 }): ArtifactAudit {
   const expected = [...input.sourceTests].map(compiledPathForSourceTest).sort();
-  const present = new Set(input.compiledTests.map(normalise));
+  // Only genuine test artifacts count — but ALL of them, wherever they sit in
+  // the output tree, not merely those under `dist/tests` (B4).
+  const present = new Set(input.compiledTests.map(normalise).filter(isTestArtifact));
   const expectedSet = new Set(expected);
 
   const missing = expected.filter((path) => !present.has(path));
@@ -90,6 +111,87 @@ export function auditTestArtifacts(input: {
     missing,
     clean: orphaned.length === 0 && missing.length === 0,
   };
+}
+
+/**
+ * Refuses a verification run that would prove nothing (review finding B4).
+ *
+ * A repository with no test files reported `verifying 0 test files`, `0/0`,
+ * exit 0 — and `node --test` with no arguments independently exits 0 too. Two
+ * separate ways to certify a tree without executing a single assertion, in the
+ * one component whose entire job is to be trustworthy about that.
+ */
+export function assertRunnableSuite(expected: readonly string[]): string | undefined {
+  if (expected.length === 0) {
+    return [
+      "no test files were discovered from source.",
+      "",
+      "Refusing to report success: a run with nothing in it proves nothing, and",
+      "`node --test` with an empty list exits 0, which would look like a pass.",
+    ].join("\n");
+  }
+  return undefined;
+}
+
+// =====================================================================
+// Output-directory trust
+// =====================================================================
+
+export type OutputDirectoryVerdict =
+  | { readonly trusted: true; readonly directory: string }
+  | { readonly trusted: false; readonly reason: string };
+
+/**
+ * Decides whether the build output directory may be trusted (findings B2, B3).
+ *
+ * Two ways the previous version could be pointed somewhere else entirely:
+ *
+ *   - `tsconfig`'s `outDir` was never consulted, so changing it left the real
+ *     output elsewhere while stale `dist` artifacts were audited, imported and
+ *     EXECUTED. Verification reported a consistent tree while running foreign
+ *     code.
+ *   - `dist` as a SYMLINK was not refused. `rmSync` does not follow it, which
+ *     looked safe — but `tsc`, the checker import and the test runner all do, so
+ *     generated code was written to and executed from outside the repository.
+ *
+ * Both are the same underlying mistake: trusting a path by its name rather than
+ * by what it resolves to. `realPath` is therefore compared, not the literal.
+ */
+export function assessOutputDirectory(input: {
+  readonly repositoryRoot: string;
+  readonly realRepositoryRoot: string;
+  readonly configuredOutputDirectory: string;
+  readonly outputDirectory: string;
+  /** `realpath` of the output directory, or `undefined` if it does not exist. */
+  readonly realOutputDirectory: string | undefined;
+  /** The `outDir` tsconfig actually declares, relative to the repo root. */
+  readonly tsconfigOutDir: string;
+}): OutputDirectoryVerdict {
+  const configured = normalise(input.configuredOutputDirectory).replace(/\/+$/, "");
+  const declared = normalise(input.tsconfigOutDir).replace(/^\.\//, "").replace(/\/+$/, "");
+
+  if (declared !== configured) {
+    return {
+      trusted: false,
+      reason: `tsconfig builds into ${JSON.stringify(declared)} but verification manages ${JSON.stringify(configured)}; they must be the same directory or stale artifacts elsewhere would be executed`,
+    };
+  }
+  if (normalise(input.repositoryRoot) !== normalise(input.realRepositoryRoot)) {
+    return {
+      trusted: false,
+      reason: `the repository path resolves elsewhere (${input.realRepositoryRoot}); refusing to build or delete through a link`,
+    };
+  }
+  if (input.realOutputDirectory !== undefined) {
+    const expected = `${normalise(input.realRepositoryRoot).replace(/\/+$/, "")}/${configured}`;
+    if (normalise(input.realOutputDirectory).replace(/\/+$/, "") !== expected) {
+      return {
+        trusted: false,
+        reason: `${configured} resolves to ${input.realOutputDirectory}, outside the repository; refusing to build into or delete a linked directory`,
+      };
+    }
+  }
+  return { trusted: true, directory: input.outputDirectory };
 }
 
 /** A human-readable account of a contaminated tree, or `undefined` if clean. */

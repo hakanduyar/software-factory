@@ -14,7 +14,6 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node scripts/verify.mjs",
-    "test:raw": "npm run build && node --test \"dist/tests/**/*.test.js\"",
     "demo": "npm run build && node dist/src/cli/main.js demo",
     "demo:persistent": "npm run build && node dist/src/cli/main.js demo:persistent",
     "demo:loop": "npm run build && node dist/src/cli/main.js demo:loop",
