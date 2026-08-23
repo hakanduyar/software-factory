@@ -80,17 +80,27 @@ function deviceOf(path) {
 }
 
 /**
- * Test sources that are hardlinks to a file living somewhere else (B9).
+ * Sources under a directory that are hardlinks to a file living elsewhere (B9).
  *
  * A hardlink is indistinguishable from an ordinary file by name, type or
- * `realpath` — the only ordinary signal is a link count above one. That catches
- * the accidental and casual cases; see the threat-model note at the top of this
- * file for what it does not catch.
+ * `realpath` — the only ordinary signal is a link count above one.
+ *
+ * EVERY compilable source counts, not only `*.test.ts` (round-4 finding). The
+ * first version checked test files alone, so a hardlinked `tests/helper.ts`
+ * IMPORTED by an ordinary test was compiled and executed from outside the tree
+ * while verification exited 0. What runs is the whole compiled graph, not the
+ * files whose names happen to say `test`.
+ *
+ * POLICY, stated because it refuses a legitimate case too: a hardlink INSIDE the
+ * repository is indistinguishable from one pointing outside it, so all are
+ * refused. If a tree genuinely needs the same content twice, it needs two files
+ * or an import — a rule that is occasionally inconvenient beats one that is
+ * sometimes wrong.
  */
 function findHardlinkedSources(directory) {
   const found = [];
   for (const rel of listFiles(directory)) {
-    if (!rel.endsWith(".test.ts")) continue;
+    if (!rel.endsWith(".ts") && !rel.endsWith(".mts") && !rel.endsWith(".cts")) continue;
     try {
       if (lstatSync(join(REPO_ROOT, rel)).nlink > 1) found.push(rel);
     } catch {
@@ -206,16 +216,48 @@ const effectiveConfig = (() => {
     const shown = execFileSync("npx", ["tsc", "-p", "tsconfig.json", "--showConfig"], {
       cwd: REPO_ROOT,
       encoding: "utf8",
+      // A hung `--showConfig` would otherwise produce no verdict at all, which
+      // is neither a pass nor a failure — the worst of the three.
+      timeout: 120_000,
     });
     return JSON.parse(shown);
   } catch {
     return undefined;
   }
 })();
-if (effectiveConfig === undefined) {
-  fail("verification refused: could not resolve the effective tsconfig; refusing to build a configuration it cannot read");
+
+/**
+ * The parsed config must be STRUCTURALLY what it claims (round-4 finding).
+ *
+ * Rejecting only `undefined` was not enough: a `--showConfig` returning `{}`
+ * satisfied that, optional chaining then read a missing `noEmit` as `false`, and
+ * verification passed while the real build did something else entirely. Absence
+ * of a field is not evidence about its value — the same mistake as treating an
+ * unreported model identity as agreement.
+ */
+const configProblem = (() => {
+  if (effectiveConfig === undefined) {
+    return "could not resolve the effective tsconfig";
+  }
+  if (typeof effectiveConfig !== "object" || effectiveConfig === null || Array.isArray(effectiveConfig)) {
+    return "the effective tsconfig is not an object";
+  }
+  const options = effectiveConfig.compilerOptions;
+  if (typeof options !== "object" || options === null || Array.isArray(options)) {
+    return "the effective tsconfig declares no compilerOptions object";
+  }
+  if (typeof options.outDir !== "string" || options.outDir.trim().length === 0) {
+    return "the effective tsconfig declares no outDir";
+  }
+  if (options.noEmit !== undefined && typeof options.noEmit !== "boolean") {
+    return `noEmit is ${JSON.stringify(options.noEmit)}, which is not a boolean`;
+  }
+  return undefined;
+})();
+if (configProblem !== undefined) {
+  fail(`verification refused: ${configProblem}; refusing to build a configuration it cannot read`);
 }
-const noEmit = effectiveConfig?.compilerOptions?.noEmit === true;
+const noEmit = effectiveConfig.compilerOptions.noEmit === true;
 if (isSymlink(join(REPO_ROOT, "tests"))) {
   fail("verification refused: the tests directory is a symlink; an external suite would be compiled and executed as though it belonged to this tree");
 }

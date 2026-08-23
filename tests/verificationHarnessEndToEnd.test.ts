@@ -296,6 +296,87 @@ describe("TASK-010 round 2: paths are judged by what they resolve to", () => {
     assert.match(output, /symlinked entries under tests|hardlinked/);
   });
 
+  /**
+   * Round 4 — the hardlink check covered only `*.test.ts`, so a hardlinked
+   * HELPER imported by an ordinary test was compiled and executed from outside
+   * the tree. What runs is the whole compiled graph, not the files whose names
+   * happen to say `test`.
+   */
+  it("REFUSES a hardlinked helper imported by an ordinary test", () => {
+    const root = makeFixtureRepo();
+    const external = mkdtempSync(join(tmpdir(), "sf-helper-"));
+    created.push(external);
+    const outsider = join(external, "helper.ts");
+    writeFileSync(outsider, "export const smuggled = 1;\n");
+    linkSync(outsider, join(root, "tests/helper.ts"));
+    writeFileSync(
+      join(root, "tests/sample.test.ts"),
+      [
+        'import assert from "node:assert/strict";',
+        'import { it } from "node:test";',
+        'import { smuggled } from "./helper.js";',
+        'it("uses a helper", () => { assert.equal(smuggled, 1); });',
+        "",
+      ].join("\n"),
+    );
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, "a hardlinked helper was compiled and executed");
+    assert.match(output, /symlinked entries under tests|helper\.ts/);
+  });
+
+  /**
+   * Round 4 — rejecting only `undefined` let a `--showConfig` returning `{}`
+   * through, after which optional chaining read a missing `noEmit` as `false`.
+   * Absence of a field is not evidence about its value.
+   */
+  it("REFUSES a structurally invalid effective tsconfig", () => {
+    const root = makeFixtureRepo();
+    assert.equal(runHarness(root).status, 0, "fixture must pass first");
+
+    /**
+     * A shim `npx` that answers `{}` to `--showConfig` and delegates every other
+     * invocation to the REAL npx by absolute path.
+     *
+     * Delegating by name would re-enter the shim, because the shim's directory
+     * is first on PATH — an earlier version did exactly that, the build died in
+     * two seconds, and the test passed on the resulting non-zero exit while
+     * proving nothing about the guard. The build must genuinely SUCCEED here so
+     * that the only thing wrong is the config the verifier was handed.
+     */
+    const realNpx = spawnSync("sh", ["-c", "command -v npx"], { encoding: "utf8" }).stdout.trim();
+    assert.ok(realNpx.length > 0, "the fixture needs a real npx to delegate to");
+
+    const shimDir = join(root, "shim");
+    mkdirSync(shimDir, { recursive: true });
+    writeFileSync(
+      join(shimDir, "npx"),
+      [
+        "#!/bin/sh",
+        'for a in "$@"; do',
+        '  if [ "$a" = "--showConfig" ]; then echo "{}"; exit 0; fi',
+        "done",
+        `exec ${realNpx} "$@"`,
+        "",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+
+    const result = spawnSync(process.execPath, ["scripts/verify.mjs"], {
+      cwd: root,
+      encoding: "utf8",
+      env: { ...process.env, PATH: `${shimDir}:${process.env["PATH"] ?? ""}` },
+    });
+    const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+
+    assert.notEqual(result.status, 0, "an empty effective config was accepted");
+    assert.match(
+      output,
+      /declares no compilerOptions object/,
+      `expected the config-shape refusal, got:\n${output.slice(0, 400)}`,
+    );
+  });
+
   /** B12 — `extends` can carry noEmit in without the root file mentioning it. */
   it("REFUSES an INHERITED noEmit, not just one written in the root tsconfig", () => {
     const root = makeFixtureRepo();
