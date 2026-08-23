@@ -607,3 +607,76 @@ failing closed, and a crash mid-materialization reconciling with no duplicates.
 - `RECOVERY_REQUIRED` has no in-band operator workflow yet (`sf plan recover` is future work), matching TASK-004.
 - The planner is assumed to be a read-only consultation of the workspace. That assumption is what makes retrying an interrupted planner attempt safe, and enforcing it is a configuration responsibility of the underlying tool's sandbox.
 - No GitHub Issues/Projects, Telegram/n8n, Control Room UI, server deployment, or scored model router — all later phases.
+
+## Autonomous Completion & Resource Supervisor (TASK-006)
+
+TASK-005 could plan and execute, but every step still needed a live AI session
+with a human relaying prompts — which made finishing anything hostage to context
+windows, rate limits and outages. TASK-006 moves the Factory's memory and
+scheduling into deterministic infrastructure, so an AI session becomes a
+*disposable worker* rather than the seat of the Factory's mind.
+
+```
+sf supervise tick        one bounded pass, then exit (for a systemd timer/cron)
+sf supervise status      state, spending policy, open human escalations
+sf supervise resources   per-resource availability, retry times, backoff
+sf supervise roadmap     the durable queue and what it is waiting on
+```
+
+### AI is never used to wait for AI
+
+`tick` does one pass and exits, publishing `nextWakeAt`. **Between ticks no
+process runs at all**, so waiting for a provider costs zero tokens and zero CPU —
+there is no loop in which a model could be held open to ask "is the limit reset
+yet?". A resource with a known `retryAt` in the future is not even probed.
+
+Availability is checked with measured **zero-token** commands — `claude auth
+status` and `codex doctor --json` — parsed by field, never by scraping prose.
+Failures are classified from process facts and a signature table; no model is
+ever asked what a provider error means. An unclassified failure fails closed to
+`UNKNOWN_FAILURE` and gets bounded, persisted backoff (`5m → 15m → 30m → 60m`),
+which survives restart so a crash loop cannot hammer a provider at the first
+rung forever.
+
+Honest about its own limits: neither CLI documents its rate-limit output, and
+observing one would mean deliberately burning a paid quota, so no rate-limit
+signature is shipped as measured. Plausible patterns are listed, labelled, and
+**inert** until a real response is captured.
+
+### Zero autonomous financial authority
+
+`AUTONOMOUS_SPEND_LIMIT = 0`. A saved card, an authenticated session, an active
+subscription and stored credentials are **authentication, not authorization**.
+The gate takes no actor, no token and no approval — there is no parameter through
+which authorization could be passed, so plan approval, task acceptance, the
+completion mandate and any model claiming "purchase approved" all have exactly
+zero effect. Classification is derived rather than declared, an unknown action
+kind is financial, a "free tier" that can bill later is financial, a missing or
+malformed policy denies, and there is no de minimis exception. A provider limit
+produces `WAITING_FOR_RESOURCE`, never a purchase.
+
+### What it schedules, and what it refuses to invent
+
+Reviewer independence (C4) survives resource pressure: a routing whose reviewer
+equals the implementer is refused, not deprioritised — the work waits instead.
+Each work class has a quality floor, and a cheaper model below it is a different
+answer, not a fallback. Requested model/effort become real argv; an effort the
+installed CLI cannot apply is refused rather than silently downgraded, and
+effective identity is recorded `UNVERIFIED` unless the provider echoes it back.
+
+A full context checkpoints and rolls the session over; an exhausted quota waits.
+Those are different problems and get different answers. Checkpoints are bounded
+and structured — raw transcripts are never the authoritative memory.
+
+TASK-006 deliberately **schedules** work rather than performing it: turning a
+roadmap item into an approved plan and driving TASK-004 is the next task's job,
+and building it here would be exactly the "second engineering loop" every
+previous task refused to build.
+
+### Known limitations (TASK-006)
+
+- Rate-limit and usage-limit signatures are unverified and inert; a real limit currently classifies as `UNKNOWN_FAILURE` and is handled by backoff. Capturing a genuine response would sharpen this to "wait until the stated reset".
+- The shipped executor reports that an approved plan is required rather than driving planning itself; wiring the queue to TASK-005/TASK-004 is the next roadmap task.
+- No systemd unit file or server deployment: the tick publishes `nextWakeAt`, which is what a timer needs, but installing the timer belongs to the server task.
+- Per-model quota cannot be probed without spending, so a resource that passes the zero-token probe is "not known to be unusable" rather than "known to have quota".
+- A second live supervisor process over one database is not supported (single-process local model, as in `docs/ARCHITECTURE.md`).
