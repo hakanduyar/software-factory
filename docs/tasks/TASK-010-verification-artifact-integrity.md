@@ -50,20 +50,46 @@ configured build output.
 
 ## Acceptance criteria (FROZEN — may not be edited to fit the implementation)
 
+> AC-2 and AC-4 were amended once, by explicit human authorisation under
+> ADR-0002, because they were demonstrably contradictory as first frozen. The
+> reasoning, the evidence and the scope of that authorisation are recorded in
+> "Human-authorised criteria correction" below. Every other criterion stands as
+> originally frozen, and the freeze rule is unchanged: these may not be edited to
+> fit an implementation.
+
 **AC-1.** Test discovery is derived from source test files, not from a glob over
 generated output.
 
-**AC-2.** A compiled test artifact with no corresponding source file causes
-verification to FAIL with a message naming the orphan — it is never silently
-ignored and never executed.
+**AC-2.** *(amended — see "Human-authorised criteria correction" below.)* If the
+initial artifact audit finds a compiled test artifact with no corresponding
+source file, verification names the orphan and never executes it. The initial
+generated state is treated as invalid: the canonical build output is safely
+discarded and recreated, the tree is rebuilt from source, and a complete
+re-audit runs **within the same invocation**.
+
+Verification FAILS if the orphan or any resulting inconsistency remains after
+that clean rebuild, or if safe cleanup, rebuild or re-audit cannot be completed.
+If the clean rebuild produces a fully consistent tree and every other
+verification requirement passes, the same invocation may complete successfully.
 
 **AC-3.** A source test file with no compiled counterpart causes verification to
 FAIL, so a partial or failed build cannot masquerade as a passing run with fewer
 tests.
 
-**AC-4.** Verification is branch-clean BY CONSTRUCTION: running it immediately
-after a branch switch, with another branch's artifacts present, yields the same
-result as running it on a freshly cloned tree. No human step is required.
+**AC-4.** *(amended — see "Human-authorised criteria correction" below.)*
+Verification is branch-clean BY CONSTRUCTION. For a source-valid tree whose
+generated output contains only stale artifacts left by another branch, a single
+invocation converges to the same final pass/fail outcome, and an equivalent
+verified generated state, as a freshly cloned tree.
+
+Stale artifacts that are detected are reported and are never executed. Safe
+cleanup, rebuild and final re-audit happen automatically inside that same
+invocation: no human re-run or other manual recovery step may be required.
+
+"The same result" means the same FINAL outcome and an equivalent final generated
+state — not byte-identical diagnostics. A contaminated tree is expected to report
+that stale artifacts were found and removed; a fresh clone has nothing stale to
+report. Contamination that does NOT cleanly converge still fails closed.
 
 **AC-5.** The clean step can only ever remove the configured build output
 directory. It refuses, with an error, if asked to remove the repository root,
@@ -90,12 +116,60 @@ Factory control (financial gate, HUMAN-ONLY boundaries, C4, the
 `STATE_INTEGRITY` + `EXECUTOR_ISOLATION` → `EXECUTOR_WIRING` ordering) is
 weakened.
 
+## Human-authorised criteria correction (AC-2 and AC-4)
+
+Status: authorised by Hakan Duyar, in-session, under ADR-0002. Scope: AC-2 and
+AC-4 of this task only.
+
+**AC-2 and AC-4 were empirically contradictory as originally frozen.** AC-2
+required an orphan to make verification FAIL; AC-4 required a tree carrying
+another branch's artifacts to yield the freshly-cloned result with no human step.
+A branch switch generally leaves orphans, so the two criteria demanded opposite
+outcomes for the same tree, and no implementation could satisfy both.
+
+This was not inferred from prose. Two independent review rounds demonstrated it
+from opposite directions:
+
+- Round 11 reviewed an implementation that satisfied AC-2, and the AC-4 breach
+  was reproduced empirically: with a planted orphan, a single `npm test` exited 1
+  saying "Re-run to verify a clean tree", while a fresh clone passed immediately.
+- Round 12 reviewed an implementation that satisfied AC-4 and recorded, on the
+  record, that it weakened AC-2.
+
+Remediation could not close both, because closing either one re-opened the other.
+`CLAUDE.md` requires a requirements conflict to be reported rather than silently
+resolved, and ADR-0002 lists weakening acceptance criteria as HUMAN-ONLY without
+exception. The conflict was therefore escalated rather than decided by the
+implementer.
+
+**The human decision was explicit reconciliation of both criteria**, amending each
+to state the agreed behaviour rather than choosing a winner. The amendment
+preserves the original security intent exactly:
+
+- stale artifacts are still reported, and still never executed;
+- they must still disappear after a clean rebuild;
+- anything that survives the rebuild, and any failure of cleanup, rebuild or
+  re-audit, still fails closed.
+
+And it preserves unattended operation, which is the property this task exists to
+create: a valid source tree does not require a second human invocation merely
+because generated output from another branch happened to be present. An
+`rm -rf dist` typed by whoever remembers is the control this task set out to
+abolish, and a mandatory second `npm test` is the same control wearing a
+different hat.
+
+**This is a human-authorised requirements correction, not an implementer
+weakening acceptance criteria.** No other criterion, and no constitutional or
+ADR-0002 provision, is changed by it.
+
 ## Verification plan
 
 - Unit: orphan detection, missing detection, and the path-safety guard, driven by
   fixtures rather than the real tree.
-- Real: plant an orphan `.test.js` in `dist/tests/`, run verification, observe it
-  fail; remove it, observe it pass.
+- Real: plant an orphan `.test.js` in `dist/tests/`, run verification ONCE, and
+  observe it name the orphan, clean, rebuild, re-audit and converge — then a case
+  whose inconsistency survives the rebuild, and observe it fail with the
+  surviving problem named.
 - Negative control: delete each check in turn and confirm its regression fails.
 - Safety: assert the clean guard refuses the repository root, a path outside the
   repository, and `src/`.
