@@ -279,7 +279,7 @@ describe("TASK-010 round 2: paths are judged by what they resolve to", () => {
 
     const { status, output } = runHarness(root);
     assert.notEqual(status, 0, "a symlinked source test was accepted");
-    assert.match(output, /symlinked entries under tests/);
+    assert.match(output, /linked sources \(symlink or hardlink\).*linked\.test\.ts/s);
   });
 
   /**
@@ -345,7 +345,7 @@ describe("TASK-010 round 2: paths are judged by what they resolve to", () => {
 
     const { status, output } = runHarness(root);
     assert.notEqual(status, 0, "a hardlinked external source was compiled and executed");
-    assert.match(output, /symlinked entries under tests|hardlinked/);
+    assert.match(output, /linked sources \(symlink or hardlink\).*hardlinked\.test\.ts/s);
   });
 
   /**
@@ -374,7 +374,7 @@ describe("TASK-010 round 2: paths are judged by what they resolve to", () => {
 
     const { status, output } = runHarness(root);
     assert.notEqual(status, 0, "a hardlinked helper was compiled and executed");
-    assert.match(output, /symlinked entries under tests|helper\.ts/);
+    assert.match(output, /linked sources \(symlink or hardlink\).*helper\.ts/s);
   });
 
   /**
@@ -534,7 +534,7 @@ describe("TASK-010 round 2: paths are judged by what they resolve to", () => {
 
     const { status, output } = runHarness(root);
     assert.notEqual(status, 0, "a hardlinked .mts source was compiled and executed");
-    assert.match(output, /symlinked entries under tests|helper\.mts/);
+    assert.match(output, /linked sources \(symlink or hardlink\).*helper\.mts/s);
   });
 
   /**
@@ -578,5 +578,207 @@ describe("TASK-010 round 2: paths are judged by what they resolve to", () => {
     assert.notEqual(status, 0, "a noEmit build produced a passing verification");
     assert.match(output, /noEmit/);
     assert.ok(!output.includes("tree-consistent"), "it must not claim consistency");
+  });
+});
+
+/**
+ * Round 6. Two blocking findings, opposite in character:
+ *
+ *   - the outDir guard refused paths that were CORRECT, and
+ *   - the source scan missed source that was FOREIGN.
+ *
+ * Both come from judging a path by its text instead of by what it resolves to
+ * and what the build actually compiles.
+ */
+describe("TASK-010 round 6: what the build compiles, and where it writes", () => {
+  /**
+   * B15 — the runtime scan looked only at `tests/`. A hardlinked `src/` file
+   * imported by an ordinary test was compiled and EXECUTED while verification
+   * exited 0 and reported `tree-consistent`, contradicting the invariant in
+   * this script's own header.
+   */
+  it("REFUSES a hardlinked source under src/, not just under tests/", () => {
+    const root = makeFixtureRepo();
+    const external = mkdtempSync(join(tmpdir(), "sf-src-hard-"));
+    created.push(external);
+    const outsider = join(external, "foreign.ts");
+    writeFileSync(outsider, "export const smuggled = 3;\n");
+    linkSync(outsider, join(root, "src/foreign.ts"));
+    writeFileSync(
+      join(root, "tests/sample.test.ts"),
+      [
+        'import assert from "node:assert/strict";',
+        'import { it } from "node:test";',
+        'import { smuggled } from "../src/foreign.js";',
+        'it("uses foreign src", () => { assert.equal(smuggled, 3); });',
+        "",
+      ].join("\n"),
+    );
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, "external source under src/ was compiled and executed");
+    assert.match(output, /linked sources \(symlink or hardlink\).*src\/foreign\.ts/s);
+    assert.ok(!output.includes("tree-consistent"), "it must not claim consistency");
+  });
+
+  /** The symlinked variant of the same escape. */
+  it("REFUSES a symlinked source under src/", () => {
+    const root = makeFixtureRepo();
+    const external = mkdtempSync(join(tmpdir(), "sf-src-sym-"));
+    created.push(external);
+    const outsider = join(external, "foreign.ts");
+    writeFileSync(outsider, "export const smuggled = 4;\n");
+    symlinkSync(outsider, join(root, "src/foreign.ts"), "file");
+    writeFileSync(
+      join(root, "tests/sample.test.ts"),
+      [
+        'import assert from "node:assert/strict";',
+        'import { it } from "node:test";',
+        'import { smuggled } from "../src/foreign.js";',
+        'it("uses foreign src", () => { assert.equal(smuggled, 4); });',
+        "",
+      ].join("\n"),
+    );
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, "a symlinked src/ source was compiled and executed");
+    assert.match(output, /linked sources \(symlink or hardlink\).*src\/foreign\.ts/s);
+  });
+
+  /** Round-5 note: `.cts` was in the clause with nothing exercising it. */
+  it("REFUSES a hardlinked .cts source", () => {
+    const root = makeFixtureRepo();
+    const external = mkdtempSync(join(tmpdir(), "sf-cts-"));
+    created.push(external);
+    const outsider = join(external, "legacy.cts");
+    writeFileSync(outsider, "export const smuggled = 5;\n");
+    linkSync(outsider, join(root, "src/legacy.cts"));
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, "a hardlinked .cts source was accepted");
+    assert.match(output, /linked sources \(symlink or hardlink\).*legacy\.cts/s);
+  });
+
+  /**
+   * B14 — every one of these names the directory being managed, and every one
+   * was REFUSED. A verifier that rejects valid trees is its own failure mode:
+   * it trains people to bypass it.
+   *
+   * The symlink alias is the sharpest case. `dist-alias -> dist` means tsc
+   * writes THROUGH the link into the very directory being audited, so there is
+   * nothing to refuse — but a lexical `resolve()` cannot see that.
+   */
+  it("ACCEPTS every spelling that resolves to the managed directory", () => {
+    const cases: readonly (readonly [string, (root: string) => string])[] = [
+      ["absolute", (root) => join(root, "dist")],
+      ["dot-relative", () => "./dist"],
+      ["traversal", () => "dist/../dist"],
+      ["trailing separator", () => "dist/"],
+    ];
+
+    for (const [label, outDirFor] of cases) {
+      const root = makeFixtureRepo();
+      // `dist` must exist for realpath to resolve; a first clean run creates it.
+      assert.equal(runHarness(root).status, 0, `${label}: fixture must pass first`);
+
+      const { status, output } = runWithShowConfigShim(
+        root,
+        JSON.stringify({ compilerOptions: { outDir: outDirFor(root), noEmit: false } }),
+      );
+      assert.equal(status, 0, `${label} was wrongly refused:\n${output.slice(0, 400)}`);
+    }
+  });
+
+  it("ACCEPTS a symlink alias that resolves into the managed directory", () => {
+    const root = makeFixtureRepo();
+    assert.equal(runHarness(root).status, 0, "fixture must pass first");
+    symlinkSync(join(root, "dist"), join(root, "dist-alias"), "dir");
+
+    const { status, output } = runWithShowConfigShim(
+      root,
+      JSON.stringify({ compilerOptions: { outDir: "dist-alias", noEmit: false } }),
+    );
+    assert.equal(status, 0, `a symlink alias into dist was wrongly refused:\n${output.slice(0, 400)}`);
+  });
+
+  /** The guard must still refuse what genuinely differs. */
+  it("still REFUSES an alias that resolves somewhere else", () => {
+    const root = makeFixtureRepo();
+    assert.equal(runHarness(root).status, 0, "fixture must pass first");
+    const decoy = mkdtempSync(join(tmpdir(), "sf-decoy-out-"));
+    created.push(decoy);
+    symlinkSync(decoy, join(root, "dist-elsewhere"), "dir");
+
+    const { status, output } = runWithShowConfigShim(
+      root,
+      JSON.stringify({ compilerOptions: { outDir: "dist-elsewhere", noEmit: false } }),
+    );
+    assert.notEqual(status, 0, "an alias resolving outside the managed directory was accepted");
+    assert.match(output, /builds into|manages/);
+  });
+
+  /**
+   * A tsconfig that inherits `outDir` through `extends` without naming it was
+   * refused outright by the removed raw-file check — a false positive with no
+   * attacker involved.
+   */
+  it("ACCEPTS an outDir inherited through extends", () => {
+    const root = makeFixtureRepo();
+    writeFileSync(
+      join(root, "tsconfig.base.json"),
+      JSON.stringify({ compilerOptions: { outDir: "dist" } }, null, 2),
+    );
+    const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as Record<
+      string,
+      unknown
+    >;
+    const options = tsconfig["compilerOptions"] as Record<string, unknown>;
+    delete options["outDir"];
+    tsconfig["extends"] = "./tsconfig.base.json";
+    writeFileSync(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
+
+    const { status, output } = runHarness(root);
+    assert.equal(status, 0, `an inherited outDir was wrongly refused:\n${output.slice(0, 400)}`);
+  });
+
+  /**
+   * Round-6 note — removing the pre-build symlink guards left the suite green,
+   * because the later gate caught the condition AFTER the build had already
+   * written through the link. Same masking as the noEmit pair; pinned the same
+   * way, by the wording only the earlier layer can produce.
+   */
+  it("refuses a symlinked tests directory BEFORE building", () => {
+    const root = makeFixtureRepo();
+    const external = mkdtempSync(join(tmpdir(), "sf-pre-tests-"));
+    created.push(external);
+    writeFileSync(
+      join(external, "outsider.test.ts"),
+      ['import { it } from "node:test";', 'it("outsider", () => {});', ""].join("\n"),
+    );
+    rmSync(join(root, "tests"), { recursive: true, force: true });
+    symlinkSync(external, join(root, "tests"), "dir");
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0);
+    assert.match(
+      output,
+      /refused before building: the tests directory is a symlink/,
+      `the pre-build layer did not fire:\n${output.slice(0, 400)}`,
+    );
+  });
+
+  it("refuses a symlinked output directory BEFORE building", () => {
+    const root = makeFixtureRepo();
+    const decoy = mkdtempSync(join(tmpdir(), "sf-pre-out-"));
+    created.push(decoy);
+    symlinkSync(decoy, join(root, "dist"), "dir");
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0);
+    assert.match(
+      output,
+      /refused before building: the build output directory is a symlink/,
+      `the pre-build layer did not fire:\n${output.slice(0, 400)}`,
+    );
   });
 });

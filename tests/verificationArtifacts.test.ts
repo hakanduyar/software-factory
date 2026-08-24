@@ -17,6 +17,7 @@ import { describe, it } from "node:test";
 
 import {
   assessCleanTarget,
+  assessOutputDirectory,
   assessTreeSafety,
   auditTestArtifacts,
   compiledPathForSourceTest,
@@ -182,7 +183,10 @@ describe("TASK-010 round 2: every tree-safety clause, judged directly", () => {
     ["output on another device", { outputOnDifferentDevice: true }, /different device/],
     ["a noEmit build", { buildEmitsNothing: true }, /noEmit/],
     ["a stale auditor", { checkerFreshlyEmitted: false }, /stale copy of the auditor/],
-    ["symlinked sources", { symlinkedSources: ["tests/linked.test.ts"] }, /symlinked entries under tests/],
+    ["linked sources", { symlinkedSources: ["tests/linked.test.ts"] }, /linked sources \(symlink or hardlink\)/],
+    // Round 6: the scan covered only `tests/`, so external source under `src/`
+    // was compiled and executed while the run reported a consistent tree.
+    ["linked sources outside tests/", { symlinkedSources: ["src/foreign.ts"] }, /src\/foreign\.ts/],
     ["symlinked artifacts", { symlinkedArtifacts: ["dist/tests/g.test.js"] }, /symlinked test artifacts/],
   ];
 
@@ -201,6 +205,84 @@ describe("TASK-010 round 2: every tree-safety clause, judged directly", () => {
     assert.equal(verdict.safe, false);
     if (!verdict.safe) {
       assert.match(verdict.reason, /ghost\.test\.js/);
+    }
+  });
+});
+
+/**
+ * `assessOutputDirectory` had NO unit tests until round 6 pointed it out — it
+ * was exercised only incidentally through the end-to-end harness, which is how
+ * its string comparison came to reject equivalent paths without anything
+ * noticing.
+ *
+ * Both directions are tested. A guard that refuses everything is not "safe by
+ * default"; it is a guard the next person deletes because it blocks valid work.
+ */
+describe("assessOutputDirectory", () => {
+  const ROOT = "/repo";
+  const base = {
+    repositoryRoot: ROOT,
+    realRepositoryRoot: ROOT,
+    configuredOutputDirectory: "dist",
+    outputDirectory: "/repo/dist",
+    realOutputDirectory: "/repo/dist",
+    resolvedTsconfigOutDir: "/repo/dist",
+  };
+
+  it("trusts the managed directory", () => {
+    assert.equal(assessOutputDirectory(base).trusted, true);
+  });
+
+  /**
+   * Round-6 finding: these were all REFUSED. The caller resolves each spelling,
+   * so by the time it arrives here `dist`, `./dist`, `dist/../dist`, `dist/`,
+   * an absolute path and a `dist-alias -> dist` symlink are one string — and
+   * this function must accept it rather than re-deriving from raw text.
+   */
+  it("trusts an equivalent path that resolves to the managed directory", () => {
+    assert.equal(
+      assessOutputDirectory({ ...base, resolvedTsconfigOutDir: "/repo/dist/" }).trusted,
+      true,
+      "a trailing separator is the same directory",
+    );
+  });
+
+  it("REFUSES a sibling directory the build would actually write to", () => {
+    const verdict = assessOutputDirectory({ ...base, resolvedTsconfigOutDir: "/repo/dist-2" });
+    assert.equal(verdict.trusted, false);
+    if (!verdict.trusted) {
+      assert.match(verdict.reason, /builds into "\/repo\/dist-2" but verification manages/);
+    }
+  });
+
+  it("REFUSES an outDir outside the repository", () => {
+    const verdict = assessOutputDirectory({ ...base, resolvedTsconfigOutDir: "/elsewhere/dist" });
+    assert.equal(verdict.trusted, false);
+  });
+
+  /** The repository itself reached through a link is not the repository. */
+  it("REFUSES a repository path that resolves elsewhere", () => {
+    const verdict = assessOutputDirectory({ ...base, realRepositoryRoot: "/somewhere/else" });
+    assert.equal(verdict.trusted, false);
+    if (!verdict.trusted) {
+      assert.match(verdict.reason, /resolves elsewhere/);
+    }
+  });
+
+  /**
+   * The output existing but resolving outside the tree is the `dist -> /tmp/x`
+   * case: `rmSync` does not follow it, but tsc, the checker import and the test
+   * runner all do.
+   */
+  it("REFUSES an output directory that resolves outside the repository", () => {
+    const verdict = assessOutputDirectory({
+      ...base,
+      realOutputDirectory: "/tmp/decoy",
+      resolvedTsconfigOutDir: "/tmp/decoy",
+    });
+    assert.equal(verdict.trusted, false);
+    if (!verdict.trusted) {
+      assert.match(verdict.reason, /outside the repository/);
     }
   });
 });

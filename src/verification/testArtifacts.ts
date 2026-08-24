@@ -162,7 +162,15 @@ export interface TreeFacts {
   readonly outputOnDifferentDevice: boolean;
   /** Symlinked test artifacts found under the output directory. */
   readonly symlinkedArtifacts: readonly string[];
-  /** Symlinked entries found under `tests/`. */
+  /**
+   * Linked entries — symlink or hardlink — found under EVERY source root the
+   * build compiles, not only `tests/` (round-6 finding).
+   *
+   * Scanning `tests/` alone was the mistake: a hardlinked `src/foreign.ts`
+   * imported by an ordinary test was compiled and executed while verification
+   * exited 0 and reported a consistent tree. What runs is the whole compiled
+   * graph, and the graph is rooted wherever the tsconfig says it is.
+   */
   readonly symlinkedSources: readonly string[];
   /** True when tsconfig sets `noEmit`, so a build would emit nothing. */
   readonly buildEmitsNothing: boolean;
@@ -217,7 +225,7 @@ export function assessTreeSafety(facts: TreeFacts): TreeSafetyVerdict {
   if (facts.symlinkedSources.length > 0) {
     return {
       safe: false,
-      reason: `symlinked entries under tests/: ${facts.symlinkedSources.join(", ")}; source must live in this repository`,
+      reason: `linked sources (symlink or hardlink): ${facts.symlinkedSources.join(", ")}; a linked source cannot be told apart from one pointing outside this tree, so all are refused`,
     };
   }
   if (facts.symlinkedArtifacts.length > 0) {
@@ -256,16 +264,31 @@ export function assessOutputDirectory(input: {
   readonly outputDirectory: string;
   /** `realpath` of the output directory, or `undefined` if it does not exist. */
   readonly realOutputDirectory: string | undefined;
-  /** The `outDir` tsconfig actually declares, relative to the repo root. */
-  readonly tsconfigOutDir: string;
+  /**
+   * The ABSOLUTE path the effective `outDir` resolves to — `realpath` where it
+   * exists, otherwise lexically resolved.
+   *
+   * Deliberately not the raw string (round-6 finding). Comparing spellings
+   * refused every equivalent way of naming the same directory: an absolute
+   * path, `dist/../dist`, a trailing separator, and a `dist-alias -> dist`
+   * symlink. A verifier that rejects valid trees is its own failure mode, and
+   * resolution is the only comparison that answers "is this the same
+   * directory?" rather than "is this the same text?".
+   *
+   * The caller resolves, because this function is pure and must stay testable
+   * without a filesystem; the RULE — that the two must be one directory —
+   * stays here where it is tested.
+   */
+  readonly resolvedTsconfigOutDir: string;
 }): OutputDirectoryVerdict {
   const configured = normalise(input.configuredOutputDirectory).replace(/\/+$/, "");
-  const declared = normalise(input.tsconfigOutDir).replace(/^\.\//, "").replace(/\/+$/, "");
+  const managed = normalise(input.realOutputDirectory ?? input.outputDirectory).replace(/\/+$/, "");
+  const declared = normalise(input.resolvedTsconfigOutDir).replace(/\/+$/, "");
 
-  if (declared !== configured) {
+  if (declared !== managed) {
     return {
       trusted: false,
-      reason: `tsconfig builds into ${JSON.stringify(declared)} but verification manages ${JSON.stringify(configured)}; they must be the same directory or stale artifacts elsewhere would be executed`,
+      reason: `tsconfig builds into ${JSON.stringify(declared)} but verification manages ${JSON.stringify(managed)}; they must be the same directory or stale artifacts elsewhere would be executed`,
     };
   }
   if (normalise(input.repositoryRoot) !== normalise(input.realRepositoryRoot)) {
