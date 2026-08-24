@@ -61,6 +61,8 @@ import { fileURLToPath } from "node:url";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const OUTPUT_DIR = "dist";
+/** How long `--showConfig` may take before the run fails closed, saying so. */
+const CONFIG_TIMEOUT_MS = 120_000;
 const CHECKER_PATH = join(REPO_ROOT, OUTPUT_DIR, "src/verification/testArtifacts.js");
 
 function isSymlink(path) {
@@ -211,20 +213,40 @@ if (declared !== OUTPUT_DIR) {
 // EFFECTIVE config, not the raw root file (round-3 finding B12). `extends` means
 // a root tsconfig that mentions nothing can still inherit `noEmit`, and scanning
 // the raw text would miss it entirely — a silent pass with no attacker involved.
-const effectiveConfig = (() => {
+const configResolution = (() => {
   try {
     const shown = execFileSync("npx", ["tsc", "-p", "tsconfig.json", "--showConfig"], {
       cwd: REPO_ROOT,
       encoding: "utf8",
       // A hung `--showConfig` would otherwise produce no verdict at all, which
       // is neither a pass nor a failure — the worst of the three.
-      timeout: 120_000,
+      timeout: CONFIG_TIMEOUT_MS,
     });
-    return JSON.parse(shown);
-  } catch {
-    return undefined;
+    return { value: JSON.parse(shown) };
+  } catch (error) {
+    // A wedged toolchain, a killed process and a config the compiler rejected
+    // are three different operator problems, and round-5 review noted that
+    // reporting all of them as "could not resolve" — after a silent two-minute
+    // pause — sends the reader to the wrong place.
+    //
+    // Kept as three branches rather than folding the signal case into the
+    // timeout: `execFileSync` enforces its own timeout by SIGTERM, so treating
+    // any SIGTERM as a timeout would confidently misreport an external kill as
+    // a slow toolchain. ETIMEDOUT is the specific claim and is tested first.
+    const failure = (() => {
+      if (typeof error !== "object" || error === null) return "could not resolve the effective tsconfig";
+      if (error.code === "ETIMEDOUT") {
+        return `resolving the effective tsconfig timed out after ${CONFIG_TIMEOUT_MS / 1000}s`;
+      }
+      if (typeof error.signal === "string") {
+        return `resolving the effective tsconfig was terminated by ${error.signal}`;
+      }
+      return "could not resolve the effective tsconfig";
+    })();
+    return { failure };
   }
 })();
+const effectiveConfig = configResolution.value;
 
 /**
  * The parsed config must be STRUCTURALLY what it claims (round-4 finding).
@@ -236,8 +258,8 @@ const effectiveConfig = (() => {
  * unreported model identity as agreement.
  */
 const configProblem = (() => {
-  if (effectiveConfig === undefined) {
-    return "could not resolve the effective tsconfig";
+  if (configResolution.failure !== undefined) {
+    return configResolution.failure;
   }
   if (typeof effectiveConfig !== "object" || effectiveConfig === null || Array.isArray(effectiveConfig)) {
     return "the effective tsconfig is not an object";
@@ -248,6 +270,27 @@ const configProblem = (() => {
   }
   if (typeof options.outDir !== "string" || options.outDir.trim().length === 0) {
     return "the effective tsconfig declares no outDir";
+  }
+  /**
+   * ...and it must be the directory this script MANAGES (round-5 finding B13).
+   *
+   * Step 1 compared the RAW tsconfig. Checking here only that the effective
+   * value was a nonempty string left the actual escape open: `--showConfig`
+   * reporting `build-output` while the root file said `dist` passed both
+   * checks. tsc then emitted into `build-output` while the audit examined an
+   * untouched `dist`, found nothing wrong with it, and reported a consistent
+   * tree — verification of a directory the build never touched.
+   *
+   * The EFFECTIVE config is the authority, because it is what tsc obeys;
+   * `extends` means the root file can be silent or contradicted. Compared by
+   * resolution rather than by string so that `dist`, `./dist` and an absolute
+   * path are one answer, and a sibling like `dist-2` is not.
+   */
+  if (resolve(REPO_ROOT, options.outDir) !== resolve(REPO_ROOT, OUTPUT_DIR)) {
+    return (
+      `the effective tsconfig builds into ${JSON.stringify(options.outDir)}, but verification manages ` +
+      `${JSON.stringify(OUTPUT_DIR)}; the audit would examine a directory the build never wrote to`
+    );
   }
   if (options.noEmit !== undefined && typeof options.noEmit !== "boolean") {
     return `noEmit is ${JSON.stringify(options.noEmit)}, which is not a boolean`;
@@ -270,7 +313,13 @@ if (outputDevice !== undefined && rootDevice !== undefined && outputDevice !== r
   fail("verification refused: the build output directory is on a different device (a mount or bind mount); a recursive delete could reach outside the repository");
 }
 if (noEmit) {
-  fail("verification refused: tsconfig sets noEmit, so the build produces nothing and any audit would run against whatever was already there");
+  // Worded differently from the `assessTreeSafety` clause that covers the same
+  // condition later. Round-5 review observed that deleting this guard still
+  // left the focused suite green, because the later guard caught it and said
+  // almost the same words — so the test passed for a different reason than it
+  // claimed. They are two checks at two different moments, and the distinct
+  // thing this one can report is that NOTHING WAS BUILT.
+  fail("verification refused before building: tsconfig sets noEmit, so the build would produce nothing and any audit would run against whatever was already there");
 }
 
 // --- 3. build, and prove it actually emitted the checker ---------------------
