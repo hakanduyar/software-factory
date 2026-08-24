@@ -162,7 +162,16 @@ export interface TreeFacts {
   readonly outputOnDifferentDevice: boolean;
   /** Symlinked test artifacts found under the output directory. */
   readonly symlinkedArtifacts: readonly string[];
-  /** Symlinked entries found under `tests/`. */
+  /**
+   * Symlinked or hardlinked entries found under the SOURCE ROOTS.
+   *
+   * Both `src/` and `tests/`, not `tests/` alone (round-11 finding C). What the
+   * build compiles and the runner executes is the whole graph; `src/` is in it.
+   * Scanning only `tests/` enforced less than this file's threat model claimed
+   * — "symlinks and hardlinks that pull code in from outside the tree" — and a
+   * hardlinked `src/` module was compiled and executed from outside the tree
+   * while verification exited 0.
+   */
   readonly symlinkedSources: readonly string[];
   /** True when tsconfig sets `noEmit`, so a build would emit nothing. */
   readonly buildEmitsNothing: boolean;
@@ -217,7 +226,7 @@ export function assessTreeSafety(facts: TreeFacts): TreeSafetyVerdict {
   if (facts.symlinkedSources.length > 0) {
     return {
       safe: false,
-      reason: `symlinked entries under tests/: ${facts.symlinkedSources.join(", ")}; source must live in this repository`,
+      reason: `symlinked or hardlinked entries under the source roots (src/, tests/): ${facts.symlinkedSources.join(", ")}; source must live in this repository`,
     };
   }
   if (facts.symlinkedArtifacts.length > 0) {
@@ -386,4 +395,152 @@ export function assessCleanTarget(input: {
     return { safe: false, reason: `refusing to remove ${relative}: path traversal` };
   }
   return { safe: true, target };
+}
+
+/**
+ * A single mount point, as reported by the kernel.
+ *
+ * Only the mount point path is needed: this module decides whether the build
+ * output directory is itself a mount, or contains one. What is mounted there is
+ * irrelevant — a recursive delete does not care.
+ */
+export interface MountPoint {
+  /** Absolute mount point path, as the kernel reports it. */
+  readonly mountPoint: string;
+}
+
+/**
+ * Parses `/proc/self/mountinfo`.
+ *
+ * WHY THIS EXISTS AT ALL. `st_dev` was the only bind-mount signal the verifier
+ * had, and it is not sufficient: a bind mount of a directory that already lives
+ * on the SAME filesystem shares the repository's device number, so
+ * `outputOnDifferentDevice` is false and the guard never fires. `rmSync(...,
+ * { recursive: true })` then deletes through the mount into whatever was bound
+ * there — outside the repository, which is exactly what AC-5 forbids and what
+ * this file's threat model claims to defend against. Adding a second device
+ * comparison would have been pseudo-protection; the mount table is the only
+ * ordinary source that actually knows.
+ *
+ * Format, per `Documentation/filesystems/proc.rst`:
+ *
+ *   36 35 98:0 /mnt1 /mnt2 rw,noatime master:1 - ext3 /dev/root rw,errors=continue
+ *   (1)(2)(3)  (4)   (5)   (6)        (7)      (8)(9)  (10)     (11)
+ *
+ * Field 5 is the mount point. Fields 7+ are optional and variable in number,
+ * terminated by a literal `-`, which is why the mount point is read positionally
+ * from the LEFT rather than by counting from the right.
+ *
+ * Octal escapes: the kernel encodes space, tab, newline and backslash in paths
+ * as `\040`, `\011`, `\012` and `\134`. A mount point containing a space would
+ * otherwise be silently truncated at the space and compare unequal — a
+ * false NEGATIVE in a guard, which is the dangerous direction.
+ *
+ * Malformed lines are skipped rather than failing the parse: a single
+ * unparseable row must not blind the caller to every other mount. The CALLER
+ * decides what an unreadable or empty table means, and it fails closed.
+ */
+export function parseMountInfo(content: string): readonly MountPoint[] {
+  const mounts: MountPoint[] = [];
+  for (const rawLine of content.split("\n")) {
+    const line = rawLine.trim();
+    if (line.length === 0) continue;
+    const fields = line.split(" ");
+    // Fields 1-5 are mandatory and positional; anything shorter is not a
+    // mountinfo row we can read.
+    if (fields.length < 5) continue;
+    const mountPoint = fields[4];
+    if (mountPoint === undefined || !mountPoint.startsWith("/")) continue;
+    mounts.push({ mountPoint: unescapeMountPath(mountPoint) });
+  }
+  return mounts;
+}
+
+/** Decodes the kernel's octal escapes for space, tab, newline and backslash. */
+function unescapeMountPath(path: string): string {
+  return path.replace(/\\([0-7]{3})/g, (_match, octal: string) =>
+    String.fromCharCode(Number.parseInt(octal, 8)),
+  );
+}
+
+export type MountTopologyVerdict =
+  | { readonly safe: true }
+  | { readonly safe: false; readonly reason: string };
+
+/**
+ * Refuses to treat the build output as deletable when the mount table says a
+ * recursive delete would cross a filesystem boundary.
+ *
+ * Two distinct refusals, because they are two different accidents:
+ *
+ * 1. The output directory IS a mount point. Deleting its contents deletes the
+ *    contents of whatever is mounted there, which is not this repository's
+ *    build output however much the path suggests otherwise. This is the
+ *    same-device bind mount that `st_dev` cannot see.
+ *
+ * 2. A mount point is NESTED INSIDE the output directory. The directory itself
+ *    is ordinary, so refusal (1) does not fire, but the recursive walk reaches
+ *    the nested mount and deletes through it.
+ *
+ * PLATFORM BOUNDARY, stated rather than implied. This guarantee is implemented
+ * for Linux only, because `/proc/self/mountinfo` is where it comes from. On any
+ * other platform the verifier does NOT claim bind-mount safety; it says so and
+ * continues, so that the claim in the threat model matches the code. A test
+ * pins this so the boundary cannot be quietly widened into a promise.
+ *
+ * FAILS CLOSED on Linux: an unreadable, empty or unparseable mount table means
+ * the question cannot be answered, and an unanswerable safety question is not a
+ * pass. `mountInfo === undefined` is "could not read it", which is precisely
+ * when a guard must refuse rather than assume.
+ */
+export function assessMountTopology(input: {
+  readonly platform: string;
+  readonly mountInfo: string | undefined;
+  readonly outputDirectory: string;
+  readonly realOutputDirectory: string | undefined;
+}): MountTopologyVerdict {
+  if (input.platform !== "linux") {
+    // Not a refusal, and deliberately not silence either.
+    return { safe: true };
+  }
+  if (input.mountInfo === undefined) {
+    return {
+      safe: false,
+      reason:
+        "the mount table (/proc/self/mountinfo) could not be read, so it is unknown whether the build output is a mount point; refusing to run a destructive clean on an unanswerable question",
+    };
+  }
+  const mounts = parseMountInfo(input.mountInfo);
+  if (mounts.length === 0) {
+    return {
+      safe: false,
+      reason:
+        "the mount table (/proc/self/mountinfo) contained no readable entries, so bind-mount safety cannot be established; refusing to run a destructive clean",
+    };
+  }
+  // Judge the path the build and the delete actually reach, which is the
+  // resolved one. `realOutputDirectory` is undefined only when the directory
+  // does not exist yet, and a directory that does not exist is not a mount.
+  const output = stripTrailingSlash(normalise(input.realOutputDirectory ?? input.outputDirectory));
+  for (const mount of mounts) {
+    const mountPoint = stripTrailingSlash(normalise(mount.mountPoint));
+    if (mountPoint === output) {
+      return {
+        safe: false,
+        reason: `the build output directory is itself a mount point (${mount.mountPoint}); a recursive delete would remove the contents of a separately mounted filesystem, not this repository's build output`,
+      };
+    }
+    if (output !== "" && mountPoint.startsWith(`${output}/`)) {
+      return {
+        safe: false,
+        reason: `a filesystem is mounted inside the build output directory (${mount.mountPoint}); a recursive delete would reach through it into a separately mounted tree`,
+      };
+    }
+  }
+  return { safe: true };
+}
+
+/** Removes a trailing slash so `/a/b` and `/a/b/` compare equal (root stays `/`). */
+function stripTrailingSlash(path: string): string {
+  return path.length > 1 ? path.replace(/\/+$/, "") : path;
 }

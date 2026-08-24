@@ -21,12 +21,40 @@
  * step guarded by an untested inline copy of the rule would be worse on both
  * counts.
  *
- * ON CONTAMINATION IT FAILS, LOUDLY. An earlier version cleaned, rebuilt and
- * exited 0 — contradicting this task's own frozen AC-2 ("causes verification to
- * FAIL with a message naming the orphan"). A verifier that silently repairs the
- * condition it exists to detect teaches everyone that contamination is normal.
- * It still cleans, so the NEXT run is honest; but this run names the problem and
- * exits non-zero.
+ * ON CONTAMINATION IT REPORTS, REPAIRS ONCE, AND RE-AUDITS — and the frozen
+ * criteria genuinely conflict here, so the reasoning is recorded rather than
+ * assumed.
+ *
+ *   AC-2: an orphan "causes verification to FAIL with a message naming the
+ *         orphan — it is never silently ignored and never executed".
+ *   AC-4: after a branch switch, "with another branch's artifacts present",
+ *         verification "yields the same result as running it on a freshly
+ *         cloned tree. No human step is required."
+ *
+ * A branch switch generally LEAVES orphans, so read literally AC-2 demands a
+ * failure exactly where AC-4 demands the fresh-clone result. Both are frozen;
+ * neither may be edited. The adjudication, taken from the spec and not from
+ * reviewer prose:
+ *
+ *   - The task's own Design direction specifies "a deterministic clean BEFORE
+ *     build". Under that shape a branch-switch leftover never reaches the audit
+ *     at all — the spec's intent is that it resolves INSIDE the run.
+ *   - AC-4 is unconditional, names the property "BY CONSTRUCTION", and rules out
+ *     a human step. A second invocation is a human step.
+ *   - AC-2's substantive guarantees are what carry its meaning: the orphan is
+ *     never silently ignored (it is named on stderr before anything is touched)
+ *     and never executed (execution derives from source, and the artifact is
+ *     deleted before any test runs).
+ *   - AC-2's FAIL is preserved where failing is the honest answer: anything that
+ *     SURVIVES a clean rebuild from source is a genuine disagreement between the
+ *     tree and its build, and that fails closed.
+ *
+ * So: transient stale output is named, removed, rebuilt and re-audited within a
+ * single invocation; a real inconsistency still fails. An earlier round chose
+ * the opposite reading and satisfied AC-2 by breaking AC-4 — a second `npm test`
+ * was required, which is precisely the "convention that depends on whoever runs
+ * the command remembering" this task exists to abolish. The repair is bounded to
+ * ONE cycle so it can never loop.
  *
  * ================================================================
  * THREAT MODEL — what this defends against, and what it does not
@@ -34,9 +62,18 @@
  * DEFENDS AGAINST (the observed, real problem): gitignored build output that git
  * does not clean on checkout; stale artifacts from another branch; a partial or
  * redirected build; a misconfigured `outDir`; an inherited `noEmit`; symlinks
- * and hardlinks that pull code in from outside the tree; a bind-mounted output
- * directory that a recursive delete would reach through; and a run that would
- * report success having executed nothing.
+ * and hardlinks that pull code in from outside the tree, under BOTH source roots
+ * (`src/` and `tests/`, not `tests/` alone); an `emitDeclarationOnly` build that
+ * exits 0 having emitted no JavaScript; a bind-mounted output directory that a
+ * recursive delete would reach through, INCLUDING a same-device bind mount that
+ * no device-number comparison can see; and a run that would report success
+ * having executed nothing.
+ *
+ * PLATFORM BOUNDARY, stated so the claim matches the code: the bind-mount
+ * guarantee is derived from `/proc/self/mountinfo` and is therefore LINUX-ONLY.
+ * On other platforms the different-device check still applies, but same-device
+ * bind mounts are not claimed to be detected. On Linux an unreadable or
+ * unparseable mount table fails closed.
  *
  * DOES NOT DEFEND AGAINST an adversary with concurrent write access to this
  * working tree, or control of `PATH`, during the run. Round-3 review
@@ -295,6 +332,24 @@ const configProblem = (() => {
   if (options.noEmit !== undefined && typeof options.noEmit !== "boolean") {
     return `noEmit is ${JSON.stringify(options.noEmit)}, which is not a boolean`;
   }
+  /**
+   * `emitDeclarationOnly` is `noEmit` wearing a hat (round-11 finding D).
+   *
+   * It emits `.d.ts` and NO JavaScript, so `tsc` exits 0 while every compiled
+   * test and the checker itself keep whatever content and mtime they already
+   * had. The freshness check then compares the stale checker's mtime against a
+   * build that legitimately succeeded, and a build started within a second of
+   * the previous one slips through the grace window with the OLD auditor in
+   * charge. Rejected here, next to `noEmit`, because it is the same ordinary
+   * misconfiguration with the same consequence: an audit of whatever was
+   * already lying there.
+   */
+  if (options.emitDeclarationOnly !== undefined && typeof options.emitDeclarationOnly !== "boolean") {
+    return `emitDeclarationOnly is ${JSON.stringify(options.emitDeclarationOnly)}, which is not a boolean`;
+  }
+  if (options.emitDeclarationOnly === true) {
+    return "the effective tsconfig sets emitDeclarationOnly, so the build emits no JavaScript and the audit would run against stale compiled output";
+  }
   return undefined;
 })();
 if (configProblem !== undefined) {
@@ -312,6 +367,19 @@ const outputDevice = deviceOf(join(REPO_ROOT, OUTPUT_DIR));
 if (outputDevice !== undefined && rootDevice !== undefined && outputDevice !== rootDevice) {
   fail("verification refused: the build output directory is on a different device (a mount or bind mount); a recursive delete could reach outside the repository");
 }
+// The device comparison above catches only a DIFFERENT-device mount. A bind
+// mount of a directory already on this filesystem shares the device number and
+// is invisible to it, to `realpath` and to any string comparison — while
+// `rmSync(recursive)` deletes straight through it. The mount table is read
+// here, before anything is built or removed; the decision itself lives in the
+// tested checker and is applied once that exists (step 4).
+const mountInfo = (() => {
+  try {
+    return readFileSync("/proc/self/mountinfo", "utf8");
+  } catch {
+    return undefined;
+  }
+})();
 if (noEmit) {
   // Worded differently from the `assessTreeSafety` clause that covers the same
   // condition later. Round-5 review observed that deleting this guard still
@@ -370,7 +438,17 @@ const safety = checker.assessTreeSafety({
   // tree. Filtering by name meant the check only caught the shape of the escape
   // that had already been demonstrated.
   symlinkedArtifacts: findSymlinks(OUTPUT_DIR),
-  symlinkedSources: [...findSymlinks("tests"), ...findHardlinkedSources("tests")].sort(),
+  // BOTH source roots (round-11 finding C). `src/` is compiled and executed
+  // just as `tests/` is, and scanning only `tests/` enforced less than the
+  // threat model above claims. Same policy, same already-documented
+  // legitimate-hardlink false positive — applied consistently rather than to
+  // whichever directory happened to be named first.
+  symlinkedSources: [
+    ...findSymlinks("src"),
+    ...findSymlinks("tests"),
+    ...findHardlinkedSources("src"),
+    ...findHardlinkedSources("tests"),
+  ].sort(),
   buildEmitsNothing: noEmit,
   checkerFreshlyEmitted,
 });
@@ -378,14 +456,34 @@ if (!safety.safe) {
   fail(`verification refused: ${safety.reason}`);
 }
 
+// --- 4b. mount topology, the part `st_dev` cannot answer ---------------------
+const mountVerdict = checker.assessMountTopology({
+  platform: process.platform,
+  mountInfo,
+  outputDirectory: join(REPO_ROOT, OUTPUT_DIR),
+  realOutputDirectory: realOrUndefined(join(REPO_ROOT, OUTPUT_DIR)),
+});
+if (!mountVerdict.safe) {
+  fail(`verification refused: ${mountVerdict.reason}`);
+}
+
 // --- 5. audit every artifact that could RUN, anywhere in the output ----------
 const sourceTests = listFiles("tests").filter((path) => path.endsWith(".test.ts"));
 const compiledTests = listFiles(OUTPUT_DIR).filter((path) => checker.isTestArtifact(path));
-const audit = checker.auditTestArtifacts({ sourceTests, compiledTests });
+let audit = checker.auditTestArtifacts({ sourceTests, compiledTests });
 
-// --- 6. contaminated? clean so the next run is honest, then FAIL ------------
+// --- 6. contaminated? report it, repair it, and re-audit the REBUILT tree ----
+// Bounded to exactly ONE repair cycle: clean, rebuild from source, re-audit.
+// Anything still inconsistent after that is not stale output, it is a real
+// source/artifact disagreement, and it fails closed. There is no loop.
 if (!audit.clean) {
   const diagnosis = checker.describeContamination(audit);
+  // Reported before anything is touched, on stderr, naming the artifacts —
+  // AC-2's "never silently ignored". A repair nobody is told about is the
+  // silence this task exists to remove.
+  console.error(`\n${diagnosis}\n`);
+  console.error("Removing the stale build output and rebuilding from source, then re-auditing.\n");
+
   const cleanVerdict = checker.assessCleanTarget({
     repositoryRoot: REPO_ROOT,
     target: join(REPO_ROOT, OUTPUT_DIR),
@@ -395,7 +493,34 @@ if (!audit.clean) {
     fail(`${diagnosis}\n\nThe stale output could NOT be removed: ${cleanVerdict.reason}`);
   }
   rmSync(cleanVerdict.target, { recursive: true, force: true });
-  fail(`${diagnosis}\n\nThe stale output has been removed. Re-run to verify a clean tree.`);
+
+  const rebuildStartedAt = Date.now();
+  build();
+  // The rebuild must actually have emitted, or the re-audit would be judging an
+  // empty directory and calling it consistent. Same discipline as the first
+  // build, for the same reason.
+  const rebuiltChecker = (() => {
+    try {
+      return statSync(CHECKER_PATH);
+    } catch {
+      return undefined;
+    }
+  })();
+  if (rebuiltChecker === undefined || rebuiltChecker.mtimeMs + 1000 < rebuildStartedAt) {
+    fail(`${diagnosis}\n\nThe rebuild after cleaning did not emit the verification checker; refusing to report a tree it could not rebuild`);
+  }
+
+  const rebuiltCompiled = listFiles(OUTPUT_DIR).filter((path) => checker.isTestArtifact(path));
+  audit = checker.auditTestArtifacts({ sourceTests, compiledTests: rebuiltCompiled });
+  if (!audit.clean) {
+    // Survived a clean rebuild from source. That is not another branch's
+    // leftovers; the tree genuinely disagrees with itself.
+    fail(
+      `${checker.describeContamination(audit)}\n\nThis survived a clean rebuild from source, so it is not stale ` +
+        `output from another branch — the source tree and the build genuinely disagree. Verification fails.`,
+    );
+  }
+  console.error("Stale output removed and rebuilt; the rebuilt tree is consistent. Continuing.\n");
 }
 
 // --- 7. refuse a run that would prove nothing -------------------------------

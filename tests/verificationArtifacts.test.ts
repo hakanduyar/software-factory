@@ -13,6 +13,7 @@
  */
 
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 
 import {
@@ -21,6 +22,8 @@ import {
   auditTestArtifacts,
   compiledPathForSourceTest,
   describeContamination,
+  assessMountTopology,
+  parseMountInfo,
 } from "../src/verification/testArtifacts.js";
 
 const SOURCES = ["tests/alpha.test.ts", "tests/nested/beta.test.ts"];
@@ -182,7 +185,7 @@ describe("TASK-010 round 2: every tree-safety clause, judged directly", () => {
     ["output on another device", { outputOnDifferentDevice: true }, /different device/],
     ["a noEmit build", { buildEmitsNothing: true }, /noEmit/],
     ["a stale auditor", { checkerFreshlyEmitted: false }, /stale copy of the auditor/],
-    ["symlinked sources", { symlinkedSources: ["tests/linked.test.ts"] }, /symlinked entries under tests/],
+    ["symlinked sources", { symlinkedSources: ["tests/linked.test.ts"] }, /symlinked or hardlinked entries under the source roots/],
     ["symlinked artifacts", { symlinkedArtifacts: ["dist/tests/g.test.js"] }, /symlinked test artifacts/],
   ];
 
@@ -235,5 +238,140 @@ describe("TASK-010 AC-8: the invariant is stated where it will be found", () => 
     assert.match(source, /DOES NOT DEFEND AGAINST/, "the boundary must be stated explicitly");
     assert.match(source, /concurrent write access/, "the adversary must be named");
     assert.match(source, /CLEAN_ROOM_CI/, "the item that would close it must be named");
+  });
+});
+
+/**
+ * TASK-010 round-11 finding B — the bind mount `st_dev` cannot see.
+ *
+ * The verifier claimed to defend against "a bind-mounted output directory that a
+ * recursive delete would reach through", but implemented that claim as a device-
+ * number comparison. A bind mount of a directory ALREADY ON THIS FILESYSTEM
+ * shares the device number, so the guard never fired and `rmSync(recursive)`
+ * would delete through it — outside the repository, which AC-5 forbids.
+ *
+ * The decision is tested here as a pure function over mount-table text, so it
+ * needs no privileged mounting to be exercised deterministically. A real
+ * bind-mount integration test would require root (`mount --bind`), which this
+ * suite must never need; that environment-level gap is stated rather than faked.
+ */
+describe("TASK-010 round 11: mount topology, not device numbers", () => {
+  const LINE = (mountPoint: string) =>
+    `36 35 8:2 / ${mountPoint} rw,relatime shared:1 - ext4 /dev/sdb2 rw`;
+  const BASE = [LINE("/"), LINE("/home"), LINE("/proc")].join("\n");
+
+  it("parses the mount point out of field 5, past the variable optional fields", () => {
+    const mounts = parseMountInfo(
+      ["36 35 8:2 / /a rw shared:1 master:2 - ext4 /dev/sdb2 rw", "37 36 8:2 / /b rw - ext4 /dev/sdb2 rw"].join("\n"),
+    );
+    assert.deepEqual(
+      mounts.map((m) => m.mountPoint),
+      ["/a", "/b"],
+    );
+  });
+
+  it("decodes octal escapes so a mount point containing a space still compares equal", () => {
+    // A false NEGATIVE is the dangerous direction: truncating at the space would
+    // make `/mnt/my dir` compare unequal to itself and silently pass.
+    const mounts = parseMountInfo(LINE("/mnt/my\\040dir"));
+    assert.deepEqual(mounts.map((m) => m.mountPoint), ["/mnt/my dir"]);
+  });
+
+  it("skips malformed rows without blinding the caller to the rest", () => {
+    const mounts = parseMountInfo(["garbage", "", LINE("/real")].join("\n"));
+    assert.deepEqual(mounts.map((m) => m.mountPoint), ["/real"]);
+  });
+
+  it("REFUSES when the output directory is itself a mount point (the same-device bind mount)", () => {
+    const verdict = assessMountTopology({
+      platform: "linux",
+      mountInfo: [BASE, LINE("/repo/dist")].join("\n"),
+      outputDirectory: "/repo/dist",
+      realOutputDirectory: "/repo/dist",
+    });
+    assert.equal(verdict.safe, false);
+    assert.match(verdict.safe === false ? verdict.reason : "", /itself a mount point/);
+  });
+
+  it("REFUSES when a filesystem is mounted INSIDE the output directory", () => {
+    const verdict = assessMountTopology({
+      platform: "linux",
+      mountInfo: [BASE, LINE("/repo/dist/nested")].join("\n"),
+      outputDirectory: "/repo/dist",
+      realOutputDirectory: "/repo/dist",
+    });
+    assert.equal(verdict.safe, false);
+    assert.match(verdict.safe === false ? verdict.reason : "", /mounted inside/);
+  });
+
+  it("judges the RESOLVED path, not the lexical one", () => {
+    const verdict = assessMountTopology({
+      platform: "linux",
+      mountInfo: [BASE, LINE("/elsewhere/output")].join("\n"),
+      outputDirectory: "/repo/dist",
+      realOutputDirectory: "/elsewhere/output",
+    });
+    assert.equal(verdict.safe, false);
+  });
+
+  it("does not confuse a sibling whose name merely starts the same", () => {
+    const verdict = assessMountTopology({
+      platform: "linux",
+      mountInfo: [BASE, LINE("/repo/dist-2")].join("\n"),
+      outputDirectory: "/repo/dist",
+      realOutputDirectory: "/repo/dist",
+    });
+    assert.equal(verdict.safe, true);
+  });
+
+  it("accepts an ordinary tree whose output is not a mount", () => {
+    const verdict = assessMountTopology({
+      platform: "linux",
+      mountInfo: BASE,
+      outputDirectory: "/repo/dist",
+      realOutputDirectory: "/repo/dist",
+    });
+    assert.equal(verdict.safe, true);
+  });
+
+  it("FAILS CLOSED on Linux when the mount table cannot be read", () => {
+    const verdict = assessMountTopology({
+      platform: "linux",
+      mountInfo: undefined,
+      outputDirectory: "/repo/dist",
+      realOutputDirectory: "/repo/dist",
+    });
+    assert.equal(verdict.safe, false);
+    assert.match(verdict.safe === false ? verdict.reason : "", /could not be read/);
+  });
+
+  it("FAILS CLOSED on Linux when the mount table has no readable entries", () => {
+    const verdict = assessMountTopology({
+      platform: "linux",
+      mountInfo: "garbage\nmore garbage\n",
+      outputDirectory: "/repo/dist",
+      realOutputDirectory: "/repo/dist",
+    });
+    assert.equal(verdict.safe, false);
+    assert.match(verdict.safe === false ? verdict.reason : "", /no readable entries/);
+  });
+
+  /**
+   * PINS THE PLATFORM BOUNDARY. The guarantee is Linux-only because
+   * `/proc/self/mountinfo` is where it comes from. If someone later widens this
+   * to claim cross-platform bind-mount safety, this test must be confronted
+   * rather than quietly passing.
+   */
+  it("does NOT claim the bind-mount guarantee off Linux, and says so in the threat model", () => {
+    const verdict = assessMountTopology({
+      platform: "darwin",
+      mountInfo: undefined,
+      outputDirectory: "/repo/dist",
+      realOutputDirectory: "/repo/dist",
+    });
+    assert.equal(verdict.safe, true, "off Linux this check must not fail closed on an unreadable Linux-only file");
+
+    const header = readFileSync(new URL("../../scripts/verify.mjs", import.meta.url), "utf8");
+    assert.match(header, /LINUX-ONLY/, "the threat model must state the platform boundary it actually implements");
   });
 });

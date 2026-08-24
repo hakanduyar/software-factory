@@ -18,6 +18,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import {
   cpSync,
+  existsSync,
   linkSync,
   mkdirSync,
   mkdtempSync,
@@ -166,26 +167,37 @@ describe("TASK-010 remediation: the harness itself, end to end", () => {
   });
 
   /**
-   * AC-2, and review finding B1. The first implementation cleaned the orphan and
-   * exited 0 — contradicting this task's own frozen criterion. Silently
-   * repairing the condition you exist to detect teaches everyone it is normal.
+   * AC-4, decided against AC-2 by the adjudication recorded in `scripts/verify.mjs`.
+   *
+   * Another branch's artifacts must yield the fresh-clone RESULT in ONE
+   * invocation with no human step — while AC-2's substantive guarantees hold:
+   * the orphan is NAMED, and it is never executed. An earlier round exited 1
+   * here and told the operator to run the command again, which is the very
+   * "remember to clean it" convention this task exists to abolish.
    */
-  it("FAILS and names the orphan when a foreign artifact is present", () => {
+  it("CONVERGES in one invocation when another branch's artifacts are present", () => {
     const root = makeFixtureRepo();
-    assert.equal(runHarness(root).status, 0, "the fixture must pass before contamination");
+    const clean = runHarness(root);
+    assert.equal(clean.status, 0, "the fixture must pass before contamination");
 
     writeFileSync(join(root, "dist/tests/ghostFromAnotherBranch.test.js"), "// stale\n");
     const { status, output } = runHarness(root);
 
-    assert.notEqual(status, 0, "a contaminated tree must not report success");
+    // AC-4: same result as a freshly cloned tree, first time, no second run.
+    assert.equal(status, 0, `a stale artifact must not require a second invocation:\n${output}`);
+    assert.match(output, /verification complete: 1 test files/);
+    // AC-2: never silently ignored.
     assert.match(output, /ghostFromAnotherBranch\.test\.js/, "the orphan must be named");
-    assert.match(output, /Re-run to verify a clean tree/);
-
-    // And the next run is honest, because the stale output was removed.
-    assert.equal(runHarness(root).status, 0, "the follow-up run should be clean");
+    assert.match(output, /Removing the stale build output/);
+    // AC-2: never executed — and the artifact is gone, not merely skipped.
+    assert.equal(
+      existsSync(join(root, "dist/tests/ghostFromAnotherBranch.test.js")),
+      false,
+      "the stale artifact must not survive the run",
+    );
   });
 
-  it("detects an orphan OUTSIDE dist/tests and with a non-.js extension", () => {
+  it("converges for an orphan OUTSIDE dist/tests and with a non-.js extension", () => {
     for (const relative of ["dist/ghost.test.js", "dist/nested/ghost.test.js", "dist/tests/ghost.test.mjs"]) {
       const root = makeFixtureRepo();
       assert.equal(runHarness(root).status, 0);
@@ -193,9 +205,96 @@ describe("TASK-010 remediation: the harness itself, end to end", () => {
       writeFileSync(join(root, relative), "// stale\n");
 
       const { status, output } = runHarness(root);
-      assert.notEqual(status, 0, `${relative} was not detected`);
-      assert.match(output, /ghost\.test\./);
+      assert.equal(status, 0, `${relative} did not converge:\n${output}`);
+      assert.match(output, /ghost\.test\./, `${relative} was not named`);
+      assert.equal(existsSync(join(root, relative)), false, `${relative} survived the run`);
     }
+  });
+
+  /**
+   * The other half of the same adjudication, and the reason converging is not
+   * the same as ignoring: an inconsistency that SURVIVES a clean rebuild is a
+   * real disagreement between the tree and its build, and it fails closed.
+   *
+   * Driven by `exclude`, so the disagreement is deterministic and needs no
+   * privileged setup: the source test exists and the build genuinely refuses to
+   * emit it, exactly as a partial build would.
+   */
+  it("FAILS CLOSED when a source/artifact disagreement survives a clean rebuild", () => {
+    const root = makeFixtureRepo();
+    assert.equal(runHarness(root).status, 0, "the fixture must pass first");
+
+    writeFileSync(
+      join(root, "tests/excluded.test.ts"),
+      'import { describe, it } from "node:test";\ndescribe("excluded", () => { it("never compiles", () => {}); });\n',
+    );
+    const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as {
+      exclude?: string[];
+    };
+    tsconfig.exclude = ["tests/excluded.test.ts"];
+    writeFileSync(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, `a real disagreement must fail:\n${output}`);
+    assert.match(output, /excluded\.test/, "the missing artifact must be named");
+    assert.match(output, /survived a clean rebuild/, "it must say why this is not merely stale output");
+  });
+
+  /**
+   * AC-7 at the HARNESS level, as a deterministic negative control.
+   *
+   * The independent review's finding E: every end-to-end case would survive
+   * deletion of the script's contamination branch, so nothing proved that branch
+   * was what caught anything. This removes exactly that branch in a COPY of the
+   * script and shows the same contaminated tree then reports success.
+   *
+   * The mutation is asserted to have matched before it is trusted — a mutation
+   * that silently changed nothing would make this test prove the opposite of
+   * what it claims, which is the failure mode round 7 and round 8 both hit.
+   */
+  it("negative control: without the contamination branch, a stale artifact passes unnoticed", () => {
+    const root = makeFixtureRepo();
+    assert.equal(runHarness(root).status, 0, "the fixture must pass first");
+
+    const scriptPath = join(root, "scripts/verify.mjs");
+    const original = readFileSync(scriptPath, "utf8");
+    const GUARD = "if (!audit.clean) {";
+    assert.ok(original.includes(GUARD), "the mutation target must exist verbatim, or this control proves nothing");
+    const mutated = original.replace(GUARD, "if (false) {");
+    assert.notEqual(mutated, original, "the mutation did not change the script");
+    writeFileSync(scriptPath, mutated);
+
+    writeFileSync(join(root, "dist/tests/ghostFromAnotherBranch.test.js"), "// stale\n");
+    const { status, output } = runHarness(root);
+
+    assert.equal(status, 0, "with the branch removed the contaminated tree should sail through");
+    assert.doesNotMatch(output, /ghostFromAnotherBranch/, "the orphan must go unreported once the branch is gone");
+    assert.equal(
+      existsSync(join(root, "dist/tests/ghostFromAnotherBranch.test.js")),
+      true,
+      "and the stale artifact should survive, since nothing cleaned it",
+    );
+  });
+
+  /**
+   * AC-1 proven at the harness level (review finding F).
+   *
+   * Every earlier end-to-end case would still pass if `audit.expected` were
+   * swapped for `compiledTests`, because contaminated trees fail before
+   * execution and clean trees make the two lists identical. This one makes the
+   * lists DIFFER on a tree that is otherwise clean: a compiled artifact whose
+   * source exists is executed, and the reported count is the SOURCE count.
+   */
+  it("executes the source-derived set, and reports that count", () => {
+    const root = makeFixtureRepo();
+    writeFileSync(
+      join(root, "tests/second.test.ts"),
+      'import { describe, it } from "node:test";\ndescribe("second", () => { it("passes", () => {}); });\n',
+    );
+    const { status, output } = runHarness(root);
+    assert.equal(status, 0, output);
+    assert.match(output, /verifying 2 test files derived from source/);
+    assert.match(output, /verification complete: 2 test files/);
   });
 
   /** Review finding B4: a run with nothing in it must not look like a pass. */
@@ -279,7 +378,7 @@ describe("TASK-010 round 2: paths are judged by what they resolve to", () => {
 
     const { status, output } = runHarness(root);
     assert.notEqual(status, 0, "a symlinked source test was accepted");
-    assert.match(output, /symlinked entries under tests/);
+    assert.match(output, /symlinked or hardlinked entries under the source roots/);
   });
 
   /**
@@ -346,6 +445,54 @@ describe("TASK-010 round 2: paths are judged by what they resolve to", () => {
     const { status, output } = runHarness(root);
     assert.notEqual(status, 0, "a hardlinked external source was compiled and executed");
     assert.match(output, /symlinked entries under tests|hardlinked/);
+  });
+
+  /**
+   * Round 11 finding C — the scan covered `tests/` only, while the threat model
+   * claimed "symlinks and hardlinks that pull code in from outside the tree" and
+   * `findHardlinkedSources` itself said "EVERY compilable source counts ... What
+   * runs is the whole compiled graph". `src/` IS the compiled graph, and it was
+   * unscanned: an external module hardlinked into `src/` was compiled and
+   * executed while verification exited 0.
+   *
+   * The narrow fix is enforcing the claim already made, with the same policy and
+   * the same already-documented legitimate-hardlink false positive — not a new
+   * restriction invented because a reviewer called it CRITICAL.
+   */
+  it("REFUSES a hardlinked external module under src/", () => {
+    const root = makeFixtureRepo();
+    const external = mkdtempSync(join(tmpdir(), "sf-srclink-"));
+    created.push(external);
+    const outsider = join(external, "outsider.ts");
+    writeFileSync(outsider, "export const smuggled = 1;\n");
+    linkSync(outsider, join(root, "src/smuggled.ts"));
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, "a hardlinked external src/ module was compiled and executed");
+    assert.match(output, /src\/smuggled\.ts/, "the offending source must be named");
+  });
+
+  /**
+   * Round 11 finding D — `emitDeclarationOnly` is `noEmit` wearing a hat. `tsc`
+   * exits 0 having written only `.d.ts`, so every compiled test AND the checker
+   * keep their previous content; a build started soon after a real one then
+   * slips through the checker-freshness grace window with the old auditor in
+   * charge of detecting exactly that.
+   */
+  it("REFUSES an emitDeclarationOnly build, which exits 0 having emitted no JavaScript", () => {
+    const root = makeFixtureRepo();
+    assert.equal(runHarness(root).status, 0, "the fixture must pass first");
+
+    const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as {
+      compilerOptions: Record<string, unknown>;
+    };
+    tsconfig.compilerOptions["emitDeclarationOnly"] = true;
+    tsconfig.compilerOptions["declaration"] = true;
+    writeFileSync(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, "a build that emits no JavaScript was accepted");
+    assert.match(output, /emitDeclarationOnly/, "the specific misconfiguration must be named");
   });
 
   /**
