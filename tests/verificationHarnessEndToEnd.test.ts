@@ -17,6 +17,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import {
+  chmodSync,
   cpSync,
   existsSync,
   linkSync,
@@ -101,11 +102,33 @@ function makeFixtureRepo(
   return root;
 }
 
+/**
+ * The fixture harness must run in a process that is NOT inside this test run.
+ *
+ * `node --test` sets `NODE_TEST_CONTEXT`, and a nested `node --test` that sees it
+ * prints "run() is being called recursively within a test file. skipping running
+ * files" and RUNS NOTHING — exiting 0. Every end-to-end fixture inherited it, so
+ * the fixture suites never executed and the harness reported "verification
+ * complete" over an empty run. Cases that only asserted refusal still passed,
+ * which is why it went unnoticed: the vacuity was invisible until a fixture was
+ * required to FAIL and did not.
+ *
+ * Stripped here rather than per call site, so a future case cannot reintroduce
+ * it by forgetting.
+ */
+function harnessEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
+  const env = { ...process.env, ...extra };
+  for (const key of Object.keys(env)) {
+    if (key.startsWith("NODE_TEST_")) delete env[key];
+  }
+  return env;
+}
+
 function runHarness(root: string): { status: number; output: string } {
   const result = spawnSync(process.execPath, ["scripts/verify.mjs"], {
     cwd: root,
     encoding: "utf8",
-    env: { ...process.env, PATH: process.env["PATH"] ?? "" },
+    env: harnessEnv({ PATH: process.env["PATH"] ?? "" }),
   });
   return {
     status: result.status ?? -1,
@@ -150,7 +173,7 @@ function runWithShowConfigShim(root: string, answer: string): { status: number; 
   const result = spawnSync(process.execPath, ["scripts/verify.mjs"], {
     cwd: root,
     encoding: "utf8",
-    env: { ...process.env, PATH: `${shimDir}:${process.env["PATH"] ?? ""}` },
+    env: harnessEnv({ PATH: `${shimDir}:${process.env["PATH"] ?? ""}` }),
   });
   return {
     status: result.status ?? -1,
@@ -180,7 +203,10 @@ describe("TASK-010 remediation: the harness itself, end to end", () => {
     const clean = runHarness(root);
     assert.equal(clean.status, 0, "the fixture must pass before contamination");
 
-    writeFileSync(join(root, "dist/tests/ghostFromAnotherBranch.test.js"), "// stale\n");
+    writeFileSync(
+      join(root, "dist/tests/ghostFromAnotherBranch.test.js"),
+      'import test from "node:test";\ntest("ghost-must-never-run", () => {});\n',
+    );
     const { status, output } = runHarness(root);
 
     // AC-4: same result as a freshly cloned tree, first time, no second run.
@@ -189,12 +215,24 @@ describe("TASK-010 remediation: the harness itself, end to end", () => {
     // AC-2: never silently ignored.
     assert.match(output, /ghostFromAnotherBranch\.test\.js/, "the orphan must be named");
     assert.match(output, /Removing the stale build output/);
-    // AC-2: never executed — and the artifact is gone, not merely skipped.
+    // AC-2: never executed — proven by the orphan's own test NAME never
+    // appearing in the runner output, not merely by the file being gone.
+    assert.doesNotMatch(output, /ghost-must-never-run/, "the orphan was executed");
+    // ...and the artifact is gone, not merely skipped.
     assert.equal(
       existsSync(join(root, "dist/tests/ghostFromAnotherBranch.test.js")),
       false,
       "the stale artifact must not survive the run",
     );
+    // The rebuild genuinely happened and the FINAL audit is what passed.
+    assert.equal(
+      existsSync(join(root, "dist/tests/sample.test.js")),
+      true,
+      "the tree was cleaned but not rebuilt",
+    );
+    // Equivalent final generated state to a fresh clone: same discovered count.
+    assert.match(clean.output, /verifying 1 test files derived from source/);
+    assert.match(output, /verifying 1 test files derived from source/);
   });
 
   it("converges for an orphan OUTSIDE dist/tests and with a non-.js extension", () => {
@@ -458,6 +496,74 @@ describe("TASK-010 round 2: paths are judged by what they resolve to", () => {
   });
 
   /**
+   * Amended AC-2, case D: safe cleanup cannot be completed → FAIL CLOSED.
+   *
+   * The convergence path is allowed to finish successfully, which makes the
+   * failure branches the load-bearing ones. `rmSync` was previously unguarded,
+   * so a read-only parent ended the run with an uncaught exception. The exit
+   * code was non-zero either way — which is exactly why nothing noticed — but
+   * failing closed has to mean the verifier DECIDED to fail and said why.
+   */
+  it("FAILS CLOSED, with a diagnosis, when the stale output cannot be removed", () => {
+    const root = makeFixtureRepo();
+    assert.equal(runHarness(root).status, 0, "the fixture must pass first");
+    writeFileSync(join(root, "dist/tests/ghostFromAnotherBranch.test.js"), "// stale\n");
+
+    // Removing `dist` needs write permission on its PARENT, not on itself.
+    chmodSync(root, 0o555);
+    let result: { status: number; output: string };
+    try {
+      result = runHarness(root);
+    } finally {
+      chmodSync(root, 0o755);
+    }
+
+    assert.notEqual(result.status, 0, "an unremovable stale tree reported success");
+    assert.match(result.output, /could NOT be removed/, "the failure must name the cleanup problem");
+    assert.match(result.output, /ghostFromAnotherBranch/, "and must still name the orphan that caused it");
+  });
+
+  /**
+   * Amended AC-2/AC-4, case E: an INVALID source tree must not be laundered into
+   * a pass by the cleanup path.
+   *
+   * The convergence behaviour exists to remove another branch's leftovers, not
+   * to make a broken tree look repaired. Both halves are checked: a tree whose
+   * tests fail, and a tree that does not compile — each with a stale orphan
+   * present, so the cleanup path is genuinely entered on the way to failing.
+   */
+  it("does NOT convert an invalid source tree into a pass by cleaning it", () => {
+    const failing = makeFixtureRepo();
+    writeFileSync(
+      join(failing, "tests/sample.test.ts"),
+      [
+        'import assert from "node:assert/strict";',
+        'import { describe, it } from "node:test";',
+        'describe("sample", () => { it("fails on purpose", () => { assert.equal(1, 2); }); });',
+        "",
+      ].join("\n"),
+    );
+    mkdirSync(join(failing, "dist/tests"), { recursive: true });
+    writeFileSync(join(failing, "dist/tests/ghostFromAnotherBranch.test.js"), "// stale\n");
+    const failed = runHarness(failing);
+    assert.notEqual(failed.status, 0, "a failing suite was reported as success after cleaning");
+    assert.match(failed.output, /ghostFromAnotherBranch/, "the orphan should still have been reported");
+    assert.match(failed.output, /fails on purpose/, "the real test failure must be the reported outcome");
+
+    const broken = makeFixtureRepo();
+    writeFileSync(join(broken, "tests/sample.test.ts"), "this is not valid typescript at all\n");
+    mkdirSync(join(broken, "dist/tests"), { recursive: true });
+    writeFileSync(join(broken, "dist/tests/ghostFromAnotherBranch.test.js"), "// stale\n");
+    const brokeResult = runHarness(broken);
+    assert.notEqual(brokeResult.status, 0, "a non-compiling tree was reported as success");
+    assert.doesNotMatch(
+      brokeResult.output,
+      /verification complete/,
+      "a tree that does not compile must never reach the success line",
+    );
+  });
+
+  /**
    * Round 12 CRITICAL, reproduced exactly: a hardlinked checker that wins by
    * being IMPORTED before the guard that rejects it.
    *
@@ -547,6 +653,7 @@ describe("TASK-010 round 2: paths are judged by what they resolve to", () => {
 
     const result = spawnSync("unshare", ["--user", "--map-root-user", "--mount", "sh", "-c", script], {
       encoding: "utf8",
+      env: harnessEnv(),
     });
     const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
 

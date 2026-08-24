@@ -556,10 +556,26 @@ if (!audit.clean) {
   if (!cleanVerdict.safe) {
     fail(`${diagnosis}\n\nThe stale output could NOT be removed: ${cleanVerdict.reason}`);
   }
-  rmSync(cleanVerdict.target, { recursive: true, force: true });
+  // Amended AC-2 requires a FAILURE, not a stack trace, when safe cleanup or the
+  // rebuild cannot be completed. Both were previously unguarded: `rmSync`
+  // throwing on a read-only parent, or `tsc` failing on the second pass, ended
+  // the run with an uncaught exception. The exit code was non-zero either way,
+  // which is why nothing noticed — but "fails closed" has to mean the verifier
+  // decided to fail, not that it fell over on the way to deciding.
+  try {
+    rmSync(cleanVerdict.target, { recursive: true, force: true });
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    fail(`${diagnosis}\n\nThe stale output could NOT be removed: ${detail}`);
+  }
 
   const rebuildStartedAt = Date.now();
-  build();
+  try {
+    build();
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    fail(`${diagnosis}\n\nThe rebuild after cleaning FAILED, so the tree could not be returned to a verifiable state: ${detail}`);
+  }
   // The rebuild must actually have emitted, or the re-audit would be judging an
   // empty directory and calling it consistent. Same discipline as the first
   // build, for the same reason.
