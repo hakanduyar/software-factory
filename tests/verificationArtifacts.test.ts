@@ -18,6 +18,7 @@ import { describe, it } from "node:test";
 
 import {
   assessCleanTarget,
+  assessOutputDirectory,
   assessTreeSafety,
   auditTestArtifacts,
   compiledPathForSourceTest,
@@ -373,5 +374,72 @@ describe("TASK-010 round 11: mount topology, not device numbers", () => {
 
     const header = readFileSync(new URL("../../scripts/verify.mjs", import.meta.url), "utf8");
     assert.match(header, /LINUX-ONLY/, "the threat model must state the platform boundary it actually implements");
+  });
+});
+
+/**
+ *  had NO unit tests: it was exercised only incidentally
+ * through the end-to-end harness, which is how a string comparison came to
+ * reject equivalent paths without anything noticing.
+ *
+ * Both directions are tested. A guard that refuses everything is not "safe by
+ * default" — it is a guard the next person deletes because it blocks valid work.
+ */
+describe("assessOutputDirectory: one directory, however it is spelled", () => {
+  const ROOT = "/repo";
+  const base = {
+    repositoryRoot: ROOT,
+    realRepositoryRoot: ROOT,
+    configuredOutputDirectory: "dist",
+    outputDirectory: "/repo/dist",
+    realOutputDirectory: "/repo/dist" as string | undefined,
+    resolvedTsconfigOutDir: "/repo/dist",
+  };
+
+  it("trusts the managed directory", () => {
+    assert.equal(assessOutputDirectory(base).trusted, true);
+  });
+
+  it("trusts a trailing-separator spelling of the same directory", () => {
+    assert.equal(assessOutputDirectory({ ...base, resolvedTsconfigOutDir: "/repo/dist/" }).trusted, true);
+  });
+
+  it("trusts the managed directory when the output does not exist yet", () => {
+    assert.equal(assessOutputDirectory({ ...base, realOutputDirectory: undefined }).trusted, true);
+  });
+
+  it("REFUSES a sibling the build would actually write to", () => {
+    const verdict = assessOutputDirectory({ ...base, resolvedTsconfigOutDir: "/repo/dist-2" });
+    assert.equal(verdict.trusted, false);
+    if (!verdict.trusted) {
+      assert.match(verdict.reason, /builds into "\/repo\/dist-2" but verification manages/);
+    }
+  });
+
+  it("REFUSES an outDir outside the repository", () => {
+    assert.equal(
+      assessOutputDirectory({ ...base, resolvedTsconfigOutDir: "/elsewhere/dist" }).trusted,
+      false,
+    );
+  });
+
+  it("REFUSES a repository path that resolves elsewhere", () => {
+    const verdict = assessOutputDirectory({ ...base, realRepositoryRoot: "/somewhere/else" });
+    assert.equal(verdict.trusted, false);
+    if (!verdict.trusted) {
+      assert.match(verdict.reason, /resolves elsewhere/);
+    }
+  });
+
+  it("REFUSES an output directory that resolves outside the repository", () => {
+    const verdict = assessOutputDirectory({
+      ...base,
+      realOutputDirectory: "/tmp/decoy",
+      resolvedTsconfigOutDir: "/tmp/decoy",
+    });
+    assert.equal(verdict.trusted, false);
+    if (!verdict.trusted) {
+      assert.match(verdict.reason, /outside the repository/);
+    }
   });
 });

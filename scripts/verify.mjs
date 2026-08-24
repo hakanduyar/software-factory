@@ -186,6 +186,28 @@ function realOrUndefined(path) {
   }
 }
 
+/**
+ * The absolute path `candidate` names, resolved through links where possible.
+ *
+ * Two spellings name the same directory when they RESOLVE to the same place,
+ * not when their text matches. Comparing spellings refused every equivalent way
+ * of naming the managed directory: an absolute path, `dist/../dist`, a trailing
+ * separator, and a `dist-alias -> dist` symlink — the last of which is the
+ * managed directory itself under another name.
+ *
+ * `realpath` is preferred; a path that does not exist yet falls back to lexical
+ * resolution, which still normalises `..`, `./` and trailing separators.
+ */
+function resolvedPath(candidate) {
+  const absolute = resolve(REPO_ROOT, candidate);
+  return realOrUndefined(absolute) ?? absolute;
+}
+
+/** True when two path spellings name one directory. */
+function sameDirectory(a, b) {
+  return resolvedPath(a) === resolvedPath(b);
+}
+
 /** The `outDir` tsconfig actually declares — not the one this script assumes. */
 function declaredOutDir() {
   const raw = readFileSync(join(REPO_ROOT, "tsconfig.json"), "utf8");
@@ -234,8 +256,8 @@ function build() {
 // found stack instead of the real diagnosis. Deliberately a plain string
 // comparison, with the substantive realpath/symlink rules still applied by the
 // tested function once the checker exists.
-const declared = declaredOutDir().replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, "");
-if (declared !== OUTPUT_DIR) {
+const declared = declaredOutDir();
+if (!sameDirectory(declared, OUTPUT_DIR)) {
   fail(
     `verification refused: tsconfig builds into ${JSON.stringify(declared)} but verification manages ` +
       `${JSON.stringify(OUTPUT_DIR)}; they must be the same directory or stale artifacts elsewhere would be executed`,
@@ -323,7 +345,7 @@ const configProblem = (() => {
    * resolution rather than by string so that `dist`, `./dist` and an absolute
    * path are one answer, and a sibling like `dist-2` is not.
    */
-  if (resolve(REPO_ROOT, options.outDir) !== resolve(REPO_ROOT, OUTPUT_DIR)) {
+  if (!sameDirectory(options.outDir, OUTPUT_DIR)) {
     return (
       `the effective tsconfig builds into ${JSON.stringify(options.outDir)}, but verification manages ` +
       `${JSON.stringify(OUTPUT_DIR)}; the audit would examine a directory the build never wrote to`
@@ -480,7 +502,7 @@ const outputVerdict = checker.assessOutputDirectory({
   configuredOutputDirectory: OUTPUT_DIR,
   outputDirectory: join(REPO_ROOT, OUTPUT_DIR),
   realOutputDirectory: realOrUndefined(join(REPO_ROOT, OUTPUT_DIR)),
-  tsconfigOutDir: declaredOutDir(),
+  resolvedTsconfigOutDir: resolvedPath(declaredOutDir()),
 });
 if (!outputVerdict.trusted) {
   fail(`verification refused: ${outputVerdict.reason}`);

@@ -265,16 +265,30 @@ export function assessOutputDirectory(input: {
   readonly outputDirectory: string;
   /** `realpath` of the output directory, or `undefined` if it does not exist. */
   readonly realOutputDirectory: string | undefined;
-  /** The `outDir` tsconfig actually declares, relative to the repo root. */
-  readonly tsconfigOutDir: string;
+  /**
+   * The ABSOLUTE path the declared `outDir` resolves to — `realpath` where it
+   * exists, otherwise lexically resolved.
+   *
+   * Deliberately not the raw string. Comparing spellings refused every
+   * equivalent way of naming the same directory: an absolute path,
+   * `dist/../dist`, a trailing separator, and a `dist-alias -> dist` symlink.
+   * A verifier that rejects valid trees is its own failure mode — it teaches
+   * people to bypass verification, which is the habit this task exists to end.
+   *
+   * The caller resolves, because this function is pure and must stay testable
+   * without a filesystem; the RULE — that the two must be one directory —
+   * stays here, where it is tested.
+   */
+  readonly resolvedTsconfigOutDir: string;
 }): OutputDirectoryVerdict {
   const configured = normalise(input.configuredOutputDirectory).replace(/\/+$/, "");
-  const declared = normalise(input.tsconfigOutDir).replace(/^\.\//, "").replace(/\/+$/, "");
+  const managed = normalise(input.realOutputDirectory ?? input.outputDirectory).replace(/\/+$/, "");
+  const declared = normalise(input.resolvedTsconfigOutDir).replace(/\/+$/, "");
 
-  if (declared !== configured) {
+  if (declared !== managed) {
     return {
       trusted: false,
-      reason: `tsconfig builds into ${JSON.stringify(declared)} but verification manages ${JSON.stringify(configured)}; they must be the same directory or stale artifacts elsewhere would be executed`,
+      reason: `tsconfig builds into ${JSON.stringify(declared)} but verification manages ${JSON.stringify(managed)}; they must be the same directory or stale artifacts elsewhere would be executed`,
     };
   }
   if (normalise(input.repositoryRoot) !== normalise(input.realRepositoryRoot)) {

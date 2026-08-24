@@ -953,3 +953,145 @@ describe("TASK-010 round 2: paths are judged by what they resolve to", () => {
     assert.ok(!output.includes("tree-consistent"), "it must not claim consistency");
   });
 });
+
+/**
+ * A directory is judged by what it RESOLVES to, not by how it is spelled.
+ *
+ * Independent review reproduced the opposite of the escapes this file mostly
+ * pins: paths that were CORRECT being refused. An absolute `outDir` naming the
+ * managed directory, `dist/../dist`, a trailing separator, and a
+ * `dist-alias -> dist` symlink were all rejected — the last being the managed
+ * directory itself under another name.
+ *
+ * This matters as much as an escape. A verifier that refuses valid trees is its
+ * own failure mode: it trains people to work around verification, which is the
+ * habit this task exists to end. Both directions are pinned, so the guard
+ * cannot be "fixed" into refusing everything.
+ */
+describe("TASK-010 follow-up: equivalent outDir spellings are one directory", () => {
+  it("ACCEPTS an absolute outDir naming the managed directory", () => {
+    const root = makeFixtureRepo();
+    assert.equal(runHarness(root).status, 0, "fixture must pass first");
+
+    const { status, output } = runWithShowConfigShim(
+      root,
+      JSON.stringify({ compilerOptions: { outDir: join(root, "dist"), noEmit: false } }),
+    );
+    assert.equal(status, 0, `an absolute outDir was wrongly refused:\n${output.slice(0, 500)}`);
+    assert.match(output, /verification complete/);
+  });
+
+  /**
+   * The check above shims `--showConfig`, which leaves the real `tsconfig.json`
+   * still saying `"dist"` — so it exercises only the EFFECTIVE comparison. The
+   * pre-build check reads the raw file, and mutation testing showed the shimmed
+   * case passing happily with the old raw string comparison restored.
+   *
+   * A test that claims to cover a guard and does not is worse than no test, so
+   * this one writes the absolute path into the file the guard actually reads.
+   */
+  it("ACCEPTS an absolute outDir written in the real tsconfig", () => {
+    const root = makeFixtureRepo();
+    const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as {
+      compilerOptions: Record<string, unknown>;
+    };
+    tsconfig.compilerOptions["outDir"] = join(root, "dist");
+    writeFileSync(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
+
+    const { status, output } = runHarness(root);
+    assert.equal(status, 0, `an absolute outDir in tsconfig was refused:\n${output.slice(0, 500)}`);
+    assert.match(output, /verification complete/);
+  });
+
+  it("ACCEPTS a traversal spelling written in the real tsconfig", () => {
+    const root = makeFixtureRepo();
+    const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as {
+      compilerOptions: Record<string, unknown>;
+    };
+    tsconfig.compilerOptions["outDir"] = "dist/../dist";
+    writeFileSync(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
+
+    const { status, output } = runHarness(root);
+    assert.equal(status, 0, `"dist/../dist" in tsconfig was refused:\n${output.slice(0, 500)}`);
+  });
+
+  it("ACCEPTS traversal and trailing-separator spellings", () => {
+    for (const spelling of ["dist/../dist", "dist/"]) {
+      const root = makeFixtureRepo();
+      assert.equal(runHarness(root).status, 0, `${spelling}: fixture must pass first`);
+
+      const { status, output } = runWithShowConfigShim(
+        root,
+        JSON.stringify({ compilerOptions: { outDir: spelling, noEmit: false } }),
+      );
+      assert.equal(status, 0, `${spelling} was wrongly refused:\n${output.slice(0, 500)}`);
+    }
+  });
+
+  /**
+   * The sharpest case: tsc writes THROUGH the alias into the very directory
+   * being audited, so there is nothing to refuse — but a lexical comparison
+   * cannot see that.
+   */
+  it("ACCEPTS a symlink alias that resolves into the managed directory", () => {
+    const root = makeFixtureRepo();
+    assert.equal(runHarness(root).status, 0, "fixture must pass first");
+    symlinkSync(join(root, "dist"), join(root, "dist-alias"), "dir");
+
+    const { status, output } = runWithShowConfigShim(
+      root,
+      JSON.stringify({ compilerOptions: { outDir: "dist-alias", noEmit: false } }),
+    );
+    assert.equal(status, 0, `a symlink alias into dist was wrongly refused:\n${output.slice(0, 500)}`);
+  });
+
+  it("still REFUSES a sibling directory", () => {
+    const root = makeFixtureRepo();
+    assert.equal(runHarness(root).status, 0, "fixture must pass first");
+
+    const { status, output } = runWithShowConfigShim(
+      root,
+      JSON.stringify({ compilerOptions: { outDir: "dist-2", noEmit: false } }),
+    );
+    assert.notEqual(status, 0, "a sibling output directory was accepted");
+    assert.ok(!output.includes("tree-consistent"), "it must not claim consistency");
+  });
+
+  it("still REFUSES an alias that resolves somewhere else entirely", () => {
+    const root = makeFixtureRepo();
+    assert.equal(runHarness(root).status, 0, "fixture must pass first");
+    const decoy = mkdtempSync(join(tmpdir(), "sf-decoy-out-"));
+    created.push(decoy);
+    symlinkSync(decoy, join(root, "dist-elsewhere"), "dir");
+
+    const { status, output } = runWithShowConfigShim(
+      root,
+      JSON.stringify({ compilerOptions: { outDir: "dist-elsewhere", noEmit: false } }),
+    );
+    assert.notEqual(status, 0, "an alias resolving outside the managed directory was accepted");
+    assert.ok(!output.includes("tree-consistent"), "it must not claim consistency");
+  });
+
+  /**
+   * A tsconfig that inherits `outDir` through `extends` without naming it was
+   * refused outright by the raw-file check — a false positive with no attacker
+   * involved and no misconfiguration.
+   */
+  it("ACCEPTS an outDir inherited through extends", () => {
+    const root = makeFixtureRepo();
+    writeFileSync(
+      join(root, "tsconfig.base.json"),
+      JSON.stringify({ compilerOptions: { outDir: "dist" } }, null, 2),
+    );
+    const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as Record<
+      string,
+      unknown
+    >;
+    (tsconfig["compilerOptions"] as Record<string, unknown>)["outDir"] = "dist";
+    tsconfig["extends"] = "./tsconfig.base.json";
+    writeFileSync(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
+
+    const { status, output } = runHarness(root);
+    assert.equal(status, 0, `an inherited outDir was wrongly refused:\n${output.slice(0, 500)}`);
+  });
+});
