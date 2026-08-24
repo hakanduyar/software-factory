@@ -258,9 +258,19 @@ describe("TASK-010 remediation: the harness itself, end to end", () => {
 
     const scriptPath = join(root, "scripts/verify.mjs");
     const original = readFileSync(scriptPath, "utf8");
-    const GUARD = "if (!audit.clean) {";
-    assert.ok(original.includes(GUARD), "the mutation target must exist verbatim, or this control proves nothing");
-    const mutated = original.replace(GUARD, "if (false) {");
+    // The bare guard text appears TWICE — the outer contamination branch and the
+    // post-rebuild fail-closed check (round-12 finding). Matching on substring
+    // presence alone would let this control mutate whichever came first and
+    // still report success, which is the round-7/round-8 mistake a third time.
+    // The target is therefore anchored to its unique two-line form AND asserted
+    // to occur exactly once.
+    const GUARD = "\nif (!audit.clean) {\n  const diagnosis = checker.describeContamination(audit);";
+    assert.equal(
+      original.split(GUARD).length - 1,
+      1,
+      "the mutation target must occur exactly once, or this control proves nothing about which guard it removed",
+    );
+    const mutated = original.replace(GUARD, "\nif (false) {\n  const diagnosis = checker.describeContamination(audit);");
     assert.notEqual(mutated, original, "the mutation did not change the script");
     writeFileSync(scriptPath, mutated);
 
@@ -445,6 +455,115 @@ describe("TASK-010 round 2: paths are judged by what they resolve to", () => {
     const { status, output } = runHarness(root);
     assert.notEqual(status, 0, "a hardlinked external source was compiled and executed");
     assert.match(output, /symlinked entries under tests|hardlinked/);
+  });
+
+  /**
+   * Round 12 CRITICAL, reproduced exactly: a hardlinked checker that wins by
+   * being IMPORTED before the guard that rejects it.
+   *
+   * `src/verification/testArtifacts.ts` is imported from the build output to do
+   * the auditing. Hardlink it to a module whose top level calls
+   * `process.exit(0)` and the process ends, successfully, during that import —
+   * before `assessTreeSafety` is ever consulted. The guard existed; it simply
+   * ran after the thing it was guarding.
+   *
+   * The assertion is deliberately about the EXIT CODE as well as the message: a
+   * false success here is the whole defect, so "it printed something" is not
+   * evidence.
+   */
+  it("REFUSES a hardlinked checker before importing it, so it cannot exit 0 first", () => {
+    const root = makeFixtureRepo();
+    assert.equal(runHarness(root).status, 0, "the fixture must pass first");
+
+    const external = mkdtempSync(join(tmpdir(), "sf-evilchecker-"));
+    created.push(external);
+    const evil = join(external, "evil.ts");
+    writeFileSync(
+      evil,
+      [
+        "// A checker that reports nothing and simply declares success on import.",
+        "process.exit(0);",
+        "export function auditTestArtifacts(): unknown { return { clean: true, expected: [] }; }",
+        "",
+      ].join("\n"),
+    );
+    rmSync(join(root, "src/verification/testArtifacts.ts"));
+    linkSync(evil, join(root, "src/verification/testArtifacts.ts"));
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, `a hardlinked checker produced a SUCCESSFUL verification:\n${output}`);
+    assert.match(output, /before building/, "the refusal must happen before the build and the import");
+    assert.match(output, /testArtifacts\.ts/, "the offending source must be named");
+  });
+
+  /**
+   * Round 12 finding — the RUNTIME mount guard, not merely its pure logic.
+   *
+   * Removing the `assessMountTopology` call from `scripts/verify.mjs` left every
+   * pure mount test and every end-to-end test green, because no fixture had a
+   * mount. The decision logic was proven and its WIRING was not, which is the
+   * same "guard vs guard's input" error round 7 recorded.
+   *
+   * This performs a REAL same-device bind mount — the exact case `st_dev` cannot
+   * see — inside an unprivileged user+mount namespace, so it needs no sudo and
+   * cannot affect the host mount table. The bind is asserted to have actually
+   * taken effect before the harness's refusal is believed; a test that silently
+   * failed to mount would otherwise "pass" while proving nothing.
+   *
+   * Skipped, loudly, where unprivileged user namespaces are unavailable. The
+   * pure decision tests still cover the logic there; only this wiring proof is
+   * environment-dependent, and that limitation is stated rather than hidden.
+   */
+  it("REFUSES a real same-device bind-mounted output directory", () => {
+    const namespaces = spawnSync("unshare", ["--user", "--map-root-user", "--mount", "true"], {
+      encoding: "utf8",
+    });
+    if (namespaces.status !== 0) {
+      // Not an assertion-free pass: the reason is printed so a green run in a
+      // restricted environment cannot be mistaken for a proven guard.
+      console.error("SKIPPED: unprivileged user namespaces unavailable; bind-mount wiring not proven here");
+      return;
+    }
+
+    const root = makeFixtureRepo();
+    const external = mkdtempSync(join(tmpdir(), "sf-bindsrc-"));
+    created.push(external);
+    writeFileSync(join(external, "marker.txt"), "must survive\n");
+    mkdirSync(join(root, "dist"), { recursive: true });
+
+    const script = [
+      "set -e",
+      `mount --bind ${JSON.stringify(external)} ${JSON.stringify(join(root, "dist"))}`,
+      // Prove the bind actually happened before trusting anything that follows.
+      `grep -qF ${JSON.stringify(join(root, "dist"))} /proc/self/mountinfo || { echo "BIND-DID-NOT-TAKE"; exit 97; }`,
+      `cd ${JSON.stringify(root)}`,
+      // `set -e` must not swallow the harness's own non-zero exit before it can
+      // be reported — that made an earlier version of this test fail while the
+      // guard under test was working correctly.
+      "set +e",
+      `${JSON.stringify(process.execPath)} scripts/verify.mjs`,
+      'echo "HARNESS-EXIT=$?"',
+    ].join("\n");
+
+    const result = spawnSync("unshare", ["--user", "--map-root-user", "--mount", "sh", "-c", script], {
+      encoding: "utf8",
+    });
+    const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+
+    assert.doesNotMatch(output, /BIND-DID-NOT-TAKE/, "the fixture failed to bind-mount, so it proved nothing");
+    assert.match(output, /HARNESS-EXIT=1/, `the harness must refuse a bind-mounted output:\n${output}`);
+    // Anchored to the PRE-BUILD refusal specifically. Asserting only "mount
+    // point" let the post-build `assessMountTopology` satisfy this test, so
+    // deleting the pre-build guard — the one that stops `tsc` writing through
+    // the mount — left it green. Two guards covering one case is defence in
+    // depth; a test that cannot tell them apart proves neither.
+    assert.match(
+      output,
+      /refused before building: the build output directory is or contains a mount point/,
+      "the refusal must come from the pre-build guard, before tsc writes through the mount",
+    );
+    // The mounted tree's contents must be intact: refusing means never deleting.
+    assert.equal(existsSync(join(external, "marker.txt")), true, "the bind-mounted tree was deleted through");
   });
 
   /**

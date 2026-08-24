@@ -362,6 +362,31 @@ if (isSymlink(join(REPO_ROOT, "tests"))) {
 if (isSymlink(join(REPO_ROOT, OUTPUT_DIR))) {
   fail("verification refused: the build output directory is a symlink; the build would write outside the repository");
 }
+
+/**
+ * Individual source links, refused BEFORE the build and BEFORE the checker is
+ * imported (round-12 finding).
+ *
+ * `assessTreeSafety` covers exactly this ground, and it was unreachable for the
+ * case that matters: it runs AFTER `await import(CHECKER_PATH)`, so a hardlinked
+ * `src/verification/testArtifacts.ts` was compiled and then EXECUTED — a module
+ * calling `process.exit(0)` at import time wins long before the guard meant to
+ * reject it is consulted. A guard placed after the thing it protects is not a
+ * guard. The tested clause stays as defence in depth; this one exists to run
+ * first, and it runs before the build too, because the build compiles the link.
+ */
+const linkedSources = [
+  ...findSymlinks("src"),
+  ...findSymlinks("tests"),
+  ...findHardlinkedSources("src"),
+  ...findHardlinkedSources("tests"),
+].sort();
+if (linkedSources.length > 0) {
+  fail(
+    `verification refused before building: symlinked or hardlinked entries under the source roots (src/, tests/): ` +
+      `${linkedSources.join(", ")}; source must live in this repository`,
+  );
+}
 const rootDevice = deviceOf(REPO_ROOT);
 const outputDevice = deviceOf(join(REPO_ROOT, OUTPUT_DIR));
 if (outputDevice !== undefined && rootDevice !== undefined && outputDevice !== rootDevice) {
@@ -380,6 +405,42 @@ const mountInfo = (() => {
     return undefined;
   }
 })();
+
+/**
+ * ...and refuse a mounted output BEFORE the build writes into it (round-12
+ * finding on AC-5).
+ *
+ * `assessMountTopology` is the authority and is applied once the checker exists,
+ * but it runs AFTER the build — so `tsc` had already written through a
+ * bind-mounted `dist` into a separately mounted tree before anything objected.
+ * Refusing early costs a conservative string comparison and removes the write.
+ *
+ * Deliberately the SAME conservative shape as the inline `outDir` comparison
+ * above: a refusal, never a deletion, with the substantive rule still living in
+ * the tested function. The octal decode is not optional — omitting it would
+ * silently fail to match a mount point containing a space, and a guard that
+ * under-matches is worse than no guard because it looks like one.
+ */
+if (process.platform === "linux") {
+  const outputPath = (realOrUndefined(join(REPO_ROOT, OUTPUT_DIR)) ?? join(REPO_ROOT, OUTPUT_DIR)).replace(/\/+$/, "");
+  const earlyMountPoints = (mountInfo ?? "")
+    .split("\n")
+    .map((line) => line.trim().split(" ")[4])
+    .filter((point) => typeof point === "string" && point.startsWith("/"))
+    .map((point) => point.replace(/\\([0-7]{3})/g, (_m, o) => String.fromCharCode(Number.parseInt(o, 8))));
+  if (mountInfo === undefined || earlyMountPoints.length === 0) {
+    fail("verification refused: the mount table (/proc/self/mountinfo) could not be read, so it is unknown whether the build output is a mount point");
+  }
+  const offending = earlyMountPoints.find(
+    (point) => point === outputPath || point.startsWith(`${outputPath}/`),
+  );
+  if (offending !== undefined) {
+    fail(
+      `verification refused before building: the build output directory is or contains a mount point (${offending}); ` +
+        `the build would write into a separately mounted tree and a recursive delete would reach through it`,
+    );
+  }
+}
 if (noEmit) {
   // Worded differently from the `assessTreeSafety` clause that covers the same
   // condition later. Round-5 review observed that deleting this guard still
@@ -443,12 +504,7 @@ const safety = checker.assessTreeSafety({
   // threat model above claims. Same policy, same already-documented
   // legitimate-hardlink false positive — applied consistently rather than to
   // whichever directory happened to be named first.
-  symlinkedSources: [
-    ...findSymlinks("src"),
-    ...findSymlinks("tests"),
-    ...findHardlinkedSources("src"),
-    ...findHardlinkedSources("tests"),
-  ].sort(),
+  symlinkedSources: linkedSources,
   buildEmitsNothing: noEmit,
   checkerFreshlyEmitted,
 });
@@ -457,6 +513,14 @@ if (!safety.safe) {
 }
 
 // --- 4b. mount topology, the part `st_dev` cannot answer ---------------------
+// DEFENCE IN DEPTH, and deliberately unreachable through the ordinary path: the
+// pre-build refusal above already rejects a mounted output, so no fixture can
+// arrive here with one. Its reachability is stated here rather than implied by
+// a green test — the repository's established answer for a guard the public
+// path cannot reach (see `resourceBindingHolds`). The DECISION is proven by the
+// pure `assessMountTopology` tests, which mutation-check each clause; this call
+// exists so that a future reordering which weakens the early check still meets a
+// tested guard before anything is deleted.
 const mountVerdict = checker.assessMountTopology({
   platform: process.platform,
   mountInfo,
