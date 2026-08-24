@@ -81,6 +81,88 @@ function printTransitions(): void {
   console.log(`  ${allowedTargets("IMPLEMENTING").join(", ")}`);
 }
 
+/**
+ * The human action recorded when `--action` is not supplied.
+ *
+ * TASK-009's documented command line carries `--reason` and `--detail` only,
+ * while AC-1 requires a human-readable action to be recorded. A fixed table per
+ * reason satisfies both without inventing per-call prose: the text is
+ * deterministic, reviewable here, and identical for every caller. `--action`
+ * remains available when the operator knows something more specific.
+ */
+const DEFAULT_HUMAN_ACTION: Readonly<Record<string, string>> = Object.freeze({
+  FINANCIAL_ACTION_REQUIRED: "A human must personally authorise and perform this transaction; the Factory has no spending authority.",
+  HUMAN_CREDENTIAL_REQUIRED: "A human must supply the credential directly; it cannot be handled by the Factory.",
+  PUBLICATION_APPROVAL_REQUIRED: "A human must approve publication before this can proceed.",
+  DESTRUCTIVE_APPROVAL_REQUIRED: "A human must approve this destructive operation before it can proceed.",
+  AUTH_REQUIRED: "A human must complete authentication before this can proceed.",
+  HUMAN_DECISION_REQUIRED: "A human must make this judgement; the work itself is free and safe, but the decision is reserved.",
+  PLATFORM_CAPABILITY_BLOCKED: "A human must perform this step manually: the available tooling refuses to do it, and the refusal is a correct default that must not be evaded.",
+  RECOVERY_REQUIRED: "A human must inspect and repair the recorded state before work resumes.",
+});
+
+interface BlockArgs {
+  readonly roadmapKey: string;
+  readonly reason: string;
+  readonly humanActionRequired: string;
+  readonly detail: string;
+}
+
+/**
+ * Accepts the documented flag form and the older positional form.
+ *
+ * Fails with a message naming the problem rather than letting a missing value
+ * reach the durable-state validator, which previously reported
+ * `field "detail" must be a non-empty string, got ""` — an internal complaint
+ * about a record the operator never knowingly built.
+ */
+export function parseBlockArgs(
+  args: readonly string[],
+): { readonly ok: true; readonly value: BlockArgs } | { readonly ok: false; readonly error: string } {
+  const positional: string[] = [];
+  const flags = new Map<string, string>();
+  const known = new Set(["--reason", "--action", "--detail"]);
+
+  for (let i = 0; i < args.length; i += 1) {
+    const token = args[i];
+    if (token === undefined) continue;
+    if (token.startsWith("--")) {
+      if (!known.has(token)) {
+        return { ok: false, error: `unknown option ${JSON.stringify(token)}` };
+      }
+      const value = args[i + 1];
+      if (value === undefined || value.startsWith("--")) {
+        return { ok: false, error: `option ${JSON.stringify(token)} requires a value` };
+      }
+      flags.set(token, value);
+      i += 1;
+      continue;
+    }
+    positional.push(token);
+  }
+
+  const roadmapKey = positional[0];
+  if (roadmapKey === undefined) {
+    return { ok: false, error: "a roadmap key is required" };
+  }
+  const reason = flags.get("--reason") ?? positional[1];
+  if (reason === undefined) {
+    return { ok: false, error: "a reason is required (--reason)" };
+  }
+  const detail = flags.get("--detail") ?? positional[3];
+  if (detail === undefined || detail.trim().length === 0) {
+    return { ok: false, error: "a non-empty detail is required (--detail)" };
+  }
+  const humanActionRequired =
+    flags.get("--action") ?? positional[2] ?? DEFAULT_HUMAN_ACTION[reason];
+  if (humanActionRequired === undefined || humanActionRequired.trim().length === 0) {
+    // Only reachable for a reason with no default, which is itself a bug worth
+    // saying out loud rather than papering over with a generic sentence.
+    return { ok: false, error: `no default human action for reason ${JSON.stringify(reason)}; pass --action` };
+  }
+  return { ok: true, value: { roadmapKey, reason, humanActionRequired, detail } };
+}
+
 async function main(argv: readonly string[]): Promise<number> {
   const command = argv[0] ?? "help";
 
@@ -238,16 +320,23 @@ async function main(argv: readonly string[]): Promise<number> {
         return 0;
       }
       if (sub === "block") {
-        // sf supervise block <KEY> <REASON> <ACTION> [DETAIL]
-        const roadmapKey = argv[2];
-        const reason = argv[3];
-        const humanActionRequired = argv[4];
-        const detail = argv[5] ?? "";
-        if (roadmapKey === undefined || reason === undefined || humanActionRequired === undefined) {
-          console.error(`Usage: sf supervise block <ROADMAP_KEY> <REASON> <HUMAN_ACTION> [DETAIL]`);
+        /**
+         * `sf supervise block <ROADMAP_KEY> --reason <REASON> --detail <TEXT>`
+         *
+         * That is the syntax TASK-009 documents and that AC-4 names by flag, and
+         * it did not work: the parser read positionally, so `--reason` landed in
+         * the reason slot and the command died with `unknown reason "--reason"`
+         * having written nothing. The positional form is still accepted, because
+         * existing callers use it, but the DOCUMENTED form is the one a human
+         * types from the task file.
+         */
+        const parsed = parseBlockArgs(argv.slice(2));
+        if (!parsed.ok) {
+          console.error(parsed.error);
+          console.error(`Usage: sf supervise block <ROADMAP_KEY> --reason <REASON> --detail <TEXT> [--action <TEXT>]`);
           return 1;
         }
-        return runSuperviseBlock({ roadmapKey, reason, humanActionRequired, detail, log });
+        return runSuperviseBlock({ ...parsed.value, log });
       }
       console.error(`Usage: sf supervise <tick|status|resources|roadmap|block>`);
       return 1;

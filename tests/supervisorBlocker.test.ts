@@ -23,6 +23,7 @@ import {
   parseSupervisorState,
 } from "../src/supervision/supervisorSerialization.js";
 import { cleanupTempDbs } from "./support/factoryFixtures.js";
+import { parseBlockArgs } from "../src/cli/main.js";
 import { newSupervisor, scriptedProbe, seedRoadmap, TEST_CATALOG } from "./support/supervisorFixtures.js";
 
 after(cleanupTempDbs);
@@ -274,5 +275,97 @@ describe("TASK-009 AC-8: the new reason round-trips and unknown reasons fail", (
       updatedAt: 1,
     };
     assert.throws(() => parseSupervisorState(JSON.stringify(bad), { version: 1 }));
+  });
+});
+
+/**
+ * The DOCUMENTED command line, which did not work.
+ *
+ * TASK-009 documents `sf supervise block <KEY> --reason <REASON> --detail <TEXT>`
+ * and AC-4 names `--detail` by flag, but the dispatcher read positionally. So the
+ * command a human copies out of the task file put `--reason` in the reason slot
+ * and died with `unknown reason "--reason"`, having recorded nothing — and the
+ * positional form silently defaulted `detail` to `""`, which then failed deep in
+ * the durable-state validator with `field "detail" must be a non-empty string`.
+ * An operator saw an internal complaint about a record they never knowingly
+ * built.
+ *
+ * The independent reviewer found the first half; the empty-detail half turned up
+ * on the way to reproducing it.
+ */
+describe("TASK-009: the documented `supervise block` command line", () => {
+  it("accepts the documented flag form", () => {
+    const parsed = parseBlockArgs([
+      "LOCAL_24_7_RUNTIME",
+      "--reason",
+      "PLATFORM_CAPABILITY_BLOCKED",
+      "--detail",
+      "systemd unit generation refused by the platform safety classifier",
+    ]);
+    assert.equal(parsed.ok, true);
+    if (!parsed.ok) return;
+    assert.equal(parsed.value.roadmapKey, "LOCAL_24_7_RUNTIME");
+    assert.equal(parsed.value.reason, "PLATFORM_CAPABILITY_BLOCKED");
+    assert.match(parsed.value.detail, /systemd unit generation refused/);
+    // AC-1 requires an action to be recorded even though the documented line
+    // carries no `--action`: a fixed per-reason default, not invented prose.
+    assert.match(parsed.value.humanActionRequired, /refuses to do it/);
+  });
+
+  it("still accepts the older positional form", () => {
+    const parsed = parseBlockArgs(["KEY", "AUTH_REQUIRED", "do the thing", "because"]);
+    assert.equal(parsed.ok, true);
+    if (!parsed.ok) return;
+    assert.equal(parsed.value.humanActionRequired, "do the thing");
+    assert.equal(parsed.value.detail, "because");
+  });
+
+  it("lets an explicit --action override the per-reason default", () => {
+    const parsed = parseBlockArgs(["KEY", "--reason", "AUTH_REQUIRED", "--detail", "d", "--action", "specific"]);
+    assert.equal(parsed.ok, true);
+    if (!parsed.ok) return;
+    assert.equal(parsed.value.humanActionRequired, "specific");
+  });
+
+  it("REFUSES a missing or blank detail, naming the flag rather than the validator", () => {
+    for (const args of [
+      ["KEY", "--reason", "AUTH_REQUIRED"],
+      ["KEY", "--reason", "AUTH_REQUIRED", "--detail", "   "],
+    ]) {
+      const parsed = parseBlockArgs(args);
+      assert.equal(parsed.ok, false, `expected refusal for ${JSON.stringify(args)}`);
+      if (parsed.ok) return;
+      assert.match(parsed.error, /detail is required \(--detail\)/);
+    }
+  });
+
+  it("REFUSES an unknown option and a flag with no value", () => {
+    const unknown = parseBlockArgs(["KEY", "--bogus", "x"]);
+    assert.equal(unknown.ok, false);
+    if (!unknown.ok) assert.match(unknown.error, /unknown option "--bogus"/);
+
+    const dangling = parseBlockArgs(["KEY", "--reason", "--detail", "d"]);
+    assert.equal(dangling.ok, false);
+    if (!dangling.ok) assert.match(dangling.error, /requires a value/);
+  });
+
+  it("REFUSES a missing roadmap key", () => {
+    const parsed = parseBlockArgs(["--reason", "AUTH_REQUIRED", "--detail", "d"]);
+    assert.equal(parsed.ok, false);
+    if (!parsed.ok) assert.match(parsed.error, /roadmap key is required/);
+  });
+
+  /**
+   * Every reason must have a default action, or the documented flag form breaks
+   * for that reason alone — the sort of gap that only shows up in the one live
+   * run that happens to use it.
+   */
+  it("has a default human action for EVERY escalation reason", () => {
+    for (const reason of ESCALATION_REASONS) {
+      const parsed = parseBlockArgs(["KEY", "--reason", reason, "--detail", "d"]);
+      assert.equal(parsed.ok, true, `no default action for ${reason}`);
+      if (!parsed.ok) continue;
+      assert.ok(parsed.value.humanActionRequired.trim().length > 0, `empty default action for ${reason}`);
+    }
   });
 });
