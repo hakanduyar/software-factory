@@ -141,6 +141,39 @@ awaiting integration. Prose can be deleted without failing anything. Closing
 
 ---
 
+## L-6 — Verification refuses trees containing any hardlinked source
+
+**Status:** OPEN, deliberate. Raised by independent review (TASK-010 round 5) as
+a false positive; referred back to the reviewer for a judgement on the
+trade-off rather than settled unilaterally by the implementer.
+
+`scripts/verify.mjs` refuses any `.ts`/`.mts`/`.cts` under `tests/` whose link
+count exceeds one. A hardlink is indistinguishable from an ordinary file by
+name, type or `realpath`; link count is the only ordinary signal, and it cannot
+tell a hardlink pointing outside the repository from one pointing inside it.
+
+**The cost is real and it lands on valid trees.** A clean checkout copied with
+`cp -al` is refused — the reviewer demonstrated it. So, potentially, are
+hardlinking backup tools, some container layer implementations, and any workflow
+that de-duplicates files across checkouts.
+
+**Why it is still the policy:** the alternative — permitting hardlinks whose
+target resolves inside the repository — accepts precisely the case that cannot
+be told apart from the dangerous one. `npm test` is the default verification for
+every human and agent here, so a rule that is occasionally inconvenient was
+preferred to one that is sometimes wrong.
+
+**What would make this reconsiderable:** `CLEAN_ROOM_CI` exists to run
+verification in an environment the adversary is not in. Once it does, the local
+hardlink rule is defending much less and could reasonably become a warning.
+
+**Watch for:** if this begins refusing ordinary working copies, the cost has
+exceeded the benefit and the trade-off should be revisited — not worked around
+with a bypass flag. A bypass flag would delete the guard for everyone while
+appearing to keep it.
+
+---
+
 ## L-5 — Provisional failure signatures are inert
 
 **Status:** OPEN, documented in TASK-006.
