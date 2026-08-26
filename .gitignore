@@ -1,4 +1,7 @@
-node_modules/
+# No trailing slash, deliberately: `node_modules/` matches a DIRECTORY and
+# not a SYMLINK of the same name, so a git worktree that links to the main
+# checkout's dependencies had its link staged by `git add -A` and committed.
+node_modules
 dist/
 *.tsbuildinfo
 .env
