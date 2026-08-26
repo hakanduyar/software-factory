@@ -107,6 +107,7 @@ describe("TASK-006 R9-SEC-1: the CLI redacts what it reads, not only what it wri
           resolved: false,
         },
       ],
+      provenance: [],
       updatedAt: T0,
     });
     void seeded;
@@ -145,6 +146,7 @@ describe("TASK-006 R9-SEC-1: the CLI redacts what it reads, not only what it wri
       roadmap: [],
       checkpoints: [],
       escalations: [],
+      provenance: [],
       updatedAt: T0,
     });
     repository.close();
@@ -229,22 +231,36 @@ describe("TASK-006 R9-C4-1: forged lineage is cross-checked, and the residue is 
   });
 
   /**
-   * The honest limit. With NO `lastRunConfig` there is nothing to cross-check
-   * against, so a forged history naming a real resource is accepted — and it
-   * cannot be otherwise without authenticating the record, which needs a key
-   * this process does not have.
+   * The honest limit — NARROWED by TASK-008, and re-stated rather than deleted
+   * (TASK-008 AC-12).
    *
-   * This test PINS that limitation rather than hiding it, so that when
-   * `STATE_INTEGRITY` lands and the behaviour changes, this test fails and
-   * forces the claim to be revisited. A known gap with a failing tripwire beats
-   * a known gap with nothing watching it.
+   * WHAT CHANGED: there is now a second, hash-chained record of the same
+   * events. A forged history that contradicts the chain fails closed, and a
+   * chain that does not verify fails closed for every ancestor. Those cases are
+   * covered in `tests/stateIntegrity.test.ts`.
+   *
+   * WHAT REMAINS, and why this test still asserts ADVANCED: with no
+   * `lastRunConfig` AND no chain entry for the item, there is nothing to
+   * cross-check against. Silence is not contradiction — a database written
+   * before TASK-008 has no entries for work already done, and treating that as
+   * tampering would strand the roadmap this protects. So a forged history
+   * naming a real resource is still accepted when NOTHING else recorded the
+   * event.
+   *
+   * The deeper limit is unchanged and is not closeable here: the chain has no
+   * secret, so an attacker who recomputes it after editing defeats it. That
+   * needs a trust anchor this machine does not have.
+   *
+   * The tripwire is kept for the residue: if this ever fails, the remaining gap
+   * has closed too, and the claim must be revisited rather than quietly
+   * inherited.
    */
-  it("documents that an unverifiable forged history still passes (STATE_INTEGRITY)", async () => {
+  it("documents the RESIDUE: a forgery with no other record still passes (STATE_INTEGRITY)", async () => {
     const { result } = await reviewWith({ implementedByResourceKeys: ["claude-code:opus"] });
     assert.equal(
       result.kind,
       "ADVANCED",
-      "if this now fails, lineage forgery has been closed — update the trust-boundary note and STATE_INTEGRITY",
+      "if this now fails, the residual lineage gap has closed — update the trust-boundary note and this comment",
     );
   });
 

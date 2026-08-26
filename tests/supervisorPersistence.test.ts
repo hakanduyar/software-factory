@@ -59,6 +59,7 @@ function validState(overrides: Partial<SupervisorState> = {}): SupervisorState {
     ],
     checkpoints: [],
     escalations: [],
+    provenance: [],
     updatedAt: 100,
     ...overrides,
   };

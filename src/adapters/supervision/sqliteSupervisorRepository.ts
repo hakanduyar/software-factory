@@ -16,6 +16,8 @@
  * green test suite.
  */
 
+import { chmodSync, existsSync, mkdirSync } from "node:fs";
+import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import {
@@ -38,8 +40,65 @@ export interface SqliteSupervisorRepository extends SupervisorRepository {
   close(): void;
 }
 
+/** Owner-only: `rwx` for the directory, `rw-` for the files. */
+const DIRECTORY_MODE = 0o700;
+const FILE_MODE = 0o600;
+
+/**
+ * SQLite's sidecars. In WAL mode the `-wal` file holds committed data that has
+ * not yet been checkpointed into the main file, so leaving it world-readable
+ * would expose exactly what tightening the database was meant to protect.
+ */
+const SIDECAR_SUFFIXES = ["", "-wal", "-shm", "-journal"] as const;
+
+/**
+ * Restrict the database and its directory (AC-7).
+ *
+ * Applied on EVERY open, not only at creation. A file created before this code
+ * existed — or by a restore, a copy, or a `umask` that permitted more — would
+ * otherwise keep its original mode forever, and "we set it correctly when we
+ * made it" is not a statement about the file in front of you.
+ *
+ * WHAT THIS DOES NOT DO, stated because the task's own criteria forbid
+ * overclaiming: it raises the bar against OTHER local users and stray
+ * processes. It does nothing against the operator's own account, which owns
+ * the file and can chmod it back. The supervisor database remains part of the
+ * trusted computing base.
+ *
+ * POSIX modes are meaningless on Windows, where `chmod` silently does almost
+ * nothing; this is a Linux control and is not claimed as portable.
+ */
+function restrictPermissions(path: string): void {
+  const directory = dirname(path);
+  // `recursive` makes this idempotent, and `mode` applies only when it creates.
+  mkdirSync(directory, { recursive: true, mode: DIRECTORY_MODE });
+  try {
+    chmodSync(directory, DIRECTORY_MODE);
+  } catch {
+    // A directory owned by someone else cannot be tightened from here. Refusing
+    // to run would make the Factory unusable on a shared checkout; the
+    // permission state is reported rather than silently assumed.
+  }
+  for (const suffix of SIDECAR_SUFFIXES) {
+    const candidate = `${path}${suffix}`;
+    if (!existsSync(candidate)) {
+      continue;
+    }
+    try {
+      chmodSync(candidate, FILE_MODE);
+    } catch {
+      /* same reasoning as the directory */
+    }
+  }
+}
+
 export function createSqliteSupervisorRepository(path: string): SqliteSupervisorRepository {
+  // Before the open, so the directory exists and is already restricted when
+  // SQLite creates the file inside it.
+  restrictPermissions(path);
   const db = new DatabaseSync(path);
+  // ...and again after, because the file (and any sidecar) only exists now.
+  restrictPermissions(path);
   ensureSchema(db);
 
   const insert = db.prepare("INSERT INTO supervisor_state (id, version, data) VALUES (?, ?, ?)");

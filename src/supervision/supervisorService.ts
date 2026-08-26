@@ -35,6 +35,11 @@ import {
 } from "./financialSafety.js";
 import { reconcileReportedIdentity, type AiRunConfigRecord } from "./modelEnforcement.js";
 import { requiresAi, selectResource, type RoutingPolicy } from "./modelRouting.js";
+import {
+  appendProvenance,
+  implementersByRoadmapKey,
+  type ProvenanceEntry,
+} from "./provenanceChain.js";
 import { boundedDiagnostic, classifyResourceOutcome, type Classification } from "./resourceClassifier.js";
 import {
   isRetryDue,
@@ -161,6 +166,10 @@ export class SupervisorService {
       roadmap: [...DEFAULT_ROADMAP],
       checkpoints: [],
       escalations: [],
+      // A new installation starts from the published genesis with nothing
+      // recorded — an empty chain verifies trivially, which is correct: there
+      // is no history to vouch for yet.
+      provenance: [],
       updatedAt: now,
     };
     return this.deps.repository.create(seeded);
@@ -955,6 +964,13 @@ export class SupervisorService {
           ),
           checkpoints: state.checkpoints.filter((entry) => entry.roadmapKey !== item.key),
           resources: markSuccess(state.resources, usedResourceKey, now),
+          provenance: appendImplementerProvenance(
+            state.provenance,
+            item.key,
+            usedResourceKey,
+            now,
+            "completed",
+          ),
         });
         void next;
         this.log(`[supervisor] ${item.key} completed; dependents re-evaluated`);
@@ -975,6 +991,13 @@ export class SupervisorService {
             usedResourceKey,
           ),
           resources: markSuccess(state.resources, usedResourceKey, now),
+          provenance: appendImplementerProvenance(
+            state.provenance,
+            item.key,
+            usedResourceKey,
+            now,
+            "changes required",
+          ),
         });
         void next;
         return { kind: "ADVANCED", roadmapKey: item.key, actionId, detail };
@@ -1280,6 +1303,85 @@ export class SupervisorService {
         }
       }
     }
+
+    /**
+     * THE SECOND SOURCE (TASK-008 AC-5, AC-6).
+     *
+     * Everything above reads `implementedByResourceKeys`, which lives in the
+     * same mutable row as the item itself — so a writer of the database edits
+     * lineage and the exclusion it produces in one move. The hash chain is a
+     * separate record of the same events, and this compares them.
+     *
+     * THREE OUTCOMES, and the middle one is the point:
+     *
+     *   - the chain does not verify at all -> every visited ancestor becomes
+     *     ambiguous. Lineage that cannot be vouched for is not lineage, and
+     *     AC-5 requires the review to wait for a human rather than proceed on
+     *     unverifiable history.
+     *   - the chain verifies but names an implementer the mutable row does not
+     *     (or vice versa) -> ambiguous. Two records disagreeing means at least
+     *     one is wrong, and nothing here can say which; picking the more
+     *     convenient one is how a forged row wins.
+     *   - both agree -> the exclusion stands, now with two independent records
+     *     behind it.
+     *
+     * NOT a replacement (AC-6): the catalog recognition, the `lastRunConfig`
+     * cross-check and the missing/unknown handling above all still run. A
+     * second lock on the door does not mean removing the first.
+     *
+     * The chain is tamper-EVIDENT only. An attacker who recomputes it after
+     * editing defeats this, and the module says so — what it stops is the
+     * corrupted row, the partial restore, the hand-edit "just fixing one
+     * field", which are the realistic cases.
+     */
+    /**
+     * ONE verification, then read it for every ancestor (AC-10).
+     *
+     * `undefined` means the chain does not verify, and it is the ONLY signal
+     * this loop acts on for AC-5 — deliberately one mechanism rather than two.
+     * An earlier version had a separate "chain broken" branch above this loop
+     * as well; mutation testing showed the two masking each other, so removing
+     * either left the behaviour intact and neither was load-bearing. Two
+     * guards that cover exactly the same case are not defence in depth, they
+     * are a test that passes for the wrong reason.
+     */
+    const chainImplementers = implementersByRoadmapKey(state.provenance);
+    for (const key of visited) {
+      const entry = byKey.get(key);
+      if (entry === undefined || key === item.key || !requiresAi(entry.workClass)) {
+        continue;
+      }
+      if (chainImplementers === undefined) {
+        // AC-5: the record cannot be vouched for, so the lineage it describes
+        // is not lineage. The review waits for a human rather than proceeding
+        // on history nobody can verify.
+        if (!ambiguous.includes(key)) {
+          ambiguous.push(key);
+        }
+        continue;
+      }
+      const fromChain = chainImplementers.get(key) ?? [];
+      const fromRow = implementerHistory(entry);
+      // An EMPTY chain entry is silence, not contradiction: a database
+      // predating TASK-008 has no entries for work already done, and refusing
+      // every review on that basis would strand the roadmap this protects.
+      if (fromChain.length === 0) {
+        continue;
+      }
+      const disagrees =
+        fromChain.some((resource) => !fromRow.includes(resource)) ||
+        fromRow.some((resource) => !fromChain.includes(resource));
+      if (disagrees && !ambiguous.includes(key)) {
+        ambiguous.push(key);
+      }
+      // A resource named by EITHER record is excluded. Exclusion is the safe
+      // direction: over-excluding costs a routing choice, under-excluding
+      // costs C4.
+      for (const resource of fromChain) {
+        excluded.add(resource);
+      }
+    }
+
     return { excluded: [...excluded], ambiguous };
   }
 
@@ -1724,6 +1826,38 @@ export function setImplementer(
         : [resourceKeyValue, ...history],
     };
   });
+}
+
+/**
+ * Appends the SECOND record of who implemented an item (TASK-008 AC-1, AC-6).
+ *
+ * Written at the same moment as `setImplementer`, from the same value, so the
+ * two records agree unless something later edits one of them — which is
+ * precisely the event the chain exists to make visible.
+ *
+ * Overflow FAILS CLOSED by returning the chain unchanged: the append is
+ * refused, the disagreement that creates will be caught by the cross-check, and
+ * the review waits for a human. The alternative — dropping the oldest entry to
+ * make room — would discard the provenance an attacker most wants gone.
+ */
+export function appendImplementerProvenance(
+  chain: readonly ProvenanceEntry[],
+  roadmapKey: string,
+  resourceKeyValue: string | undefined,
+  recordedAt: Timestamp,
+  detail: string,
+): readonly ProvenanceEntry[] {
+  if (resourceKeyValue === undefined) {
+    return chain;
+  }
+  const result = appendProvenance(chain, {
+    kind: "IMPLEMENTED_BY",
+    roadmapKey,
+    resourceKey: resourceKeyValue,
+    detail,
+    recordedAt,
+  });
+  return result.ok ? result.chain : chain;
 }
 
 /** Records how many action attempts an item has consumed (F-6). */

@@ -220,6 +220,7 @@ describe("TASK-009 remediation: `roadmap` shows the blocker reason and detail", 
           resolved: false,
         },
       ],
+      provenance: [],
       updatedAt: T0,
     });
     repository.close();
@@ -246,6 +247,7 @@ describe("TASK-009 remediation: `roadmap` shows the blocker reason and detail", 
       ],
       checkpoints: [],
       escalations: [],
+      provenance: [],
       updatedAt: T0,
     });
     repository.close();

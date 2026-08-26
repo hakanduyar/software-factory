@@ -24,6 +24,7 @@ import { createSequentialIdGenerator } from "../domain/ids.js";
 import { DEFAULT_ROUTING_POLICY } from "../supervision/modelRouting.js";
 import { parseFinancialPolicy } from "../supervision/financialSafety.js";
 import { boundedDiagnostic } from "../supervision/resourceClassifier.js";
+import { verifyChain } from "../supervision/provenanceChain.js";
 import { SupervisorService, type TickResult } from "../supervision/supervisorService.js";
 import type { WorkExecutionInput, WorkExecutor, WorkOutcome } from "../supervision/supervisorPorts.js";
 import { ESCALATION_REASONS, type EscalationReason, type SupervisorState } from "../supervision/supervisorTypes.js";
@@ -285,6 +286,22 @@ export async function runSuperviseStatus(options: SuperviseCliOptions = {}): Pro
     );
     log(`next wake      : ${state.nextWakeAt === undefined ? "none scheduled" : new Date(state.nextWakeAt).toISOString()}`);
     log(`active claim   : ${state.activeClaim === undefined ? "none" : `${safe(state.activeClaim.actionId)} (${state.activeClaim.state})`}`);
+
+    /**
+     * TASK-008 AC-8: say what this is, where an operator actually reads it.
+     *
+     * "tamper-evident" is printed on the same line as the verdict, not buried
+     * in a source comment, because the failure mode being guarded against is a
+     * reader who sees "intact" and concludes the history cannot have been
+     * changed. It can — by anyone who recomputes the chain. What "intact" means
+     * is that nobody edited it WITHOUT recomputing.
+     */
+    const chain = verifyChain(state.provenance);
+    log(
+      `provenance     : ${state.provenance.length} entries, ${
+        chain.intact ? "chain intact" : `CHAIN BROKEN — ${safe(chain.problem)}`
+      } (tamper-evident, not tamper-proof)`,
+    );
 
     const open = state.escalations.filter((entry) => !entry.resolved);
     log(`human needed   : ${open.length}`);

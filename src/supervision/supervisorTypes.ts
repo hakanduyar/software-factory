@@ -15,6 +15,7 @@
 import type { Timestamp } from "../domain/time.js";
 import type { AiRunConfigRecord } from "./modelEnforcement.js";
 import type { WorkClass } from "./modelRouting.js";
+import type { ProvenanceEntry } from "./provenanceChain.js";
 import type { ResourceRecord } from "./resourceTypes.js";
 
 // =====================================================================
@@ -268,6 +269,21 @@ export interface SupervisorState {
   /** When the next tick is worth running. Absent means "nothing scheduled". */
   readonly nextWakeAt?: Timestamp;
   readonly escalations: readonly HumanEscalation[];
+  /**
+   * Append-only, hash-chained provenance (TASK-008).
+   *
+   * A SECOND record of who implemented what, independent of the mutable
+   * `implementedByResourceKeys` carried on each roadmap item. Neither replaces
+   * the other: where they disagree the review fails closed, because two records
+   * that contradict each other mean at least one is wrong and nothing here can
+   * say which.
+   *
+   * Absent-means-empty on read, so a database written before this field existed
+   * still loads rather than being refused as corrupt.
+   *
+   * Tamper-EVIDENT, not tamper-proof — see `provenanceChain.ts`.
+   */
+  readonly provenance: readonly ProvenanceEntry[];
   readonly updatedAt: Timestamp;
 }
 

@@ -41,6 +41,7 @@ import {
 import { BILLING_MODES, type BillingMode } from "./financialSafety.js";
 import { CONFIG_VERIFICATIONS, type AiRunConfigRecord, type ConfigVerification } from "./modelEnforcement.js";
 import { WORK_CLASSES, type WorkClass } from "./modelRouting.js";
+import { PROVENANCE_KINDS, type ProvenanceEntry, type ProvenanceKind } from "./provenanceChain.js";
 import {
   BACKOFF_LADDER_MS,
   RESOURCE_STATES,
@@ -360,6 +361,30 @@ function parseEscalation(raw: unknown, index: number, context: string): HumanEsc
   };
 }
 
+/**
+ * One provenance entry, field by field (TASK-008).
+ *
+ * Constructed explicitly rather than spread, for the reason every parser in
+ * this file is: a spread copies whatever the row happens to carry, and an
+ * entry whose extra fields survive into memory is an entry whose digest is
+ * computed over something other than what was verified.
+ */
+function parseProvenanceEntry(raw: unknown, index: number, context: string): ProvenanceEntry {
+  const itemContext = `${context}.provenance[${index}]`;
+  const row = asObject(raw, itemContext);
+  const resourceKeyValue = optionalStr(row, "resourceKey", itemContext);
+  return {
+    sequence: nonNegativeInt(row, "sequence", itemContext),
+    kind: oneOf<ProvenanceKind>(row, "kind", PROVENANCE_KINDS, itemContext),
+    roadmapKey: str(row, "roadmapKey", itemContext),
+    ...(resourceKeyValue === undefined ? {} : { resourceKey: resourceKeyValue }),
+    detail: str(row, "detail", itemContext),
+    recordedAt: num(row, "recordedAt", itemContext),
+    previousDigest: str(row, "previousDigest", itemContext),
+    digest: str(row, "digest", itemContext),
+  };
+}
+
 export function encodeSupervisorState(state: SupervisorState): string {
   return JSON.stringify(state);
 }
@@ -439,6 +464,32 @@ export function parseSupervisorState(json: string, expected: { readonly version:
     }
   }
 
+  /**
+   * ABSENT means an empty chain, not corruption (TASK-008).
+   *
+   * A database written before provenance existed is not damaged, and refusing
+   * it would repeat exactly the forward-compatibility failure recorded as L-1
+   * in docs/KNOWN-LIMITATIONS.md: an operator whose supervisor stops loading
+   * because a newer build added a field. A PRESENT-but-malformed chain is still
+   * corruption and is refused field by field.
+   *
+   * The chain is NOT verified here. Parsing answers "is this well-formed"; the
+   * C4 decision asks "is this intact", and conflating the two would mean a
+   * tampered chain took down state loading entirely instead of failing that one
+   * decision closed.
+   */
+  const provenance =
+    row["provenance"] === undefined
+      ? []
+      : asArray(row["provenance"], `${context}.provenance`).map((entry, index) =>
+          parseProvenanceEntry(entry, index, context),
+        );
+  for (const entry of provenance) {
+    if (!roadmapKeys.has(entry.roadmapKey)) {
+      corrupt(context, `provenance entry ${entry.sequence} references unknown roadmap item "${entry.roadmapKey}"`);
+    }
+  }
+
   const nextWakeAt = optionalNum(row, "nextWakeAt", context);
   return {
     version,
@@ -449,6 +500,7 @@ export function parseSupervisorState(json: string, expected: { readonly version:
     ...(activeClaim === undefined ? {} : { activeClaim }),
     ...(nextWakeAt === undefined ? {} : { nextWakeAt }),
     escalations,
+    provenance,
     updatedAt: num(row, "updatedAt", context),
   };
 }
