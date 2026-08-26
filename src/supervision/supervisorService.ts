@@ -918,9 +918,17 @@ export class SupervisorService {
      * ran has not demonstrated that it ran what was authorized.
      *
      * NOT CLOSED by this, and said plainly: the report is an executor CLAIM, not
-     * proof. Proof needs evidence bound to the launched process, which needs the
-     * executor to be a process the supervisor owns — the same architectural gap
-     * recorded for F5-FIN-3/F6-FIN-2 and tracked as EXECUTOR_ISOLATION.
+     * proof. Proof needs evidence bound to the launched process.
+     *
+     * NARROWED BY TASK-011 (EXECUTOR_ISOLATION): the executor is now a process
+     * the supervisor owns and constrains, and everything it says is parsed as
+     * untrusted data rather than believed. That removes the ambient capability
+     * behind F5-FIN-3/F6-FIN-2 — a child holds no credential store, so it
+     * cannot launch a provider at all.
+     *
+     * What is STILL a claim is the identity a worker reports about a run the
+     * supervisor itself launched. Isolation does not make a claim true; binding
+     * it to process-level evidence would, and nothing does that today.
      */
     if (outcome.kind === "COMPLETED" && runConfig !== undefined && !statesItsIdentity(reported)) {
       const humanAction = `Investigate ${item.key}: the worker reported COMPLETED without stating which provider/model it ran, so the authorized configuration cannot be confirmed.`;

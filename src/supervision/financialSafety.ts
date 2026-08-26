@@ -437,12 +437,21 @@ export function mintedResourceKey(action: SupervisedAction): string | undefined 
  * A billing mode can no longer be passed as a bare string. It must arrive inside
  * an observation, minted here, bound to the provider and model it describes.
  *
- * HONEST LIMIT, in the same terms as `EXECUTOR_ISOLATION` and
- * `STATE_INTEGRITY`: this makes asserting "that resource is free" a deliberate,
+ * HONEST LIMIT: this makes asserting "that resource is free" a deliberate,
  * greppable act rather than an incidental argument. It does not make it
  * impossible — an in-process caller can still construct an observation, exactly
- * as it could construct anything else. Closing that needs the probe to be
- * outside this process, which is `EXECUTOR_ISOLATION`'s territory.
+ * as it could construct anything else.
+ *
+ * NARROWED BY TASK-011 (EXECUTOR_ISOLATION), and stated precisely rather than
+ * declared closed: the executor now runs in its own process with no credential
+ * store, so EXECUTOR code is no longer an in-process caller and cannot mint an
+ * observation at all. What remains is that anything running INSIDE the
+ * supervisor process still can. That is a smaller surface — supervisor code
+ * this repository owns and reviews — rather than the open-ended one it was when
+ * executors ran here too.
+ *
+ * What would close the residue entirely is moving the probe out of this process
+ * as well. Nothing does that today, and no comment here should imply otherwise.
  */
 export interface BillingObservation {
   readonly provider: string;
