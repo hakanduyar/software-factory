@@ -90,37 +90,77 @@ a test asserting that statement is present, so it cannot quietly disappear.
 
 ---
 
-## L-3 — The in-process executor can act outside what it declared
+## L-3 — The executor's process is not a network sandbox
 
-**Status:** ACCEPTED BOUNDARY, tracked as the `EXECUTOR_ISOLATION` roadmap item.
-Adjudicated legitimate by independent review (TASK-006 round 7).
+**Status:** NARROWED by TASK-011 (`feat/executor-isolation`, `e3fe829`),
+IMPLEMENTED and AWAITING INDEPENDENT REVIEW. The original in-process form was
+adjudicated a legitimate boundary by independent review (TASK-006 round 7).
 
-The financial gate authorises a LAUNCH. It cannot police what trusted in-process
-executor code does afterwards, because an in-process function cannot restrain
-code that can already call `fetch` — the same trust boundary TASK-003's `Worker`
-has.
+**What it used to say:** the financial gate authorises a LAUNCH and cannot
+police what trusted in-process executor code does afterwards, because an
+in-process function cannot restrain code that can already call `fetch`.
 
-**What would close it:** running executors in a restricted process with no
-ambient network or billing capability.
+**What changed:** the executor now runs in a separate process with an explicit
+environment, a bounded request, a timeout, and strict parsing of everything it
+returns. It holds no credential store, and the response format has no field
+through which a child could grant itself authority.
+
+**What is STILL open, and is the reason this entry survives rather than being
+deleted:** raw network egress is **not blocked**. A child can still open a
+socket. Closing that needs an OS-level control — a network namespace, seccomp,
+or a firewall rule — and installing one needs a sudo password, which ADR-0002
+reserves to the human. Autonomous work cannot acquire it.
+
+**What is genuinely removed is BILLING capability**, which is the property
+`AUTONOMOUS_SPEND_LIMIT = 0` actually rests on: provider CLIs authenticate from
+credential stores under `HOME`/`CODEX_HOME`/`XDG_*`, the isolated allowlist
+omits all of them, and a process that cannot authenticate cannot cause a charge
+whether or not it can reach the network. A child reaching an unauthenticated
+endpoint is a real but much smaller problem than one that can spend money.
+
+**Consequence for the design:** the isolated child performs deterministic work
+only. An AI launch needs exactly the credential access it is denied, so launches
+stay with the supervisor behind the gate that authorises them — a deliberate
+division, not a missing feature.
 
 **Kept honest by:** `EXECUTOR_WIRING` depends on `EXECUTOR_ISOLATION`, and a test
-asserts that dependency, so nothing can be wired to execute autonomous work
-before the executor can be constrained.
+asserts that dependency. A second test reads the implementation source and fails
+if it ever claims to be sandboxed, or claims egress is blocked.
+
+**Watch for:** anyone merging the executor allowlist with the WORKER allowlist
+"for tidiness". The difference between those two lists IS this control; a worker
+is given `HOME` on purpose, and an executor must not be.
 
 ---
 
 ## L-4 — Implementer lineage is tamper-evident, not tamper-proof
 
-**Status:** ACCEPTED BOUNDARY, tracked as the `STATE_INTEGRITY` roadmap item.
-Adjudicated legitimate by independent review (TASK-006 round 10).
+**Status:** NARROWED by TASK-008 (`feat/state-integrity-rebased`, `7f5e96a`),
+IMPLEMENTED and AWAITING INDEPENDENT REVIEW. Adjudicated a legitimate boundary
+by independent review in its original form (TASK-006 round 10).
 
 Lineage is a recorded historical fact living in a database, and there is no key
 on this machine to authenticate it. Catalog recognition, a cross-check against
 `lastRunConfig`, and fail-closed handling of anything missing or contradictory
 raise the cost of forgery; none of them make the record self-proving.
 
-The hash chain added by TASK-008 detects edits, deletions, reordering and broken
-links. With no secret it detects nothing against someone who recomputes it.
+**What changed:** there is now a SECOND record — an append-only hash chain
+written at the same moment as the mutable row. A row rewritten to name a
+different implementer contradicts the chain and the review waits for a human; a
+chain that does not verify makes every AI ancestor ambiguous. The database and
+its directory are also owner-only now, tightened on every open.
+
+**What is STILL open:** the chain has no secret, so it detects nothing against
+someone who recomputes it after editing. It catches the corrupted row, the
+partial restore, the hand-edit "just fixing one field" — the realistic cases —
+and not a determined forger.
+
+**And one gap the second record does not close:** an EMPTY chain is treated as
+silence rather than contradiction, because a database written before TASK-008
+has no entries for work already done. An attacker who can write the database can
+also delete the whole chain, which returns the system to the pre-TASK-008
+behaviour for that item. Refusing instead would strand every existing database;
+the trade-off was made deliberately and is flagged here rather than buried.
 
 **The contrast worth remembering:** spending authority has no equivalent
 weakness, because F-1 made it impossible to EXPRESS in data — no row can grant
@@ -133,11 +173,12 @@ it, so no row has to be trusted. Lineage cannot be built that way.
 that dependency, so nothing can be wired to execute autonomous work while this
 gap is open.
 
-**Not yet kept honest by:** there is no test pinning the residual forgery gap
-itself. The header of `provenanceChain.ts` states the tamper-evident/tamper-proof
-distinction in prose only, and that file is still on `feat/state-integrity`
-awaiting integration. Prose can be deleted without failing anything. Closing
-`STATE_INTEGRITY` should add that pin.
+**Also kept honest by:** `sf supervise status` prints the chain verdict with the
+words "tamper-evident, not tamper-proof" beside it, and a test fails if that
+wording disappears — so the distinction reaches an operator rather than living
+only in a source comment. `tests/task006RemediationRound9Repro.test.ts` still
+pins the residual forgery case and now states precisely what narrowed and what
+did not.
 
 ---
 
