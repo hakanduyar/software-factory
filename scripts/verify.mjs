@@ -208,27 +208,6 @@ function sameDirectory(a, b) {
   return resolvedPath(a) === resolvedPath(b);
 }
 
-/**
- * The `outDir` the ROOT tsconfig names, or `undefined` when it names none.
- *
- * ABSENT IS NOT AN ERROR (round-2 finding on this fix). A config that inherits
- * `outDir` through `extends` declares nothing here, and refusing it was a false
- * positive with no attacker and no misconfiguration involved — the same class
- * of defect as B14 itself, one layer up. The EFFECTIVE config resolves
- * `extends` and is checked below; that is the authority, and it catches a real
- * mismatch whether or not the root file mentions `outDir` at all.
- *
- * This early check therefore exists only to give a good diagnostic when the
- * root file names a DIFFERENT directory. It cannot be the thing that decides.
- */
-function declaredOutDir() {
-  const raw = readFileSync(join(REPO_ROOT, "tsconfig.json"), "utf8");
-  // tsconfig permits comments; JSON.parse does not.
-  const stripped = raw.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
-  const outDir = JSON.parse(stripped)?.compilerOptions?.outDir;
-  return typeof outDir === "string" && outDir.trim().length > 0 ? outDir : undefined;
-}
-
 function listFiles(directory) {
   const found = [];
   const walk = (current) => {
@@ -258,28 +237,21 @@ function build() {
   execFileSync("npx", ["tsc", "-p", "tsconfig.json"], { cwd: REPO_ROOT, stdio: "inherit" });
 }
 
-// --- 1. does tsconfig build where we manage? ---------------------------------
-// Checked BEFORE building, and inline rather than through the tested checker,
-// because the checker is imported FROM the output directory — if that is not
-// where tsc writes, the import fails first and the operator gets a module-not-
-// found stack instead of the real diagnosis.
+// --- 1. refuse an unreasonable tree BEFORE building --------------------------
 //
-// Compared by RESOLUTION, not as strings: `dist`, `./dist`, `dist/../dist`, a
-// trailing separator, an absolute path and a symlink alias all name the same
-// directory, and refusing any of them is a false positive.
+// THE RAW-TSCONFIG CHECK IS GONE (round-2 finding). It read the root file and
+// compared its `outDir` before resolving `extends`, and it was:
 //
-// SKIPPED ENTIRELY when the root file declares no `outDir` — an `extends`-only
-// config is legitimate, and the effective check below is the authority in
-// every case anyway.
-const declared = declaredOutDir();
-if (declared !== undefined && !sameDirectory(declared, OUTPUT_DIR)) {
-  fail(
-    `verification refused: tsconfig builds into ${JSON.stringify(declared)} but verification manages ` +
-      `${JSON.stringify(OUTPUT_DIR)}; they must be the same directory or stale artifacts elsewhere would be executed`,
-  );
-}
-
-// --- 2. refuse an unreasonable tree BEFORE building --------------------------
+//   - the source of a false positive, refusing a legitimate `extends`-only
+//     config outright; and then, once that was fixed,
+//   - not load-bearing at all. Deleting it left the whole end-to-end suite
+//     green, because the EFFECTIVE check below runs before the build too and
+//     catches every mismatch the raw one could.
+//
+// Its stated justification was an earlier diagnostic than the checker import.
+// The effective check already provides that, so the raw one was two things at
+// once — a duplicate and a hazard. A guard nothing exercises is not defence in
+// depth; it is code that will be wrong one day with nothing to notice.
 // Building is itself a write through whatever these paths resolve to, so the
 // structural checks that do not need the compiled checker happen first. A
 // symlinked output directory was previously refused only AFTER the build had

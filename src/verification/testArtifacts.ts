@@ -297,14 +297,27 @@ export function assessOutputDirectory(input: {
       reason: `the repository path resolves elsewhere (${input.realRepositoryRoot}); refusing to build or delete through a link`,
     };
   }
-  if (input.realOutputDirectory !== undefined) {
-    const expected = `${normalise(input.realRepositoryRoot).replace(/\/+$/, "")}/${configured}`;
-    if (normalise(input.realOutputDirectory).replace(/\/+$/, "") !== expected) {
-      return {
-        trusted: false,
-        reason: `${configured} resolves to ${input.realOutputDirectory}, outside the repository; refusing to build into or delete a linked directory`,
-      };
-    }
+  /**
+   * CONTAINMENT IS CHECKED WHETHER OR NOT THE OUTPUT EXISTS YET (round-2 note).
+   *
+   * The first version only compared when `realOutputDirectory` was defined, so
+   * an output path pointing outside the repository was trusted whenever the
+   * directory did not exist. The production caller cannot currently produce
+   * that combination — it fixes the path inside the repository and validates
+   * the effective `outDir` first — so the reviewer rated it non-blocking.
+   *
+   * It is closed anyway. "Unreachable from today's only caller" is a fact about
+   * the caller, not about this function, and this function is the reviewable
+   * rule. A second caller, or a change to the first, would inherit a hole that
+   * nothing here refuses.
+   */
+  const expected = `${normalise(input.realRepositoryRoot).replace(/\/+$/, "")}/${configured}`;
+  const effective = normalise(input.realOutputDirectory ?? input.outputDirectory).replace(/\/+$/, "");
+  if (effective !== expected) {
+    return {
+      trusted: false,
+      reason: `${configured} resolves to ${input.realOutputDirectory ?? input.outputDirectory}, outside the repository; refusing to build into or delete a linked directory`,
+    };
   }
   return { trusted: true, directory: input.outputDirectory };
 }

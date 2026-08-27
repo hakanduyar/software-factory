@@ -442,4 +442,23 @@ describe("assessOutputDirectory: one directory, however it is spelled", () => {
       assert.match(verdict.reason, /outside the repository/);
     }
   });
+  /**
+   * Round-2 non-blocking note, closed anyway: an output path outside the
+   * repository was trusted whenever the directory did not exist yet, because
+   * containment was only checked when `realOutputDirectory` was defined.
+   *
+   * Today's only caller cannot produce that combination. That is a fact about
+   * the caller, not about this function — and this function is the rule.
+   */
+  it("REFUSES an output path outside the repository even when it does not exist yet", () => {
+    const verdict = assessOutputDirectory({
+      ...base,
+      outputDirectory: "/elsewhere/dist",
+      realOutputDirectory: undefined,
+      resolvedTsconfigOutDir: "/elsewhere/dist",
+    });
+    assert.equal(verdict.trusted, false, "a non-existent outside path must not be trusted");
+    if (!verdict.trusted) assert.match(verdict.reason, /outside the repository/);
+  });
 });
+
