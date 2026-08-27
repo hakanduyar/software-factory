@@ -112,6 +112,40 @@ const SOURCE_ROOTS = ["src", "tests"];
 const CONFIG_TIMEOUT_MS = 120_000;
 const CHECKER_PATH = join(REPO_ROOT, OUTPUT_DIR, "src/verification/testArtifacts.js");
 
+/**
+ * Directories the walk COULD NOT READ (round-6 CRITICAL).
+ *
+ * Every walker caught `readdirSync` and returned nothing, so a subtree with
+ * mode 000 was indistinguishable from an empty one. The reviewer hid an orphan
+ * under `dist/hidden` and a test under `tests/hidden`, and the run reported
+ * "tree-consistent" and exited 0 — verification of the READABLE PROJECTION of
+ * the tree, presented as verification of the tree.
+ *
+ * Collected rather than thrown from inside the walk, so the refusal names
+ * every unreadable path at once instead of the first one; a reader fixing
+ * permissions wants the whole list.
+ */
+const unreadable = [];
+function noteUnreadable(path) {
+  const rel = relative(REPO_ROOT, path).replace(/\\/g, "/");
+  const shown = rel.length === 0 ? "." : rel;
+  if (!unreadable.includes(shown)) {
+    unreadable.push(shown);
+  }
+}
+
+/** Refuses if anything scanned so far could not be read. */
+function assertEverythingWasReadable(stage) {
+  if (unreadable.length === 0) {
+    return;
+  }
+  fail(
+    `verification refused ${stage}: these directories could not be read, so their contents are unknown: ` +
+      `${unreadable.sort().join(", ")}. An unreadable subtree is not an empty one, and treating it as empty ` +
+      "would verify only the part of the tree this process happens to be allowed to see.",
+  );
+}
+
 function isSymlink(path) {
   try {
     return lstatSync(path).isSymbolicLink();
@@ -186,7 +220,13 @@ function findSymlinks(directory, keep = () => true) {
     let entries;
     try {
       entries = readdirSync(current, { withFileTypes: true });
-    } catch {
+    } catch (error) {
+      // A directory that does not EXIST is genuinely empty; one that exists and
+      // cannot be READ is unknown, and the difference decides whether an
+      // unseen orphan can hide there.
+      if (error?.code !== "ENOENT") {
+        noteUnreadable(current);
+      }
       return;
     }
     for (const entry of entries) {
@@ -244,7 +284,13 @@ function listFiles(directory) {
     let entries;
     try {
       entries = readdirSync(current, { withFileTypes: true });
-    } catch {
+    } catch (error) {
+      // A directory that does not EXIST is genuinely empty; one that exists and
+      // cannot be READ is unknown, and the difference decides whether an
+      // unseen orphan can hide there.
+      if (error?.code !== "ENOENT") {
+        noteUnreadable(current);
+      }
       return;
     }
     for (const entry of entries) {
@@ -519,8 +565,18 @@ if (process.platform === "linux") {
     fail("verification refused: the mount table (/proc/self/mountinfo) could not be read, so it is unknown whether the build output is a mount point");
   }
   for (const managed of managedPaths) {
+    /**
+     * AT or BELOW the managed path only (round-6 finding).
+     *
+     * The condition also matched ANCESTORS, so bind-mounting the whole
+     * repository onto its own path — an ordinary workspace layout — was
+     * refused with "dist is or contains a mount point". An ancestor mount
+     * splices nothing INTO the tree: everything below it moves together and
+     * stays consistent. What matters is a mount AT or INSIDE a managed path,
+     * which is exactly how foreign content gets spliced in.
+     */
     const offending = earlyMountPoints.find(
-      (point) => point === managed.path || managed.path.startsWith(`${point}/`) || point.startsWith(`${managed.path}/`),
+      (point) => point === managed.path || point.startsWith(`${managed.path}/`),
     );
     if (offending !== undefined && offending !== "/") {
       fail(
@@ -564,6 +620,8 @@ if (outputLinksBeforeBuild.length > 0) {
       `${outputLinksBeforeBuild.join(", ")}; the build would write through them into files outside this tree`,
   );
 }
+
+assertEverythingWasReadable("before building");
 
 // --- 3. build, and prove it actually emitted the checker ---------------------
 const buildStartedAt = Date.now();
@@ -651,6 +709,7 @@ if (!mountVerdict.safe) {
 // --- 5. audit every artifact that could RUN, anywhere in the output ----------
 const sourceTests = listFiles("tests").filter((path) => path.endsWith(".test.ts"));
 const compiledTests = listFiles(OUTPUT_DIR).filter((path) => checker.isTestArtifact(path));
+assertEverythingWasReadable("before auditing");
 let audit = checker.auditTestArtifacts({ sourceTests, compiledTests });
 
 // --- 6. contaminated? report it, repair it, and re-audit the REBUILT tree ----

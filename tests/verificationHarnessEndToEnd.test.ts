@@ -1471,3 +1471,103 @@ describe("TASK-010 round 5: an accepted alias still converges", () => {
     assert.match(output, /verification complete/);
   });
 });
+
+
+// =====================================================================
+// ROUND-6 — an unreadable subtree is not an empty one
+// =====================================================================
+
+describe("TASK-010 round 6: verification covers the tree, not its readable projection", () => {
+  /**
+   * THE CRITICAL. Every walker caught `readdirSync` and returned nothing, so a
+   * subtree with mode 000 was indistinguishable from an empty one. The reviewer
+   * hid an orphan under `dist/hidden` and a test under `tests/hidden`; the run
+   * reported "tree-consistent" and exited 0.
+   *
+   * That is verification of the part of the tree this process happens to be
+   * allowed to see, presented as verification of the tree.
+   */
+  it("REFUSES when a subtree under the output cannot be read", () => {
+    const root = makeFixtureRepo();
+    assert.equal(runHarness(root).status, 0, "the fixture must pass first");
+
+    mkdirSync(join(root, "dist/hidden"), { recursive: true });
+    writeFileSync(join(root, "dist/hidden/ghost.test.js"), "// stale\n");
+    chmodSync(join(root, "dist/hidden"), 0o000);
+    try {
+      const { status, output } = runHarness(root);
+      assert.notEqual(status, 0, "an unreadable subtree hid an orphan and the run reported success");
+      assert.match(output, /could not be read/);
+      assert.ok(!output.includes("tree-consistent"), "it must not claim consistency about what it could not see");
+    } finally {
+      chmodSync(join(root, "dist/hidden"), 0o755);
+    }
+  });
+
+  it("REFUSES when a subtree under a source root cannot be read", () => {
+    const root = makeFixtureRepo();
+    assert.equal(runHarness(root).status, 0, "the fixture must pass first");
+
+    mkdirSync(join(root, "tests/hidden"), { recursive: true });
+    writeFileSync(join(root, "tests/hidden/ghost.test.ts"), 'import { it } from "node:test";\nit("x", () => {});\n');
+    chmodSync(join(root, "tests/hidden"), 0o000);
+    try {
+      const { status, output } = runHarness(root);
+      assert.notEqual(status, 0, "an unreadable source subtree was silently omitted");
+      assert.match(output, /could not be read/);
+    } finally {
+      chmodSync(join(root, "tests/hidden"), 0o755);
+    }
+  });
+
+  /**
+   * A directory that does not EXIST is genuinely empty. Conflating the two
+   * would refuse every fresh checkout, where `dist` has not been built yet —
+   * which is exactly what the first version of this guard did.
+   */
+  it("does NOT refuse a fixture whose output directory has never been built", () => {
+    const root = makeFixtureRepo();
+    assert.equal(runHarness(root).status, 0, "a missing dist must not be treated as unreadable");
+  });
+});
+
+describe("TASK-010 round 6: an ancestor mount is an ordinary workspace", () => {
+  /**
+   * The mount condition also matched ANCESTORS, so bind-mounting the whole
+   * repository onto its own path — a normal layout — was refused with
+   * "dist is or contains a mount point".
+   *
+   * An ancestor mount splices nothing INTO the tree: everything below it moves
+   * together and stays consistent. Only a mount AT or INSIDE a managed path
+   * splices foreign content in.
+   */
+  it("ACCEPTS a repository that is itself a bind mount", () => {
+    const namespaces = spawnSync("unshare", ["--user", "--map-root-user", "--mount", "true"], {
+      encoding: "utf8",
+    });
+    if (namespaces.status !== 0) {
+      console.error("SKIPPED: unprivileged user namespaces unavailable; repository bind mount not proven here");
+      return;
+    }
+
+    const root = makeFixtureRepo();
+    const script = [
+      "set -e",
+      `mount --bind ${JSON.stringify(root)} ${JSON.stringify(root)}`,
+      `grep -qF ${JSON.stringify(root)} /proc/self/mountinfo || { echo "BIND-DID-NOT-TAKE"; exit 97; }`,
+      `cd ${JSON.stringify(root)}`,
+      "set +e",
+      `${JSON.stringify(process.execPath)} scripts/verify.mjs`,
+      'echo "HARNESS-EXIT=$?"',
+    ].join("\n");
+
+    const result = spawnSync("unshare", ["--user", "--map-root-user", "--mount", "sh", "-c", script], {
+      encoding: "utf8",
+      env: harnessEnv(),
+    });
+    const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+
+    assert.doesNotMatch(output, /BIND-DID-NOT-TAKE/, "the fixture failed to bind-mount, so it proved nothing");
+    assert.match(output, /HARNESS-EXIT=0/, `a repository-level bind mount was wrongly refused:\n${output.slice(0, 500)}`);
+  });
+});
