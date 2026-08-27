@@ -22,33 +22,49 @@
  *
  * Blocking egress needs OS-level privilege — a network namespace, seccomp, or a
  * firewall rule — and acquiring that privilege needs a sudo password, which
- * ADR-0002 reserves to the human and autonomous work cannot obtain. Building
- * something that LOOKED like a sandbox without that privilege would manufacture
- * assurance rather than provide it, which is the overstatement this project has
- * removed over and over.
+ * ADR-0002 reserves to the human and autonomous work cannot obtain.
  *
- * WHAT IS ACTUALLY REMOVED IS BILLING CAPABILITY, which is the property
- * `AUTONOMOUS_SPEND_LIMIT = 0` depends on. The allowlist below deliberately
- * omits `HOME`, `CODEX_HOME` and `XDG_*`: the provider CLIs authenticate from
- * credential stores under those paths, so a child without them cannot
- * authenticate to a provider, and a process that cannot authenticate cannot
- * cause a charge — whether or not it can open a socket. A child reaching an
- * unauthenticated endpoint is a real but much smaller problem than one that can
- * spend money.
+ * ================================================================
+ * HOW BILLING CAPABILITY IS REMOVED — and why the first attempt did not
+ * ================================================================
+ * `AUTONOMOUS_SPEND_LIMIT = 0` depends on the child being unable to make a
+ * chargeable call. The first version tried to achieve that by omitting `HOME`,
+ * `CODEX_HOME` and `XDG_*` from the environment, and claimed a child therefore
+ * "cannot authenticate to a provider".
  *
- * This is why the isolated executor performs DETERMINISTIC work only. Launching
- * an AI worker requires exactly the credential access this child is denied, so
- * an AI launch stays with the supervisor, behind the gate that authorises it.
- * That is a deliberate division, not an omission.
+ * THAT CLAIM WAS FALSE, and independent review demonstrated it in one step:
+ * `os.homedir()` does not read `HOME`, it falls back to the passwd database, so
+ * the child resolved `/home/<user>` anyway and read
+ * `~/.claude/.credentials.json` and `~/.codex/auth.json` directly. Both provider
+ * CLIs were also on `PATH`. Removing an environment variable hides a path; it
+ * does not remove the ability to read one.
+ *
+ * What actually removes it is a FILESYSTEM RESTRICTION the runtime enforces.
+ * The child runs under Node's permission model with reads confined to the build
+ * output and its own request file, and with child processes and worker threads
+ * denied outright. Measured on this host, that turns both credential reads and
+ * any attempt to spawn a provider CLI into `ERR_ACCESS_DENIED`.
+ *
+ * So the honest statement is narrow and testable: a child cannot READ the
+ * provider credential stores and cannot SPAWN the provider CLIs, therefore it
+ * cannot authenticate, therefore it cannot cause a charge — even though it can
+ * still open a socket to an endpoint that does not require credentials.
+ *
+ * The environment allowlist remains, frozen, as defence in depth. It is no
+ * longer load-bearing on its own, and this file no longer pretends it is.
+ *
+ * This is also why the isolated executor performs DETERMINISTIC work only:
+ * launching an AI worker needs exactly the access this child is denied, so
+ * launches stay with the supervisor behind the gate that authorises them.
  *
  * The remaining egress gap is recorded in docs/KNOWN-LIMITATIONS.md and closes
  * with an OS-level control a human must install.
  */
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { buildWorkerEnvironment, redactSecrets, type EnvironmentPolicy } from "../workers/environmentPolicy.js";
 import {
@@ -70,11 +86,37 @@ import type { WorkExecutionInput, WorkExecutor, WorkOutcome } from "../../superv
  * `PATH` is forwarded because a child that cannot find `node` cannot run at
  * all; it grants no authority by itself.
  */
-export const ISOLATED_EXECUTOR_ENV_ALLOWLIST: readonly string[] = ["PATH", "LANG", "LC_ALL", "TMPDIR", "TEMP", "TMP"];
+export const ISOLATED_EXECUTOR_ENV_ALLOWLIST: readonly string[] = Object.freeze([
+  "PATH",
+  "LANG",
+  "LC_ALL",
+  "TMPDIR",
+  "TEMP",
+  "TMP",
+]);
 
 export const ISOLATED_EXECUTOR_ENVIRONMENT_POLICY: EnvironmentPolicy = Object.freeze({
   allowedVars: ISOLATED_EXECUTOR_ENV_ALLOWLIST,
 });
+
+/**
+ * The runtime flags that actually enforce the isolation.
+ *
+ * `--permission` confines the child to the paths granted below. Everything not
+ * granted is denied, including the provider credential stores — which is the
+ * point, because the environment allowlist alone did NOT deny them
+ * (`os.homedir()` reads the passwd database, not `HOME`).
+ *
+ * Child processes and worker threads are NOT granted. A child that could spawn
+ * would simply run the provider CLI from `PATH`, which is the same capability
+ * by another route.
+ *
+ * Node 22 spells this `--experimental-permission`; later versions use
+ * `--permission`. Both are passed and the unrecognised one is rejected by the
+ * runtime, so `permissionFlagFor` picks the spelling this binary accepts rather
+ * than guessing from a version string.
+ */
+export const PERMISSION_DENIED_CODE = "ERR_ACCESS_DENIED";
 
 /** Default ceiling on a single execution. Overridable for tests. */
 export const DEFAULT_EXECUTOR_TIMEOUT_MS = 15 * 60 * 1000;
@@ -117,9 +159,52 @@ function processFailure(
   };
 }
 
+/**
+ * Which spelling of the permission flag THIS binary accepts.
+ *
+ * Node 22 uses `--experimental-permission`; later versions use `--permission`.
+ * Probed once by running the binary rather than parsed from a version string:
+ * the question is what the runtime in front of us accepts, and a version
+ * comparison is a guess about that.
+ *
+ * A binary supporting NEITHER cannot enforce the isolation this file promises,
+ * so it fails closed rather than silently running an unrestricted child.
+ */
+function permissionFlagFor(nodePath: string): string {
+  /**
+   * Probes the CAPABILITY, not the exit code.
+   *
+   * The first version ran `<flag> -e 0` and accepted any zero exit — which
+   * `/bin/true` also returns, for any arguments at all. It would have reported
+   * a working permission model on a binary that has none, and the child would
+   * then run unrestricted behind a claim that it was contained. Measuring the
+   * wrong thing confidently is precisely how the original CRITICAL happened.
+   *
+   * So this asks the runtime to do the thing that must be denied: read a file
+   * it was not granted. Only a genuinely active permission model answers
+   * `ERR_ACCESS_DENIED`.
+   */
+  const probeScript =
+    "try{require('node:fs').readFileSync('/etc/hostname');console.log('ALLOWED')}" +
+    "catch(e){console.log(e.code||'ERROR')}";
+  for (const flag of ["--permission", "--experimental-permission"]) {
+    const probe = spawnSync(nodePath, [flag, "-e", probeScript], { encoding: "utf8" });
+    if (probe.status === 0 && (probe.stdout ?? "").trim() === PERMISSION_DENIED_CODE) {
+      return flag;
+    }
+  }
+  throw new Error(
+    `refusing to run an isolated executor: ${nodePath} supports neither --permission nor ` +
+      "--experimental-permission, so filesystem access cannot be restricted and the child could read " +
+      "provider credentials. Isolation that is claimed but not enforced is worse than none.",
+  );
+}
+
 export function createIsolatedExecutor(options: IsolatedExecutorOptions): WorkExecutor {
   const timeoutMs = options.timeoutMs ?? DEFAULT_EXECUTOR_TIMEOUT_MS;
   const policy = options.environmentPolicy ?? ISOLATED_EXECUTOR_ENVIRONMENT_POLICY;
+  const nodePath = options.nodePath ?? process.execPath;
+  const permissionFlag = permissionFlagFor(nodePath);
 
   /** One spawn, one outcome, whatever happens to the child. */
   const spawnChild = (requestPath: string, env: Record<string, string>): Promise<WorkOutcome> =>
@@ -134,13 +219,36 @@ export function createIsolatedExecutor(options: IsolatedExecutorOptions): WorkEx
 
       let child: ReturnType<typeof spawn>;
       try {
-        child = spawn(options.nodePath ?? process.execPath, [options.childScript, requestPath], {
-          env,
-          stdio: ["ignore", "pipe", "pipe"],
-          // No shell: an item title is attacker-influenced text, and a shell
-          // would make it a command line.
-          shell: false,
-        });
+        child = spawn(
+          nodePath,
+          [
+            permissionFlag,
+            // Only the compiled tree the child must import, and its own
+            // request. Everything else — notably the provider credential
+            // stores under the home directory — is denied by the runtime.
+            `--allow-fs-read=${dirname(dirname(options.childScript))}`,
+            `--allow-fs-read=${options.childScript}`,
+            `--allow-fs-read=${requestPath}`,
+            options.childScript,
+            requestPath,
+          ],
+          {
+            env,
+            stdio: ["ignore", "pipe", "pipe"],
+            // No shell: an item title is attacker-influenced text, and a shell
+            // would make it a command line.
+            shell: false,
+            /**
+             * Its OWN process group, so termination reaches DESCENDANTS
+             * (round-1 finding AC-7). Signalling only the direct child left
+             * grandchildren running after the supervisor had moved on.
+             */
+            detached: true,
+            // Not the repository: a child that inherits the repo as cwd can
+            // reach durable state by relative path.
+            cwd: dirname(requestPath),
+          },
+        );
       } catch (error) {
         settle(processFailure("SPAWN_ERROR", null, "", error instanceof Error ? error.message : String(error)));
         return;
@@ -157,9 +265,12 @@ export function createIsolatedExecutor(options: IsolatedExecutorOptions): WorkEx
         if (overflowed) return;
         if (into === "out") {
           stdout += chunk;
-          if (stdout.length > MAX_RESPONSE_BYTES) {
+          // Measured in BYTES, not code units (round-1 finding): a UTF-8
+          // response can exceed the byte limit while its JavaScript string
+          // length stays under it, so a 1,000,057-byte reply was accepted.
+          if (Buffer.byteLength(stdout, "utf8") > MAX_RESPONSE_BYTES) {
             overflowed = true;
-            child.kill("SIGKILL");
+            signalGroup("SIGKILL");
           }
         } else {
           stderr = (stderr + chunk).slice(0, 16_000);
@@ -176,9 +287,33 @@ export function createIsolatedExecutor(options: IsolatedExecutorOptions): WorkEx
        * including one deliberately trapping it — cannot linger holding
        * resources.
        */
+      /**
+       * Signals the process GROUP, not just the child (round-1 finding AC-7).
+       *
+       * `child.kill()` reaches one process. The reviewer showed a child that
+       * forked a grandchild and exited, leaving the grandchild running after
+       * the supervisor had moved on — a "terminated" executor that was still
+       * doing whatever it liked. The child is spawned `detached`, so it leads
+       * its own group and a negative pid reaches every descendant.
+       */
+      function signalGroup(signal: NodeJS.Signals): void {
+        if (child.pid === undefined) return;
+        try {
+          process.kill(-child.pid, signal);
+        } catch {
+          // The group is already gone, or the child never started. Fall back to
+          // the direct child so a partial failure still signals what it can.
+          try {
+            child.kill(signal);
+          } catch {
+            /* nothing left to signal */
+          }
+        }
+      }
+
       const timer = setTimeout(() => {
-        child.kill("SIGTERM");
-        setTimeout(() => child.kill("SIGKILL"), 2_000).unref();
+        signalGroup("SIGTERM");
+        setTimeout(() => signalGroup("SIGKILL"), 2_000).unref();
         settle(processFailure("TIMEOUT", null, stdout, `${stderr}\n[timed out after ${timeoutMs}ms]`));
       }, timeoutMs);
 

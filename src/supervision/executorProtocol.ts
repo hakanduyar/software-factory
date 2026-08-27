@@ -76,6 +76,28 @@ export function buildExecutorRequest(input: WorkExecutionInput): ExecutorRequest
   };
 }
 
+/**
+ * Refuses an object carrying any key the contract does not name (AC-4).
+ *
+ * Round-1 review: the parser IGNORED unexpected fields, and a test in this
+ * repository had codified that as intended — "extra fields should simply be
+ * ignored, not fail". That was wrong. AC-4 requires unknown fields to be
+ * REFUSED, and ignoring them means a child can attach anything it likes to a
+ * response the supervisor then stores, logs or reasons about. `__proto__` and
+ * `constructor` came through the same way.
+ *
+ * Deliberately checks OWN properties including non-enumerable ones, so a
+ * response cannot smuggle a key past `Object.keys`.
+ */
+function onlyKeys(row: Record<string, unknown>, allowed: readonly string[], where: string): string | undefined {
+  for (const key of Object.getOwnPropertyNames(row)) {
+    if (!allowed.includes(key)) {
+      return `${where} carries an unexpected field ${JSON.stringify(key)}`;
+    }
+  }
+  return undefined;
+}
+
 export type ParseResult =
   | { readonly ok: true; readonly outcome: WorkOutcome }
   | { readonly ok: false; readonly reason: string };
@@ -101,8 +123,11 @@ function stringField(row: Record<string, unknown>, field: string): string | unde
  * believed is worse than no outcome, because the supervisor acts on it.
  */
 export function parseExecutorResponse(raw: string): ParseResult {
-  if (raw.length > MAX_RESPONSE_BYTES) {
-    return fail(`response is ${raw.length} bytes, over the ${MAX_RESPONSE_BYTES} limit`);
+  // BYTES, not code units (round-1 finding). A UTF-8 response can pass a
+  // string-length check while exceeding the byte budget it claims to enforce.
+  const byteLength = Buffer.byteLength(raw, "utf8");
+  if (byteLength > MAX_RESPONSE_BYTES) {
+    return fail(`response is ${byteLength} bytes, over the ${MAX_RESPONSE_BYTES} limit`);
   }
   const trimmed = raw.trim();
   if (trimmed.length === 0) {
@@ -118,6 +143,8 @@ export function parseExecutorResponse(raw: string): ParseResult {
   if (!isObject(parsed)) {
     return fail("the executor response is not an object");
   }
+  const topProblem = onlyKeys(parsed, ["protocol", "outcome"], "the executor response");
+  if (topProblem !== undefined) return fail(topProblem);
   if (parsed["protocol"] !== EXECUTOR_PROTOCOL_VERSION) {
     // A version mismatch is a DIFFERENT problem from corruption, and saying so
     // sends the operator to the right place — the lesson of L-1 in
@@ -135,6 +162,8 @@ export function parseExecutorResponse(raw: string): ParseResult {
 
   switch (kind) {
     case "COMPLETED": {
+      const problem = onlyKeys(outcome, ["kind", "detail", "reportedIdentity"], "COMPLETED");
+      if (problem !== undefined) return fail(problem);
       const detail = stringField(outcome, "detail");
       if (detail === undefined) return fail("COMPLETED requires a string detail");
       const identity = parseIdentity(outcome["reportedIdentity"]);
@@ -145,6 +174,8 @@ export function parseExecutorResponse(raw: string): ParseResult {
       };
     }
     case "CHANGES_REQUIRED": {
+      const problem = onlyKeys(outcome, ["kind", "findings"], "CHANGES_REQUIRED");
+      if (problem !== undefined) return fail(problem);
       const findings = outcome["findings"];
       if (!Array.isArray(findings) || findings.some((entry) => typeof entry !== "string")) {
         return fail("CHANGES_REQUIRED requires an array of string findings");
@@ -152,8 +183,16 @@ export function parseExecutorResponse(raw: string): ParseResult {
       return { ok: true, outcome: { kind: "CHANGES_REQUIRED", findings: findings as readonly string[] } };
     }
     case "RESOURCE_FAILURE": {
+      const problem = onlyKeys(outcome, ["kind", "process", "retryAt"], "RESOURCE_FAILURE");
+      if (problem !== undefined) return fail(problem);
       const process_ = outcome["process"];
       if (!isObject(process_)) return fail("RESOURCE_FAILURE requires a process object");
+      const processProblem = onlyKeys(
+        process_,
+        ["terminationReason", "exitCode", "stdout", "stderr"],
+        "RESOURCE_FAILURE.process",
+      );
+      if (processProblem !== undefined) return fail(processProblem);
       const reason = process_["terminationReason"];
       if (reason !== "EXITED" && reason !== "TIMEOUT" && reason !== "CANCELLED" && reason !== "SPAWN_ERROR") {
         return fail(`RESOURCE_FAILURE has an unknown terminationReason ${JSON.stringify(reason)}`);
@@ -205,6 +244,7 @@ export function parseExecutorResponse(raw: string): ParseResult {
 function parseIdentity(value: unknown): { provider?: string; model?: string; effort?: string } | undefined | "invalid" {
   if (value === undefined) return undefined;
   if (!isObject(value)) return "invalid";
+  if (onlyKeys(value, ["provider", "model", "effort"], "reportedIdentity") !== undefined) return "invalid";
   const provider = value["provider"];
   const model = value["model"];
   const effort = value["effort"];

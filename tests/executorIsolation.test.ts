@@ -216,18 +216,51 @@ describe("TASK-011 AC-4: a child's response is parsed, not believed", () => {
     }
   });
 
-  it("has no field through which a child could grant spending authority", () => {
+  /**
+   * CORRECTED. The first version of this test asserted that unexpected fields
+   * "should simply be ignored, not fail" — codifying the OPPOSITE of AC-4,
+   * which requires them to be refused. Round-1 review caught the test and the
+   * behaviour together.
+   *
+   * Ignoring is not harmless: a child can attach anything to a response the
+   * supervisor then stores, logs or reasons about, and `__proto__` came through
+   * the same door.
+   */
+  it("REFUSES a response carrying fields that could look like spending authority", () => {
     const parsed = parseExecutorResponse(
       `{"protocol":${EXECUTOR_PROTOCOL_VERSION},"outcome":{"kind":"COMPLETED","detail":"ok",` +
         `"autonomousSpendAllowed":true,"autonomousSpendLimit":9999,"billingMode":"INCLUDED_SUBSCRIPTION"}}`,
     );
-    assert.equal(parsed.ok, true, "the extra fields should simply be ignored, not fail");
-    if (parsed.ok) {
-      const asRecord = parsed.outcome as unknown as Record<string, unknown>;
-      assert.ok(!("autonomousSpendAllowed" in asRecord));
-      assert.ok(!("autonomousSpendLimit" in asRecord));
-      assert.ok(!("billingMode" in asRecord));
+    assert.equal(parsed.ok, false, "unexpected fields must be refused, not ignored");
+    if (!parsed.ok) assert.match(parsed.reason, /unexpected field/);
+  });
+
+  it("REFUSES unexpected fields at every level, and prototype-shaped keys", () => {
+    const cases: readonly string[] = [
+      `{"protocol":${EXECUTOR_PROTOCOL_VERSION},"outcome":{"kind":"COMPLETED","detail":"x"},"extra":1}`,
+      `{"protocol":${EXECUTOR_PROTOCOL_VERSION},"outcome":{"kind":"COMPLETED","detail":"x","extra":1}}`,
+      `{"protocol":${EXECUTOR_PROTOCOL_VERSION},"outcome":{"kind":"COMPLETED","detail":"x","__proto__":{"a":1}}}`,
+      `{"protocol":${EXECUTOR_PROTOCOL_VERSION},"outcome":{"kind":"COMPLETED","detail":"x","constructor":{}}}`,
+      `{"protocol":${EXECUTOR_PROTOCOL_VERSION},"outcome":{"kind":"RESOURCE_FAILURE","process":` +
+        `{"terminationReason":"EXITED","exitCode":1,"stdout":"","stderr":"","extra":1}}}`,
+      `{"protocol":${EXECUTOR_PROTOCOL_VERSION},"outcome":{"kind":"COMPLETED","detail":"x",` +
+        `"reportedIdentity":{"provider":"p","surprise":1}}}`,
+    ];
+    for (const payload of cases) {
+      assert.equal(parseExecutorResponse(payload).ok, false, `accepted: ${payload.slice(0, 90)}`);
     }
+  });
+
+  /** The byte limit must be measured in BYTES, not code units. */
+  it("REFUSES a response over the byte limit even when its string length is under it", () => {
+    // Each of these is 4 UTF-8 bytes but 2 code units.
+    const filler = "\u{1F600}".repeat(260_000); // ~1.04 MB, ~520k code units
+    const payload = `{"protocol":${EXECUTOR_PROTOCOL_VERSION},"outcome":{"kind":"COMPLETED","detail":"${filler}"}}`;
+    assert.ok(payload.length < 1_000_000, "the fixture must be UNDER the limit by code units");
+    assert.ok(Buffer.byteLength(payload, "utf8") > 1_000_000, "...and OVER it by bytes");
+    const parsed = parseExecutorResponse(payload);
+    assert.equal(parsed.ok, false, "a response over the byte budget was accepted");
+    if (!parsed.ok) assert.match(parsed.reason, /over the/);
   });
 });
 
@@ -319,15 +352,24 @@ describe("TASK-011 AC-6/AC-7: nothing hangs, nothing is assumed successful", () 
     }
   });
 
-  it("a child that cannot be SPAWNED fails closed", async () => {
+  /**
+   * A missing RUNTIME now fails at CONSTRUCTION rather than at execution, since
+   * a runtime without the permission model cannot enforce the isolation this
+   * adapter promises — see the permission-model test below.
+   *
+   * What remains here is the case a real deployment actually hits: the runtime
+   * is fine and the child entry point is not where it was expected.
+   */
+  it("a child whose SCRIPT is missing fails closed", async () => {
     const executor = createIsolatedExecutor({
       childScript: "/nonexistent/child.mjs",
-      timeoutMs: 5_000,
-      nodePath: "/nonexistent/node-binary",
+      timeoutMs: 15_000,
     });
     const outcome = await executor.execute(INPUT);
-    assert.equal(outcome.kind, "RESOURCE_FAILURE");
-    if (outcome.kind === "RESOURCE_FAILURE") assert.equal(outcome.process.terminationReason, "SPAWN_ERROR");
+    assert.equal(outcome.kind, "RESOURCE_FAILURE", "a missing child script must not look like success");
+    if (outcome.kind === "RESOURCE_FAILURE") {
+      assert.notEqual(outcome.process.exitCode, 0);
+    }
   });
 });
 
@@ -443,5 +485,129 @@ describe("TASK-011: the shipped child process", () => {
     if (outcome.kind === "CHANGES_REQUIRED") {
       assert.match(outcome.findings.join(" "), /EXECUTOR_WIRING/);
     }
+  });
+});
+
+// =====================================================================
+// ROUND-1 CRITICAL — billing capability, measured rather than asserted
+// =====================================================================
+
+describe("TASK-011 round 1: a child cannot reach the provider credentials", () => {
+  /**
+   * The claim this task rests on, and the one round-1 review demolished.
+   *
+   * Omitting HOME does NOT deny the credential store: `os.homedir()` falls back
+   * to the passwd database, so the child resolved the real home directory and
+   * read `~/.claude/.credentials.json` and `~/.codex/auth.json` directly. The
+   * environment allowlist hid a path; it removed no ability.
+   *
+   * The child now runs under the runtime's permission model, which denies the
+   * read outright. This asks the CHILD what it can actually do, rather than
+   * inspecting configuration and inferring — the inference is exactly what was
+   * wrong before.
+   */
+  it("is DENIED reading the real credential stores", async () => {
+    const { homedir } = await import("node:os");
+    const script = childScript(
+      `import { readFileSync } from "node:fs";
+       import { homedir } from "node:os";
+       JSON.parse(readFileSync(process.argv[2], "utf8"));
+       const probe = {};
+       for (const rel of [".claude/.credentials.json", ".codex/auth.json"]) {
+         const path = homedir() + "/" + rel;
+         try { readFileSync(path, "utf8"); probe[rel] = "READABLE"; }
+         catch (e) { probe[rel] = e.code ?? "ERROR"; }
+       }
+       probe.homedir = homedir();
+       process.stdout.write(JSON.stringify({
+         protocol: ${EXECUTOR_PROTOCOL_VERSION},
+         outcome: { kind: "COMPLETED", detail: JSON.stringify(probe) },
+       }));`,
+    );
+    const executor = createIsolatedExecutor({ childScript: script, timeoutMs: 60_000 });
+    const outcome = await executor.execute(INPUT);
+
+    assert.equal(outcome.kind, "COMPLETED", "the probe child must run");
+    if (outcome.kind === "COMPLETED") {
+      const probe = JSON.parse(outcome.detail) as Record<string, string>;
+      // The child still RESOLVES the home directory — that was never the
+      // defence, and pretending otherwise is what went wrong the first time.
+      assert.equal(probe["homedir"], homedir(), "homedir resolves regardless of the environment");
+      for (const rel of [".claude/.credentials.json", ".codex/auth.json"]) {
+        assert.notEqual(probe[rel], "READABLE", `${rel} was readable: billing capability is NOT removed`);
+      }
+    }
+  });
+
+  /** ...and it cannot simply run the provider CLI instead. */
+  it("is DENIED spawning any child process", async () => {
+    const script = childScript(
+      `import { readFileSync } from "node:fs";
+       JSON.parse(readFileSync(process.argv[2], "utf8"));
+       let verdict;
+       try {
+         const { execFileSync } = await import("node:child_process");
+         execFileSync("/bin/echo", ["hi"]);
+         verdict = "ALLOWED";
+       } catch (e) { verdict = e.code ?? "ERROR"; }
+       process.stdout.write(JSON.stringify({
+         protocol: ${EXECUTOR_PROTOCOL_VERSION},
+         outcome: { kind: "COMPLETED", detail: verdict },
+       }));`,
+    );
+    const executor = createIsolatedExecutor({ childScript: script, timeoutMs: 60_000 });
+    const outcome = await executor.execute(INPUT);
+
+    assert.equal(outcome.kind, "COMPLETED");
+    if (outcome.kind === "COMPLETED") {
+      assert.notEqual(outcome.detail, "ALLOWED", "a child that can spawn can run the provider CLI");
+    }
+  });
+
+  /** A runtime that cannot enforce this must not be used as if it could. */
+  it("REFUSES to construct an executor on a runtime without the permission model", () => {
+    assert.throws(
+      () => createIsolatedExecutor({ childScript: "/tmp/whatever.mjs", nodePath: "/bin/true" }),
+      /supports neither --permission/,
+      "isolation that is claimed but not enforced is worse than none",
+    );
+  });
+});
+
+describe("TASK-011 round 1: descendants do not outlive the wait (AC-7)", () => {
+  /**
+   * The reviewer forked a grandchild and exited the child; the grandchild kept
+   * running after the supervisor had moved on. Only the direct child was
+   * signalled. The child now leads its own process group and the group is
+   * signalled.
+   *
+   * Driven with a grandchild that writes a file after a delay: if it survives
+   * termination, the file appears.
+   */
+  it("kills a GRANDCHILD when the executor times out", async () => {
+    const { existsSync, mkdtempSync: mkTemp } = await import("node:fs");
+    const { tmpdir: osTmp } = await import("node:os");
+    const { join: pathJoin } = await import("node:path");
+
+    const evidenceDir = mkTemp(pathJoin(osTmp(), "sf-grandchild-"));
+    created.push(evidenceDir);
+    const evidence = pathJoin(evidenceDir, "survived.txt");
+
+    // The child cannot spawn under the permission model, so the grandchild is
+    // created by the SHIM node the test controls — the parent's own group
+    // handling is what is under test.
+    const script = childScript(
+      `import { readFileSync, writeFileSync } from "node:fs";
+       JSON.parse(readFileSync(process.argv[2], "utf8"));
+       setTimeout(() => { try { writeFileSync(${JSON.stringify(evidence)}, "x"); } catch {} }, 3000);
+       setInterval(() => {}, 1000);`,
+    );
+
+    const executor = createIsolatedExecutor({ childScript: script, timeoutMs: 1_200 });
+    const outcome = await executor.execute(INPUT);
+    assert.equal(outcome.kind, "RESOURCE_FAILURE");
+
+    await new Promise((r) => setTimeout(r, 4_000));
+    assert.ok(!existsSync(evidence), "the terminated child was still running afterwards");
   });
 });
