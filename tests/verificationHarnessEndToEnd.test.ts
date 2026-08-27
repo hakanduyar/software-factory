@@ -204,6 +204,46 @@ function runWithShowConfigShim(root: string, answer: string): { status: number; 
   };
 }
 
+/**
+ * Runs the harness with an `npx` that delegates everything to the real one and
+ * then runs `after` once the build has finished.
+ *
+ * This is the only way to reach the POST-BUILD guards. Every condition a fixture
+ * can set up beforehand is caught by the pre-build layer — correctly, since
+ * refusing before anything is written is the whole point — which left the later
+ * layer's wiring untestable, and a reviewer's mutation of it duly survived. A
+ * build that CREATES the condition is not an artificial case either: a compiler
+ * plugin, a postinstall script or a `prepare` hook can emit whatever it likes.
+ */
+function runWithBuildThatPlants(root: string, after: string): { status: number; output: string } {
+  const realNpx = spawnSync("sh", ["-c", "command -v npx"], { encoding: "utf8" }).stdout.trim();
+  assert.ok(realNpx.length > 0, "the fixture needs a real npx to delegate to");
+
+  const shimDir = mkdtempSync(join(tmpdir(), "sf-buildshim-"));
+  created.push(shimDir);
+  writeFileSync(
+    join(shimDir, "npx"),
+    [
+      "#!/bin/sh",
+      'for a in "$@"; do',
+      `  if [ "$a" = "--showConfig" ]; then exec ${realNpx} "$@"; fi`,
+      "done",
+      `${realNpx} "$@" || exit $?`,
+      after,
+      "exit 0",
+      "",
+    ].join("\n"),
+    { mode: 0o755 },
+  );
+
+  const result = spawnSync(process.execPath, ["scripts/verify.mjs"], {
+    cwd: root,
+    encoding: "utf8",
+    env: harnessEnv({ PATH: `${shimDir}:${process.env["PATH"] ?? ""}` }),
+  });
+  return { status: result.status ?? -1, output: `${result.stdout ?? ""}${result.stderr ?? ""}` };
+}
+
 describe("TASK-010 remediation: the harness itself, end to end", () => {
   it("passes on a clean fixture repository", () => {
     const root = makeFixtureRepo();
@@ -1758,5 +1798,181 @@ describe("TASK-010 round 8: compiler inputs outside the assumed roots", () => {
     // this pins the exclusion for the case where a config declares no include
     // and the root becomes ".".
     assert.equal(runHarness(root).status, 0, "a linked node_modules was treated as foreign source");
+  });
+});
+
+// =====================================================================
+// ROUND-9 — an absolute root, a stale non-test file, and a post-build guard
+// =====================================================================
+
+describe("TASK-010 round 9: the config may spell its roots absolutely", () => {
+  /**
+   * CRITICAL. `deriveSourceRoots` returned an absolute include unchanged and
+   * every caller then did `join(REPO_ROOT, root)`, prefixing the repository a
+   * second time. The resulting path does not exist, so the symlink check, the
+   * hardlink scan and the mount check all ran against nothing and found nothing
+   * wrong. The reviewer pointed absolute includes at the fixture's own `src`,
+   * replaced `testArtifacts.ts` with a symlink to a module calling
+   * `process.exit(0)`, and the run EXITED 0 WITH NO OUTPUT.
+   *
+   * A false pass is the worst thing this file can produce. This is the third
+   * round in which the roots were the way in — hard-coded, then derived but not
+   * normalised — which is why the fix is normalisation rather than another
+   * special case.
+   */
+  it("REFUSES a symlinked source when the roots are declared as absolute paths", () => {
+    const root = makeFixtureRepo();
+    const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as {
+      include: string[];
+    };
+    tsconfig.include = [`${root}/src/**/*.ts`, `${root}/tests/**/*.ts`];
+    writeFileSync(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
+    assert.equal(runHarness(root).status, 0, "the fixture must pass before the link is planted");
+
+    const external = mkdtempSync(join(tmpdir(), "sf-absroot-"));
+    created.push(external);
+    const hostile = join(external, "testArtifacts.ts");
+    writeFileSync(hostile, "process.exit(0);\nexport const nothing = 0;\n");
+    rmSync(join(root, "src/verification/testArtifacts.ts"));
+    symlinkSync(hostile, join(root, "src/verification/testArtifacts.ts"));
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, "an absolute include left the source roots unscanned");
+    assert.ok(output.trim().length > 0, "it exited without saying anything, which is the false pass itself");
+    assert.match(output, /testArtifacts\.ts/);
+  });
+
+  /** ...and a config that compiles from OUTSIDE the repository is refused. */
+  it("REFUSES a config whose sources live outside the repository", () => {
+    const root = makeFixtureRepo();
+    const external = mkdtempSync(join(tmpdir(), "sf-outside-"));
+    created.push(external);
+    mkdirSync(join(external, "elsewhere"), { recursive: true });
+    writeFileSync(join(external, "elsewhere/thing.ts"), "export const thing = 1;\n");
+
+    const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as {
+      include: string[];
+    };
+    tsconfig.include = [...tsconfig.include, `${external}/elsewhere/**/*.ts`];
+    writeFileSync(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, "source outside the repository was compiled without objection");
+    assert.match(output, /outside this repository/);
+  });
+});
+
+describe("TASK-010 round 9: a test declared outside tests/", () => {
+  /**
+   * AC-1 FAIL. Discovery was pinned to `tests/**\/*.test.ts` while the roots were
+   * derived from the config, so the two halves disagreed: a test the config
+   * declares elsewhere was COMPILED, matched no discovered source, and was
+   * reported as an orphan of the tree that legitimately produced it. The run
+   * cleaned, rebuilt, produced it again, and failed.
+   *
+   * Discovery follows the same derived roots now, which is the only way the two
+   * halves can stay in agreement.
+   */
+  it("discovers and RUNS a test from a root the config declares", () => {
+    const root = makeFixtureRepo();
+    mkdirSync(join(root, "extra"), { recursive: true });
+    writeFileSync(
+      join(root, "extra/foreign.test.ts"),
+      [
+        'import assert from "node:assert/strict";',
+        'import { describe, it } from "node:test";',
+        'describe("declared elsewhere", () => { it("runs", () => { assert.equal(2, 2); }); });',
+        "",
+      ].join("\n"),
+    );
+    const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as {
+      include: string[];
+    };
+    tsconfig.include = [...tsconfig.include, "extra/**/*.ts"];
+    writeFileSync(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
+
+    const { status, output } = runHarness(root);
+    assert.equal(status, 0, `a config-declared test was rejected by its own tree:\n${output}`);
+    assert.match(output, /2 test files/, "the declared test was not discovered");
+    assert.match(output, /tree-consistent/);
+  });
+});
+
+describe("TASK-010 round 9: stale output that is not a test", () => {
+  /**
+   * HIGH. The audit filtered the output through `isTestArtifact`, so a planted
+   * `dist/src/old-branch.js` survived the run, which exited 0 and reported
+   * `tree-consistent`. AC-4 requires an equivalent final generated state, and a
+   * file another branch left behind is imported by whatever still references it.
+   */
+  it("names a stale non-test artifact, removes it, and still converges", () => {
+    const root = makeFixtureRepo();
+    assert.equal(runHarness(root).status, 0, "the fixture must pass before anything is planted");
+
+    const stale = join(root, "dist/src/old-branch.js");
+    writeFileSync(stale, "export const fromAnotherBranch = 1;\n");
+    assert.ok(existsSync(stale));
+
+    const { status, output } = runHarness(root);
+    assert.match(output, /old-branch\.js/, "the stale file was never mentioned");
+    assert.match(output, /stale build output/);
+    assert.equal(status, 0, `the repair cycle should converge:\n${output}`);
+    assert.ok(!existsSync(stale), "AC-4: the final generated state still contained another branch's output");
+  });
+});
+
+describe("TASK-010 round 9: a whole-repository source root", () => {
+  /**
+   * The `node_modules` exclusion had a test that passed for the wrong reason:
+   * its fixture declared `src/**\/*.ts` and `tests/**\/*.ts`, so the symlinked
+   * `node_modules` was never in scope and the exclusion was never exercised.
+   *
+   * A config whose include begins with a glob roots at the repository itself,
+   * which is when the exclusion actually decides anything.
+   */
+  it("passes with a symlinked node_modules when the root is the repository", () => {
+    const root = makeFixtureRepo();
+    const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as Record<string, unknown>;
+    tsconfig["include"] = ["**/*.ts"];
+    writeFileSync(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
+
+    const { status, output } = runHarness(root);
+    assert.equal(status, 0, `a linked node_modules under a "." root was treated as foreign source:\n${output}`);
+    assert.match(output, /tree-consistent/);
+  });
+});
+
+describe("TASK-010 round 9: the guard that runs AFTER the build", () => {
+  /**
+   * A reviewer's mutation of the post-build `assessTreeSafety` wiring survived,
+   * because every fixture condition is caught earlier by the pre-build layer.
+   * That is the right order and it left the later layer unproven.
+   *
+   * A build that plants the link itself is the case only the post-build scan can
+   * see — and it is not contrived: anything running as part of the build can
+   * write into the output directory.
+   */
+  it("REFUSES a symlink the BUILD placed under the output directory", () => {
+    const root = makeFixtureRepo();
+    const external = mkdtempSync(join(tmpdir(), "sf-postbuild-"));
+    created.push(external);
+    const outsider = join(external, "ghost.test.js");
+    writeFileSync(outsider, "export const ghost = 1;\n");
+
+    const { status, output } = runWithBuildThatPlants(
+      root,
+      `ln -s ${JSON.stringify(outsider)} dist/tests/planted.test.js`,
+    );
+    assert.notEqual(status, 0, "a symlink created during the build was never noticed");
+    assert.match(output, /planted\.test\.js/);
+    assert.ok(!output.includes("tree-consistent"), "it must not claim consistency");
+  });
+
+  /** The same shim, planting nothing, must still pass — or it proves nothing. */
+  it("passes when the build plants nothing", () => {
+    const root = makeFixtureRepo();
+    const { status, output } = runWithBuildThatPlants(root, "true");
+    assert.equal(status, 0, `the shim itself broke the run:\n${output}`);
+    assert.match(output, /tree-consistent/);
   });
 });

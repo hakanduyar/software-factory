@@ -116,6 +116,8 @@ const OUTPUT_DIR = "dist";
  * only from code that runs after that point.
  */
 let SOURCE_ROOTS = ["src", "tests"];
+/** `rootDir` from the effective config: what the output layout is relative to. */
+let ROOT_DIR = ".";
 function deriveSourceRoots(config) {
   const patterns = [
     ...(Array.isArray(config?.include) ? config.include : []),
@@ -123,6 +125,7 @@ function deriveSourceRoots(config) {
   ].filter((pattern) => typeof pattern === "string");
 
   const roots = new Set();
+  const outside = new Set();
   for (const pattern of patterns) {
     const segments = pattern.replace(/\\/g, "/").replace(/^\.\//, "").split("/");
     const literal = [];
@@ -135,9 +138,34 @@ function deriveSourceRoots(config) {
     const candidate = literal.length > 0 && literal[literal.length - 1].includes(".")
       ? literal.slice(0, -1).join("/")
       : literal.join("/");
-    roots.add(candidate.length === 0 ? "." : candidate);
+    /**
+     * NORMALISED against the repository root (round-9 CRITICAL).
+     *
+     * A tsconfig may declare its includes ABSOLUTELY, and this returned the
+     * absolute path unchanged. Every caller then did `join(REPO_ROOT, root)`,
+     * which prefixed the repository a second time and produced a path that does
+     * not exist — so the symlink check, the hardlink scan and the mount check
+     * all ran against nothing and found nothing wrong. The reviewer pointed an
+     * absolute include at the fixture's own `src`, replaced `testArtifacts.ts`
+     * with a symlink to a module calling `process.exit(0)`, and the run exited 0
+     * WITH NO OUTPUT.
+     *
+     * `resolve` treats an absolute candidate as absolute and a relative one as
+     * relative to the repository, so both spellings land on the same directory;
+     * `relative` then puts it back in the form every caller expects.
+     */
+    const absolute = resolve(REPO_ROOT, candidate.length === 0 ? "." : candidate);
+    const rel = relative(REPO_ROOT, absolute).replace(/\\/g, "/");
+    if (rel.startsWith("../")) {
+      // The compiler reads from OUTSIDE the repository. Nothing here can scan
+      // it meaningfully, and a build that compiles foreign source is precisely
+      // what these guards exist to refuse.
+      outside.add(absolute);
+      continue;
+    }
+    roots.add(rel === "" ? "." : rel);
   }
-  return roots.size === 0 ? ["."] : [...roots].sort();
+  return { roots: roots.size === 0 ? ["."] : [...roots].sort(), outside: [...outside].sort() };
 }
 /** How long `--showConfig` may take before the run fails closed, saying so. */
 const CONFIG_TIMEOUT_MS = 120_000;
@@ -520,7 +548,34 @@ if (configProblem !== undefined) {
 const noEmit = effectiveConfig.compilerOptions.noEmit === true;
 // The roots are a fact about the CONFIG, so they are derived the moment the
 // config is known and before anything scans a directory.
-SOURCE_ROOTS = deriveSourceRoots(effectiveConfig);
+const derivedRoots = deriveSourceRoots(effectiveConfig);
+if (derivedRoots.outside.length > 0) {
+  fail(
+    `verification refused: the effective tsconfig compiles source from outside this repository ` +
+      `(${derivedRoots.outside.join(", ")}); nothing here can scan or vouch for it`,
+  );
+}
+SOURCE_ROOTS = derivedRoots.roots;
+/**
+ * The output layout is DERIVED too, for the same reason the roots are.
+ *
+ * `rootDir` decides where a source lands under `outDir`, so the audit cannot map
+ * one to the other without it. An absolute `rootDir` is normalised exactly as
+ * the roots are; one outside the repository is refused for the same reason.
+ */
+ROOT_DIR = (() => {
+  const declared = effectiveConfig.compilerOptions.rootDir;
+  if (declared === undefined) return ".";
+  if (typeof declared !== "string") {
+    fail(`verification refused: rootDir is ${JSON.stringify(declared)}, which is not a string`);
+  }
+  const rel = relative(REPO_ROOT, resolve(REPO_ROOT, declared)).replace(/\\/g, "/");
+  if (rel.startsWith("../")) {
+    fail(`verification refused: rootDir (${declared}) is outside this repository`);
+  }
+  return rel === "" ? "." : rel;
+})();
+const EMIT_LAYOUT = { rootDir: ROOT_DIR, outputDirectory: OUTPUT_DIR };
 /**
  * Refused BEFORE the build, and the wording says so (round-3 finding).
  *
@@ -551,7 +606,7 @@ SOURCE_ROOTS = deriveSourceRoots(effectiveConfig);
  * the kind of omission a list prevents and a pair of lines invites.
  */
 for (const root of SOURCE_ROOTS) {
-  if (isSymlink(join(REPO_ROOT, root))) {
+  if (isSymlink(resolve(REPO_ROOT, root))) {
     fail(
       `verification refused before building: the ${root} directory is a symlink; external code would be ` +
         "compiled and executed as though it belonged to this tree",
@@ -632,15 +687,43 @@ if (process.platform === "linux") {
    *
    * The same list the source scan uses, so the two cannot drift apart.
    */
-  const managedPaths = [OUTPUT_DIR, ...SOURCE_ROOTS].map((relative) => {
-    const absolute = join(REPO_ROOT, relative);
-    return { relative, path: (realOrUndefined(absolute) ?? absolute).replace(/\/+$/, "") };
+  const managedPaths = [OUTPUT_DIR, ...SOURCE_ROOTS].map((managed) => {
+    const absolute = resolve(REPO_ROOT, managed);
+    return { relative: managed, path: (realOrUndefined(absolute) ?? absolute).replace(/\/+$/, "") };
   });
-  const earlyMountPoints = (mountInfo ?? "")
-    .split("\n")
-    .map((line) => line.trim().split(" ")[4])
-    .filter((point) => typeof point === "string" && point.startsWith("/"))
-    .map((point) => point.replace(/\\([0-7]{3})/g, (_m, o) => String.fromCharCode(Number.parseInt(o, 8))));
+  /**
+   * Rows are VALIDATED, not merely counted (round-9 HIGH).
+   *
+   * `split(" ")[4]` accepted `not a mountinfo row /unrelated` as a mount at
+   * `/unrelated`. Arbitrary text became a mount point, which is wrong in both
+   * directions: garbage rows kept the "could not be read" refusal below
+   * unreachable, and a table of garbage missing the real mount looked safe.
+   *
+   * Deliberately the same shape as `parseMountInfoRow` in the tested checker.
+   * This copy exists because this guard runs BEFORE anything is compiled, so
+   * the checker does not exist yet; the tested one remains the authority.
+   */
+  const earlyMountRow = (line) => {
+    const fields = line.split(" ").filter((field) => field.length > 0);
+    if (fields.length < 10) return undefined;
+    if (!/^\d+$/.test(fields[0] ?? "")) return undefined;
+    if (!/^\d+$/.test(fields[1] ?? "")) return undefined;
+    if (!/^\d+:\d+$/.test(fields[2] ?? "")) return undefined;
+    if (!(fields[3] ?? "").startsWith("/")) return undefined;
+    const point = fields[4] ?? "";
+    if (!point.startsWith("/")) return undefined;
+    const separator = fields.indexOf("-", 6);
+    if (separator === -1 || fields.length - separator < 4) return undefined;
+    return point.replace(/\\([0-7]{3})/g, (_m, o) => String.fromCharCode(Number.parseInt(o, 8)));
+  };
+  const earlyLines = (mountInfo ?? "").split("\n").map((line) => line.trim()).filter((line) => line.length > 0);
+  const earlyMountPoints = earlyLines.map(earlyMountRow).filter((point) => point !== undefined);
+  if (mountInfo !== undefined && earlyMountPoints.length !== earlyLines.length) {
+    fail(
+      "verification refused: the mount table (/proc/self/mountinfo) contains lines this verifier does not " +
+        "recognise as mountinfo rows, so the mount topology is not fully known",
+    );
+  }
   if (mountInfo === undefined || earlyMountPoints.length === 0) {
     fail("verification refused: the mount table (/proc/self/mountinfo) could not be read, so it is unknown whether the build output is a mount point");
   }
@@ -743,7 +826,14 @@ if (!outputVerdict.trusted) {
 
 // --- 4. the full tested safety judgement, now that the checker exists --------
 const safety = checker.assessTreeSafety({
-  testsRootIsSymlink: isSymlink(join(REPO_ROOT, "tests")),
+  /**
+   * EVERY derived root, not the one called `tests` (round-9).
+   *
+   * The pre-build loop already asks this of every root; this fact was still
+   * phrased as a question about one hard-coded directory, which is the same
+   * subset-for-the-whole substitution the roots themselves stopped making.
+   */
+  testsRootIsSymlink: SOURCE_ROOTS.some((root) => isSymlink(resolve(REPO_ROOT, root))),
   outputIsSymlink: isSymlink(join(REPO_ROOT, OUTPUT_DIR)),
   outputOnDifferentDevice:
     outputDevice !== undefined && rootDevice !== undefined && outputDevice !== rootDevice,
@@ -787,10 +877,27 @@ if (!mountVerdict.safe) {
 }
 
 // --- 5. audit every artifact that could RUN, anywhere in the output ----------
-const sourceTests = listFiles("tests").filter((path) => path.endsWith(".test.ts"));
-const compiledTests = listFiles(OUTPUT_DIR).filter((path) => checker.isTestArtifact(path));
+/**
+ * DISCOVERED FROM THE DERIVED ROOTS (round-9 AC-1 finding).
+ *
+ * `listFiles("tests")` was the same hard-coded guess the roots used to be: a
+ * test the config declares elsewhere was compiled, matched no source, and was
+ * reported as an orphan of the tree that legitimately produced it.
+ */
+const allSources = [...new Set(SOURCE_ROOTS.flatMap((root) => listFiles(root, true)))]
+  .filter((path) => /\.(ts|mts|cts)$/.test(path) && !/\.d\.(ts|mts|cts)$/.test(path))
+  .sort();
+const sourceTests = allSources.filter((path) => checker.isSourceTest(path));
+const generatedFiles = listFiles(OUTPUT_DIR);
+const compiledTests = generatedFiles.filter((path) => checker.isTestArtifact(path));
 assertEverythingWasReadable("before auditing");
-let audit = checker.auditTestArtifacts({ sourceTests, compiledTests });
+let audit = checker.auditTestArtifacts({
+  sourceTests,
+  compiledTests,
+  sources: allSources,
+  generated: generatedFiles,
+  layout: EMIT_LAYOUT,
+});
 
 // --- 6. contaminated? report it, repair it, and re-audit the REBUILT tree ----
 // Bounded to exactly ONE repair cycle: clean, rebuild from source, re-audit.
@@ -858,8 +965,15 @@ if (!audit.clean) {
     fail(`${diagnosis}\n\nThe rebuild after cleaning did not emit the verification checker; refusing to report a tree it could not rebuild`);
   }
 
-  const rebuiltCompiled = listFiles(OUTPUT_DIR).filter((path) => checker.isTestArtifact(path));
-  audit = checker.auditTestArtifacts({ sourceTests, compiledTests: rebuiltCompiled });
+  const rebuiltGenerated = listFiles(OUTPUT_DIR);
+  const rebuiltCompiled = rebuiltGenerated.filter((path) => checker.isTestArtifact(path));
+  audit = checker.auditTestArtifacts({
+    sourceTests,
+    compiledTests: rebuiltCompiled,
+    sources: allSources,
+    generated: rebuiltGenerated,
+    layout: EMIT_LAYOUT,
+  });
   if (!audit.clean) {
     // Survived a clean rebuild from source. That is not another branch's
     // leftovers; the tree genuinely disagrees with itself.

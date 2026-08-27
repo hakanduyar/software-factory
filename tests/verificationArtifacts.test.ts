@@ -21,14 +21,41 @@ import {
   assessOutputDirectory,
   assessTreeSafety,
   auditTestArtifacts,
+  compiledPathForSource,
   compiledPathForSourceTest,
   describeContamination,
+  isSourceTest,
   assessMountTopology,
   parseMountInfo,
+  readMountTable,
+  sourceForGeneratedPath,
 } from "../src/verification/testArtifacts.js";
 
 const SOURCES = ["tests/alpha.test.ts", "tests/nested/beta.test.ts"];
 const COMPILED = ["dist/tests/alpha.test.js", "dist/tests/nested/beta.test.js"];
+const LAYOUT = { rootDir: ".", outputDirectory: "dist" };
+
+/**
+ * The audit needs the WHOLE picture (round-9 HIGH), so every call supplies the
+ * full source list and the full output listing. These helpers keep the cases
+ * about what they are testing instead of about their arguments.
+ */
+function auditOf(input: {
+  readonly sourceTests?: readonly string[];
+  readonly compiledTests?: readonly string[];
+  readonly sources?: readonly string[];
+  readonly generated?: readonly string[];
+}) {
+  const sourceTests = input.sourceTests ?? SOURCES;
+  const compiledTests = input.compiledTests ?? COMPILED;
+  return auditTestArtifacts({
+    sourceTests,
+    compiledTests,
+    sources: input.sources ?? sourceTests,
+    generated: input.generated ?? compiledTests,
+    layout: LAYOUT,
+  });
+}
 
 describe("TASK-010 AC-1: discovery is derived from source", () => {
   it("maps a source test to its compiled artifact", () => {
@@ -38,13 +65,24 @@ describe("TASK-010 AC-1: discovery is derived from source", () => {
   });
 
   it("refuses anything that is not a source test path", () => {
-    for (const bad of ["src/thing.ts", "tests/helper.ts", "dist/tests/alpha.test.js", "alpha.test.ts"]) {
+    for (const bad of ["src/thing.ts", "tests/helper.ts", "dist/tests/alpha.test.js"]) {
       assert.throws(() => compiledPathForSourceTest(bad), /not a source test path/);
     }
   });
 
+  /**
+   * `alpha.test.ts` used to be listed as invalid, on the strength of a hard-coded
+   * `tests/` prefix. That prefix was the same guess the source roots used to be:
+   * a test the CONFIG declares at the root is a legitimate test, and calling it
+   * invalid is the mirror image of failing to notice it (round-9 AC-1).
+   */
+  it("maps a test the config declares outside tests/", () => {
+    assert.equal(compiledPathForSourceTest("alpha.test.ts"), "dist/alpha.test.js");
+    assert.equal(compiledPathForSourceTest("extra/foreign.test.ts"), "dist/extra/foreign.test.js");
+  });
+
   it("expects exactly the artifacts the source declares", () => {
-    const audit = auditTestArtifacts({ sourceTests: SOURCES, compiledTests: COMPILED });
+    const audit = auditOf({});
     assert.deepEqual(audit.expected, [...COMPILED].sort());
     assert.equal(audit.clean, true);
   });
@@ -54,10 +92,7 @@ describe("TASK-010 AC-2: a foreign compiled test is an ERROR", () => {
   it("detects an orphan left by another branch", () => {
     // This is the real event: provenanceChain.test.js surviving a checkout onto
     // a branch whose source does not contain it.
-    const audit = auditTestArtifacts({
-      sourceTests: SOURCES,
-      compiledTests: [...COMPILED, "dist/tests/provenanceChain.test.js"],
-    });
+    const audit = auditOf({ compiledTests: [...COMPILED, "dist/tests/provenanceChain.test.js"] });
     assert.equal(audit.clean, false);
     assert.deepEqual(audit.orphaned, ["dist/tests/provenanceChain.test.js"]);
     // And it is NOT in the run list — an orphan is never executed.
@@ -65,10 +100,7 @@ describe("TASK-010 AC-2: a foreign compiled test is an ERROR", () => {
   });
 
   it("names the orphan in the failure message", () => {
-    const audit = auditTestArtifacts({
-      sourceTests: SOURCES,
-      compiledTests: [...COMPILED, "dist/tests/ghost.test.js"],
-    });
+    const audit = auditOf({ compiledTests: [...COMPILED, "dist/tests/ghost.test.js"] });
     const message = describeContamination(audit);
     assert.ok(message !== undefined);
     assert.match(message, /ghost\.test\.js/);
@@ -77,7 +109,7 @@ describe("TASK-010 AC-2: a foreign compiled test is an ERROR", () => {
 
   it("says nothing when the tree is clean", () => {
     assert.equal(
-      describeContamination(auditTestArtifacts({ sourceTests: SOURCES, compiledTests: COMPILED })),
+      describeContamination(auditOf({})),
       undefined,
     );
   });
@@ -87,20 +119,14 @@ describe("TASK-010 AC-3: a missing artifact is also an ERROR", () => {
   it("detects a source test that produced no output", () => {
     // The same lie from the other direction: a partial build runs fewer tests
     // and still reports success.
-    const audit = auditTestArtifacts({
-      sourceTests: SOURCES,
-      compiledTests: ["dist/tests/alpha.test.js"],
-    });
+    const audit = auditOf({ compiledTests: ["dist/tests/alpha.test.js"] });
     assert.equal(audit.clean, false);
     assert.deepEqual(audit.missing, ["dist/tests/nested/beta.test.js"]);
     assert.match(describeContamination(audit) ?? "", /build is incomplete/);
   });
 
   it("reports orphans and missing together", () => {
-    const audit = auditTestArtifacts({
-      sourceTests: SOURCES,
-      compiledTests: ["dist/tests/alpha.test.js", "dist/tests/ghost.test.js"],
-    });
+    const audit = auditOf({ compiledTests: ["dist/tests/alpha.test.js", "dist/tests/ghost.test.js"] });
     assert.equal(audit.orphaned.length, 1);
     assert.equal(audit.missing.length, 1);
   });
@@ -346,10 +372,19 @@ describe("TASK-010 round 11: mount topology, not device numbers", () => {
     assert.match(verdict.safe === false ? verdict.reason : "", /could not be read/);
   });
 
+  /**
+   * An EMPTY table, which is what this case has always been about: the file was
+   * readable and said nothing.
+   *
+   * It used to be driven with `"garbage\nmore garbage"`, which round 9 showed
+   * was not the same thing — garbage lines were silently skipped, so the test
+   * reached this branch only by accident. Garbage now has its own refusal, and
+   * its own case below.
+   */
   it("FAILS CLOSED on Linux when the mount table has no readable entries", () => {
     const verdict = assessMountTopology({
       platform: "linux",
-      mountInfo: "garbage\nmore garbage\n",
+      mountInfo: "\n   \n",
       outputDirectory: "/repo/dist",
       realOutputDirectory: "/repo/dist",
     });
@@ -459,5 +494,152 @@ describe("assessOutputDirectory: one directory, however it is spelled", () => {
     });
     assert.equal(verdict.trusted, false, "a non-existent outside path must not be trusted");
     if (!verdict.trusted) assert.match(verdict.reason, /outside the repository/);
+  });
+});
+
+
+// =====================================================================
+// ROUND 9 — the audit covers the whole output, and a mount row is a mount row
+// =====================================================================
+
+describe("TASK-010 round 9: generated files no source explains", () => {
+  /**
+   * HIGH. The audit filtered the output through `isTestArtifact`, so a stale
+   * `dist/src/old-branch.js` sat there while the run reported `tree-consistent`.
+   * AC-4 asks for an equivalent final generated state; a check that inspects the
+   * files whose names say `test` describes a subset and claims the whole — the
+   * same error as the suffix-filtered hardlink scan and the hard-coded roots.
+   */
+  it("reports a stale non-test artifact", () => {
+    const audit = auditOf({
+      sources: [...SOURCES, "src/thing.ts"],
+      generated: [...COMPILED, "dist/src/thing.js", "dist/src/old-branch.js"],
+    });
+    assert.equal(audit.clean, false);
+    assert.deepEqual(audit.staleOutput, ["dist/src/old-branch.js"]);
+    assert.match(describeContamination(audit) ?? "", /old-branch\.js/);
+    assert.match(describeContamination(audit) ?? "", /stale build output/);
+  });
+
+  /** Declarations and source maps belong to their source, and are not stale. */
+  it("accepts the .d.ts and .js.map a real source produces", () => {
+    const audit = auditOf({
+      sources: ["src/thing.ts"],
+      sourceTests: [],
+      compiledTests: [],
+      generated: ["dist/src/thing.js", "dist/src/thing.d.ts", "dist/src/thing.js.map", "dist/src/thing.d.ts.map"],
+    });
+    assert.deepEqual(audit.staleOutput, []);
+    assert.equal(audit.clean, true);
+  });
+
+  /** A file nothing in this configuration could have emitted is stale. */
+  it("treats an unmappable file under the output as stale", () => {
+    const audit = auditOf({
+      sources: ["src/thing.ts"],
+      sourceTests: [],
+      compiledTests: [],
+      generated: ["dist/src/thing.js", "dist/leftover.wasm"],
+    });
+    assert.deepEqual(audit.staleOutput, ["dist/leftover.wasm"]);
+  });
+
+  /** A source that emitted nothing is still the other half of the same lie. */
+  it("reports a non-test source that produced no output", () => {
+    const audit = auditOf({
+      sources: [...SOURCES, "src/thing.ts"],
+      generated: [...COMPILED],
+    });
+    assert.equal(audit.clean, false);
+    assert.deepEqual(audit.missing, ["dist/src/thing.js"]);
+  });
+
+  it("maps generated back to source through a non-trivial rootDir", () => {
+    const layout = { rootDir: "src", outputDirectory: "build" };
+    assert.equal(compiledPathForSource("src/a/b.ts", layout), "build/a/b.js");
+    assert.equal(sourceForGeneratedPath("build/a/b.js", layout), "src/a/b.ts");
+    assert.equal(sourceForGeneratedPath("build/a/b.d.ts", layout), "src/a/b.ts");
+    assert.equal(sourceForGeneratedPath("dist/a/b.js", layout), undefined);
+  });
+});
+
+describe("TASK-010 round 9: .mts and .cts tests are discoverable", () => {
+  /**
+   * The OUTPUT side has accepted `.test.mjs` and `.test.cjs` since round 2. The
+   * DISCOVERY side accepted only `.test.ts`, so a legitimate `.test.mts`
+   * compiled into an artifact the audit then called an orphan. A false positive
+   * rather than a false pass — but still the two halves of one question
+   * disagreeing about its scope.
+   */
+  it("recognises every test suffix the artifact rule accepts", () => {
+    assert.equal(isSourceTest("tests/a.test.mts"), true);
+    assert.equal(isSourceTest("tests/a.test.cts"), true);
+    assert.equal(isSourceTest("tests/a.helper.ts"), false);
+    assert.equal(compiledPathForSourceTest("tests/a.test.mts"), "dist/tests/a.test.mjs");
+    assert.equal(compiledPathForSourceTest("tests/a.test.cts"), "dist/tests/a.test.cjs");
+  });
+});
+
+describe("TASK-010 round 9: a mountinfo row must look like one", () => {
+  const REAL_ROW = "36 35 98:0 / /mnt/data rw,noatime shared:1 - ext4 /dev/sda1 rw";
+
+  /**
+   * HIGH. The test was "at least five tokens, the fifth absolute", and
+   * `not a mountinfo row /unrelated` satisfies it. Arbitrary text became a MOUNT
+   * POINT — wrong in both directions: garbage rows made the "no readable
+   * entries" refusal unreachable, and a table of garbage that omits the real
+   * mount was assessed as safe.
+   */
+  it("refuses a table containing the reviewer's five-token line", () => {
+    const verdict = assessMountTopology({
+      platform: "linux",
+      mountInfo: `${REAL_ROW}\nnot a mountinfo row /unrelated\n`,
+      outputDirectory: "/repo/dist",
+      realOutputDirectory: "/repo/dist",
+    });
+    assert.equal(verdict.safe, false);
+    if (!verdict.safe) {
+      assert.match(verdict.reason, /does not recognise|not fully known/);
+      assert.match(verdict.reason, /not a mountinfo row/);
+    }
+  });
+
+  it("reports which lines it could not read", () => {
+    const table = readMountTable(`${REAL_ROW}\nnot a mountinfo row /unrelated\n`);
+    assert.equal(table.mounts.length, 1);
+    assert.deepEqual(table.malformed, ["not a mountinfo row /unrelated"]);
+  });
+
+  it("still reads a genuine row, optional fields and all", () => {
+    const table = readMountTable(
+      [
+        REAL_ROW,
+        "37 36 0:52 / /mnt/with\\040space rw,relatime shared:2 master:3 - tmpfs tmpfs rw",
+        "38 37 0:53 / /nested rw - proc proc rw",
+      ].join("\n"),
+    );
+    assert.deepEqual(table.malformed, []);
+    assert.deepEqual(
+      table.mounts.map((mount) => mount.mountPoint),
+      ["/mnt/data", "/mnt/with space", "/nested"],
+    );
+  });
+
+  /** The refusals it already made must survive the stricter parse. */
+  it("still refuses a mount at, and inside, the output directory", () => {
+    const at = assessMountTopology({
+      platform: "linux",
+      mountInfo: `${REAL_ROW}\n40 35 98:0 / /repo/dist rw - ext4 /dev/sdb1 rw`,
+      outputDirectory: "/repo/dist",
+      realOutputDirectory: "/repo/dist",
+    });
+    assert.equal(at.safe, false);
+    const inside = assessMountTopology({
+      platform: "linux",
+      mountInfo: `${REAL_ROW}\n41 35 98:0 / /repo/dist/nested rw - ext4 /dev/sdb1 rw`,
+      outputDirectory: "/repo/dist",
+      realOutputDirectory: "/repo/dist",
+    });
+    assert.equal(inside.safe, false);
   });
 });
