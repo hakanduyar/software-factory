@@ -650,13 +650,14 @@ if (outputDevice !== undefined && rootDevice !== undefined && outputDevice !== r
 // `rmSync(recursive)` deletes straight through it. The mount table is read
 // here, before anything is built or removed; the decision itself lives in the
 // tested checker and is applied once that exists (step 4).
-const mountInfo = (() => {
+function readMountInfo() {
   try {
     return readFileSync("/proc/self/mountinfo", "utf8");
   } catch {
     return undefined;
   }
-})();
+}
+const mountInfo = readMountInfo();
 
 /**
  * ...and refuse a mounted output BEFORE the build writes into it (round-12
@@ -805,27 +806,26 @@ if (!checkerFreshlyEmitted) {
 }
 const checker = await import(`file://${CHECKER_PATH}?t=${buildStartedAt}`);
 
-// --- 3b. the realpath-based output check, now that the checker exists -------
-// A path is judged by what it RESOLVES to, not by its name. `rmSync` does not
-// follow a symlinked `dist`, which looked safe — but `tsc`, this import and the
-// test runner all do.
-const outputVerdict = checker.assessOutputDirectory({
-  repositoryRoot: REPO_ROOT,
-  realRepositoryRoot: realOrUndefined(REPO_ROOT) ?? REPO_ROOT,
-  configuredOutputDirectory: OUTPUT_DIR,
-  outputDirectory: join(REPO_ROOT, OUTPUT_DIR),
-  realOutputDirectory: realOrUndefined(join(REPO_ROOT, OUTPUT_DIR)),
-  // The EFFECTIVE outDir, which is validated above and always present. The raw
-  // file may legitimately declare none (an `extends`-only config), so reading
-  // it here would reintroduce the false positive this round removed.
-  resolvedTsconfigOutDir: resolvedPath(effectiveConfig.compilerOptions.outDir),
-});
-if (!outputVerdict.trusted) {
-  fail(`verification refused: ${outputVerdict.reason}`);
-}
+// --- 3b. output, mount and tree safety, together and REPEATABLY ------------
+// These used to be three separate blocks that ran once. They are one function
+// now, called after every build, because the repair rebuild is a build too —
+// see `assertTreeIsSafe`.
 
 // --- 4. the full tested safety judgement, now that the checker exists --------
-const safety = checker.assessTreeSafety({
+/**
+ * A FUNCTION, because it has to happen TWICE (round-10 HIGH).
+ *
+ * The repair cycle cleans and rebuilds, and the second build is a build like any
+ * other: the reviewer made it replace `dist` with a symlink to an external
+ * generated tree, and nothing looked again. The run reported success and
+ * executed the external tree's tests.
+ *
+ * The facts are gathered fresh on each call rather than reused, which is the
+ * whole point — a fact captured before the second build says nothing about
+ * after it.
+ */
+function assertTreeIsSafe(stage, checkerIsFresh) {
+  const safety = checker.assessTreeSafety({
   /**
    * EVERY derived root, not the one called `tests` (round-9).
    *
@@ -834,47 +834,59 @@ const safety = checker.assessTreeSafety({
    * subset-for-the-whole substitution the roots themselves stopped making.
    */
   testsRootIsSymlink: SOURCE_ROOTS.some((root) => isSymlink(resolve(REPO_ROOT, root))),
-  outputIsSymlink: isSymlink(join(REPO_ROOT, OUTPUT_DIR)),
-  outputOnDifferentDevice:
-    outputDevice !== undefined && rootDevice !== undefined && outputDevice !== rootDevice,
+    outputIsSymlink: isSymlink(join(REPO_ROOT, OUTPUT_DIR)),
+    outputOnDifferentDevice: (() => {
+      const nowDevice = deviceOf(join(REPO_ROOT, OUTPUT_DIR));
+      return nowDevice !== undefined && rootDevice !== undefined && nowDevice !== rootDevice;
+    })(),
   // EVERY symlink under the output, not only those whose own name ends in
   // `.test.js` (round-3 finding B11). A symlinked DIRECTORY called
   // `foreign-output` was neither walked into nor reported, so an external
   // `ghost.test.js` inside it was invisible and the run reported a consistent
   // tree. Filtering by name meant the check only caught the shape of the escape
   // that had already been demonstrated.
-  symlinkedArtifacts: findSymlinks(OUTPUT_DIR),
+    symlinkedArtifacts: [...findSymlinks(OUTPUT_DIR), ...findHardlinkedUnder(OUTPUT_DIR)],
   // BOTH source roots (round-11 finding C). `src/` is compiled and executed
   // just as `tests/` is, and scanning only `tests/` enforced less than the
   // threat model above claims. Same policy, same already-documented
   // legitimate-hardlink false positive — applied consistently rather than to
   // whichever directory happened to be named first.
-  symlinkedSources: linkedSources,
-  buildEmitsNothing: noEmit,
-  checkerFreshlyEmitted,
-});
-if (!safety.safe) {
-  fail(`verification refused: ${safety.reason}`);
-}
+    symlinkedSources: [
+      ...SOURCE_ROOTS.flatMap((root) => findSymlinks(root, () => true, true)),
+      ...SOURCE_ROOTS.flatMap((root) => findHardlinkedSources(root)),
+    ].sort(),
+    buildEmitsNothing: noEmit,
+    checkerFreshlyEmitted: checkerIsFresh,
+  });
+  if (!safety.safe) {
+    fail(`verification refused ${stage}: ${safety.reason}`);
+  }
 
-// --- 4b. mount topology, the part `st_dev` cannot answer ---------------------
-// DEFENCE IN DEPTH, and deliberately unreachable through the ordinary path: the
-// pre-build refusal above already rejects a mounted output, so no fixture can
-// arrive here with one. Its reachability is stated here rather than implied by
-// a green test — the repository's established answer for a guard the public
-// path cannot reach (see `resourceBindingHolds`). The DECISION is proven by the
-// pure `assessMountTopology` tests, which mutation-check each clause; this call
-// exists so that a future reordering which weakens the early check still meets a
-// tested guard before anything is deleted.
-const mountVerdict = checker.assessMountTopology({
-  platform: process.platform,
-  mountInfo,
-  outputDirectory: join(REPO_ROOT, OUTPUT_DIR),
-  realOutputDirectory: realOrUndefined(join(REPO_ROOT, OUTPUT_DIR)),
-});
-if (!mountVerdict.safe) {
-  fail(`verification refused: ${mountVerdict.reason}`);
+  const outputVerdictNow = checker.assessOutputDirectory({
+    repositoryRoot: REPO_ROOT,
+    realRepositoryRoot: realOrUndefined(REPO_ROOT) ?? REPO_ROOT,
+    configuredOutputDirectory: OUTPUT_DIR,
+    outputDirectory: join(REPO_ROOT, OUTPUT_DIR),
+    realOutputDirectory: realOrUndefined(join(REPO_ROOT, OUTPUT_DIR)),
+    resolvedTsconfigOutDir: resolvedPath(effectiveConfig.compilerOptions.outDir),
+  });
+  if (!outputVerdictNow.trusted) {
+    fail(`verification refused ${stage}: ${outputVerdictNow.reason}`);
+  }
+
+  const mountNow = checker.assessMountTopology({
+    platform: process.platform,
+    mountInfo: readMountInfo(),
+    outputDirectory: join(REPO_ROOT, OUTPUT_DIR),
+    realOutputDirectory: realOrUndefined(join(REPO_ROOT, OUTPUT_DIR)),
+  });
+  if (!mountNow.safe) {
+    fail(`verification refused ${stage}: ${mountNow.reason}`);
+  }
+
+  assertEverythingWasReadable(stage);
 }
+assertTreeIsSafe("after building", checkerFreshlyEmitted);
 
 // --- 5. audit every artifact that could RUN, anywhere in the output ----------
 /**
@@ -884,9 +896,60 @@ if (!mountVerdict.safe) {
  * test the config declares elsewhere was compiled, matched no source, and was
  * reported as an orphan of the tree that legitimately produced it.
  */
-const allSources = [...new Set(SOURCE_ROOTS.flatMap((root) => listFiles(root, true)))]
-  .filter((path) => /\.(ts|mts|cts)$/.test(path) && !/\.d\.(ts|mts|cts)$/.test(path))
-  .sort();
+/**
+ * THE COMPILER'S OWN FILE LIST (round-10 CRITICAL).
+ *
+ * Globbing the derived roots was still a guess — a better one than
+ * `["src", "tests"]`, and still not what tsc reads. `exclude` was ignored
+ * entirely, so a test source the config EXCLUDES counted as current, and an old
+ * artifact at the same path was therefore explained by it. The reviewer excluded
+ * a test, planted its previous build output, and watched the stale artifact RUN
+ * while the harness reported success.
+ *
+ * Asking the compiler removes the last of the guessing. `--listFilesOnly`
+ * enumerates the actual program: `include` minus `exclude`, PLUS anything
+ * reachable by import — which matters, because `exclude` does not stop an
+ * excluded file being pulled in by an included one, and a glob-based answer gets
+ * that wrong in both directions.
+ *
+ * Filtered to this repository, because the list also names `lib.*.d.ts` and
+ * whatever `node_modules` types the program pulls in, and those are not this
+ * tree's source.
+ */
+function compilerInputs() {
+  let listed;
+  try {
+    listed = execFileSync("npx", ["tsc", "-p", "tsconfig.json", "--listFilesOnly"], {
+      cwd: REPO_ROOT,
+      encoding: "utf8",
+      timeout: CONFIG_TIMEOUT_MS,
+      maxBuffer: 64 * 1024 * 1024,
+    });
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    fail(
+      `verification refused: the compiler could not list its own inputs (${detail}); refusing to audit a tree ` +
+        "whose source set is unknown",
+    );
+  }
+  const inRepo = [];
+  for (const line of listed.split("\n")) {
+    const path = line.trim();
+    if (path.length === 0) continue;
+    const rel = relative(REPO_ROOT, resolve(REPO_ROOT, path)).replace(/\\/g, "/");
+    if (rel.startsWith("../") || rel.length === 0) continue;
+    if (rel.startsWith("node_modules/") || rel.startsWith(`${OUTPUT_DIR}/`)) continue;
+    // Declaration files are inputs but emit nothing, so they explain no artifact.
+    if (/\.d\.(ts|mts|cts)$/.test(rel)) continue;
+    if (!/\.(ts|mts|cts)$/.test(rel)) continue;
+    inRepo.push(rel);
+  }
+  if (inRepo.length === 0) {
+    fail("verification refused: the compiler reported no source files of its own in this repository");
+  }
+  return [...new Set(inRepo)].sort();
+}
+const allSources = compilerInputs();
 const sourceTests = allSources.filter((path) => checker.isSourceTest(path));
 const generatedFiles = listFiles(OUTPUT_DIR);
 const compiledTests = generatedFiles.filter((path) => checker.isTestArtifact(path));
@@ -961,9 +1024,14 @@ if (!audit.clean) {
       return undefined;
     }
   })();
-  if (rebuiltChecker === undefined || rebuiltChecker.mtimeMs + 1000 < rebuildStartedAt) {
+  const rebuiltCheckerIsFresh =
+    rebuiltChecker !== undefined && rebuiltChecker.mtimeMs + 1000 >= rebuildStartedAt;
+  if (!rebuiltCheckerIsFresh) {
     fail(`${diagnosis}\n\nThe rebuild after cleaning did not emit the verification checker; refusing to report a tree it could not rebuild`);
   }
+
+  // The second build is a build like any other, so it is judged like one.
+  assertTreeIsSafe("after the repair rebuild", rebuiltCheckerIsFresh);
 
   const rebuiltGenerated = listFiles(OUTPUT_DIR);
   const rebuiltCompiled = rebuiltGenerated.filter((path) => checker.isTestArtifact(path));

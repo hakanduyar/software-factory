@@ -321,23 +321,32 @@ describe("TASK-010 remediation: the harness itself, end to end", () => {
    * privileged setup: the source test exists and the build genuinely refuses to
    * emit it, exactly as a partial build would.
    */
+  /**
+   * REWRITTEN IN ROUND 10, because its fixture was the defect.
+   *
+   * It added a test source, EXCLUDED it in tsconfig, and expected the missing
+   * artifact to be a disagreement that survived the rebuild. That only worked
+   * because the source set was globbed from the filesystem and ignored
+   * `exclude` — the very hole round-10 review used to run a stale artifact. An
+   * excluded file is not a disagreement; it is a configuration change, and the
+   * tree without it is correct.
+   *
+   * A genuine survivor is one the REBUILD reproduces. A build that emits
+   * something no source explains does exactly that: cleaning removes it, the
+   * rebuild puts it back, and the second audit is entitled to conclude the tree
+   * disagrees with itself rather than that it is holding another branch's
+   * leftovers.
+   */
   it("FAILS CLOSED when a source/artifact disagreement survives a clean rebuild", () => {
     const root = makeFixtureRepo();
     assert.equal(runHarness(root).status, 0, "the fixture must pass first");
 
-    writeFileSync(
-      join(root, "tests/excluded.test.ts"),
-      'import { describe, it } from "node:test";\ndescribe("excluded", () => { it("never compiles", () => {}); });\n',
+    const { status, output } = runWithBuildThatPlants(
+      root,
+      'printf "export const ghost = 1;\\n" > dist/src/ghost.js',
     );
-    const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as {
-      exclude?: string[];
-    };
-    tsconfig.exclude = ["tests/excluded.test.ts"];
-    writeFileSync(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
-
-    const { status, output } = runHarness(root);
     assert.notEqual(status, 0, `a real disagreement must fail:\n${output}`);
-    assert.match(output, /excluded\.test/, "the missing artifact must be named");
+    assert.match(output, /ghost\.js/, "the unexplained artifact must be named");
     assert.match(output, /survived a clean rebuild/, "it must say why this is not merely stale output");
   });
 
@@ -1974,5 +1983,119 @@ describe("TASK-010 round 9: the guard that runs AFTER the build", () => {
     const { status, output } = runWithBuildThatPlants(root, "true");
     assert.equal(status, 0, `the shim itself broke the run:\n${output}`);
     assert.match(output, /tree-consistent/);
+  });
+});
+
+// =====================================================================
+// ROUND-10 — the compiler's own inputs, and a second build judged like a build
+// =====================================================================
+
+describe("TASK-010 round 10: an EXCLUDED source explains nothing", () => {
+  /**
+   * CRITICAL. The source set was globbed from the derived roots, which ignores
+   * `exclude` entirely — so a test the config excludes still counted as current,
+   * and an old artifact at the same path was therefore "explained" by it. The
+   * reviewer excluded a test, planted its previous build output, and the stale
+   * artifact RAN while the harness reported success.
+   *
+   * The set now comes from `tsc --listFilesOnly`: the actual program, which is
+   * `include` minus `exclude` PLUS whatever imports reach — a distinction a glob
+   * gets wrong in both directions.
+   */
+  it("REFUSES a stale artifact whose only explanation is an excluded source", () => {
+    const root = makeFixtureRepo();
+    assert.equal(runHarness(root).status, 0, "the fixture must pass before anything is planted");
+
+    // A second test, compiled once so that a real artifact exists...
+    writeFileSync(
+      join(root, "tests/excluded.test.ts"),
+      [
+        'import assert from "node:assert/strict";',
+        'import { describe, it } from "node:test";',
+        'describe("excluded", () => { it("passes", () => { assert.equal(1, 1); }); });',
+        "",
+      ].join("\n"),
+    );
+    assert.equal(runHarness(root).status, 0, "the second test must compile and pass first");
+    assert.ok(existsSync(join(root, "dist/tests/excluded.test.js")), "its artifact must exist");
+
+    // ...then excluded, leaving the artifact behind. Nothing compiles it now, so
+    // nothing explains it, and it must not be treated as current.
+    const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as {
+      exclude?: string[];
+    };
+    tsconfig.exclude = ["tests/excluded.test.ts"];
+    writeFileSync(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
+
+    const { status, output } = runHarness(root);
+    assert.match(output, /excluded\.test\.js/, "the unexplained artifact was never mentioned");
+    assert.ok(
+      !existsSync(join(root, "dist/tests/excluded.test.js")),
+      "the artifact an excluded source cannot explain is still in the final tree",
+    );
+    assert.equal(status, 0, `the repair cycle should converge:\n${output}`);
+  });
+
+  /** An import from an included file DOES make a file an input, exclude or not. */
+  it("still counts a file the program reaches by import", () => {
+    const root = makeFixtureRepo();
+    writeFileSync(join(root, "tests/helper.ts"), "export const helper = 41;\n");
+    writeFileSync(
+      join(root, "tests/sample.test.ts"),
+      [
+        'import assert from "node:assert/strict";',
+        'import { describe, it } from "node:test";',
+        'import { helper } from "./helper.js";',
+        'describe("sample", () => { it("passes", () => { assert.equal(helper + 1, 42); }); });',
+        "",
+      ].join("\n"),
+    );
+    const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as {
+      exclude?: string[];
+    };
+    // Excluded, and imported anyway — tsc compiles it, so the audit must expect
+    // its artifact rather than calling it an orphan.
+    tsconfig.exclude = ["tests/helper.ts"];
+    writeFileSync(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
+
+    const { status, output } = runHarness(root);
+    assert.equal(status, 0, `an imported-but-excluded file confused the audit:\n${output}`);
+    assert.match(output, /tree-consistent/);
+  });
+});
+
+describe("TASK-010 round 10: the repair rebuild is a build like any other", () => {
+  /**
+   * HIGH. After cleaning, the second build ran and only the AUDIT looked at the
+   * result — no output-link scan, no output-directory check, no mount check, no
+   * readability check. The reviewer made the second build replace `dist` with a
+   * symlink to an external generated tree; the run exited 0 and executed that
+   * tree's tests.
+   *
+   * The safety judgement is one function now, called after every build, and it
+   * gathers its facts fresh each time — a fact captured before the second build
+   * says nothing about after it.
+   */
+  it("REFUSES an output directory the SECOND build replaced with a symlink", () => {
+    const root = makeFixtureRepo();
+    const external = mkdtempSync(join(tmpdir(), "sf-second-build-"));
+    created.push(external);
+    mkdirSync(join(external, "tests"), { recursive: true });
+
+    // Build once, so there is a `dist` to contaminate.
+    assert.equal(runHarness(root).status, 0, "the fixture must pass before anything is planted");
+
+    // Contaminate, so the repair cycle definitely runs; then swap the output on
+    // the SECOND build only, using a marker the first build leaves behind.
+    writeFileSync(join(root, "dist/src/old-branch.js"), "export const stale = 1;\n");
+    const marker = join(root, ".second-build");
+    const { status, output } = runWithBuildThatPlants(
+      root,
+      `if [ -f ${JSON.stringify(marker)} ]; then rm -rf dist && ln -s ${JSON.stringify(external)} dist; ` +
+        `else : > ${JSON.stringify(marker)}; fi`,
+    );
+
+    assert.notEqual(status, 0, "the second build redirected the output and nothing looked again");
+    assert.match(output, /after the repair rebuild/, "the refusal must say which stage caught it");
   });
 });
