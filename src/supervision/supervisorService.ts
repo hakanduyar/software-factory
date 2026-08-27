@@ -36,10 +36,11 @@ import {
 import { reconcileReportedIdentity, type AiRunConfigRecord } from "./modelEnforcement.js";
 import { requiresAi, selectResource, type RoutingPolicy } from "./modelRouting.js";
 import {
+  anchorFor,
   appendProvenance,
   implementersByRoadmapKey,
   keysWithUnknownImplementer,
-  verifyChain,
+  verifyAgainstAnchor,
   type ProvenanceEntry,
 } from "./provenanceChain.js";
 import { boundedDiagnostic, classifyResourceOutcome, type Classification } from "./resourceClassifier.js";
@@ -973,13 +974,16 @@ export class SupervisorService {
           ),
           checkpoints: state.checkpoints.filter((entry) => entry.roadmapKey !== item.key),
           resources: markSuccess(state.resources, usedResourceKey, now),
-          provenance: appendImplementerProvenance(
-            state.provenance,
-            item.key,
-            usedResourceKey,
-            now,
-            "completed",
-          ),
+          ...(() => {
+            const provenance = appendImplementerProvenance(
+              state.provenance,
+              item.key,
+              usedResourceKey,
+              now,
+              "completed",
+            );
+            return { provenance, provenanceAnchor: anchorFor(provenance) };
+          })(),
         });
         void next;
         this.log(`[supervisor] ${item.key} completed; dependents re-evaluated`);
@@ -1000,13 +1004,16 @@ export class SupervisorService {
             usedResourceKey,
           ),
           resources: markSuccess(state.resources, usedResourceKey, now),
-          provenance: appendImplementerProvenance(
-            state.provenance,
-            item.key,
-            usedResourceKey,
-            now,
-            "changes required",
-          ),
+          ...(() => {
+            const provenance = appendImplementerProvenance(
+              state.provenance,
+              item.key,
+              usedResourceKey,
+              now,
+              "changes required",
+            );
+            return { provenance, provenanceAnchor: anchorFor(provenance) };
+          })(),
         });
         void next;
         return { kind: "ADVANCED", roadmapKey: item.key, actionId, detail };
@@ -1412,9 +1419,39 @@ export class SupervisorService {
      */
     const chainImplementers = implementersByRoadmapKey(state.provenance);
     const unknownImplementers = keysWithUnknownImplementer(state.provenance);
-    for (const key of visited) {
+
+    /**
+     * THE CHAIN DECIDES WHAT THE CHAIN IS ASKED ABOUT (round-5 CRITICAL).
+     *
+     * `visited` comes from walking `dependsOn`, which lives in the MUTABLE
+     * roadmap. So editing `B.dependsOn` to `[]` meant the chain entry naming
+     * who implemented `A` was never consulted — the chain stayed perfectly
+     * valid and was simply never asked. Mutable data decided whether immutable
+     * data was read, which is the third time that exact shape has produced a
+     * CRITICAL in this task.
+     *
+     * Every key the chain MENTIONS is examined, whatever the current edges say.
+     * A dependency edit can no longer hide lineage, because the lineage record
+     * itself supplies the list.
+     */
+    const chainKeys = new Set<string>([
+      ...visited,
+      ...state.provenance.map((entry) => entry.roadmapKey),
+    ]);
+    for (const key of chainKeys) {
       const entry = byKey.get(key);
       if (entry === undefined) {
+        /**
+         * The chain names an item the roadmap no longer contains. That is not
+         * nothing — it is a record of work on something that has since been
+         * removed or renamed, and its implementer must still be excluded.
+         */
+        for (const resource of chainImplementers?.get(key) ?? []) {
+          excluded.add(resource);
+        }
+        if (unknownImplementers.has(key) && !ambiguous.includes(key)) {
+          ambiguous.push(key);
+        }
         continue;
       }
       /**
@@ -1531,7 +1568,7 @@ export class SupervisorService {
     if (state.provenance.length === 0) {
       return undefined;
     }
-    const verdict = verifyChain(state.provenance);
+    const verdict = verifyAgainstAnchor(state.provenance, state.provenanceAnchor);
     if (verdict.intact) {
       return undefined;
     }

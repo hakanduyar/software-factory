@@ -154,6 +154,7 @@ const STATE_FIELDS: Record<keyof Required<SupervisorState>, true> = {
   nextWakeAt: true,
   escalations: true,
   provenance: true,
+  provenanceAnchor: true,
   updatedAt: true,
 };
 
@@ -270,6 +271,7 @@ const MAXIMAL_STATE: Required<SupervisorState> = {
   nextWakeAt: 1_600,
   escalations: [MAXIMAL_ESCALATION],
   provenance: [MAXIMAL_PROVENANCE],
+  provenanceAnchor: { length: 1, headDigest: MAXIMAL_PROVENANCE.digest },
   updatedAt: 1_200,
 };
 

@@ -40,10 +40,12 @@ import {
 } from "../src/adapters/supervision/sqliteSupervisorRepository.js";
 import { runSuperviseStatus } from "../src/cli/supervise.js";
 import {
+  anchorFor,
   appendProvenance,
   computeDigest,
   GENESIS_DIGEST,
   MAX_CHAIN_ENTRIES,
+  verifyAgainstAnchor,
   verifyChain,
   type ProvenanceEntry,
 } from "../src/supervision/provenanceChain.js";
@@ -1438,5 +1440,107 @@ describe("TASK-008 round 4: a broken chain on disk is a DECISION, not a crash", 
     } finally {
       reopened.close();
     }
+  });
+});
+
+
+// =====================================================================
+// ROUND-5 — mutable edges, and truncation the chain cannot see
+// =====================================================================
+
+describe("TASK-008 round 5: a dependency edit cannot hide lineage", () => {
+  /**
+   * CRITICAL. The traversal walked `dependsOn` from the MUTABLE roadmap, so
+   * editing `B.dependsOn` to `[]` meant the chain entry naming who implemented
+   * `A` was never consulted. The chain stayed perfectly valid and was simply
+   * never asked — mutable data deciding whether immutable data is read, for
+   * the third time in this task.
+   */
+  it("REFUSES even when the reviewed item's dependency edge has been deleted", async () => {
+    const appended = appendProvenance([], {
+      kind: "IMPLEMENTED_BY",
+      roadmapKey: "A",
+      resourceKey: "codex-cli:gpt-5.6-luna",
+      detail: "implemented",
+      recordedAt: 1_000,
+    });
+    assert.equal(appended.ok, true);
+    if (!appended.ok) throw new Error("unreachable");
+
+    const supervisor = newSupervisor({ probe: healthyProbe() });
+    const state = await supervisor.service.ensureInitialized();
+    await supervisor.repository.compareAndSave(
+      {
+        ...state,
+        version: state.version + 1,
+        roadmap: [
+          // B no longer depends on A — the edge the traversal relied on is gone.
+          { key: "B", title: "Review", dependsOn: [], status: "ELIGIBLE", workClass: "INDEPENDENT_REVIEW", order: 1 },
+          { key: "A", title: "Implemented", dependsOn: [], status: "DONE", workClass: "NORMAL_IMPLEMENTATION", order: 2, attempts: 1, implementedByResourceKeys: ["codex-cli:gpt-5.6-luna"] } as RoadmapItem,
+        ],
+        provenance: appended.chain,
+        provenanceAnchor: anchorFor(appended.chain),
+      },
+      state.version,
+    );
+
+    const result = await supervisor.service.tick();
+    for (const call of supervisor.executor.calls()) {
+      if (call.item.key !== "B" || call.config === undefined) continue;
+      assert.notEqual(
+        `${call.config.effectiveProvider}:${call.config.effectiveModel}`,
+        "codex-cli:gpt-5.6-luna",
+        "a deleted dependency edge hid the chain entry and the implementer reviewed its own work",
+      );
+    }
+    void result;
+  });
+});
+
+describe("TASK-008 round 5: tail truncation is detected by an anchor", () => {
+  /**
+   * CRITICAL. A valid PREFIX of a valid chain is a valid chain — that is what a
+   * hash chain is, and `verifyChain` structurally cannot see truncation. The
+   * reviewer cut the tail and deleted the matching row so neither record
+   * mentioned the removed work.
+   *
+   * The length and head are recorded separately, so truncating now requires
+   * editing the anchor too. NOT a trust anchor: someone who updates both is
+   * still undetected, exactly as the module says.
+   */
+  it("REFUSES a chain whose tail was cut, leaving a valid prefix", () => {
+    let chain: readonly ProvenanceEntry[] = [];
+    for (const resource of ["claude-code:opus", "codex-cli:gpt-5.6-luna"]) {
+      const appended = appendProvenance(chain, {
+        kind: "IMPLEMENTED_BY",
+        roadmapKey: "A",
+        resourceKey: resource,
+        detail: "implemented",
+        recordedAt: chain.length + 1,
+      });
+      assert.equal(appended.ok, true);
+      if (!appended.ok) throw new Error("unreachable");
+      chain = appended.chain;
+    }
+    const anchor = anchorFor(chain);
+    const truncated = chain.slice(0, 1);
+
+    // The prefix verifies perfectly on its own terms — that is the problem.
+    assert.equal(verifyChain(truncated).intact, true, "the fixture must verify structurally");
+
+    const verdict = verifyAgainstAnchor(truncated, anchor);
+    assert.equal(verdict.intact, false, "tail truncation went undetected");
+    if (!verdict.intact) assert.match(verdict.problem, /removed from the end/);
+  });
+
+  it("ACCEPTS a chain that matches its anchor", () => {
+    const chain = chainFor("claude-code:opus");
+    assert.equal(verifyAgainstAnchor(chain, anchorFor(chain)).intact, true);
+  });
+
+  /** An absent anchor is silence, so old databases still load. */
+  it("ACCEPTS a chain with no anchor recorded", () => {
+    const chain = chainFor("claude-code:opus");
+    assert.equal(verifyAgainstAnchor(chain, undefined).intact, true);
   });
 });

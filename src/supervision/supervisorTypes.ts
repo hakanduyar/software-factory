@@ -284,6 +284,20 @@ export interface SupervisorState {
    * Tamper-EVIDENT, not tamper-proof — see `provenanceChain.ts`.
    */
   readonly provenance: readonly ProvenanceEntry[];
+  /**
+   * The chain's length and head digest, recorded SEPARATELY (TASK-008 AC-3).
+   *
+   * A hash chain cannot detect TAIL truncation on its own: a valid prefix is a
+   * valid chain, and round-5 review cut the tail and deleted the matching row
+   * so neither record mentioned the removed work. Detecting that needs
+   * something outside the chain to say how long it should be.
+   *
+   * This is the same "second source" idea the chain itself applies to the
+   * mutable row, one level up: an attacker must now edit the chain AND this
+   * anchor consistently. It is not a trust anchor — nothing here is signed —
+   * and it does not stop someone who updates both. It stops a truncation.
+   */
+  readonly provenanceAnchor?: { readonly length: number; readonly headDigest: string };
   readonly updatedAt: Timestamp;
 }
 

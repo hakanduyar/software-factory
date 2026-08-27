@@ -565,6 +565,27 @@ export function parseSupervisorState(json: string, expected: { readonly version:
     }
   }
 
+  /**
+   * The anchor is parsed strictly and is OPTIONAL, so a database written before
+   * it existed still loads. Its ABSENCE means "no anchor recorded"; its
+   * presence is checked against the chain by the service.
+   */
+  const anchorRaw = row["provenanceAnchor"];
+  const provenanceAnchor =
+    anchorRaw === undefined
+      ? undefined
+      : (() => {
+          const anchorRow = asObject(anchorRaw, `${context}.provenanceAnchor`);
+          return {
+            length: nonNegativeInt(anchorRow, "length", `${context}.provenanceAnchor`),
+            headDigest: digestField(
+              str(anchorRow, "headDigest", `${context}.provenanceAnchor`),
+              "headDigest",
+              `${context}.provenanceAnchor`,
+            ),
+          };
+        })();
+
   const nextWakeAt = optionalNum(row, "nextWakeAt", context);
   return {
     version,
@@ -576,6 +597,7 @@ export function parseSupervisorState(json: string, expected: { readonly version:
     ...(nextWakeAt === undefined ? {} : { nextWakeAt }),
     escalations,
     provenance,
+    ...(provenanceAnchor === undefined ? {} : { provenanceAnchor }),
     updatedAt: num(row, "updatedAt", context),
   };
 }

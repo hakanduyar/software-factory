@@ -311,3 +311,50 @@ export function keysWithUnknownImplementer(chain: readonly ProvenanceEntry[]): R
   }
   return unknown;
 }
+
+
+/**
+ * The anchor a chain SHOULD have, given its contents.
+ *
+ * Kept next to `verifyChain` so the two cannot drift: whatever the chain is,
+ * this is what an honest record of it looks like.
+ */
+export function anchorFor(chain: readonly ProvenanceEntry[]): { length: number; headDigest: string } {
+  return { length: chain.length, headDigest: chain.at(-1)?.digest ?? GENESIS_DIGEST };
+}
+
+/**
+ * Detects TAIL TRUNCATION, which `verifyChain` structurally cannot (AC-3).
+ *
+ * A valid prefix of a valid chain is a valid chain — that is what a hash chain
+ * is. Round-5 review cut the tail and deleted the matching row so that neither
+ * record mentioned the removed work, and nothing objected.
+ *
+ * Comparing against a separately recorded length and head closes it for anyone
+ * who does not update BOTH. It is not a trust anchor and is not claimed as one:
+ * an attacker who rewrites the chain and the anchor together is still
+ * undetected, exactly as the module header says.
+ */
+export function verifyAgainstAnchor(
+  chain: readonly ProvenanceEntry[],
+  anchor: { readonly length: number; readonly headDigest: string } | undefined,
+): ChainVerdict {
+  const structural = verifyChain(chain);
+  if (!structural.intact || anchor === undefined) {
+    return structural;
+  }
+  const expected = anchorFor(chain);
+  if (expected.length !== anchor.length) {
+    return {
+      intact: false,
+      problem: `the chain has ${expected.length} entries but was recorded as having ${anchor.length}; entries were removed from the end`,
+    };
+  }
+  if (expected.headDigest !== anchor.headDigest) {
+    return {
+      intact: false,
+      problem: `the chain ends at ${expected.headDigest} but was recorded as ending at ${anchor.headDigest}`,
+    };
+  }
+  return structural;
+}
