@@ -461,4 +461,3 @@ describe("assessOutputDirectory: one directory, however it is spelled", () => {
     if (!verdict.trusted) assert.match(verdict.reason, /outside the repository/);
   });
 });
-

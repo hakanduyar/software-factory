@@ -24,6 +24,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -1158,6 +1159,110 @@ describe("TASK-010 follow-up: equivalent outDir spellings are one directory", ()
       output,
       /the effective tsconfig builds into "\.?\/?build-output", but verification manages/,
       `expected the effective-outDir refusal, got:\n${output.slice(0, 500)}`,
+    );
+  });
+});
+
+// =====================================================================
+// ROUND-3 — the pre-build layer, pinned by what only it can guarantee
+// =====================================================================
+
+describe("TASK-010 round 3: nothing is written through a hostile path", () => {
+  /**
+   * These guards duplicate the later `assessTreeSafety` clauses on PURPOSE:
+   * one runs before the build, the other is the reviewable rule. Round-3
+   * review showed the duplication had made the earlier layer untestable —
+   * deleting it left the named tests green, because the later guard produced a
+   * refusal too. But by then `tsc` had already written through the symlink,
+   * and the reviewer found the compiled checker and test files sitting in the
+   * external target of a "refused" run.
+   *
+   * So these assert the property only the EARLY layer can provide: the outside
+   * directory is still EMPTY afterwards. A later refusal cannot satisfy that,
+   * which is what makes these regressions load-bearing where wording alone
+   * would not be.
+   */
+  function decoy(): string {
+    const dir = mkdtempSync(join(tmpdir(), "sf-decoy-target-"));
+    created.push(dir);
+    return dir;
+  }
+
+  /** A fixture has no `dist/` until something builds; absent counts as empty. */
+  function listing(path: string): readonly string[] {
+    try {
+      return readdirSync(path).sort();
+    } catch {
+      return [];
+    }
+  }
+
+  it("writes NOTHING into the target of a symlinked output directory", () => {
+    const root = makeFixtureRepo();
+    const target = decoy();
+    rmSync(join(root, "dist"), { recursive: true, force: true });
+    symlinkSync(target, join(root, "dist"), "dir");
+
+    const { status, output } = runHarness(root);
+
+    assert.notEqual(status, 0, "a symlinked output directory was accepted");
+    assert.match(
+      output,
+      /refused before building: the build output directory is a symlink/,
+      `the PRE-BUILD layer did not fire:\n${output.slice(0, 400)}`,
+    );
+    assert.deepEqual(
+      listing(target),
+      [],
+      "the build wrote through the symlink before the refusal — the early guard did not run first",
+    );
+  });
+
+  it("writes NOTHING when the tests directory is a symlink", () => {
+    const root = makeFixtureRepo();
+    const external = mkdtempSync(join(tmpdir(), "sf-ext-tests-"));
+    created.push(external);
+    writeFileSync(
+      join(external, "outsider.test.ts"),
+      ['import { it } from "node:test";', 'it("outsider", () => {});', ""].join("\n"),
+    );
+    rmSync(join(root, "tests"), { recursive: true, force: true });
+    symlinkSync(external, join(root, "tests"), "dir");
+    const distBefore = listing(join(root, "dist"));
+
+    const { status, output } = runHarness(root);
+
+    assert.notEqual(status, 0);
+    assert.match(
+      output,
+      /refused before building: the tests directory is a symlink/,
+      `the PRE-BUILD layer did not fire:\n${output.slice(0, 400)}`,
+    );
+    // The external suite must not have been compiled into the output.
+    assert.deepEqual(
+      listing(join(root, "dist")),
+      distBefore,
+      "the external suite was compiled before the refusal",
+    );
+  });
+
+  it("writes NOTHING when a linked source is present under a source root", () => {
+    const root = makeFixtureRepo();
+    const external = mkdtempSync(join(tmpdir(), "sf-ext-src-"));
+    created.push(external);
+    const outsider = join(external, "foreign.ts");
+    writeFileSync(outsider, "export const smuggled = 9;\n");
+    symlinkSync(outsider, join(root, "src/foreign.ts"), "file");
+    const distBefore = listing(join(root, "dist"));
+
+    const { status, output } = runHarness(root);
+
+    assert.notEqual(status, 0);
+    assert.match(output, /refused before building: symlinked or hardlinked entries/);
+    assert.deepEqual(
+      listing(join(root, "dist")),
+      distBefore,
+      "the linked source was compiled before the refusal",
     );
   });
 });

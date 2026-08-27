@@ -365,11 +365,26 @@ if (configProblem !== undefined) {
   fail(`verification refused: ${configProblem}; refusing to build a configuration it cannot read`);
 }
 const noEmit = effectiveConfig.compilerOptions.noEmit === true;
+/**
+ * Refused BEFORE the build, and the wording says so (round-3 finding).
+ *
+ * The later `assessTreeSafety` clauses cover the same conditions, so removing
+ * these left their named tests green — but only because the build had ALREADY
+ * written through the link by the time the later guard ran. The reviewer found
+ * compiled checker and test files sitting in the external target of a symlinked
+ * `dist` after a "refused" run.
+ *
+ * That is the whole point of checking here: not to produce a different verdict,
+ * but to produce it before anything is written. The distinct wording lets a
+ * test pin THIS layer, and the regressions also assert the external target is
+ * still empty — which is the property that actually matters and cannot be
+ * satisfied by a later refusal.
+ */
 if (isSymlink(join(REPO_ROOT, "tests"))) {
-  fail("verification refused: the tests directory is a symlink; an external suite would be compiled and executed as though it belonged to this tree");
+  fail("verification refused before building: the tests directory is a symlink; an external suite would be compiled and executed as though it belonged to this tree");
 }
 if (isSymlink(join(REPO_ROOT, OUTPUT_DIR))) {
-  fail("verification refused: the build output directory is a symlink; the build would write outside the repository");
+  fail("verification refused before building: the build output directory is a symlink; the build would write outside the repository");
 }
 
 /**
