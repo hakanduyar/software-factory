@@ -511,12 +511,20 @@ describe("TASK-010 round 2: paths are judged by what they resolve to", () => {
     writeFileSync(join(root, "dist/tests/ghostFromAnotherBranch.test.js"), "// stale\n");
 
     // Removing `dist` needs write permission on its PARENT, not on itself.
-    chmodSync(root, 0o555);
+    /**
+     * The OUTPUT directory is made read-only, not its parent.
+     *
+     * Cleanup used to delete `dist` itself, so an unwritable parent was enough
+     * to make it fail. It now empties the directory instead — deleting `dist`
+     * left an accepted `dist-alias` dangling and broke convergence — so the
+     * condition that actually blocks cleanup is an unwritable `dist`.
+     */
+    chmodSync(join(root, "dist"), 0o555);
     let result: { status: number; output: string };
     try {
       result = runHarness(root);
     } finally {
-      chmodSync(root, 0o755);
+      chmodSync(join(root, "dist"), 0o755);
     }
 
     assert.notEqual(result.status, 0, "an unremovable stale tree reported success");
@@ -667,7 +675,7 @@ describe("TASK-010 round 2: paths are judged by what they resolve to", () => {
     // depth; a test that cannot tell them apart proves neither.
     assert.match(
       output,
-      /refused before building: the build output directory is or contains a mount point/,
+      /refused before building: dist is or contains a mount point/,
       "the refusal must come from the pre-build guard, before tsc writes through the mount",
     );
     // The mounted tree's contents must be intact: refusing means never deleting.
@@ -1322,4 +1330,144 @@ describe("TASK-010 round 4: an entire source root cannot be a link", () => {
       assert.match(output, new RegExp(`refused before building: the ${root} directory is a symlink`));
     });
   }
+});
+
+
+// =====================================================================
+// ROUND-5 — a bind-mounted SOURCE root, and links under the output
+// =====================================================================
+
+describe("TASK-010 round 5: a mount is not a directory just because it looks like one", () => {
+  /**
+   * THE CRITICAL. The mount guard asked only whether `dist` was a mount point.
+   * A bind-mounted `src/` is invisible to every other check: `isSymlink` says
+   * no, link counts say no, and `realpath` resolves INSIDE the repository,
+   * because a bind mount IS the path it is mounted at.
+   *
+   * The reviewer mounted an external `src` whose `testArtifacts.ts` began with
+   * `process.exit(0)`. The run returned EXIT 0 WITH NO OUTPUT — a false pass,
+   * from a check that covered one managed path and not its siblings.
+   */
+  for (const root of ["src", "tests"] as const) {
+    it(`REFUSES a real bind-mounted ${root} root before building`, () => {
+      const namespaces = spawnSync("unshare", ["--user", "--map-root-user", "--mount", "true"], {
+        encoding: "utf8",
+      });
+      if (namespaces.status !== 0) {
+        // Printed, not silently skipped: a green run in a restricted
+        // environment must not be mistaken for a proven guard.
+        console.error(`SKIPPED: unprivileged user namespaces unavailable; ${root} bind-mount not proven here`);
+        return;
+      }
+
+      const fixture = makeFixtureRepo();
+      const external = mkdtempSync(join(tmpdir(), `sf-bind-${root}-`));
+      created.push(external);
+      // Mirror the real layout so the build would genuinely succeed if the
+      // mount were followed — otherwise the refusal proves nothing.
+      cpSync(join(fixture, root), external, { recursive: true });
+      if (root === "src") {
+        writeFileSync(join(external, "verification/testArtifacts.ts"), "process.exit(0);\nexport {};\n");
+      }
+
+      const script = [
+        "set -e",
+        `mount --bind ${JSON.stringify(external)} ${JSON.stringify(join(fixture, root))}`,
+        `grep -qF ${JSON.stringify(join(fixture, root))} /proc/self/mountinfo || { echo "BIND-DID-NOT-TAKE"; exit 97; }`,
+        `cd ${JSON.stringify(fixture)}`,
+        "set +e",
+        `${JSON.stringify(process.execPath)} scripts/verify.mjs`,
+        'echo "HARNESS-EXIT=$?"',
+      ].join("\n");
+
+      const result = spawnSync("unshare", ["--user", "--map-root-user", "--mount", "sh", "-c", script], {
+        encoding: "utf8",
+        env: harnessEnv(),
+      });
+      const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+
+      assert.doesNotMatch(output, /BIND-DID-NOT-TAKE/, "the fixture failed to bind-mount, so it proved nothing");
+      assert.match(output, /HARNESS-EXIT=1/, `a bind-mounted ${root} produced a SUCCESS:\n${output}`);
+      assert.match(output, new RegExp(`refused before building: ${root} is or contains a mount point`));
+      assert.ok(!output.includes("tree-consistent"), "it must not claim consistency");
+    });
+  }
+});
+
+describe("TASK-010 round 5: links under the output are refused before the build", () => {
+  /**
+   * These were scanned only AFTER `tsc` ran, so the build wrote THROUGH them
+   * first. The symlink case eventually refused with the damage already done;
+   * the hardlink case was not looked at all — the external file was
+   * overwritten and the run still reported the tree consistent.
+   *
+   * Asserted by the external file's CONTENT surviving, which only a pre-build
+   * refusal can achieve.
+   */
+  it("does not write through a symlinked artifact under the output", () => {
+    const root = makeFixtureRepo();
+    assert.equal(runHarness(root).status, 0, "the fixture must pass first");
+
+    const external = mkdtempSync(join(tmpdir(), "sf-outlink-"));
+    created.push(external);
+    const target = join(external, "external.js");
+    writeFileSync(target, "MARKER-MUST-SURVIVE");
+    rmSync(join(root, "dist/tests/sample.test.js"), { force: true });
+    symlinkSync(target, join(root, "dist/tests/sample.test.js"), "file");
+
+    const { status, output } = runHarness(root);
+
+    assert.notEqual(status, 0, "a symlinked artifact under the output was accepted");
+    assert.equal(
+      readFileSync(target, "utf8"),
+      "MARKER-MUST-SURVIVE",
+      "the build wrote through the symlink before the refusal",
+    );
+    assert.match(output, /refused before building: linked entries under dist/);
+  });
+
+  it("does not overwrite a HARDLINKED artifact under the output", () => {
+    const root = makeFixtureRepo();
+    assert.equal(runHarness(root).status, 0, "the fixture must pass first");
+
+    const external = mkdtempSync(join(tmpdir(), "sf-outhard-"));
+    created.push(external);
+    const target = join(external, "external.js");
+    writeFileSync(target, "MARKER-MUST-SURVIVE");
+    rmSync(join(root, "dist/tests/sample.test.js"), { force: true });
+    linkSync(target, join(root, "dist/tests/sample.test.js"));
+
+    const { status, output } = runHarness(root);
+
+    assert.notEqual(status, 0, "a hardlinked artifact under the output was accepted");
+    assert.equal(
+      readFileSync(target, "utf8"),
+      "MARKER-MUST-SURVIVE",
+      "the build overwrote the hardlinked external file",
+    );
+    assert.ok(!output.includes("tree-consistent"), "it must not claim consistency");
+  });
+});
+
+describe("TASK-010 round 5: an accepted alias still converges", () => {
+  /**
+   * My own regression. Accepting a `dist-alias -> dist` spelling was right —
+   * refusing an equivalent name is a false positive. But cleanup then deleted
+   * `dist` itself, leaving the alias dangling and the rebuild failing with
+   * TS5033, which breaks the convergence AC-4 requires.
+   */
+  it("converges when contaminated while the config names an alias", () => {
+    const root = makeFixtureRepo();
+    assert.equal(runHarness(root).status, 0, "the fixture must pass first");
+    symlinkSync(join(root, "dist"), join(root, "dist-alias"), "dir");
+    writeFileSync(join(root, "dist/tests/ghostFromAnotherBranch.test.js"), "// stale\n");
+
+    const { status, output } = runWithShowConfigShim(
+      root,
+      JSON.stringify({ compilerOptions: { outDir: "dist-alias", noEmit: false } }),
+    );
+
+    assert.equal(status, 0, `an aliased outDir did not converge:\n${output.slice(0, 600)}`);
+    assert.match(output, /verification complete/);
+  });
 });

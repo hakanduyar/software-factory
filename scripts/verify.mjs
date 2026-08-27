@@ -159,6 +159,26 @@ function findHardlinkedSources(directory) {
   return found.sort();
 }
 
+/**
+ * ANY file beneath a directory with a link count above one.
+ *
+ * `findHardlinkedSources` filters by compilable suffix, which is right for a
+ * source root and wrong for build output: a hardlinked `dist/tests/x.test.js`
+ * is not a source file, and it was overwritten by the build while the run
+ * still reported the tree consistent (round-5 finding).
+ */
+function findHardlinkedUnder(directory) {
+  const found = [];
+  for (const rel of listFiles(directory)) {
+    try {
+      if (lstatSync(join(REPO_ROOT, rel)).nlink > 1) found.push(rel);
+    } catch {
+      /* unreadable entries are reported by the walk itself */
+    }
+  }
+  return found.sort();
+}
+
 /** Symlinked entries anywhere beneath a directory, as repo-relative paths. */
 function findSymlinks(directory, keep = () => true) {
   const found = [];
@@ -473,7 +493,23 @@ const mountInfo = (() => {
  * under-matches is worse than no guard because it looks like one.
  */
 if (process.platform === "linux") {
-  const outputPath = (realOrUndefined(join(REPO_ROOT, OUTPUT_DIR)) ?? join(REPO_ROOT, OUTPUT_DIR)).replace(/\/+$/, "");
+  /**
+   * EVERY managed path, not just the output (round-5 CRITICAL).
+   *
+   * The guard asked only whether `dist` was a mount point. A bind-mounted
+   * `src/` therefore sailed past every source check — `isSymlink` says no, link
+   * counts say no, and `realpath` resolves inside the repository because a bind
+   * mount IS the path it is mounted at. The reviewer mounted an external `src`
+   * whose `testArtifacts.ts` began with `process.exit(0)`, and the run returned
+   * EXIT 0 WITH NO OUTPUT. A false pass, again, from a check that covered one
+   * path and not its siblings.
+   *
+   * The same list the source scan uses, so the two cannot drift apart.
+   */
+  const managedPaths = [OUTPUT_DIR, ...SOURCE_ROOTS].map((relative) => {
+    const absolute = join(REPO_ROOT, relative);
+    return { relative, path: (realOrUndefined(absolute) ?? absolute).replace(/\/+$/, "") };
+  });
   const earlyMountPoints = (mountInfo ?? "")
     .split("\n")
     .map((line) => line.trim().split(" ")[4])
@@ -482,14 +518,17 @@ if (process.platform === "linux") {
   if (mountInfo === undefined || earlyMountPoints.length === 0) {
     fail("verification refused: the mount table (/proc/self/mountinfo) could not be read, so it is unknown whether the build output is a mount point");
   }
-  const offending = earlyMountPoints.find(
-    (point) => point === outputPath || point.startsWith(`${outputPath}/`),
-  );
-  if (offending !== undefined) {
-    fail(
-      `verification refused before building: the build output directory is or contains a mount point (${offending}); ` +
-        `the build would write into a separately mounted tree and a recursive delete would reach through it`,
+  for (const managed of managedPaths) {
+    const offending = earlyMountPoints.find(
+      (point) => point === managed.path || managed.path.startsWith(`${point}/`) || point.startsWith(`${managed.path}/`),
     );
+    if (offending !== undefined && offending !== "/") {
+      fail(
+        `verification refused before building: ${managed.relative} is or contains a mount point (${offending}); ` +
+          "a bind mount is indistinguishable from an ordinary directory by name, link count or realpath, so code " +
+          "from outside this tree would be compiled and executed as though it belonged to it",
+      );
+    }
   }
 }
 if (noEmit) {
@@ -500,6 +539,30 @@ if (noEmit) {
   // claimed. They are two checks at two different moments, and the distinct
   // thing this one can report is that NOTHING WAS BUILT.
   fail("verification refused before building: tsconfig sets noEmit, so the build would produce nothing and any audit would run against whatever was already there");
+}
+
+/**
+ * Links UNDER the output directory, refused BEFORE the build (round-5 finding).
+ *
+ * These were scanned only after `tsc` ran, so a symlinked
+ * `dist/tests/whatever.test.js` was written THROUGH into an external file
+ * before anything objected: the run refused, and the damage was already done.
+ * A hardlinked artifact was worse — it was overwritten and the run still
+ * reported the tree consistent, because nothing looked at link counts under
+ * the output at all.
+ *
+ * Refusing here costs a walk of a directory that is usually small, and removes
+ * a write the later guard could only report.
+ */
+const outputLinksBeforeBuild = [
+  ...findSymlinks(OUTPUT_DIR),
+  ...findHardlinkedUnder(OUTPUT_DIR),
+].sort();
+if (outputLinksBeforeBuild.length > 0) {
+  fail(
+    `verification refused before building: linked entries under ${OUTPUT_DIR}: ` +
+      `${outputLinksBeforeBuild.join(", ")}; the build would write through them into files outside this tree`,
+  );
 }
 
 // --- 3. build, and prove it actually emitted the checker ---------------------
@@ -616,8 +679,20 @@ if (!audit.clean) {
   // the run with an uncaught exception. The exit code was non-zero either way,
   // which is why nothing noticed — but "fails closed" has to mean the verifier
   // decided to fail, not that it fell over on the way to deciding.
+  /**
+   * Removes the CONTENTS, not the directory (round-5 finding, and my own
+   * regression).
+   *
+   * Accepting a `dist-alias -> dist` spelling was right — refusing an
+   * equivalent name is a false positive. But cleanup then deleted `dist`
+   * itself, leaving the alias dangling and the rebuild failing with TS5033,
+   * which broke the convergence AC-4 requires. Emptying the directory achieves
+   * the same thing without invalidating any path that points at it.
+   */
   try {
-    rmSync(cleanVerdict.target, { recursive: true, force: true });
+    for (const entry of readdirSync(cleanVerdict.target)) {
+      rmSync(join(cleanVerdict.target, entry), { recursive: true, force: true });
+    }
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
     fail(`${diagnosis}\n\nThe stale output could NOT be removed: ${detail}`);
