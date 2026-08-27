@@ -1544,3 +1544,91 @@ describe("TASK-008 round 5: tail truncation is detected by an anchor", () => {
     assert.equal(verifyAgainstAnchor(chain, undefined).intact, true);
   });
 });
+
+
+// =====================================================================
+// ROUND-6 — deletion must not decide whether the anchor is consulted
+// =====================================================================
+
+describe("TASK-008 round 6: an empty chain does not escape its own anchor", () => {
+  /**
+   * CRITICAL. The empty-chain allowance existed so a database written before
+   * provenance existed would still load. But it was checked BEFORE the anchor,
+   * so deleting the whole chain — while leaving an anchor saying it had two
+   * entries — read as a legacy database with no history at all.
+   *
+   * The anchor exists precisely to make deletion visible. Letting the deletion
+   * decide whether the anchor is consulted inverts it.
+   */
+  it("REFUSES an empty chain when the anchor says entries existed", async () => {
+    const chain = chainFor("claude-code:opus");
+    const anchor = anchorFor(chain);
+
+    const supervisor = newSupervisor({ probe: healthyProbe() });
+    const state = await supervisor.service.ensureInitialized();
+    await supervisor.repository.compareAndSave(
+      {
+        ...state,
+        version: state.version + 1,
+        roadmap: [
+          { key: "B", title: "Review of A", dependsOn: ["A"], status: "ELIGIBLE", workClass: "INDEPENDENT_REVIEW", order: 1 },
+          { key: "A", title: "Implemented", dependsOn: [], status: "DONE", workClass: "NORMAL_IMPLEMENTATION", order: 2, attempts: 1, implementedByResourceKeys: ["claude-code:opus"] } as RoadmapItem,
+        ],
+        // The chain is GONE; the anchor still says it had one entry.
+        provenance: [],
+        provenanceAnchor: anchor,
+      },
+      state.version,
+    );
+
+    const result = await supervisor.service.tick();
+    assert.equal(result.kind, "WAITING_FOR_HUMAN", "a deleted chain read as legacy silence");
+    assert.equal(supervisor.executor.calls().length, 0, "nothing may run on deleted history");
+  });
+
+  /** ...and a genuinely legacy database — no chain, no anchor — still works. */
+  it("still ACCEPTS a database with neither chain nor anchor", async () => {
+    const { result } = await reviewWith({
+      item: { implementedByResourceKeys: ["claude-code:opus"] },
+      provenance: [],
+    });
+    assert.equal(result.kind, "ADVANCED", "a genuinely legacy database must still advance");
+  });
+});
+
+describe("TASK-008 round 6: the chain's names are recognised too", () => {
+  /**
+   * CRITICAL. Catalog recognition lived inside the row-based branch, gated on
+   * the MUTABLE `workClass`. Relabelling an item `DETERMINISTIC` skipped it,
+   * and the chain cross-check never asked whether a name was recognisable at
+   * all — so two records agreeing on `not-a-catalog-resource` satisfied
+   * everything while the real implementer stayed eligible.
+   *
+   * Agreement between two rewritable records is not recognition.
+   */
+  it("REFUSES a chain naming a resource no catalog knows, whatever the row says", async () => {
+    const appended = appendProvenance([], {
+      kind: "IMPLEMENTED_BY",
+      roadmapKey: "A",
+      resourceKey: "not-a-catalog-resource",
+      detail: "implemented",
+      recordedAt: 1_000,
+    });
+    assert.equal(appended.ok, true);
+    if (!appended.ok) throw new Error("unreachable");
+
+    const { result, supervisor } = await reviewWith({
+      // Relabelled, so the row-based recognition branch is skipped entirely.
+      item: {
+        workClass: "DETERMINISTIC",
+        implementedByResourceKeys: ["not-a-catalog-resource"],
+      },
+      provenance: appended.chain,
+    });
+
+    assert.equal(result.kind, "WAITING_FOR_HUMAN", "an unrecognisable chain identity was accepted");
+    for (const call of supervisor.executor.calls()) {
+      assert.notEqual(call.item.key, "B", "a review ran on lineage nobody can recognise");
+    }
+  });
+});

@@ -1500,6 +1500,25 @@ export class SupervisorService {
       const fromRow = implementerHistory(entry);
 
       /**
+       * The CHAIN's names are checked against the catalog too (round-6
+       * CRITICAL).
+       *
+       * Recognition lived inside the row-based branch, which is gated on the
+       * MUTABLE `workClass` — so relabelling an item `DETERMINISTIC` skipped it,
+       * and the chain cross-check never asked whether a name was recognisable
+       * at all. Two records agreeing on `not-a-catalog-resource` satisfied
+       * everything and the real implementer stayed eligible.
+       *
+       * Agreement between two rewritable records is not recognition. The
+       * catalog is code-level configuration and is the only answer to "could
+       * this have run here".
+       */
+      const unrecognisedInChain = fromChain.filter((resource) => !knownResourceKeys.has(resource));
+      if (unrecognisedInChain.length > 0 && !ambiguous.includes(key)) {
+        ambiguous.push(key);
+      }
+
+      /**
        * SILENCE IS ONLY SILENCE WHEN THE WHOLE CHAIN IS EMPTY (round-1 finding).
        *
        * The first version skipped whenever THIS ITEM had no chain entry, and
@@ -1519,7 +1538,11 @@ export class SupervisorService {
        * and refusing every review would strand the roadmap this protects. That
        * residue is recorded in docs/KNOWN-LIMITATIONS.md rather than hidden.
        */
-      if (state.provenance.length === 0) {
+      /**
+       * The same rule as above: an empty chain is legacy silence ONLY when no
+       * anchor claims otherwise. With an anchor, an empty chain is a deletion.
+       */
+      if (state.provenance.length === 0 && (state.provenanceAnchor?.length ?? 0) === 0) {
         continue;
       }
       if (fromChain.length === 0 && fromRow.length === 0) {
@@ -1565,7 +1588,21 @@ export class SupervisorService {
    * human-decision it is.
    */
   private brokenChainOutcome(state: SupervisorState): TickResult | undefined {
-    if (state.provenance.length === 0) {
+    /**
+     * AN EMPTY CHAIN IS ONLY SILENCE IF NOTHING SAYS OTHERWISE (round-6
+     * CRITICAL).
+     *
+     * The early return skipped the anchor check whenever the chain was empty,
+     * so deleting the WHOLE chain — while leaving an anchor saying it had two
+     * entries — read as a legacy database with no history. The reviewer then
+     * had Codex review its own work.
+     *
+     * The anchor exists precisely to make deletion visible; letting the
+     * deletion decide whether the anchor is consulted inverts it. An empty
+     * chain with an anchor claiming entries is the loudest possible
+     * contradiction.
+     */
+    if (state.provenance.length === 0 && (state.provenanceAnchor?.length ?? 0) === 0) {
       return undefined;
     }
     const verdict = verifyAgainstAnchor(state.provenance, state.provenanceAnchor);
