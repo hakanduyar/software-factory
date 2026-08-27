@@ -43,6 +43,7 @@ import { CONFIG_VERIFICATIONS, type AiRunConfigRecord, type ConfigVerification }
 import { WORK_CLASSES, type WorkClass } from "./modelRouting.js";
 import {
   GENESIS_DIGEST,
+  isHashable,
   PROVENANCE_KINDS,
   type ProvenanceEntry,
   type ProvenanceKind,
@@ -400,6 +401,19 @@ function boundedProvenanceText(value: string, field: string, context: string): s
       context,
       `field "${field}" is ${value.length} characters, over the ${MAX_PARSED_PROVENANCE_TEXT} limit; ` +
         "the write path bounds every provenance string, so this row was not written by it",
+    );
+  }
+  /**
+   * Round-3 finding: `appendProvenance` refused a lone surrogate, but nothing
+   * refused one already on disk — and `computeDigest` gives `x\uD800y` and
+   * `x\uFFFDy` the same digest, because UTF-8 encoding replaces the lone
+   * surrogate. A row carrying one is therefore a row whose digest does not
+   * distinguish it from a different value.
+   */
+  if (!isHashable(value)) {
+    corrupt(
+      context,
+      `field "${field}" is not well-formed UTF-16; its digest would not distinguish it from a different string`,
     );
   }
   if (redactSecrets(value) !== value) {

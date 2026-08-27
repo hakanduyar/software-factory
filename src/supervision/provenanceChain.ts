@@ -280,9 +280,34 @@ export function implementersByRoadmapKey(
     if (entry.kind !== "IMPLEMENTED_BY" || entry.resourceKey === undefined) {
       continue;
     }
+    // NOTE: an IMPLEMENTED_BY with no resourceKey is NOT silence — see
+    // `keysWithUnknownImplementer`, which the caller must also consult.
     const found = byKey.get(entry.roadmapKey) ?? new Set<string>();
     found.add(entry.resourceKey);
     byKey.set(entry.roadmapKey, found);
   }
   return new Map([...byKey].map(([key, resources]) => [key, [...resources]]));
+}
+
+
+/**
+ * Items the chain says were implemented by SOMEONE IT DOES NOT NAME.
+ *
+ * Round-3 CRITICAL: `implementersByRoadmapKey` silently discarded an
+ * `IMPLEMENTED_BY` entry with no `resourceKey`, so a chain recording that work
+ * happened — without saying who did it — read as though nothing had happened
+ * at all. A review then advanced and launched the very resource that may have
+ * done it.
+ *
+ * An unknown implementer is MORE dangerous than a missing record, not less:
+ * the chain is asserting that someone did the work. That has to fail closed.
+ */
+export function keysWithUnknownImplementer(chain: readonly ProvenanceEntry[]): ReadonlySet<string> {
+  const unknown = new Set<string>();
+  for (const entry of chain) {
+    if (entry.kind === "IMPLEMENTED_BY" && entry.resourceKey === undefined) {
+      unknown.add(entry.roadmapKey);
+    }
+  }
+  return unknown;
 }

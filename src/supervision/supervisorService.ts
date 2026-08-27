@@ -38,6 +38,7 @@ import { requiresAi, selectResource, type RoutingPolicy } from "./modelRouting.j
 import {
   appendProvenance,
   implementersByRoadmapKey,
+  keysWithUnknownImplementer,
   type ProvenanceEntry,
 } from "./provenanceChain.js";
 import { boundedDiagnostic, classifyResourceOutcome, type Classification } from "./resourceClassifier.js";
@@ -1293,6 +1294,23 @@ export class SupervisorService {
       }
       queue.push(...entry.dependsOn);
     }
+    /**
+     * The item under review contributes its OWN run evidence (round-3 finding).
+     *
+     * The ancestor loop deliberately skips `item.key` for the ambiguity rules,
+     * which is right — an item is not its own ancestor. But its `lastRunConfig`
+     * still records a resource that has already run ON IT, and choosing that
+     * resource as its reviewer is the thing C4 forbids. Excluded rather than
+     * escalated: over-excluding costs a routing choice, under-excluding costs
+     * the gate.
+     */
+    const reviewed = byKey.get(item.key);
+    if (reviewed?.lastRunConfig !== undefined) {
+      excluded.add(
+        `${reviewed.lastRunConfig.effectiveProvider}:${reviewed.lastRunConfig.effectiveModel}`,
+      );
+    }
+
     // Belt and braces: a checkpoint may still name one for an in-flight item.
     // Every implementer finding is read, not merely the first — a rolled-over
     // session can accumulate more than one.
@@ -1346,9 +1364,30 @@ export class SupervisorService {
      * are a test that passes for the wrong reason.
      */
     const chainImplementers = implementersByRoadmapKey(state.provenance);
+    const unknownImplementers = keysWithUnknownImplementer(state.provenance);
     for (const key of visited) {
       const entry = byKey.get(key);
-      if (entry === undefined || !requiresAi(entry.workClass)) {
+      if (entry === undefined) {
+        continue;
+      }
+      /**
+       * NO `workClass` FILTER HERE (round-3 CRITICAL).
+       *
+       * `workClass` lives in the MUTABLE row. Using it to decide whether to
+       * consult the immutable record inverts the whole design: the reviewer
+       * relabelled an item `DETERMINISTIC`, the chain entry naming its
+       * implementer was skipped, and that implementer reviewed it. A record
+       * consulted only when another record permits it is not a second source.
+       *
+       * The chain is authoritative about who did work, whatever the row now
+       * says the work was.
+       */
+      if (unknownImplementers.has(key)) {
+        // The chain asserts work happened and does not say who did it. That is
+        // worse than no record, because something DID run.
+        if (!ambiguous.includes(key)) {
+          ambiguous.push(key);
+        }
         continue;
       }
       /**

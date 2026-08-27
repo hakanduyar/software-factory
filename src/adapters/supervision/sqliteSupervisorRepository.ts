@@ -211,16 +211,32 @@ export function createSqliteSupervisorRepository(path: string): SqliteSupervisor
       }
       // Round-trip on write, so a value that could not be read back never
       // reaches the file in the first place.
-      const encoded = encodeSupervisorState(state);
-      parseSupervisorState(encoded, { version: state.version });
-      assertChainPersistable(state.provenance, "create");
-      insert.run(SINGLETON_ID, state.version, encoded);
+      /**
+       * VERIFY AND STORE WHAT IS ACTUALLY SERIALIZED (round-3 findings).
+       *
+       * Checking the in-memory object was checking the wrong artefact twice
+       * over. An entry with a `toJSON()` returning edited content and the old
+       * digest passed every guard and landed in SQLite as a chain that does not
+       * verify; and an entry carrying an extra property persisted that property
+       * — a credential, in the reviewer's reproduction — because the parser
+       * drops unknown fields only AFTER the row is written.
+       *
+       * Parsing the encoded text and re-encoding the RESULT closes both: what
+       * is verified is what the bytes say, and what is stored contains only
+       * fields the parser recognises.
+       */
+      const canonical = encodeSupervisorState(parseSupervisorState(encodeSupervisorState(state), { version: state.version }));
+      assertChainPersistable(parseSupervisorState(canonical, { version: state.version }).provenance, "create");
+      insert.run(SINGLETON_ID, state.version, canonical);
       return state;
     },
 
     async compareAndSave(next: SupervisorState, expectedVersion: number): Promise<SupervisorState> {
-      const encoded = encodeSupervisorState(next);
-      parseSupervisorState(encoded, { version: next.version });
+      // Same reasoning as `create`: the bytes are the artefact.
+      const encoded = encodeSupervisorState(
+        parseSupervisorState(encodeSupervisorState(next), { version: next.version }),
+      );
+      const persisted = parseSupervisorState(encoded, { version: next.version });
 
       /**
        * APPEND-ONLY IS ENFORCED HERE, not merely intended (AC-1, round-1
@@ -243,9 +259,9 @@ export function createSqliteSupervisorRepository(path: string): SqliteSupervisor
         const previous = parseSupervisorState(stored.data, { version: stored.version }).provenance;
         // Prefix first, so a rewritten entry is reported as a rewrite rather
         // than as a generic broken chain — the diagnosis an operator needs.
-        assertProvenanceExtends(previous, next.provenance);
+        assertProvenanceExtends(previous, persisted.provenance);
       }
-      assertChainPersistable(next.provenance, "write");
+      assertChainPersistable(persisted.provenance, "write");
 
       const result = update.run(next.version, encoded, SINGLETON_ID, expectedVersion);
       if (result.changes === 0) {

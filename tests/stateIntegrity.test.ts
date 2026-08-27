@@ -343,9 +343,15 @@ describe("TASK-008 AC-3/AC-4: verification names what is wrong, with no model in
 // =====================================================================
 
 describe("TASK-008 AC-10: the chain is bounded and refuses rather than truncating", () => {
+  /**
+   * DISCLOSED: this fixture uses repeated fake digests, so the chain is already
+   * invalid. Round-3 review called it vacuous against the maximum guard, and it
+   * is — `verifyChain` would refuse it for a different reason. It is kept only
+   * because `appendProvenance` never verifies its input, so the LENGTH refusal
+   * is genuinely what fires here. The guard is proven properly by
+   * "REFUSES a VALID chain that is one entry too long", which builds a real one.
+   */
   it("refuses to append beyond the maximum instead of dropping the oldest", () => {
-    // Constructed directly rather than by appending 10_000 times: what is being
-    // tested is the refusal, not the loop.
     const full = Array.from({ length: MAX_CHAIN_ENTRIES }, (_unused, index) => ({
       sequence: index,
       kind: "IMPLEMENTED_BY" as const,
@@ -1113,5 +1119,208 @@ describe("TASK-008 round 2: the repository verifies what it persists", () => {
     } finally {
       repository.close();
     }
+  });
+});
+
+
+// =====================================================================
+// ROUND-3 REMEDIATION — two CRITICALs and four HIGHs
+// =====================================================================
+
+describe("TASK-008 round 3: the chain is read whatever the row now claims", () => {
+  /**
+   * CRITICAL. `workClass` lives in the MUTABLE row, and the chain loop used it
+   * to decide whether to consult the IMMUTABLE record. Relabelling the
+   * dependency `DETERMINISTIC` skipped its chain entry entirely, and the
+   * resource that built it reviewed it.
+   */
+  it("REFUSES when the row relabels an implemented item as DETERMINISTIC", async () => {
+    const appended = appendProvenance([], {
+      kind: "IMPLEMENTED_BY",
+      roadmapKey: "A",
+      resourceKey: "codex-cli:gpt-5.6-luna",
+      detail: "implemented",
+      recordedAt: 1_000,
+    });
+    assert.equal(appended.ok, true);
+    if (!appended.ok) throw new Error("unreachable");
+
+    const { result, supervisor } = await reviewWith({
+      // The row claims A was deterministic work with no implementer.
+      item: { workClass: "DETERMINISTIC", implementedByResourceKeys: [] },
+      provenance: appended.chain,
+    });
+
+    assert.equal(result.kind, "WAITING_FOR_HUMAN", "a relabelled row hid the chain entry");
+    for (const call of supervisor.executor.calls()) {
+      assert.notEqual(call.item.key, "B", "the chain-named implementer reviewed the work");
+    }
+  });
+
+  /**
+   * CRITICAL. An `IMPLEMENTED_BY` with no `resourceKey` was DISCARDED, so a
+   * chain asserting that work happened — without saying who did it — read as
+   * though nothing had happened. Unknown identity is worse than no record.
+   */
+  it("REFUSES an IMPLEMENTED_BY entry that names no resource", async () => {
+    /**
+     * The fixture must make the UNNAMED entry the only signal.
+     *
+     * My first version left the row with no implementer, so the existing
+     * row-based rule flagged it as ambiguous anyway and the test passed with or
+     * without the fix — mutation testing showed it surviving. Here the row and
+     * the chain AGREE about claude, and an additional entry says work happened
+     * without saying who did it. Nothing else can produce the refusal.
+     */
+    let chain: readonly ProvenanceEntry[] = [];
+    const named = appendProvenance(chain, {
+      kind: "IMPLEMENTED_BY",
+      roadmapKey: "A",
+      resourceKey: "claude-code:opus",
+      detail: "implemented",
+      recordedAt: 1_000,
+    });
+    assert.equal(named.ok, true);
+    if (!named.ok) throw new Error("unreachable");
+    chain = named.chain;
+
+    const unnamed = appendProvenance(chain, {
+      kind: "IMPLEMENTED_BY",
+      roadmapKey: "A",
+      detail: "someone else also worked on this",
+      recordedAt: 2_000,
+    });
+    assert.equal(unnamed.ok, true);
+    if (!unnamed.ok) throw new Error("unreachable");
+    chain = unnamed.chain;
+    assert.equal(chain[1]!.resourceKey, undefined, "the fixture must have an entry with no resourceKey");
+
+    const { result } = await reviewWith({
+      // Row and chain agree about claude, so the ordinary rules are satisfied.
+      item: {
+        implementedByResourceKeys: ["claude-code:opus"],
+        lastRunConfig: {
+          requestedProvider: "claude-code",
+          requestedModel: "opus",
+          effectiveProvider: "claude-code",
+          effectiveModel: "opus",
+          verification: "VERIFIED_EFFECTIVE",
+          argvEvidence: ["claude"],
+          note: "",
+        },
+      },
+      provenance: chain,
+    });
+    assert.equal(result.kind, "WAITING_FOR_HUMAN", "an unnamed implementer must fail closed");
+  });
+});
+
+describe("TASK-008 round 3: what is stored is what was verified", () => {
+  const stateWithChain = (provenance: readonly ProvenanceEntry[]) => ({
+    version: 1,
+    financialPolicy: { autonomousSpendAllowed: false, autonomousSpendLimit: 0 },
+    resources: [],
+    roadmap: [
+      { key: "A", title: "Implemented", dependsOn: [], status: "DONE" as const, workClass: "NORMAL_IMPLEMENTATION" as const, order: 1 },
+    ],
+    checkpoints: [],
+    escalations: [],
+    provenance,
+    updatedAt: 1_000,
+  });
+
+  /**
+   * The repository verified the in-memory OBJECT. An entry whose `toJSON`
+   * returned different content passed every guard and landed in SQLite as a
+   * chain that does not verify.
+   */
+  it("REFUSES an entry whose serialized form differs from its object", async () => {
+    const chain = chainFor("claude-code:opus");
+    const treacherous = chain.map((entry) => ({
+      ...entry,
+      toJSON() {
+        return { ...entry, detail: "edited only in the bytes" };
+      },
+    })) as unknown as readonly ProvenanceEntry[];
+
+    const dbPath = tempDbPath("t8-tojson");
+    const repository = createSqliteSupervisorRepository(dbPath);
+    try {
+      await assert.rejects(repository.create(stateWithChain(treacherous)), /does not verify/);
+    } finally {
+      repository.close();
+    }
+  });
+
+  /**
+   * An unknown property was dropped by the PARSER — after the row had already
+   * been written with it. The credential was in the file either way.
+   */
+  it("does not PERSIST an unknown property, even though the parser ignores it", async () => {
+    const { readFileSync } = await import("node:fs");
+    const leak = "sk-ant-api03-UNKNOWNPROPERTYLEAKLEAKLEAK00";
+    const chain = chainFor("claude-code:opus").map((entry) => ({ ...entry, unexpectedSecret: leak }));
+
+    const dbPath = tempDbPath("t8-unknown-prop");
+    const repository = createSqliteSupervisorRepository(dbPath);
+    try {
+      await repository.create(stateWithChain(chain as unknown as readonly ProvenanceEntry[]));
+    } finally {
+      repository.close();
+    }
+
+    const raw = readFileSync(dbPath);
+    assert.ok(!raw.includes(leak), "the credential reached the database file");
+  });
+});
+
+describe("TASK-008 round 3: append-only is pinned by content, not only by digest", () => {
+  /**
+   * The reviewer's blind spot: disabling the digest/sequence comparison left
+   * the suite green, because a REHASHED rewrite still verifies as a chain. Only
+   * the prefix comparison can catch it.
+   */
+  it("REFUSES a rewrite that was rehashed so the chain still verifies", async () => {
+    const dbPath = tempDbPath("t8-rehashed");
+    const repository = createSqliteSupervisorRepository(dbPath);
+    try {
+      const seeded = await repository.create({
+        version: 1,
+        financialPolicy: { autonomousSpendAllowed: false, autonomousSpendLimit: 0 },
+        resources: [],
+        roadmap: [
+          { key: "A", title: "Implemented", dependsOn: [], status: "DONE", workClass: "NORMAL_IMPLEMENTATION", order: 1 },
+        ],
+        checkpoints: [],
+        escalations: [],
+        provenance: chainFor("claude-code:opus"),
+        updatedAt: 1_000,
+      });
+
+      // Rebuild the chain from scratch with DIFFERENT content: internally
+      // consistent, verifies perfectly, and is not the history that was stored.
+      const rehashed = chainFor("codex-cli:gpt-5.6-luna");
+      assert.equal(verifyChain(rehashed).intact, true, "the forgery must itself verify");
+
+      await assert.rejects(
+        repository.compareAndSave({ ...seeded, version: 2, provenance: rehashed }, 1),
+        /was rewritten/,
+      );
+    } finally {
+      repository.close();
+    }
+  });
+});
+
+describe("TASK-008 round 3: a lone surrogate cannot be persisted either", () => {
+  it("REFUSES a stored entry containing a lone surrogate", () => {
+    const entry = {
+      ...chainFor("claude-code:opus")[0]!,
+      detail: `x${String.fromCharCode(0xd800)}y`,
+    };
+    assert.throws(
+      () => parseSupervisorState(JSON.stringify(stateWith([entry])), { version: 1 }),
+      /not well-formed/,
+    );
   });
 });
