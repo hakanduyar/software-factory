@@ -1571,3 +1571,118 @@ describe("TASK-010 round 6: an ancestor mount is an ordinary workspace", () => {
     assert.match(output, /HARNESS-EXIT=0/, `a repository-level bind mount was wrongly refused:\n${output.slice(0, 500)}`);
   });
 });
+
+
+// =====================================================================
+// ROUND-7 — what a compiler reads is not predictable from a filename
+// =====================================================================
+
+describe("TASK-010 round 7: hardlinked sources of any kind", () => {
+  /**
+   * THE CRITICAL. The hardlink scan filtered by compilable SUFFIX, encoding an
+   * assumption about what tsc reads — and with `allowJs` the assumption was
+   * wrong. An external `foreign.js` hardlinked into `src/` was compiled,
+   * executed by a test, and the run exited 0 with "tree-consistent".
+   */
+  it("REFUSES a hardlinked .js source that allowJs makes compilable", () => {
+    const root = makeFixtureRepo();
+    const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as {
+      compilerOptions: Record<string, unknown>;
+      include: string[];
+    };
+    tsconfig.compilerOptions["allowJs"] = true;
+    tsconfig.include = [...tsconfig.include, "src/**/*.js"];
+    writeFileSync(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
+
+    const external = mkdtempSync(join(tmpdir(), "sf-alljs-"));
+    created.push(external);
+    const outsider = join(external, "foreign.js");
+    writeFileSync(outsider, "export const smuggled = 7;\n");
+    linkSync(outsider, join(root, "src/foreign.js"));
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, "a hardlinked .js source was compiled and executed");
+    assert.match(output, /foreign\.js/);
+    assert.ok(!output.includes("tree-consistent"), "it must not claim consistency");
+  });
+
+  /** ...and any other extension, because the filter is gone entirely. */
+  it("REFUSES a hardlinked file of an extension nobody anticipated", () => {
+    const root = makeFixtureRepo();
+    const external = mkdtempSync(join(tmpdir(), "sf-anyext-"));
+    created.push(external);
+    const outsider = join(external, "data.json");
+    writeFileSync(outsider, "{}\n");
+    linkSync(outsider, join(root, "src/data.json"));
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, "a hardlinked file was accepted because of its extension");
+    assert.match(output, /data\.json/);
+  });
+});
+
+describe("TASK-010 round 7: a path whose PARENT is a symlink", () => {
+  /**
+   * `resolvedPath` fell back to lexical resolution when the path did not exist
+   * yet, so with `workspace -> .` and no `dist` built, `workspace/dist`
+   * resolved somewhere other than `dist` and was refused — even though tsc
+   * would write to exactly the managed directory.
+   */
+  it("ACCEPTS an outDir reached through a symlinked parent, before dist exists", () => {
+    const root = makeFixtureRepo();
+    rmSync(join(root, "dist"), { recursive: true, force: true });
+    symlinkSync(root, join(root, "workspace"), "dir");
+
+    const { status, output } = runWithShowConfigShim(
+      root,
+      JSON.stringify({ compilerOptions: { outDir: "workspace/dist", noEmit: false } }),
+    );
+    assert.equal(status, 0, `a symlinked-parent outDir was wrongly refused:\n${output.slice(0, 500)}`);
+  });
+});
+
+describe("TASK-010 round 7: each readability layer is pinned separately", () => {
+  /**
+   * Round-7 review: removing EITHER readability assertion left both
+   * unreadable-subtree tests green, because the other caught it. Two guards
+   * covering one case is defence in depth; a test that cannot tell them apart
+   * proves neither.
+   *
+   * Each stage names itself, so each can be pinned by the message only it
+   * produces.
+   */
+  it("refuses BEFORE BUILDING when a source subtree is unreadable", () => {
+    const root = makeFixtureRepo();
+    mkdirSync(join(root, "tests/hidden"), { recursive: true });
+    writeFileSync(join(root, "tests/hidden/x.test.ts"), 'import { it } from "node:test";\nit("x", () => {});\n');
+    chmodSync(join(root, "tests/hidden"), 0o000);
+    try {
+      const { output } = runHarness(root);
+      assert.match(
+        output,
+        /refused before building: these directories could not be read/,
+        "the PRE-BUILD layer did not fire; the later one may be masking it",
+      );
+    } finally {
+      chmodSync(join(root, "tests/hidden"), 0o755);
+    }
+  });
+
+  it("refuses BEFORE AUDITING when the output becomes unreadable after the build", () => {
+    const root = makeFixtureRepo();
+    assert.equal(runHarness(root).status, 0, "the fixture must pass first");
+
+    // Readable while the source is scanned, unreadable by the time the output
+    // is audited: only the later layer can catch this.
+    mkdirSync(join(root, "dist/hidden"), { recursive: true });
+    writeFileSync(join(root, "dist/hidden/ghost.test.js"), "// stale\n");
+    chmodSync(join(root, "dist/hidden"), 0o000);
+    try {
+      const { status, output } = runHarness(root);
+      assert.notEqual(status, 0);
+      assert.match(output, /could not be read/);
+    } finally {
+      chmodSync(join(root, "dist/hidden"), 0o755);
+    }
+  });
+});

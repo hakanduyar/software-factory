@@ -181,16 +181,21 @@ function deviceOf(path) {
  * sometimes wrong.
  */
 function findHardlinkedSources(directory) {
-  const found = [];
-  for (const rel of listFiles(directory)) {
-    if (!rel.endsWith(".ts") && !rel.endsWith(".mts") && !rel.endsWith(".cts")) continue;
-    try {
-      if (lstatSync(join(REPO_ROOT, rel)).nlink > 1) found.push(rel);
-    } catch {
-      /* unreadable entries are reported by the walk itself */
-    }
-  }
-  return found.sort();
+  /**
+   * EVERY file, not only `.ts`/`.mts`/`.cts` (round-7 CRITICAL).
+   *
+   * The suffix filter encoded an assumption about what tsc compiles, and the
+   * assumption was wrong: with `allowJs`, an external `foreign.js` hardlinked
+   * into `src/` was compiled, executed by a test, and the run exited 0 with
+   * "tree-consistent". `resolveJsonModule` and future options make the same
+   * mistake available again.
+   *
+   * What a compiler decides to read is not a fact this file can predict from a
+   * filename, so it stops guessing. The POLICY is unchanged and already refuses
+   * more than strictly necessary: a hardlink inside the repository is
+   * indistinguishable from one pointing outside, so all are refused.
+   */
+  return findHardlinkedUnder(directory);
 }
 
 /**
@@ -270,7 +275,30 @@ function realOrUndefined(path) {
  */
 function resolvedPath(candidate) {
   const absolute = resolve(REPO_ROOT, candidate);
-  return realOrUndefined(absolute) ?? absolute;
+  const direct = realOrUndefined(absolute);
+  if (direct !== undefined) {
+    return direct;
+  }
+  /**
+   * The path does not exist YET — but its parents might, and one of them might
+   * be a symlink (round-7 finding). With `workspace -> .` and no `dist` built,
+   * `workspace/dist` resolved lexically to a different directory than `dist`
+   * and was refused, even though tsc would write to exactly the managed one.
+   *
+   * So: resolve the longest EXISTING ancestor, then re-attach the remainder.
+   * Falls back to the lexical answer when nothing on the path exists, which is
+   * the same conservative result as before.
+   */
+  const parts = absolute.split("/");
+  const tail = [];
+  while (parts.length > 1) {
+    tail.unshift(parts.pop());
+    const real = realOrUndefined(parts.join("/") || "/");
+    if (real !== undefined) {
+      return [real.replace(/\/+$/, ""), ...tail].join("/");
+    }
+  }
+  return absolute;
 }
 
 /** True when two path spellings name one directory. */
