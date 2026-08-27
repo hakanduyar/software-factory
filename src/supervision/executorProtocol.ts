@@ -73,9 +73,26 @@ export interface ExecutorRequest {
  * strength of their declared type, and a declared type is a claim about the
  * caller rather than a fact about the value: a malformed object in a `string`
  * field crosses the boundary just as an array element did.
+ *
+ * Round-7 finished the job. Fixing the two fields a reviewer named and leaving
+ * the rest is fixing an instance and not a class — `actionId`, the provider and
+ * model identities, and the checkpoint's `actionId` all carried objects
+ * through. EVERY free-text scalar goes through this now; the only fields still
+ * copied as declared are the literal UNIONS, which have no free text to hide in
+ * and whose only consumer fails closed on an unrecognised value.
  */
 function asPlainString(value: unknown): string {
   return typeof value === "string" ? value : "";
+}
+
+/**
+ * A NUMBER field is copied on exactly the same strength as a string one, and an
+ * object in a `number` field crosses the boundary exactly as far. Non-finite
+ * values go too: `NaN` and `Infinity` do not survive JSON, so forwarding them
+ * would put `null` in a field the child's parser declares numeric.
+ */
+function asPlainNumber(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
 export function buildExecutorRequest(input: WorkExecutionInput): ExecutorRequest {
@@ -102,29 +119,29 @@ export function buildExecutorRequest(input: WorkExecutionInput): ExecutorRequest
       title: asPlainString(item.title),
       dependsOn: item.dependsOn.map(asPlainString),
       /**
-       *  and  are literal UNIONS, not free text, so they are
-       * copied as declared. Coercing them to  breaks the contract, and
+       * "status" and "workClass" are literal UNIONS, not free text, so they are
+       * copied as declared. Coercing them to string breaks the contract, and
        * substituting a fallback would silently change meaning — the child reads
-       *  for exactly one comparison, and a malformed value simply
+       * "workClass" for exactly one comparison, and a malformed value simply
        * fails that comparison, which is already the closed direction.
        */
       status: item.status,
       workClass: item.workClass,
-      order: item.order,
-      ...(item.attempts === undefined ? {} : { attempts: item.attempts }),
-      ...(item.detail === undefined ? {} : { detail: item.detail }),
+      order: asPlainNumber(item.order),
+      ...(item.attempts === undefined ? {} : { attempts: asPlainNumber(item.attempts) }),
+      ...(item.detail === undefined ? {} : { detail: asPlainString(item.detail) }),
     },
-    actionId: input.actionId,
+    actionId: asPlainString(input.actionId),
     ...(config === undefined
       ? {}
       : {
           config: {
-            requestedProvider: config.requestedProvider,
-            requestedModel: config.requestedModel,
-            ...(config.requestedEffort === undefined ? {} : { requestedEffort: config.requestedEffort }),
-            effectiveProvider: config.effectiveProvider,
-            effectiveModel: config.effectiveModel,
-            ...(config.effectiveEffort === undefined ? {} : { effectiveEffort: config.effectiveEffort }),
+            requestedProvider: asPlainString(config.requestedProvider),
+            requestedModel: asPlainString(config.requestedModel),
+            ...(config.requestedEffort === undefined ? {} : { requestedEffort: asPlainString(config.requestedEffort) }),
+            effectiveProvider: asPlainString(config.effectiveProvider),
+            effectiveModel: asPlainString(config.effectiveModel),
+            ...(config.effectiveEffort === undefined ? {} : { effectiveEffort: asPlainString(config.effectiveEffort) }),
             verification: config.verification,
             argvEvidence: config.argvEvidence.map(asPlainString),
             note: asPlainString(config.note),
@@ -135,14 +152,14 @@ export function buildExecutorRequest(input: WorkExecutionInput): ExecutorRequest
       : {
           checkpoint: {
             roadmapKey: asPlainString(checkpoint.roadmapKey),
-            actionId: checkpoint.actionId,
+            actionId: asPlainString(checkpoint.actionId),
             requiredWorkClass: checkpoint.requiredWorkClass,
-            iteration: checkpoint.iteration,
+            iteration: asPlainNumber(checkpoint.iteration),
             nextAction: asPlainString(checkpoint.nextAction),
             findings: checkpoint.findings.map(asPlainString),
             completedVerification: checkpoint.completedVerification.map(asPlainString),
             pendingVerification: checkpoint.pendingVerification.map(asPlainString),
-            updatedAt: checkpoint.updatedAt,
+            updatedAt: asPlainNumber(checkpoint.updatedAt),
           },
         }),
   };

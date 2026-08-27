@@ -358,7 +358,25 @@ function assertNoLinksUnder(paths: readonly string[]): void {
     let entries;
     try {
       entries = readdirSync(current, { withFileTypes: true });
-    } catch {
+    } catch (error) {
+      /**
+       * FAILS CLOSED (round-7 CRITICAL).
+       *
+       * The catch returned silently, so a directory inside a grant that could
+       * not be read was scanned as though it were empty — and a link hiding
+       * there was never found. "The walk did not crash" is not "the walk found
+       * nothing"; the verifier had exactly this defect in its own scans, one
+       * round earlier.
+       *
+       * A directory that does not EXIST is genuinely nothing; one that exists
+       * and cannot be read is unknown, and unknown must not be granted.
+       */
+      if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") {
+        throw new Error(
+          `refusing to run an isolated executor: ${current} is inside a granted directory and could not be ` +
+            "read, so whether it contains a link is unknown. An unreadable directory is not an empty one.",
+        );
+      }
       return;
     }
     for (const entry of entries) {

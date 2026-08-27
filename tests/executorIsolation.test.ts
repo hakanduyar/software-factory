@@ -15,7 +15,7 @@
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { linkSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, linkSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, describe, it } from "node:test";
@@ -1111,5 +1111,103 @@ describe("TASK-011 round 6: scalar fields are validated at runtime too", () => {
 
     const request = buildExecutorRequest(contaminated) as unknown as { item: { title: unknown } };
     assert.equal(typeof request.item.title, "string", "an object crossed the boundary in a string field");
+  });
+});
+
+describe("TASK-011 round 7: an unreadable directory inside a grant", () => {
+  /**
+   * CRITICAL. The grant walk caught every `readdirSync` error and returned, so
+   * a directory it could not read was scanned as though it were empty — and a
+   * link hiding in there was never found. "The walk did not crash" is not "the
+   * walk found nothing".
+   *
+   * This is the same fail-open the verifier had in its own scans one round
+   * earlier, which is why it is worth stating as a rule rather than a fix: an
+   * unreadable subtree is not an empty one.
+   */
+  it("REFUSES to run when a directory inside a grant cannot be read", async () => {
+    const script = childScript("export {};");
+    const dir = dirname(script);
+    const closed = join(dir, "closed");
+    mkdirSync(closed, { recursive: true });
+    writeFileSync(join(closed, "ordinary.txt"), "x");
+    chmodSync(closed, 0o000);
+
+    // The fixture must actually block the read, or it demonstrates nothing.
+    let blocked = false;
+    try {
+      readdirSync(closed);
+    } catch {
+      blocked = true;
+    }
+    if (!blocked) {
+      chmodSync(closed, 0o700);
+      assert.fail("this fixture cannot block a directory read (running as root?), so it proves nothing");
+    }
+
+    try {
+      await assert.rejects(
+        executorFor(script, 30_000).execute(INPUT),
+        /could not be read/,
+        "an unreadable directory inside the grant was scanned as empty",
+      );
+    } finally {
+      chmodSync(closed, 0o700);
+    }
+  });
+});
+
+describe("TASK-011 round 7: every scalar is validated, not just the two that were named", () => {
+  /**
+   * Round 6 validated `title` and `note` — the two fields a reviewer had put an
+   * object into. Round 7 put objects in the others and they crossed: `actionId`,
+   * the provider and model identities, and the checkpoint's `actionId` were all
+   * still copied on the strength of their declaration.
+   *
+   * Fixing the instances a reviewer names and leaving the class open is how the
+   * same finding comes back with a different field name.
+   */
+  it("does not forward the reviewer's payload in actionId or config", () => {
+    const contaminated = {
+      ...INPUT,
+      actionId: {
+        databasePath: "/home/hakanduyar/.factory/supervisor.db",
+        financialPolicy: { autonomousSpendAllowed: true },
+      } as unknown as string,
+      config: {
+        requestedProvider: { databasePath: "/home/hakanduyar/.factory/supervisor.db" } as unknown as string,
+        requestedModel: "m",
+        effectiveProvider: "p",
+        effectiveModel: "m",
+        verification: "UNVERIFIED",
+        argvEvidence: [],
+        note: "",
+      },
+    } as unknown as WorkExecutionInput;
+
+    const request = buildExecutorRequest(contaminated) as unknown as {
+      actionId: unknown;
+      config: { requestedProvider: unknown };
+    };
+    assert.equal(typeof request.actionId, "string", "an object crossed the boundary as actionId");
+    assert.equal(
+      typeof request.config.requestedProvider,
+      "string",
+      "an object crossed the boundary as a provider identity",
+    );
+    const serialized = JSON.stringify(request);
+    assert.ok(!serialized.includes("supervisor.db"), "the database path reached the child");
+    assert.ok(!serialized.includes("autonomousSpendAllowed"), "the financial policy reached the child");
+  });
+
+  /** A number field is copied on exactly the same strength as a string one. */
+  it("does not forward an object sitting in a number field", () => {
+    const contaminated = {
+      ...INPUT,
+      item: { ...ITEM, order: { databasePath: "/home/hakanduyar/.factory/supervisor.db" } as unknown as number },
+    } as unknown as WorkExecutionInput;
+
+    const request = buildExecutorRequest(contaminated) as unknown as { item: { order: unknown } };
+    assert.equal(typeof request.item.order, "number", "an object crossed the boundary in a number field");
   });
 });
