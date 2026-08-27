@@ -1324,3 +1324,119 @@ describe("TASK-008 round 3: a lone surrogate cannot be persisted either", () => 
     );
   });
 });
+
+
+// =====================================================================
+// ROUND-4 — recognition, and a broken chain found on disk
+// =====================================================================
+
+describe("TASK-008 round 4: an unrecognised identity is not lineage", () => {
+  /**
+   * THE CRITICAL. Catalog recognition was applied only to ANCESTORS, so the
+   * reviewed item's row and chain could agree on a resource that is not in the
+   * code-level catalog at all. That fake identity was dutifully excluded — and
+   * the real implementer, named nowhere, stayed eligible. The reviewer had
+   * Codex review its own work through exactly that gap.
+   */
+  it("REFUSES when the reviewed item names an implementer no catalog knows", async () => {
+    const appended = appendProvenance([], {
+      kind: "IMPLEMENTED_BY",
+      roadmapKey: "B",
+      resourceKey: "not-a-catalog-resource",
+      detail: "implemented",
+      recordedAt: 1_000,
+    });
+    assert.equal(appended.ok, true);
+    if (!appended.ok) throw new Error("unreachable");
+
+    const supervisor = newSupervisor({ probe: healthyProbe() });
+    const state = await supervisor.service.ensureInitialized();
+    await supervisor.repository.compareAndSave(
+      {
+        ...state,
+        version: state.version + 1,
+        roadmap: [
+          {
+            key: "B",
+            title: "Review of A",
+            dependsOn: ["A"],
+            status: "ELIGIBLE",
+            workClass: "INDEPENDENT_REVIEW",
+            order: 1,
+            attempts: 1,
+            implementedByResourceKeys: ["not-a-catalog-resource"],
+          } as RoadmapItem,
+          { key: "A", title: "Done", dependsOn: [], status: "DONE", workClass: "DETERMINISTIC", order: 2 },
+        ],
+        provenance: appended.chain,
+      },
+      state.version,
+    );
+
+    const result = await supervisor.service.tick();
+    assert.equal(
+      result.kind,
+      "WAITING_FOR_HUMAN",
+      "an implementer this installation cannot recognise must fail closed",
+    );
+    for (const call of supervisor.executor.calls()) {
+      assert.notEqual(call.item.key, "B", "the review ran on unrecognisable lineage");
+    }
+  });
+});
+
+describe("TASK-008 round 4: a broken chain on disk is a DECISION, not a crash", () => {
+  /**
+   * The repository refuses to persist a chain that does not verify — correctly.
+   * The consequence the reviewer found: the tick's ordinary housekeeping write
+   * then threw `SchemaIntegrityError`, so a tampered database produced a stack
+   * trace, zero executor calls and NO recorded escalation.
+   *
+   * Fail-closed has to mean the supervisor decided to stop, not that it fell
+   * over on the way to deciding.
+   *
+   * Tampered by writing the ROW DIRECTLY, which is how it happens.
+   */
+  it("returns WAITING_FOR_HUMAN instead of throwing", async () => {
+    const { DatabaseSync } = await import("node:sqlite");
+    const dbPath = tempDbPath("t8-broken-ondisk");
+
+    const repository = createSqliteSupervisorRepository(dbPath);
+    const seeded = await repository.create({
+      version: 1,
+      financialPolicy: { autonomousSpendAllowed: false, autonomousSpendLimit: 0 },
+      resources: [],
+      roadmap: [
+        { key: "A", title: "Implemented", dependsOn: [], status: "DONE", workClass: "NORMAL_IMPLEMENTATION", order: 1 },
+      ],
+      checkpoints: [],
+      escalations: [],
+      provenance: chainFor("claude-code:opus"),
+      updatedAt: 1_000,
+    });
+    repository.close();
+
+    const db = new DatabaseSync(dbPath);
+    db.prepare("UPDATE supervisor_state SET data = ? WHERE id = ?").run(
+      JSON.stringify({
+        ...seeded,
+        provenance: seeded.provenance.map((entry) => ({ ...entry, detail: "edited on disk" })),
+      }),
+      "supervisor",
+    );
+    db.close();
+
+    const reopened = createSqliteSupervisorRepository(dbPath);
+    const supervisor = newSupervisor({ probe: healthyProbe(), repository: reopened });
+    try {
+      const result = await supervisor.service.tick();
+      assert.equal(result.kind, "WAITING_FOR_HUMAN", "a tampered chain must produce a decision");
+      if (result.kind === "WAITING_FOR_HUMAN") {
+        assert.match(result.humanActionRequired, /provenance/i);
+      }
+      assert.equal(supervisor.executor.calls().length, 0, "nothing may run on unverifiable history");
+    } finally {
+      reopened.close();
+    }
+  });
+});

@@ -39,6 +39,7 @@ import {
   appendProvenance,
   implementersByRoadmapKey,
   keysWithUnknownImplementer,
+  verifyChain,
   type ProvenanceEntry,
 } from "./provenanceChain.js";
 import { boundedDiagnostic, classifyResourceOutcome, type Classification } from "./resourceClassifier.js";
@@ -265,6 +266,13 @@ export class SupervisorService {
 
   private async runTick(): Promise<TickResult> {
     const state = await this.ensureInitialized();
+
+    // 0. Refuse before anything tries to WRITE. The repository will not persist
+    //    a broken chain, so housekeeping would throw rather than decide.
+    const broken = this.brokenChainOutcome(state);
+    if (broken !== undefined) {
+      return broken;
+    }
 
     // 1. Reconcile any claim left behind by a previous process.
     const reconciled = await this.reconcileClaim(state);
@@ -1257,8 +1265,31 @@ export class SupervisorService {
        * A never-started ancestor (no attempts, not DONE, not BLOCKED) genuinely
        * has no implementer to record, and is not ambiguous.
        */
-      if (key !== item.key && requiresAi(entry.workClass)) {
-        const workHappened = entry.status === "DONE" || entry.status === "BLOCKED" || (entry.attempts ?? 0) > 0;
+      /**
+       * INCLUDES THE ITEM UNDER REVIEW (round-4 CRITICAL).
+       *
+       * Recognition was applied only to ancestors, so the reviewed item's row
+       * and chain could agree on a resource that is not in the code-level
+       * catalog at all. That fake identity was dutifully excluded — and the
+       * REAL implementer, never named anywhere, stayed eligible. The reviewer
+       * had Codex review its own work through exactly that gap.
+       *
+       * An unrecognised implementer is not lineage; it is an unrecognised
+       * string sitting where lineage should be, and it is no less suspicious
+       * for being attached to the item being reviewed rather than to one of
+       * its ancestors.
+       */
+      if (requiresAi(entry.workClass)) {
+        /**
+         * For the item under review, ATTEMPTS alone are not evidence that an
+         * implementer exists: a review that has been attempted once has run a
+         * reviewer, not an implementer. Its recorded identities are still
+         * checked below — what changes is only whether SILENCE is suspicious.
+         */
+        const workHappened =
+          key === item.key
+            ? entry.status === "DONE" || entry.status === "BLOCKED"
+            : entry.status === "DONE" || entry.status === "BLOCKED" || (entry.attempts ?? 0) > 0;
         const history = implementerHistory(entry);
         /**
          * R7-C4-1: a history entry that names no resource this installation
@@ -1288,7 +1319,23 @@ export class SupervisorService {
             ? undefined
             : `${entry.lastRunConfig.effectiveProvider}:${entry.lastRunConfig.effectiveModel}`;
         const contradicted = fromRunConfig !== undefined && !history.includes(fromRunConfig);
-        if (workHappened && (history.length === 0 || unrecognised.length > 0 || contradicted)) {
+        /**
+         * `workHappened` governs SILENCE, and nothing else.
+         *
+         * An empty history is only suspicious if work actually happened — a
+         * never-started item genuinely has no implementer to record. But a
+         * history naming something UNRECOGNISED, or contradicting the recorded
+         * run configuration, is suspicious on its own terms: those are
+         * assertions about who ran, and a wrong assertion does not become
+         * harmless because the item has not finished.
+         *
+         * The first version gated all three on `workHappened`, so the reviewed
+         * item — ELIGIBLE, so not "done" — could name a resource no catalog
+         * knows and be waved through, while the real implementer stayed
+         * eligible to review it.
+         */
+        const silentButShouldNotBe = workHappened && history.length === 0;
+        if (silentButShouldNotBe || unrecognised.length > 0 || contradicted) {
           ambiguous.push(key);
         }
       }
@@ -1466,6 +1513,38 @@ export class SupervisorService {
       .map((record) => record.retryAt)
       .filter((value): value is Timestamp => value !== undefined);
     return candidates.length === 0 ? undefined : Math.min(...candidates);
+  }
+
+  /**
+   * A chain that does not verify makes the state UNUSABLE FOR WRITING, because
+   * the repository refuses to persist it — correctly. Round-4 review then found
+   * the consequence: the tick's ordinary housekeeping write threw
+   * `SchemaIntegrityError`, so a supervisor whose durable history had been
+   * tampered with produced a stack trace, zero executor calls, and NO recorded
+   * escalation. Fail-closed has to mean the supervisor decided to stop, not
+   * that it fell over on the way to deciding.
+   *
+   * Detected on LOAD, before anything tries to write, and reported as the
+   * human-decision it is.
+   */
+  private brokenChainOutcome(state: SupervisorState): TickResult | undefined {
+    if (state.provenance.length === 0) {
+      return undefined;
+    }
+    const verdict = verifyChain(state.provenance);
+    if (verdict.intact) {
+      return undefined;
+    }
+    const action =
+      "Durable provenance no longer verifies, so who implemented what cannot be established and no review " +
+      `can be trusted. Restore the supervisor database from a known-good backup. Detail: ${verdict.problem}`;
+    this.log(`[supervisor] provenance chain is broken: ${verdict.problem}`);
+    return {
+      kind: "WAITING_FOR_HUMAN",
+      roadmapKey: state.roadmap[0]?.key ?? "unknown",
+      reason: "HUMAN_DECISION_REQUIRED",
+      humanActionRequired: boundedDiagnostic(action),
+    };
   }
 
   private async escalate(
