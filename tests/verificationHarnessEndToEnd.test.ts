@@ -1206,15 +1206,24 @@ describe("TASK-010 round 3: nothing is written through a hostile path", () => {
     const { status, output } = runHarness(root);
 
     assert.notEqual(status, 0, "a symlinked output directory was accepted");
-    assert.match(
-      output,
-      /refused before building: the build output directory is a symlink/,
-      `the PRE-BUILD layer did not fire:\n${output.slice(0, 400)}`,
-    );
+    /**
+     * SUBSTANCE FIRST, wording second (round-4 finding).
+     *
+     * The first version asserted the message before the filesystem state, so a
+     * mutated run failed on the message and never reached the assertion that
+     * actually matters — the mutation proof was wording-driven, which is
+     * circular. Checking the emptiness first means removing the guard fails on
+     * the property, not on a string.
+     */
     assert.deepEqual(
       listing(target),
       [],
       "the build wrote through the symlink before the refusal — the early guard did not run first",
+    );
+    assert.match(
+      output,
+      /refused before building: the build output directory is a symlink/,
+      `the PRE-BUILD layer did not fire:\n${output.slice(0, 400)}`,
     );
   });
 
@@ -1233,16 +1242,16 @@ describe("TASK-010 round 3: nothing is written through a hostile path", () => {
     const { status, output } = runHarness(root);
 
     assert.notEqual(status, 0);
-    assert.match(
-      output,
-      /refused before building: the tests directory is a symlink/,
-      `the PRE-BUILD layer did not fire:\n${output.slice(0, 400)}`,
-    );
-    // The external suite must not have been compiled into the output.
+    // Substance first — see the note above.
     assert.deepEqual(
       listing(join(root, "dist")),
       distBefore,
       "the external suite was compiled before the refusal",
+    );
+    assert.match(
+      output,
+      /refused before building: the tests directory is a symlink/,
+      `the PRE-BUILD layer did not fire:\n${output.slice(0, 400)}`,
     );
   });
 
@@ -1258,11 +1267,59 @@ describe("TASK-010 round 3: nothing is written through a hostile path", () => {
     const { status, output } = runHarness(root);
 
     assert.notEqual(status, 0);
-    assert.match(output, /refused before building: symlinked or hardlinked entries/);
+    // Substance first — see the note above.
     assert.deepEqual(
       listing(join(root, "dist")),
       distBefore,
       "the linked source was compiled before the refusal",
     );
+    assert.match(output, /refused before building: symlinked or hardlinked entries/);
   });
+});
+
+
+// =====================================================================
+// ROUND-4 CRITICAL — a symlinked source ROOT produced a FALSE SUCCESS
+// =====================================================================
+
+describe("TASK-010 round 4: an entire source root cannot be a link", () => {
+  /**
+   * `findSymlinks("src")` walked what was INSIDE `src` and never asked whether
+   * `src` itself was a link. `tests` was checked; `src` was not — two roots
+   * written as two lines, one of which grew a guard the other did not.
+   *
+   * The consequence was the worst outcome this script can produce: the
+   * external `testArtifacts.ts` was compiled and imported, and because a module
+   * calling `process.exit(0)` at import time wins before any later guard runs,
+   * the run EXITED 0 WITH NO OUTPUT. Not a crash — a false pass.
+   */
+  for (const root of ["src", "tests"] as const) {
+    it(`REFUSES a symlinked ${root} root, and does not exit 0`, () => {
+      const fixture = makeFixtureRepo();
+      const external = mkdtempSync(join(tmpdir(), `sf-external-${root}-`));
+      created.push(external);
+
+      // Mirror the real layout so the build would genuinely succeed if the
+      // link were followed — otherwise the refusal proves nothing.
+      cpSync(join(fixture, root), external, { recursive: true });
+      if (root === "src") {
+        // ...and make the external checker hostile, exactly as reproduced.
+        writeFileSync(
+          join(external, "verification/testArtifacts.ts"),
+          "process.exit(0);\nexport {};\n",
+        );
+      }
+      rmSync(join(fixture, root), { recursive: true, force: true });
+      symlinkSync(external, join(fixture, root), "dir");
+
+      const { status, output } = runHarness(fixture);
+
+      assert.notEqual(status, 0, `a symlinked ${root} root produced a SUCCESS`);
+      assert.ok(
+        !output.includes("tree-consistent"),
+        "it must not claim consistency about a tree it did not read",
+      );
+      assert.match(output, new RegExp(`refused before building: the ${root} directory is a symlink`));
+    });
+  }
 });

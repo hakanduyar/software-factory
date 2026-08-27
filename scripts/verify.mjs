@@ -98,6 +98,16 @@ import { fileURLToPath } from "node:url";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const OUTPUT_DIR = "dist";
+/**
+ * Every directory this build compiles FROM.
+ *
+ * Written as one list because the round-4 CRITICAL came from having two: `src`
+ * and `tests` were handled on separate lines, `tests` gained a root-symlink
+ * check, `src` did not, and an entire symlinked `src` sailed through every
+ * guard into a false success. A list is checked once; a pair of lines has to
+ * be remembered twice.
+ */
+const SOURCE_ROOTS = ["src", "tests"];
 /** How long `--showConfig` may take before the run fails closed, saying so. */
 const CONFIG_TIMEOUT_MS = 120_000;
 const CHECKER_PATH = join(REPO_ROOT, OUTPUT_DIR, "src/verification/testArtifacts.js");
@@ -380,8 +390,27 @@ const noEmit = effectiveConfig.compilerOptions.noEmit === true;
  * still empty — which is the property that actually matters and cannot be
  * satisfied by a later refusal.
  */
-if (isSymlink(join(REPO_ROOT, "tests"))) {
-  fail("verification refused before building: the tests directory is a symlink; an external suite would be compiled and executed as though it belonged to this tree");
+/**
+ * EVERY source root, not just `tests` (round-4 CRITICAL).
+ *
+ * `findSymlinks("src")` walks what is INSIDE `src`; it never asked whether
+ * `src` itself was a link. `tests` was checked here and `src` was not, so a
+ * repository whose entire `src` pointed elsewhere passed every guard: the
+ * external `testArtifacts.ts` was compiled and imported, and a module calling
+ * `process.exit(0)` at import time produced EXIT 0 WITH NO OUTPUT.
+ *
+ * A false success is the worst outcome this file can produce — worse than a
+ * crash, because nothing looks wrong. The asymmetry existed only because the
+ * two roots were written as separate lines instead of a list, which is exactly
+ * the kind of omission a list prevents and a pair of lines invites.
+ */
+for (const root of SOURCE_ROOTS) {
+  if (isSymlink(join(REPO_ROOT, root))) {
+    fail(
+      `verification refused before building: the ${root} directory is a symlink; external code would be ` +
+        "compiled and executed as though it belonged to this tree",
+    );
+  }
 }
 if (isSymlink(join(REPO_ROOT, OUTPUT_DIR))) {
   fail("verification refused before building: the build output directory is a symlink; the build would write outside the repository");
@@ -400,10 +429,8 @@ if (isSymlink(join(REPO_ROOT, OUTPUT_DIR))) {
  * first, and it runs before the build too, because the build compiles the link.
  */
 const linkedSources = [
-  ...findSymlinks("src"),
-  ...findSymlinks("tests"),
-  ...findHardlinkedSources("src"),
-  ...findHardlinkedSources("tests"),
+  ...SOURCE_ROOTS.flatMap((root) => findSymlinks(root)),
+  ...SOURCE_ROOTS.flatMap((root) => findHardlinkedSources(root)),
 ].sort();
 if (linkedSources.length > 0) {
   fail(
