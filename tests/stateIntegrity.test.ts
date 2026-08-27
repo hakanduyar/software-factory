@@ -112,6 +112,8 @@ function chainFor(resource: string, recordedAt = 1_000): readonly ProvenanceEntr
 async function reviewWith(input: {
   readonly item: Partial<RoadmapItem>;
   readonly provenance?: readonly ProvenanceEntry[];
+  /** Record a matching anchor, so the chain is not read as legacy silence. */
+  readonly anchor?: boolean;
 }) {
   const supervisor = newSupervisor({ probe: healthyProbe() });
   const state = await supervisor.service.ensureInitialized();
@@ -133,6 +135,9 @@ async function reviewWith(input: {
         } as RoadmapItem,
       ],
       ...(input.provenance === undefined ? {} : { provenance: input.provenance }),
+      ...(input.anchor === true && input.provenance !== undefined
+        ? { provenanceAnchor: anchorFor(input.provenance) }
+        : {}),
     },
     state.version,
   );
@@ -1629,6 +1634,110 @@ describe("TASK-008 round 6: the chain's names are recognised too", () => {
     assert.equal(result.kind, "WAITING_FOR_HUMAN", "an unrecognisable chain identity was accepted");
     for (const call of supervisor.executor.calls()) {
       assert.notEqual(call.item.key, "B", "a review ran on lineage nobody can recognise");
+    }
+  });
+});
+
+
+// =====================================================================
+// ROUND-7 — an anchor's head is half its claim
+// =====================================================================
+
+describe("TASK-008 round 7: a zero-length anchor still asserts something", () => {
+  /**
+   * CRITICAL. The early return checked only the anchor's LENGTH, so an anchor
+   * claiming zero entries but a NON-GENESIS head — a contradiction on its face
+   * — skipped verification entirely.
+   */
+  it("REFUSES an empty chain whose anchor names a head it cannot have", async () => {
+    const supervisor = newSupervisor({ probe: healthyProbe() });
+    const state = await supervisor.service.ensureInitialized();
+    await supervisor.repository.compareAndSave(
+      {
+        ...state,
+        version: state.version + 1,
+        /**
+         * The dependency is DETERMINISTIC with no implementers, so none of the
+         * row-based or chain-based rules can object. The self-contradictory
+         * anchor is the ONLY thing left that could refuse.
+         *
+         * My first fixture gave A an implementer, so the row/chain
+         * disagreement refused it and the test passed with or without the
+         * anchor check — mutation testing showed it surviving.
+         */
+        roadmap: [
+          { key: "B", title: "Review of A", dependsOn: ["A"], status: "ELIGIBLE", workClass: "INDEPENDENT_REVIEW", order: 1 },
+          { key: "A", title: "Prepared", dependsOn: [], status: "DONE", workClass: "DETERMINISTIC", order: 2 },
+        ],
+        provenance: [],
+        provenanceAnchor: { length: 0, headDigest: chainFor("claude-code:opus")[0]!.digest },
+      },
+      state.version,
+    );
+
+    const result = await supervisor.service.tick();
+    assert.equal(result.kind, "WAITING_FOR_HUMAN", "a self-contradictory anchor was accepted");
+    assert.equal(supervisor.executor.calls().length, 0);
+  });
+
+  /** A genuinely empty state — zero length, genesis head — still advances. */
+  it("ACCEPTS an empty chain whose anchor is consistent with being empty", async () => {
+    const { result } = await reviewWith({
+      item: { implementedByResourceKeys: ["claude-code:opus"] },
+      provenance: [],
+    });
+    assert.equal(result.kind, "ADVANCED");
+  });
+});
+
+describe("TASK-008 round 7: what actually ran is read whatever the row claims", () => {
+  /**
+   * CRITICAL. The `lastRunConfig` cross-check lived inside the branch gated on
+   * the MUTABLE work class, so relabelling an ancestor `DETERMINISTIC` skipped
+   * it — and an item whose row and chain named Claude while its run
+   * configuration named Codex was reviewed by Codex.
+   *
+   * A record of what ran does not stop being a record because a mutable field
+   * was edited.
+   */
+  it("REFUSES when the run configuration names a resource neither record does", async () => {
+    const appended = appendProvenance([], {
+      kind: "IMPLEMENTED_BY",
+      roadmapKey: "A",
+      resourceKey: "claude-code:opus",
+      detail: "implemented",
+      recordedAt: 1_000,
+    });
+    assert.equal(appended.ok, true);
+    if (!appended.ok) throw new Error("unreachable");
+
+    const { result, supervisor } = await reviewWith({
+      item: {
+        // Relabelled, so the old gate would have skipped the cross-check.
+        workClass: "DETERMINISTIC",
+        implementedByResourceKeys: ["claude-code:opus"],
+        lastRunConfig: {
+          requestedProvider: "codex-cli",
+          requestedModel: "gpt-5.6-luna",
+          effectiveProvider: "codex-cli",
+          effectiveModel: "gpt-5.6-luna",
+          verification: "VERIFIED_EFFECTIVE",
+          argvEvidence: ["codex"],
+          note: "",
+        },
+      },
+      provenance: appended.chain,
+      anchor: true,
+    });
+
+    assert.equal(result.kind, "WAITING_FOR_HUMAN", "a relabelled row hid the run-configuration evidence");
+    for (const call of supervisor.executor.calls()) {
+      if (call.item.key !== "B" || call.config === undefined) continue;
+      assert.notEqual(
+        `${call.config.effectiveProvider}:${call.config.effectiveModel}`,
+        "codex-cli:gpt-5.6-luna",
+        "the resource that actually ran was chosen as the reviewer",
+      );
     }
   });
 });

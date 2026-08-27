@@ -38,6 +38,7 @@ import { requiresAi, selectResource, type RoutingPolicy } from "./modelRouting.j
 import {
   anchorFor,
   appendProvenance,
+  GENESIS_DIGEST,
   implementersByRoadmapKey,
   keysWithUnknownImplementer,
   verifyAgainstAnchor,
@@ -1234,6 +1235,12 @@ export class SupervisorService {
     );
     const excluded = new Set<string>();
     /**
+     * Computed before the row walk because the run-configuration cross-check
+     * above needs it, and that check must not depend on the mutable work class
+     * to decide whether it runs.
+     */
+    const chainImplementersEarly = implementersByRoadmapKey(state.provenance);
+    /**
      * Ancestors that DID AI work but recorded no implementer (F5-C4-1).
      *
      * The fifth review's counter-example: a DONE implementation item with no
@@ -1286,6 +1293,30 @@ export class SupervisorService {
        * for being attached to the item being reviewed rather than to one of
        * its ancestors.
        */
+      /**
+       * `lastRunConfig` is consulted REGARDLESS of the mutable work class
+       * (round-7 CRITICAL).
+       *
+       * It records what actually ran. Relabelling an item `DETERMINISTIC`
+       * skipped the whole branch, so an ancestor whose row and chain named
+       * Claude while its run configuration named Codex was never cross-checked
+       * — and Codex reviewed it. A record of what ran does not stop being a
+       * record because a mutable field was edited.
+       */
+      const runConfigResource =
+        entry.lastRunConfig === undefined
+          ? undefined
+          : `${entry.lastRunConfig.effectiveProvider}:${entry.lastRunConfig.effectiveModel}`;
+      if (runConfigResource !== undefined) {
+        excluded.add(runConfigResource);
+        const namedAnywhere =
+          implementerHistory(entry).includes(runConfigResource) ||
+          (chainImplementersEarly?.get(key) ?? []).includes(runConfigResource);
+        if (!namedAnywhere && !ambiguous.includes(key)) {
+          ambiguous.push(key);
+        }
+      }
+
       if (requiresAi(entry.workClass)) {
         /**
          * For the item under review, ATTEMPTS alone are not evidence that an
@@ -1542,7 +1573,15 @@ export class SupervisorService {
        * The same rule as above: an empty chain is legacy silence ONLY when no
        * anchor claims otherwise. With an anchor, an empty chain is a deletion.
        */
-      if (state.provenance.length === 0 && (state.provenanceAnchor?.length ?? 0) === 0) {
+      /**
+       * The same complete test as `brokenChainOutcome`: an empty chain is
+       * silence only when NO anchor claims otherwise, in either field.
+       */
+      const anchor = state.provenanceAnchor;
+      if (
+        state.provenance.length === 0 &&
+        (anchor === undefined || (anchor.length === 0 && anchor.headDigest === GENESIS_DIGEST))
+      ) {
         continue;
       }
       if (fromChain.length === 0 && fromRow.length === 0) {
@@ -1602,7 +1641,19 @@ export class SupervisorService {
      * chain with an anchor claiming entries is the loudest possible
      * contradiction.
      */
-    if (state.provenance.length === 0 && (state.provenanceAnchor?.length ?? 0) === 0) {
+    /**
+     * A zero-length anchor still ASSERTS SOMETHING (round-7 CRITICAL).
+     *
+     * The early return checked only the anchor's LENGTH, so an anchor claiming
+     * zero entries but a non-genesis head — a contradiction on its face —
+     * skipped verification entirely. An anchor is a claim about the whole
+     * chain, and half of the claim is the head.
+     */
+    const anchor = state.provenanceAnchor;
+    const emptyAndUnclaimed =
+      state.provenance.length === 0 &&
+      (anchor === undefined || (anchor.length === 0 && anchor.headDigest === GENESIS_DIGEST));
+    if (emptyAndUnclaimed) {
       return undefined;
     }
     const verdict = verifyAgainstAnchor(state.provenance, state.provenanceAnchor);
