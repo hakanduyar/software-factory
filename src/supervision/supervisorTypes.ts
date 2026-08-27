@@ -297,7 +297,7 @@ export const DEFAULT_ROADMAP: readonly RoadmapItem[] = [
    * tracked roadmap item rather than a paragraph of reassurance, and it sits
    * before anything is wired to actually execute autonomous work.
    */
-  { key: "EXECUTOR_ISOLATION", title: "Run executors in a restricted process with no ambient network or billing capability", dependsOn: ["SUPERVISOR_SERVICE"], status: "PENDING", workClass: "ARCHITECTURE_SECURITY", order: 3 },
+  { key: "EXECUTOR_ISOLATION", title: "Run executors in a restricted process with no ambient billing capability (network egress is NOT blocked)", dependsOn: ["SUPERVISOR_SERVICE"], status: "PENDING", workClass: "ARCHITECTURE_SECURITY", order: 3 },
   /**
    * The second thing TASK-006 cannot close from inside itself (finding
    * R9-C4-1).

@@ -611,3 +611,125 @@ describe("TASK-011 round 1: descendants do not outlive the wait (AC-7)", () => {
     assert.ok(!existsSync(evidence), "the terminated child was still running afterwards");
   });
 });
+
+
+// =====================================================================
+// ROUND-2 CRITICAL — the escape that never touched the child's filesystem
+// =====================================================================
+
+describe("TASK-011 round 2: the child cannot re-enter the supervisor", () => {
+  /**
+   * The reviewer defeated the whole isolation without reading one file from
+   * the child: it sent SIGUSR1 to its PARENT. Node's default handler opens an
+   * unauthenticated inspector on 127.0.0.1:9229, and the child — which is
+   * allowed network access, because nothing here can remove it — connected and
+   * evaluated code IN THE SUPERVISOR, reading the credential file it could not
+   * touch itself.
+   *
+   * Restricting the child's filesystem was never going to stop that: the
+   * capability being abused belonged to the parent. Owning the signal does.
+   *
+   * The child here reports whether the inspector port ACCEPTED a connection,
+   * which is the fact that matters — not whether the signal was delivered.
+   */
+  it("cannot open the supervisor's inspector by signalling it", async () => {
+    const script = childScript(
+      `import { readFileSync } from "node:fs";
+       import { connect } from "node:net";
+       JSON.parse(readFileSync(process.argv[2], "utf8"));
+       try { process.kill(process.ppid, "SIGUSR1"); } catch {}
+       await new Promise((r) => setTimeout(r, 800));
+       const verdict = await new Promise((resolve) => {
+         const socket = connect({ host: "127.0.0.1", port: 9229 });
+         const done = (v) => { try { socket.destroy(); } catch {} resolve(v); };
+         socket.on("connect", () => done("INSPECTOR_OPEN"));
+         socket.on("error", () => done("REFUSED"));
+         setTimeout(() => done("TIMEOUT"), 2000);
+       });
+       process.stdout.write(JSON.stringify({
+         protocol: ${EXECUTOR_PROTOCOL_VERSION},
+         outcome: { kind: "COMPLETED", detail: verdict },
+       }));`,
+    );
+    const executor = createIsolatedExecutor({ childScript: script, timeoutMs: 60_000 });
+    const outcome = await executor.execute(INPUT);
+
+    assert.equal(outcome.kind, "COMPLETED", "the probe child must run");
+    if (outcome.kind === "COMPLETED") {
+      assert.notEqual(
+        outcome.detail,
+        "INSPECTOR_OPEN",
+        "the child opened the supervisor's inspector — it can evaluate code in the parent",
+      );
+    }
+  });
+
+  /**
+   * AC-2 — `extraVars` layered arbitrary values on top of the allowlist, so a
+   * caller-supplied policy could hand the child HOME or an API key. The
+   * isolated environment is now built from allowed NAMES only.
+   */
+  it("IGNORES extraVars, which would otherwise bypass the allowlist", async () => {
+    const script = childScript(
+      `import { readFileSync } from "node:fs";
+       JSON.parse(readFileSync(process.argv[2], "utf8"));
+       process.stdout.write(JSON.stringify({
+         protocol: ${EXECUTOR_PROTOCOL_VERSION},
+         outcome: { kind: "COMPLETED", detail: Object.keys(process.env).sort().join(",") },
+       }));`,
+    );
+    const executor = createIsolatedExecutor({
+      childScript: script,
+      timeoutMs: 60_000,
+      environmentPolicy: {
+        allowedVars: ISOLATED_EXECUTOR_ENV_ALLOWLIST,
+        extraVars: { HOME: "/home/injected", ANTHROPIC_API_KEY: "sk-ant-api03-INJECTED-VIA-EXTRAVARS" },
+      },
+    });
+    const outcome = await executor.execute(INPUT);
+
+    assert.equal(outcome.kind, "COMPLETED");
+    if (outcome.kind === "COMPLETED") {
+      const names = outcome.detail.split(",");
+      assert.ok(!names.includes("HOME"), "extraVars injected HOME past the allowlist");
+      assert.ok(!names.includes("ANTHROPIC_API_KEY"), "extraVars injected a credential past the allowlist");
+    }
+  });
+
+  /**
+   * AC-7 — the timeout settled before the child was dead, so the supervisor
+   * moved on while it was still running. "Terminated" must be a statement of
+   * fact, not of intent.
+   */
+  it("does not report a timeout until the child has actually exited", async () => {
+    const script = childScript(
+      `import { readFileSync } from "node:fs";
+       JSON.parse(readFileSync(process.argv[2], "utf8"));
+       process.on("SIGTERM", () => {});
+       setInterval(() => {}, 1000);`,
+    );
+    const executor = createIsolatedExecutor({ childScript: script, timeoutMs: 1_200 });
+    const started = Date.now();
+    const outcome = await executor.execute(INPUT);
+    const elapsed = Date.now() - started;
+
+    assert.equal(outcome.kind, "RESOURCE_FAILURE");
+    if (outcome.kind === "RESOURCE_FAILURE") {
+      assert.equal(outcome.process.terminationReason, "TIMEOUT");
+    }
+    /**
+     * The child IGNORES SIGTERM, so it only dies when SIGKILL follows two
+     * seconds later. Settling on actual exit therefore cannot happen before
+     * ~3.2s; settling at the timeout instant would land at ~1.2s.
+     *
+     * The first version asserted `elapsed >= 1_200`, which the timeout instant
+     * also satisfies — mutation testing showed it surviving the exact change it
+     * was written to catch.
+     */
+    assert.ok(
+      elapsed >= 2_500,
+      `settled at ${elapsed}ms — before the child could have been killed, so "terminated" was not a fact`,
+    );
+    assert.ok(elapsed < 20_000, `did not settle promptly: ${elapsed}ms`);
+  });
+});

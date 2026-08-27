@@ -57,6 +57,11 @@
  * launching an AI worker needs exactly the access this child is denied, so
  * launches stay with the supervisor behind the gate that authorises them.
  *
+ * The claim is about THIS child's own capabilities. It is not a claim that
+ * no path from a compromised child to a provider can exist — round-2 review
+ * found one through the parent's inspector, closed above, and finding one
+ * class of escape is not proof there is no other.
+ *
  * The remaining egress gap is recorded in docs/KNOWN-LIMITATIONS.md and closes
  * with an OS-level control a human must install.
  */
@@ -117,6 +122,37 @@ export const ISOLATED_EXECUTOR_ENVIRONMENT_POLICY: EnvironmentPolicy = Object.fr
  * than guessing from a version string.
  */
 export const PERMISSION_DENIED_CODE = "ERR_ACCESS_DENIED";
+
+/**
+ * Closes the INSPECTOR door before any child exists (round-2 CRITICAL).
+ *
+ * The reviewer escaped the whole isolation without reading a single file from
+ * the child: it sent `SIGUSR1` to its parent. Node's default handler for that
+ * signal opens an UNAUTHENTICATED inspector on 127.0.0.1:9229, and the child —
+ * which is allowed network access, because nothing here can take it away —
+ * connected and issued `Runtime.evaluate` IN THE SUPERVISOR. From there it read
+ * the credential file the child itself could not touch.
+ *
+ * Restricting the child's filesystem was never going to stop that, because the
+ * capability being abused belonged to the PARENT.
+ *
+ * Installing our own `SIGUSR1` listener replaces Node's default, so the signal
+ * no longer opens anything. Measured: without a listener the port accepts a
+ * connection; with one it is refused.
+ *
+ * Idempotent, and deliberately global rather than per-executor: the supervisor
+ * has one signal disposition, and a child spawned by any path can send the
+ * signal.
+ */
+let inspectorDoorClosed = false;
+function closeInspectorDoor(): void {
+  if (inspectorDoorClosed) return;
+  inspectorDoorClosed = true;
+  process.on("SIGUSR1", () => {
+    // Deliberately does nothing. The point is to OWN the signal so Node's
+    // default inspector-opening handler does not run.
+  });
+}
 
 /** Default ceiling on a single execution. Overridable for tests. */
 export const DEFAULT_EXECUTOR_TIMEOUT_MS = 15 * 60 * 1000;
@@ -205,6 +241,7 @@ export function createIsolatedExecutor(options: IsolatedExecutorOptions): WorkEx
   const policy = options.environmentPolicy ?? ISOLATED_EXECUTOR_ENVIRONMENT_POLICY;
   const nodePath = options.nodePath ?? process.execPath;
   const permissionFlag = permissionFlagFor(nodePath);
+  closeInspectorDoor();
 
   /** One spawn, one outcome, whatever happens to the child. */
   const spawnChild = (requestPath: string, env: Record<string, string>): Promise<WorkOutcome> =>
@@ -311,10 +348,30 @@ export function createIsolatedExecutor(options: IsolatedExecutorOptions): WorkEx
         }
       }
 
+      /**
+       * SETTLES ONLY ONCE THE CHILD IS ACTUALLY DEAD (round-2 finding AC-7).
+       *
+       * The first version signalled and resolved immediately, so the supervisor
+       * moved on while the child was still running — "terminated" as a
+       * statement of intent rather than of fact. SIGKILL follows SIGTERM, and
+       * the outcome is delivered from the `close` handler, which fires when the
+       * process has genuinely exited.
+       *
+       * HONEST LIMIT: a descendant that calls `setsid` leaves the process group
+       * and cannot be reached this way. Following it needs a PID namespace,
+       * which needs privilege this process does not have — the same boundary as
+       * network egress, recorded in docs/KNOWN-LIMITATIONS.md.
+       */
+      let timedOut = false;
       const timer = setTimeout(() => {
+        timedOut = true;
         signalGroup("SIGTERM");
         setTimeout(() => signalGroup("SIGKILL"), 2_000).unref();
-        settle(processFailure("TIMEOUT", null, stdout, `${stderr}\n[timed out after ${timeoutMs}ms]`));
+        // Backstop: if `close` never arrives, still produce a verdict rather
+        // than hanging the tick forever.
+        setTimeout(() => {
+          settle(processFailure("TIMEOUT", null, stdout, `${stderr}\n[timed out after ${timeoutMs}ms; the child did not exit]`));
+        }, 10_000).unref();
       }, timeoutMs);
 
       child.on("error", (error: Error) => {
@@ -322,6 +379,10 @@ export function createIsolatedExecutor(options: IsolatedExecutorOptions): WorkEx
       });
 
       child.on("close", (code: number | null, signal: NodeJS.Signals | null) => {
+        if (timedOut) {
+          settle(processFailure("TIMEOUT", code, stdout, `${stderr}\n[timed out after ${timeoutMs}ms]`));
+          return;
+        }
         if (overflowed) {
           settle(processFailure("EXITED", code, "", `${stderr}\n[response exceeded ${MAX_RESPONSE_BYTES} bytes]`));
           return;
@@ -347,7 +408,19 @@ export function createIsolatedExecutor(options: IsolatedExecutorOptions): WorkEx
 
   return {
     async execute(input: WorkExecutionInput): Promise<WorkOutcome> {
-      const env = buildWorkerEnvironment(policy, options.sourceEnv ?? process.env);
+      /**
+       * The policy's `extraVars` are IGNORED here (round-2 finding AC-2).
+       *
+       * `buildWorkerEnvironment` layers them on top of the allowlist by design,
+       * which is right for a worker the gate has authorised and wrong for this
+       * child: a caller-supplied policy could inject HOME or an API key and
+       * walk straight past the allowlist. The isolated environment is built
+       * from allowed names ONLY, so there is no channel to add to it.
+       */
+      const env = buildWorkerEnvironment(
+        { allowedVars: policy.allowedVars },
+        options.sourceEnv ?? process.env,
+      );
 
       /**
        * The request goes in a FILE, not down the child's standard input.
