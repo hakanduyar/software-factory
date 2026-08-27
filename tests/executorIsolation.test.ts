@@ -15,7 +15,7 @@
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, describe, it } from "node:test";
@@ -617,31 +617,38 @@ describe("TASK-011 round 1: descendants do not outlive the wait (AC-7)", () => {
    * Driven with a grandchild that writes a file after a delay: if it survives
    * termination, the file appears.
    */
-  it("kills a GRANDCHILD when the executor times out", async () => {
-    const { existsSync, mkdtempSync: mkTemp } = await import("node:fs");
-    const { tmpdir: osTmp } = await import("node:os");
-    const { join: pathJoin } = await import("node:path");
-
-    const evidenceDir = mkTemp(pathJoin(osTmp(), "sf-grandchild-"));
-    created.push(evidenceDir);
-    const evidence = pathJoin(evidenceDir, "survived.txt");
-
-    // The child cannot spawn under the permission model, so the grandchild is
-    // created by the SHIM node the test controls — the parent's own group
-    // handling is what is under test.
+  /**
+   * CORRECTED. Round-5 review pointed out this test created no grandchild at
+   * all — it scheduled a timer in the SAME child, so it proved only that the
+   * child itself was killed. It could not have created one either: the
+   * permission model denies the child `child_process` entirely.
+   *
+   * That denial is the stronger property, so it is what is asserted. A child
+   * that cannot spawn cannot leave a descendant behind, which makes the
+   * process-group handling defence in depth rather than the primary control.
+   * The residual case — a descendant created by some route not yet known, or
+   * one that calls `setsid` — is stated in the adapter and cannot be closed
+   * without a PID namespace.
+   */
+  it("cannot create a descendant at all, because spawning is denied", async () => {
     const script = childScript(
-      `import { readFileSync, writeFileSync } from "node:fs";
+      `import { readFileSync } from "node:fs";
        JSON.parse(readFileSync(process.argv[2], "utf8"));
-       setTimeout(() => { try { writeFileSync(${JSON.stringify(evidence)}, "x"); } catch {} }, 3000);
-       setInterval(() => {}, 1000);`,
+       let verdict = "SPAWNED";
+       try {
+         const { spawn } = await import("node:child_process");
+         spawn("/bin/sleep", ["30"], { detached: true }).unref();
+       } catch (e) { verdict = e.code ?? "ERROR"; }
+       process.stdout.write(JSON.stringify({
+         protocol: ${EXECUTOR_PROTOCOL_VERSION},
+         outcome: { kind: "COMPLETED", detail: verdict },
+       }));`,
     );
-
-    const executor = executorFor(script, 1_200);
-    const outcome = await executor.execute(INPUT);
-    assert.equal(outcome.kind, "RESOURCE_FAILURE");
-
-    await new Promise((r) => setTimeout(r, 4_000));
-    assert.ok(!existsSync(evidence), "the terminated child was still running afterwards");
+    const outcome = await executorFor(script, 30_000).execute(INPUT);
+    assert.equal(outcome.kind, "COMPLETED");
+    if (outcome.kind === "COMPLETED") {
+      assert.notEqual(outcome.detail, "SPAWNED", "the child created a descendant the parent cannot see");
+    }
   });
 });
 
@@ -896,29 +903,127 @@ describe("TASK-011 round 4: an ALREADY-OPEN inspector is not a closed door", () 
    * Driven in a REAL parent started with `--inspect`, because the property is
    * about this process's own state and a mock cannot have an inspector.
    */
-  it("closes an active inspector before spawning, or refuses to spawn", () => {
+  it("closes an active inspector at EXECUTION, not merely at construction", () => {
+    /**
+     * Round-5 CRITICAL: the check ran once, when the executor was built. The
+     * parent could reopen the inspector afterwards and the child connected to
+     * it — check-then-use with a very long gap.
+     *
+     * The probe reopens the inspector AFTER construction and then executes, so
+     * only a per-execution check can close it.
+     */
     const probe = `
       const inspector = require("node:inspector");
       const { createIsolatedExecutorForTests } = require(${JSON.stringify(join(process.cwd(), "dist/src/adapters/supervision/isolatedExecutor.js"))});
-      const before = inspector.url();
-      let refused = false;
-      try {
-        createIsolatedExecutorForTests({ repositoryRoot: "/tmp", childScript: "/tmp/x.mjs", readablePaths: ["/tmp"] });
-      } catch { refused = true; }
-      const after = inspector.url();
-      console.log(JSON.stringify({ before: before !== undefined, after: after !== undefined, refused }));
-    `;
-    const result = spawnSync(process.execPath, ["--inspect=0", "-e", probe], {
-      encoding: "utf8",
-      env: { ...process.env },
-    });
-    const line = (result.stdout ?? "").trim().split("\n").pop() ?? "";
-    const verdict = JSON.parse(line) as { before: boolean; after: boolean; refused: boolean };
+      const { mkdtempSync, writeFileSync } = require("node:fs");
+      const { tmpdir } = require("node:os");
+      const { join } = require("node:path");
 
-    assert.equal(verdict.before, true, "the fixture must actually start with an inspector, or it proves nothing");
-    assert.ok(
-      !verdict.after || verdict.refused,
-      "an active inspector survived: a child can connect to it and evaluate code in the supervisor",
+      const dir = mkdtempSync(join(tmpdir(), "sf-insp-"));
+      writeFileSync(join(dir, "child.mjs"), 'process.stdout.write(JSON.stringify({protocol:1,outcome:{kind:"COMPLETED",detail:"ok"}}));');
+
+      const executor = createIsolatedExecutorForTests({
+        repositoryRoot: dir, childScript: join(dir, "child.mjs"), readablePaths: [dir], timeoutMs: 30000,
+      });
+
+      // ...and NOW the parent opens an inspector, after every construction-time
+      // check has already run.
+      inspector.open(0, "127.0.0.1");
+      const openedAfterConstruction = inspector.url() !== undefined;
+
+      const item = { key: "X", title: "t", dependsOn: [], status: "ELIGIBLE", workClass: "DETERMINISTIC", order: 1 };
+      executor.execute({ item, actionId: "X:RUN_DETERMINISTIC_WORK:a1" })
+        .then(() => {
+          console.log(JSON.stringify({ openedAfterConstruction, stillOpen: inspector.url() !== undefined, refused: false }));
+        })
+        .catch(() => {
+          console.log(JSON.stringify({ openedAfterConstruction, stillOpen: inspector.url() !== undefined, refused: true }));
+        });
+    `;
+    const result = spawnSync(process.execPath, ["-e", probe], { encoding: "utf8", env: { ...process.env } });
+    const line = (result.stdout ?? "").trim().split("\n").pop() ?? "";
+    const verdict = JSON.parse(line) as { openedAfterConstruction: boolean; stillOpen: boolean; refused: boolean };
+
+    assert.equal(
+      verdict.openedAfterConstruction,
+      true,
+      "the fixture must actually reopen the inspector, or it proves nothing",
     );
+    assert.ok(
+      !verdict.stillOpen || verdict.refused,
+      "an inspector opened after construction survived into execution: a child can evaluate code in the supervisor",
+    );
+  });
+});
+
+
+// =====================================================================
+// ROUND-5 — a grant is only as contained as its contents
+// =====================================================================
+
+describe("TASK-011 round 5: symlinks inside a granted directory", () => {
+  /**
+   * CRITICAL. `assertGrantIsContained` validated the granted PATH and stopped
+   * there, but Node's permission model follows symlinks INSIDE a granted
+   * directory. A `dist/credential-link -> ~/.codex/auth.json` was readable by a
+   * child granted only `dist`.
+   *
+   * The same rule the verifier applies to the tree it audits: a link inside
+   * cannot be told apart from one pointing outside.
+   */
+  it("REFUSES to run when a granted directory contains a symlink", async () => {
+    const script = childScript("export {};");
+    const dir = dirname(script);
+    symlinkSync(join(homedir(), ".codex"), join(dir, "credential-link"), "dir");
+
+    const executor = executorFor(script, 30_000);
+    await assert.rejects(
+      executor.execute(INPUT),
+      /symlink inside a granted directory/,
+      "a symlink inside the grant reaches wherever it points",
+    );
+  });
+
+  /**
+   * ...and the check runs PER EXECUTION, because a validated directory can
+   * gain a link afterwards. Check-then-use is the defect this whole round is
+   * about.
+   */
+  it("re-checks the grant on every execution, not once at construction", async () => {
+    const script = childScript(
+      `import { readFileSync } from "node:fs";
+       JSON.parse(readFileSync(process.argv[2], "utf8"));
+       process.stdout.write(JSON.stringify({
+         protocol: ${EXECUTOR_PROTOCOL_VERSION},
+         outcome: { kind: "COMPLETED", detail: "ok" },
+       }));`,
+    );
+    const dir = dirname(script);
+    const executor = executorFor(script, 30_000);
+
+    // Clean at construction: the first run must succeed.
+    const first = await executor.execute(INPUT);
+    assert.equal(first.kind, "COMPLETED", "the fixture must work before the link is planted");
+
+    // ...and now the world changes.
+    symlinkSync(join(homedir(), ".codex"), join(dir, "planted-after"), "dir");
+    await assert.rejects(executor.execute(INPUT), /symlink inside a granted directory/);
+  });
+});
+
+describe("TASK-011 round 5: array elements are validated, not merely copied", () => {
+  it("does not forward an object hiding in a string array", () => {
+    const contaminated = {
+      ...INPUT,
+      item: {
+        ...ITEM,
+        dependsOn: [{ databasePath: "/home/hakanduyar/.factory/supervisor.db" }] as unknown as string[],
+      },
+    } as unknown as WorkExecutionInput;
+
+    const request = buildExecutorRequest(contaminated) as unknown as { item: { dependsOn: unknown[] } };
+    for (const entry of request.item.dependsOn) {
+      assert.equal(typeof entry, "string", "a non-string element crossed the boundary");
+    }
   });
 });

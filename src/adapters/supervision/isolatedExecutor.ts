@@ -62,13 +62,31 @@
  * found one through the parent's inspector, closed above, and finding one
  * class of escape is not proof there is no other.
  *
- * The remaining egress gap is recorded in docs/KNOWN-LIMITATIONS.md and closes
- * with an OS-level control a human must install.
+ * ================================================================
+ * WHAT A CHILD CAN STILL DO TO ITS PARENT
+ * ================================================================
+ * A child runs as the SAME UID as the supervisor, so it can signal it:
+ * `process.kill(process.ppid, "SIGTERM")` terminates the supervisor, and
+ * SIGKILL cannot be caught by anything. Round-5 review demonstrated it.
+ *
+ * Nothing in this file can prevent that, and no in-process guard can: signal
+ * permission is a property of the UID pair, not of the code. Preventing it
+ * needs the child to run as a DIFFERENT user, which needs privilege this
+ * process does not have and ADR-0002 reserves to the human.
+ *
+ * What IS true is that a killed supervisor produces no false success: the tick
+ * dies with it, no outcome is recorded, and durable state keeps whatever it
+ * last committed. That is a denial of service, not a bypass of the gate — a
+ * real limitation, and a smaller one than a child that can spend money.
+ *
+ * The remaining egress and signalling gaps are recorded in
+ * docs/KNOWN-LIMITATIONS.md on the docs/known-limitations branch, and close
+ * with OS-level controls a human must install.
  */
 
 import { spawn, spawnSync } from "node:child_process";
 import * as inspector from "node:inspector";
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
@@ -306,6 +324,56 @@ function realOrUndefined(path: string): string | undefined {
 }
 
 /**
+ * A granted directory is only as contained as its CONTENTS (round-5 CRITICAL).
+ *
+ * `assertGrantIsContained` validated the granted path itself and stopped there.
+ * Node's permission model follows symlinks INSIDE a granted directory, so a
+ * `dist/credential-link -> ~/.codex/auth.json` was readable by a child granted
+ * only `dist` — and replacing a validated directory with a symlink after
+ * construction did the same thing.
+ *
+ * This is the identical rule the verifier already applies to the tree it
+ * audits: a link is refused because a link inside the tree cannot be told apart
+ * from one pointing outside it.
+ *
+ * HONEST LIMIT: this is a check, and a check has a moment. A writer that
+ * creates a symlink between this scan and the child's read defeats it. That is
+ * the same concurrent-adversary boundary the verifier documents, and closing it
+ * needs the child to run somewhere the adversary is not — a different UID or a
+ * namespace, which need privilege this process does not have.
+ */
+function assertNoLinksUnder(paths: readonly string[]): void {
+  const walk = (current: string): void => {
+    let entries;
+    try {
+      entries = readdirSync(current, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const full = join(current, entry.name);
+      if (entry.isSymbolicLink()) {
+        throw new Error(
+          `refusing to run an isolated executor: ${full} is a symlink inside a granted directory. ` +
+            "The permission model follows it, so the grant would reach wherever it points.",
+        );
+      }
+      if (entry.isDirectory()) {
+        walk(full);
+      }
+    }
+  };
+  for (const granted of paths) {
+    if (lstatSync(granted, { throwIfNoEntry: false })?.isSymbolicLink() === true) {
+      throw new Error(
+        `refusing to run an isolated executor: the granted path ${granted} is itself a symlink.`,
+      );
+    }
+    walk(granted);
+  }
+}
+
+/**
  * Every granted path must be INSIDE the tree being verified (round-4 finding).
  *
  * The first version was a denylist — `/`, the home directory, its ancestors —
@@ -388,8 +456,9 @@ function buildExecutor(options: ResolvedExecutorOptions, overrides: UnsafeTestOv
    */
   const readablePaths = Object.freeze([...options.readablePaths]);
   const childScript = options.childScript;
+  // Containment of the NAMES is a property of the options, so it is settled
+  // here and the frozen copy is what executes.
   assertGrantIsContained([...readablePaths, childScript], options.repositoryRoot);
-  assertInspectorClosed();
   const permissionFlag = permissionFlagFor(nodePath);
   closeInspectorDoor();
 
@@ -567,6 +636,18 @@ function buildExecutor(options: ResolvedExecutorOptions, overrides: UnsafeTestOv
        * walk straight past the allowlist. The isolated environment is built
        * from allowed names ONLY, so there is no channel to add to it.
        */
+      /**
+       * RE-CHECKED PER EXECUTION, not once at construction (round-5 CRITICALs).
+       *
+       * Both of these are properties of the WORLD rather than of the options,
+       * and the world moves between constructing an executor and running one:
+       * the parent can reopen its inspector, and a validated directory can gain
+       * a symlink or become one. Checking at construction was check-then-use
+       * with a longer gap than usual.
+       */
+      assertInspectorClosed();
+      assertNoLinksUnder([...readablePaths]);
+
       const env = buildWorkerEnvironment(
         { allowedVars: policy.allowedVars },
         overrides.sourceEnv ?? process.env,

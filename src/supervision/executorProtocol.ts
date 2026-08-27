@@ -63,6 +63,16 @@ export interface ExecutorRequest {
   readonly checkpoint?: SessionCheckpoint;
 }
 
+/**
+ * Arrays were SHALLOW-copied, so an object sitting in a string array crossed
+ * the boundary intact — `{ databasePath: "..." }` inside `dependsOn` reached
+ * the child (round-5 note). Spreading an array copies the array, not what is
+ * in it.
+ */
+function asPlainString(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
 export function buildExecutorRequest(input: WorkExecutionInput): ExecutorRequest {
   // Constructed field by field, never spread from `input`. A spread would
   // forward whatever the caller's object happened to carry, which is how a
@@ -85,7 +95,7 @@ export function buildExecutorRequest(input: WorkExecutionInput): ExecutorRequest
     item: {
       key: item.key,
       title: item.title,
-      dependsOn: [...item.dependsOn],
+      dependsOn: item.dependsOn.map(asPlainString),
       status: item.status,
       workClass: item.workClass,
       order: item.order,
@@ -104,7 +114,7 @@ export function buildExecutorRequest(input: WorkExecutionInput): ExecutorRequest
             effectiveModel: config.effectiveModel,
             ...(config.effectiveEffort === undefined ? {} : { effectiveEffort: config.effectiveEffort }),
             verification: config.verification,
-            argvEvidence: [...config.argvEvidence],
+            argvEvidence: config.argvEvidence.map(asPlainString),
             note: config.note,
           },
         }),
@@ -117,9 +127,9 @@ export function buildExecutorRequest(input: WorkExecutionInput): ExecutorRequest
             requiredWorkClass: checkpoint.requiredWorkClass,
             iteration: checkpoint.iteration,
             nextAction: checkpoint.nextAction,
-            findings: [...checkpoint.findings],
-            completedVerification: [...checkpoint.completedVerification],
-            pendingVerification: [...checkpoint.pendingVerification],
+            findings: checkpoint.findings.map(asPlainString),
+            completedVerification: checkpoint.completedVerification.map(asPlainString),
+            pendingVerification: checkpoint.pendingVerification.map(asPlainString),
             updatedAt: checkpoint.updatedAt,
           },
         }),
