@@ -245,6 +245,17 @@ export interface UnsafeTestOverrides {
  * leaves a claim held with nothing to release it. The SUPERVISOR classifies
  * what a failure means about a resource; this only reports the process facts.
  */
+/** Applies the same redaction to a SUCCESSFUL outcome that failures already get. */
+function redactOutcome(outcome: WorkOutcome): WorkOutcome {
+  if (outcome.kind === "COMPLETED") {
+    return { ...outcome, detail: redactSecrets(outcome.detail) };
+  }
+  if (outcome.kind === "CHANGES_REQUIRED") {
+    return { ...outcome, findings: outcome.findings.map((finding) => redactSecrets(finding)) };
+  }
+  return outcome;
+}
+
 function processFailure(
   terminationReason: "EXITED" | "TIMEOUT" | "CANCELLED" | "SPAWN_ERROR",
   exitCode: number | null,
@@ -357,6 +368,29 @@ function assertNoLinksUnder(paths: readonly string[]): void {
           `refusing to run an isolated executor: ${full} is a symlink inside a granted directory. ` +
             "The permission model follows it, so the grant would reach wherever it points.",
         );
+      }
+      /**
+       * HARD LINKS TOO (round-6 CRITICAL).
+       *
+       * The scan rejected symbolic links and stopped there. A hard link is
+       * indistinguishable from an ordinary file by name, type or realpath —
+       * the permission model authorises the allowed PATHNAME and follows it —
+       * so `dist/credential-link` hard-linked to `~/.codex/auth.json` was
+       * opened by a child granted only `dist`.
+       *
+       * Link count above one is the ordinary signal, and it is the same rule
+       * the verifier already applies to the tree it audits. It refuses some
+       * legitimate trees too; a grant that is occasionally inconvenient beats
+       * one that is sometimes a credential.
+       */
+      if (entry.isFile()) {
+        const stats = lstatSync(full, { throwIfNoEntry: false });
+        if (stats !== undefined && stats.nlink > 1) {
+          throw new Error(
+            `refusing to run an isolated executor: ${full} is a hard link inside a granted directory. ` +
+              "It cannot be told apart from one pointing at a credential store, so it is refused.",
+          );
+        }
       }
       if (entry.isDirectory()) {
         walk(full);
@@ -621,7 +655,11 @@ function buildExecutor(options: ResolvedExecutorOptions, overrides: UnsafeTestOv
           settle(processFailure("EXITED", code, stdout, `${stderr}\n[unusable response: ${parsed.reason}]`));
           return;
         }
-        settle(parsed.outcome);
+        // Redacted at THIS boundary, not only later (round-6 note):
+        // SupervisorService sanitizes a completion before it becomes durable
+        // state, which is correct and is not the same as this adapter handing
+        // back clean data to whoever calls it.
+        settle(redactOutcome(parsed.outcome));
       });
     });
 

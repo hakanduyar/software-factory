@@ -68,6 +68,11 @@ export interface ExecutorRequest {
  * the boundary intact — `{ databasePath: "..." }` inside `dependsOn` reached
  * the child (round-5 note). Spreading an array copies the array, not what is
  * in it.
+ *
+ * Round-6 extends this to SCALARS. `title` and `note` were copied on the
+ * strength of their declared type, and a declared type is a claim about the
+ * caller rather than a fact about the value: a malformed object in a `string`
+ * field crosses the boundary just as an array element did.
  */
 function asPlainString(value: unknown): string {
   return typeof value === "string" ? value : "";
@@ -93,9 +98,16 @@ export function buildExecutorRequest(input: WorkExecutionInput): ExecutorRequest
   return {
     protocol: EXECUTOR_PROTOCOL_VERSION,
     item: {
-      key: item.key,
-      title: item.title,
+      key: asPlainString(item.key),
+      title: asPlainString(item.title),
       dependsOn: item.dependsOn.map(asPlainString),
+      /**
+       *  and  are literal UNIONS, not free text, so they are
+       * copied as declared. Coercing them to  breaks the contract, and
+       * substituting a fallback would silently change meaning — the child reads
+       *  for exactly one comparison, and a malformed value simply
+       * fails that comparison, which is already the closed direction.
+       */
       status: item.status,
       workClass: item.workClass,
       order: item.order,
@@ -115,18 +127,18 @@ export function buildExecutorRequest(input: WorkExecutionInput): ExecutorRequest
             ...(config.effectiveEffort === undefined ? {} : { effectiveEffort: config.effectiveEffort }),
             verification: config.verification,
             argvEvidence: config.argvEvidence.map(asPlainString),
-            note: config.note,
+            note: asPlainString(config.note),
           },
         }),
     ...(checkpoint === undefined
       ? {}
       : {
           checkpoint: {
-            roadmapKey: checkpoint.roadmapKey,
+            roadmapKey: asPlainString(checkpoint.roadmapKey),
             actionId: checkpoint.actionId,
             requiredWorkClass: checkpoint.requiredWorkClass,
             iteration: checkpoint.iteration,
-            nextAction: checkpoint.nextAction,
+            nextAction: asPlainString(checkpoint.nextAction),
             findings: checkpoint.findings.map(asPlainString),
             completedVerification: checkpoint.completedVerification.map(asPlainString),
             pendingVerification: checkpoint.pendingVerification.map(asPlainString),

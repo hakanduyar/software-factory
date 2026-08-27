@@ -15,7 +15,7 @@
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { linkSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, describe, it } from "node:test";
@@ -1025,5 +1025,91 @@ describe("TASK-011 round 5: array elements are validated, not merely copied", ()
     for (const entry of request.item.dependsOn) {
       assert.equal(typeof entry, "string", "a non-string element crossed the boundary");
     }
+  });
+});
+
+
+// =====================================================================
+// ROUND-6 — a hard link is a grant too
+// =====================================================================
+
+describe("TASK-011 round 6: hard links inside a granted directory", () => {
+  /**
+   * CRITICAL. The grant scan rejected SYMBOLIC links and stopped there. A hard
+   * link is indistinguishable from an ordinary file by name, type or realpath,
+   * and the permission model authorises the allowed PATHNAME and follows it —
+   * so `dist/credential-link`, hard-linked to the real credential store, was
+   * opened by a child granted only `dist`.
+   */
+  it("REFUSES to run when a granted directory contains a hard link", async () => {
+    const script = childScript("export {};");
+    const dir = dirname(script);
+    const target = join(homedir(), ".codex/auth.json");
+
+    let linked = false;
+    try {
+      linkSync(target, join(dir, "credential-link"));
+      linked = true;
+    } catch {
+      // No credential store on this machine, or a cross-device link. Use any
+      // hard link at all — the guard is about link COUNT, not about the target.
+      const other = join(dir, "ordinary.txt");
+      writeFileSync(other, "x");
+      linkSync(other, join(dir, "credential-link"));
+      linked = true;
+    }
+    assert.ok(linked, "the fixture must create a hard link, or it proves nothing");
+
+    await assert.rejects(
+      executorFor(script, 30_000).execute(INPUT),
+      /hard link inside a granted directory/,
+      "a hard link inside the grant reaches whatever it points at",
+    );
+  });
+});
+
+describe("TASK-011 round 6: the adapter redacts its own successful output", () => {
+  /**
+   * `SupervisorService` sanitizes a completion before it becomes durable state,
+   * which is correct and is not the same as this adapter handing back clean
+   * data. A second caller, or a log statement in between, would see the raw
+   * text.
+   */
+  it("redacts a credential a child puts in a COMPLETED detail", async () => {
+    const leak = "sk-ant-api03-COMPLETEDDETAILLEAKLEAKLEAK";
+    const script = childScript(
+      `import { readFileSync } from "node:fs";
+       JSON.parse(readFileSync(process.argv[2], "utf8"));
+       process.stdout.write(JSON.stringify({
+         protocol: ${EXECUTOR_PROTOCOL_VERSION},
+         outcome: { kind: "COMPLETED", detail: "provider said ${leak}" },
+       }));`,
+    );
+    const outcome = await executorFor(script, 30_000).execute(INPUT);
+    assert.equal(outcome.kind, "COMPLETED");
+    if (outcome.kind === "COMPLETED") {
+      assert.ok(!outcome.detail.includes(leak), "a credential left the adapter unredacted");
+    }
+  });
+});
+
+describe("TASK-011 round 6: scalar fields are validated at runtime too", () => {
+  /**
+   * A declared type is a claim about the caller, not a fact about the value.
+   * `title` and `note` were copied on the strength of their declaration, so a
+   * malformed object in a `string` field crossed the boundary just as an array
+   * element did.
+   */
+  it("does not forward an object sitting in a string field", () => {
+    const contaminated = {
+      ...INPUT,
+      item: {
+        ...ITEM,
+        title: { databasePath: "/home/hakanduyar/.factory/supervisor.db" } as unknown as string,
+      },
+    } as unknown as WorkExecutionInput;
+
+    const request = buildExecutorRequest(contaminated) as unknown as { item: { title: unknown } };
+    assert.equal(typeof request.item.title, "string", "an object crossed the boundary in a string field");
   });
 });
