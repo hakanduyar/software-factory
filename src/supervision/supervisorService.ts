@@ -2329,7 +2329,41 @@ export function chainIsLegacySilence(state: {
     return false;
   }
   const anchor = state.provenanceAnchor;
-  return anchor === undefined || (anchor.length === 0 && anchor.headDigest === GENESIS_DIGEST);
+  if (anchor !== undefined && !(anchor.length === 0 && anchor.headDigest === GENESIS_DIGEST)) {
+    return false;
+  }
+  /**
+   * WHY THERE IS NO THIRD CHECK HERE, and what was tried (round-10 HIGH).
+   *
+   * The reviewer ran a review on the only routable resource, then deleted the
+   * item's implementer history, its `lastRunConfig`, the chain AND the anchor —
+   * and the same resource reviewed the item again, because what remained was
+   * byte-for-byte what a fresh installation looks like.
+   *
+   * I tried to close it with a third record: `lastSuccessAt` on the resource,
+   * which the completion path writes and the deletion left behind. It is not a
+   * record of WORK. A successful PROBE writes the same field, so the check fired
+   * on any installation that had ever looked at a provider, and three negative
+   * controls in this suite failed immediately. That is the evidence, not a
+   * guess.
+   *
+   * Every other survivor fails the same way. `attempts` is incremented when an
+   * action is CLAIMED, before anything launches, so a supervisor killed in that
+   * window would leave `attempts > 0` with no lineage and be refused forever.
+   * `detail` is free text an attacker writes anyway.
+   *
+   * So this is the keyless limit, not a missing guard: after the chain, the
+   * anchor, the implementer history and the run configuration are all removed,
+   * the remaining state is CONSISTENT with a database where the work never
+   * happened, and no scheme without a secret or an external witness can tell
+   * those apart. Detecting it needs a record the attacker cannot reach, which is
+   * what CLEAN_ROOM_CI is for.
+   *
+   * Recorded as L-4 in docs/KNOWN-LIMITATIONS.md with the reviewer's exact
+   * reproduction, rather than left as a control that looks like it covers this
+   * and does not.
+   */
+  return true;
 }
 
 /**

@@ -142,8 +142,13 @@ its original form (TASK-006 round 10).
 
 Lineage is a recorded historical fact living in a database, and there is no key
 on this machine to authenticate it. Catalog recognition, a cross-check against
-`lastRunConfig`, and fail-closed handling of anything missing or contradictory
-raise the cost of forgery; none of them make the record self-proving.
+`lastRunConfig`, and fail-closed handling of anything CONTRADICTORY raise the
+cost of forgery; none of them make the record self-proving.
+
+"Anything missing" was the wording here until round 10, and it was an
+overstatement. Missing lineage fails closed when something else still says work
+happened. When every record of it is removed together, nothing is left to
+contradict.
 
 **What changed:** there is now a SECOND record — an append-only hash chain
 written at the same moment as the mutable row. A row rewritten to name a
@@ -179,6 +184,34 @@ and the repository refuses to persist a chain whose anchor disagrees with it.
 where an empty chain is not read as a DISAGREEMENT about who implemented an
 ancestor whose class needs no AI. And the deeper limit below, which no amount of
 this closes.
+
+**The reproduction that shows the floor**, from round-10 review, recorded so it
+is not rediscovered as though it were new:
+
+1. `A` is deterministic; `B` is an `INDEPENDENT_REVIEW` depending on `A`.
+2. Only `claude-code:sonnet` is routable.
+3. `B` runs and returns `CHANGES_REQUIRED`, leaving `B` ELIGIBLE.
+4. Delete, by writing SQLite directly: `B`'s implementer history, its
+   `lastRunConfig`, the provenance chain, and the anchor.
+5. Tick. `B` runs again — on the resource that reviewed it before.
+
+No digest is recomputed. What remains after step 4 is byte-for-byte what a
+database looks like where the work never happened, so there is nothing to
+detect. Every candidate survivor was checked and each is produced by ordinary
+operation: `lastSuccessAt` on the resource is written by a successful PROBE, not
+only by completed work; `attempts` is incremented when an action is CLAIMED,
+before anything launches, so a supervisor killed in that window would leave it
+set with no lineage; `detail` is free text.
+
+An implementation of the `lastSuccessAt` check was written and REVERTED when
+three negative controls failed — an installation that had merely probed a
+provider was refused. A control that fires on ordinary operation is not a
+control, and shipping it would have made this entry read as closed while making
+the system less usable and no safer.
+
+**What would actually close it:** a record the database writer cannot reach — a
+signature over the chain with a key held elsewhere, or an external witness.
+That is `CLEAN_ROOM_CI`, and it is where this belongs.
 
 **What TASK-012 changed, and what it did not:** an item's DEFINITION — `key`,
 `title`, `workClass`, `dependsOn`, `order` — no longer comes from the database at

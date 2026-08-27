@@ -319,7 +319,7 @@ describe("TASK-012 AC-1/AC-2: every definition field, detected and named", () =>
    * The literal below is the specification. The assertion after it pins the two
    * together, so ADDING a field without a case here fails too.
    */
-  const EXPECTED_DEFINITION_FIELDS = ["title", "workClass", "dependsOn", "order"] as const;
+  const EXPECTED_DEFINITION_FIELDS = ["key", "title", "workClass", "dependsOn", "order"] as const;
 
   it("checks exactly the fields this suite covers", () => {
     assert.deepEqual(
@@ -332,6 +332,7 @@ describe("TASK-012 AC-1/AC-2: every definition field, detected and named", () =>
   for (const field of EXPECTED_DEFINITION_FIELDS) {
     it(`detects a persisted ${field} that disagrees with the catalog`, () => {
       const edits: Record<string, unknown> = {
+        key: "RENAMED_KEY",
         title: "Renamed",
         workClass: "DETERMINISTIC",
         dependsOn: ["A", "A"],
@@ -343,8 +344,19 @@ describe("TASK-012 AC-1/AC-2: every definition field, detected and named", () =>
       );
       assert.equal(verdict.ok, false, `a rewritten ${field} was accepted`);
       if (!verdict.ok) {
-        assert.match(verdict.problem, new RegExp(field));
-        assert.match(verdict.problem, /"B"/);
+        if (field === "key") {
+          /**
+           * `key` is the field the lookup is BY, so rewriting it does not
+           * produce a field disagreement — it produces an item the catalog has
+           * never heard of, and AC-3 refuses it under that name. Same refusal,
+           * different sentence, and the sentence is the accurate one.
+           */
+          assert.match(verdict.problem, /RENAMED_KEY/);
+          assert.match(verdict.problem, /is not in this installation's catalog/);
+        } else {
+          assert.match(verdict.problem, new RegExp(field));
+          assert.match(verdict.problem, /"B"/);
+        }
       }
     });
   }
@@ -380,6 +392,13 @@ describe("TASK-012 AC-1/AC-2: every definition field, detected and named", () =>
         [CATALOG[0]!],
       );
       assert.equal(edited.ok, false, `a rewritten ${field} reached a caller`);
+    }
+
+    /** ...and the rebuilt item takes its identity from the catalog, not the row. */
+    const rebuilt = reconcileRoadmapWithCatalog([{ ...CATALOG[0]! }], [CATALOG[0]!]);
+    assert.equal(rebuilt.ok, true);
+    if (rebuilt.ok) {
+      assert.equal(rebuilt.roadmap[0]?.key, CATALOG[0]!.key);
     }
   });
 

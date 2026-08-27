@@ -49,7 +49,10 @@ import {
   verifyChain,
   type ProvenanceEntry,
 } from "../src/supervision/provenanceChain.js";
-import { appendImplementerProvenance } from "../src/supervision/supervisorService.js";
+import {
+  appendImplementerProvenance,
+  chainIsLegacySilence,
+} from "../src/supervision/supervisorService.js";
 import { parseSupervisorState } from "../src/supervision/supervisorSerialization.js";
 import type { WorkOutcome } from "../src/supervision/supervisorPorts.js";
 import { DEFAULT_ROADMAP, type RoadmapItem } from "../src/supervision/supervisorTypes.js";
@@ -2468,5 +2471,55 @@ describe("TASK-011 round 9: a worker that handed over mid-item is still excluded
     const state = (await supervisor.repository.load())!;
     const history = state.roadmap.find((item) => item.key === "A")?.implementedByResourceKeys ?? [];
     assert.ok(history.includes(r1Key), "the history forgot the resource that handed over");
+  });
+});
+
+describe("TASK-008 round 10: the floor: deleting EVERY record of a run", () => {
+  /**
+   * THE LIMIT, ASSERTED RATHER THAN DESCRIBED — the pattern TASK-006's residue
+   * test established, and the reason that one was noticed when it closed.
+   *
+   * Round-10 review deleted an item's implementer history, its `lastRunConfig`,
+   * the provenance chain AND the anchor, and the resource that had just reviewed
+   * the item reviewed it again. There is nothing left to detect: what remains is
+   * byte-for-byte a database where the work never happened.
+   *
+   * Every candidate survivor was tried and each is produced by ordinary
+   * operation — `lastSuccessAt` is written by a successful PROBE, `attempts` is
+   * incremented when an action is CLAIMED before anything launches, `detail` is
+   * free text. An implementation of the `lastSuccessAt` check was written and
+   * reverted when three negative controls in this file failed.
+   *
+   * IF THIS TEST EVER FAILS, the floor has moved: update L-4 in
+   * docs/KNOWN-LIMITATIONS.md and this comment rather than deleting the case.
+   */
+  it("documents that a complete deletion is indistinguishable from a fresh database", () => {
+    const ran = chainFor("claude-code:opus");
+    // The anchor field is ABSENT, not present-and-undefined: that is what the
+    // deletion leaves behind, and  makes the
+    // difference a compile-time one.
+    const afterDeletion: { readonly provenance: readonly ProvenanceEntry[] } = { provenance: [] };
+
+    assert.equal(
+      verifyAgainstAnchor(ran, anchorFor(ran)).intact,
+      true,
+      "the fixture must start from a chain that verifies",
+    );
+    assert.equal(
+      verifyAgainstAnchor(afterDeletion.provenance, undefined).intact,
+      true,
+      "if this now fails, a complete deletion has become detectable — update L-4 and this comment",
+    );
+
+    // And the same state read as legacy silence, which is what lets the walk
+    // proceed. Both halves are the limit; neither is a bug on its own.
+    assert.equal(chainIsLegacySilence(afterDeletion), true);
+  });
+
+  /** The PARTIAL deletion is still caught, which is what makes the above a floor and not a hole. */
+  it("still catches a deletion that forgets the anchor", () => {
+    const ran = chainFor("claude-code:opus");
+    const verdict = verifyAgainstAnchor([], anchorFor(ran));
+    assert.equal(verdict.intact, false, "a chain deleted under a surviving anchor must be visible");
   });
 });

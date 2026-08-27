@@ -58,7 +58,20 @@ import type { RoadmapItem } from "./supervisorTypes.js";
  * checked CRITICAL in the verifier, and the `provider`-was-not-a-dimension
  * finding before that.
  */
-export const DEFINITION_FIELDS = ["title", "workClass", "dependsOn", "order"] as const;
+export const DEFINITION_FIELDS = ["key", "title", "workClass", "dependsOn", "order"] as const;
+
+/**
+ * `key` is in that list because TASK-012's frozen AC-1 puts it there, and a
+ * frozen criterion is not something an implementer trims to what felt necessary
+ * (round-10 HIGH).
+ *
+ * It is the field the lookup is BY, so on the reconciliation path the row and
+ * the catalog agree about it trivially. That makes it the weakest of the five
+ * and not the pointless one: it is what makes the returned item's identity
+ * come from the catalog rather than from the row, which is the property AC-1
+ * actually states. It is checked and rebuilt with its four siblings, under one
+ * rule, rather than being the exception someone has to remember.
+ */
 
 export type CatalogVerdict =
   | { readonly ok: true; readonly roadmap: readonly RoadmapItem[] }
@@ -135,6 +148,7 @@ export function reconcileRoadmapWithCatalog(
     }
     reconciled.push({
       ...row,
+      key: declared.key,
       title: declared.title,
       workClass: declared.workClass,
       dependsOn: [...declared.dependsOn],
