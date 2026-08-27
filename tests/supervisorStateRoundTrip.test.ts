@@ -34,6 +34,7 @@ import { describe, it } from "node:test";
 import { BILLING_MODES } from "../src/supervision/financialSafety.js";
 import type { AiRunConfigRecord } from "../src/supervision/modelEnforcement.js";
 import type { ResourceRecord } from "../src/supervision/resourceTypes.js";
+import { appendProvenance, type ProvenanceEntry } from "../src/supervision/provenanceChain.js";
 import {
   encodeSupervisorState,
   parseSupervisorState,
@@ -132,6 +133,17 @@ const ESCALATION_FIELDS: Record<keyof Required<HumanEscalation>, true> = {
   resolved: true,
 };
 
+const PROVENANCE_FIELDS: Record<keyof Required<ProvenanceEntry>, true> = {
+  sequence: true,
+  kind: true,
+  roadmapKey: true,
+  resourceKey: true,
+  detail: true,
+  recordedAt: true,
+  previousDigest: true,
+  digest: true,
+};
+
 const STATE_FIELDS: Record<keyof Required<SupervisorState>, true> = {
   version: true,
   financialPolicy: true,
@@ -141,6 +153,8 @@ const STATE_FIELDS: Record<keyof Required<SupervisorState>, true> = {
   activeClaim: true,
   nextWakeAt: true,
   escalations: true,
+  provenance: true,
+  provenanceAnchor: true,
   updatedAt: true,
 };
 
@@ -229,6 +243,24 @@ const MAXIMAL_ESCALATION: Required<HumanEscalation> = {
   resolved: false,
 };
 
+/**
+ * A REAL chained entry, not a hand-written literal: its digest must be the one
+ * `computeDigest` produces, or the round-trip would be proving that an invalid
+ * chain survives serialization — which is true but useless.
+ */
+const MAXIMAL_PROVENANCE: Required<ProvenanceEntry> = (() => {
+  const appended = appendProvenance([], {
+    kind: "IMPLEMENTED_BY",
+    roadmapKey: "LOCAL_24_7_RUNTIME",
+    resourceKey: "claude-code:opus",
+    detail: "completed",
+    recordedAt: 1_190,
+  });
+  assert.equal(appended.ok, true);
+  if (!appended.ok) throw new Error("unreachable");
+  return appended.chain[0] as Required<ProvenanceEntry>;
+})();
+
 const MAXIMAL_STATE: Required<SupervisorState> = {
   version: 9,
   financialPolicy: { autonomousSpendAllowed: false, autonomousSpendLimit: 0 },
@@ -238,6 +270,8 @@ const MAXIMAL_STATE: Required<SupervisorState> = {
   activeClaim: MAXIMAL_CLAIM,
   nextWakeAt: 1_600,
   escalations: [MAXIMAL_ESCALATION],
+  provenance: [MAXIMAL_PROVENANCE],
+  provenanceAnchor: { length: 1, headDigest: MAXIMAL_PROVENANCE.digest },
   updatedAt: 1_200,
 };
 
@@ -259,6 +293,7 @@ describe("TASK-006: every durable supervisor field survives serialization", () =
       CHECKPOINT_FIELDS,
       CLAIM_FIELDS,
       ESCALATION_FIELDS,
+      PROVENANCE_FIELDS,
       STATE_FIELDS,
     ]) {
       assert.ok(Object.keys(map).length > 0);

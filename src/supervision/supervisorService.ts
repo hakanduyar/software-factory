@@ -19,7 +19,13 @@
  *   - ambiguity fails closed rather than being retried.
  */
 
-import { ConcurrencyError, ValidationError } from "../domain/errors.js";
+import { reconcileRoadmapWithCatalog, unprovenCompletion } from "./roadmapCatalog.js";
+import {
+  ConcurrencyError,
+  PersistenceCorruptionError,
+  SchemaIntegrityError,
+  ValidationError,
+} from "../domain/errors.js";
 import type { IdGenerator } from "../domain/ids.js";
 import type { Clock } from "../ports/clock.js";
 import type { Timestamp } from "../domain/time.js";
@@ -35,6 +41,15 @@ import {
 } from "./financialSafety.js";
 import { reconcileReportedIdentity, type AiRunConfigRecord } from "./modelEnforcement.js";
 import { requiresAi, selectResource, type RoutingPolicy } from "./modelRouting.js";
+import {
+  anchorFor,
+  appendProvenance,
+  GENESIS_DIGEST,
+  implementersByRoadmapKey,
+  keysWithUnknownImplementer,
+  verifyAgainstAnchor,
+  type ProvenanceEntry,
+} from "./provenanceChain.js";
 import { boundedDiagnostic, classifyResourceOutcome, type Classification } from "./resourceClassifier.js";
 import {
   isRetryDue,
@@ -85,6 +100,14 @@ export interface SupervisorServiceDeps {
     readonly model: string;
     readonly billingMode?: BillingMode;
   }[];
+  /**
+   * The roadmap's DEFINITION, from code (TASK-012 AC-4).
+   *
+   * Injectable for the same reason `resourceCatalog` is: a test declares its
+   * roadmap in code rather than smuggling one in through persisted state, which
+   * is precisely the channel this task closes.
+   */
+  readonly roadmapCatalog?: readonly RoadmapItem[];
   readonly log?: (line: string) => void;
   readonly ownerId?: string;
 }
@@ -158,9 +181,13 @@ export class SupervisorService {
         backoff: NO_BACKOFF,
         diagnostic: "never probed",
       })),
-      roadmap: [...DEFAULT_ROADMAP],
+      roadmap: this.roadmapCatalog().map((item) => ({ ...item, dependsOn: [...item.dependsOn] })),
       checkpoints: [],
       escalations: [],
+      // A new installation starts from the published genesis with nothing
+      // recorded — an empty chain verifies trivially, which is correct: there
+      // is no history to vouch for yet.
+      provenance: [],
       updatedAt: now,
     };
     return this.deps.repository.create(seeded);
@@ -182,7 +209,41 @@ export class SupervisorService {
    * to reach it.
    */
   async tick(): Promise<TickResult> {
-    const result = await this.runTick();
+    let result: TickResult;
+    try {
+      result = await this.runTick();
+    } catch (error) {
+      /**
+       * A CORRUPT RECORD IS AN ANSWER, NOT AN EXCEPTION (round-8 HIGH).
+       *
+       * AC-5 requires tampering to produce a human decision. It did — as long
+       * as the tampering left something the DESERIALIZER would accept. Writing
+       * `prov-forged` into a digest instead failed earlier than that, in
+       * parsing, and the supervisor died with a `PersistenceCorruptionError`
+       * before it could decide anything. From the operator's side a crash and a
+       * refusal are not the same event: one is a fault to debug, the other is a
+       * verdict with an instruction attached.
+       *
+       * DELIBERATELY NARROW. Only failures to READ are converted. A refusal to
+       * WRITE keeps propagating, because that is the repository enforcing the
+       * chain and no caller should be able to mistake it for a decision — and
+       * because converting it here would mask `runTick`'s own step 0.
+       */
+      if (!(error instanceof PersistenceCorruptionError)) {
+        throw error;
+      }
+      this.log(`[supervisor] durable state could not be read: ${error.message}`);
+      return sanitizeTickResult({
+        kind: "WAITING_FOR_HUMAN",
+        roadmapKey: "unknown",
+        reason: "HUMAN_DECISION_REQUIRED",
+        humanActionRequired: boundedDiagnostic(
+          "Durable supervisor state no longer parses, so nothing about the roadmap, its provenance or its " +
+            "progress can be established. Restore the supervisor database from a known-good backup. " +
+            `Detail: ${error.message}`,
+        ),
+      });
+    }
     await this.publishWake();
     return sanitizeTickResult(result);
   }
@@ -233,7 +294,17 @@ export class SupervisorService {
   }
 
   private async publishWake(): Promise<void> {
-    const state = await this.deps.repository.load();
+    let state: SupervisorState | undefined;
+    try {
+      state = await this.deps.repository.load();
+    } catch (error) {
+      // Same rule, one step earlier: state too corrupt to READ is not this
+      // tick's verdict either, and `runTick` has already produced one.
+      if (!(error instanceof PersistenceCorruptionError)) {
+        throw error;
+      }
+      return;
+    }
     if (state === undefined) {
       return;
     }
@@ -244,20 +315,58 @@ export class SupervisorService {
     try {
       await this.commit(state, withWake(state, wake));
     } catch (error) {
-      // Advisory bookkeeping. Losing the CAS means another supervisor just
-      // wrote, and it will publish its own wake — that is not this tick's
-      // result to fail over.
-      if (!(error instanceof ConcurrencyError)) {
-        throw error;
+      /**
+       * ADVISORY BOOKKEEPING, and that has to mean it CANNOT decide the tick
+       * (round-8 HIGH).
+       *
+       * The rule was already written for `ConcurrencyError` and applied only to
+       * it. With a tampered chain the repository correctly REFUSES the write,
+       * and that refusal was rethrown from here — after `runTick` had already
+       * decided `WAITING_FOR_HUMAN` — so the fail-closed result the whole guard
+       * exists to produce never reached the caller.
+       *
+       * All three of these mean the same thing: the wake time could not be
+       * written. None of them is this tick's verdict. A refusal to write is
+       * still enforced everywhere it MATTERS — every substantive path commits
+       * through `commit`, where it is not swallowed.
+       */
+      if (error instanceof ConcurrencyError) {
+        return;
       }
+      if (error instanceof SchemaIntegrityError || error instanceof PersistenceCorruptionError) {
+        this.log(`[supervisor] could not publish the next wake time: ${error.message}`);
+        return;
+      }
+      throw error;
     }
   }
 
   private async runTick(): Promise<TickResult> {
     const state = await this.ensureInitialized();
 
+    // 0. Refuse before anything tries to WRITE. The repository will not persist
+    //    a broken chain, so housekeeping would throw rather than decide.
+    const broken = this.brokenChainOutcome(state);
+    if (broken !== undefined) {
+      return broken;
+    }
+
+    /**
+     * 0b. THE DEFINITION COMES FROM CODE (TASK-012).
+     *
+     * Before anything reads `workClass` to decide whether review is required,
+     * or `dependsOn` to decide what is eligible, or `status` to decide that a
+     * dependency is satisfied. Those three reads are the whole attack surface
+     * the reviewer demonstrated, and every one of them happens below this line.
+     */
+    const catalogued = await this.catalogState(state);
+    if (catalogued.result !== undefined) {
+      return catalogued.result;
+    }
+    const defined = catalogued.state;
+
     // 1. Reconcile any claim left behind by a previous process.
-    const reconciled = await this.reconcileClaim(state);
+    const reconciled = await this.reconcileClaim(defined);
     if (reconciled.result !== undefined) {
       return reconciled.result;
     }
@@ -892,9 +1001,45 @@ export class SupervisorService {
         : reported === undefined || Object.keys(reported).length === 0
           ? runConfig
           : reconcileReportedIdentity(runConfig, reported);
+    /**
+     * LINEAGE IS RECORDED ONCE, HERE (round-9 HIGH).
+     *
+     * Rounds 8 and 9 each found paths that ran a worker and recorded nothing:
+     * round 8 found `CHECKPOINT` and `RESOURCE_FAILURE`, and round 9 found
+     * `HUMAN_REQUIRED`, the unverified-`COMPLETED` refusal and the
+     * mismatched-identity refusal — plus `lastRunConfig` missing from the two
+     * paths round 8 had just fixed.
+     *
+     * That is not five bugs; it is one. Recording lineage inside each outcome
+     * branch means every new branch is a fresh opportunity to forget, and the
+     * reviewer will keep finding the ones that did. So it happens BEFORE the
+     * branches, on the single fact that decides it: a worker RAN.
+     *
+     * Everything below builds on `withLineage`, so a future branch cannot omit
+     * it by being written — only by deliberately reaching past it.
+     *
+     * Both helpers are no-ops when no resource was used, so DETERMINISTIC work
+     * is unaffected.
+     */
+    const lineageProvenance = appendImplementerProvenance(
+      state.provenance,
+      item.key,
+      usedResourceKey,
+      now,
+      LINEAGE_DETAIL[outcome.kind],
+    );
+    const withLineage: SupervisorState = {
+      ...withoutClaim,
+      roadmap: setRunConfig(setImplementer(state.roadmap, item.key, usedResourceKey), item.key, reconciled),
+      provenance: lineageProvenance,
+      // An anchor is written with EVERY chain, so that its absence is a
+      // detectable deletion rather than a permitted state (round-9 CRITICAL).
+      provenanceAnchor: anchorFor(lineageProvenance),
+    };
+
     if (reconciled?.verification === "MISMATCH") {
       const escalated = await this.escalate(
-        { ...withoutClaim, roadmap: setRunConfig(state.roadmap, item.key, reconciled) },
+        withLineage,
         item.key,
         "RECOVERY_REQUIRED",
         `Investigate ${item.key}: the worker reported running a different model/effort than was authorized. ${reconciled.note}`,
@@ -933,7 +1078,7 @@ export class SupervisorService {
     if (outcome.kind === "COMPLETED" && runConfig !== undefined && !statesItsIdentity(reported)) {
       const humanAction = `Investigate ${item.key}: the worker reported COMPLETED without stating which provider/model it ran, so the authorized configuration cannot be confirmed.`;
       const escalated = await this.escalate(
-        { ...withoutClaim, roadmap: setRunConfig(state.roadmap, item.key, runConfig) },
+        withLineage,
         item.key,
         "RECOVERY_REQUIRED",
         humanAction,
@@ -953,14 +1098,8 @@ export class SupervisorService {
         // N-2: the identity of whoever did the work outlives the item, so a
         // later review of anything depending on it can exclude them.
         const next = await this.commit(state, {
-          ...withoutClaim,
-          roadmap: recomputeEligibility(
-            setRunConfig(
-              setImplementer(setStatus(state.roadmap, item.key, "DONE", detail), item.key, usedResourceKey),
-              item.key,
-              reconciled,
-            ),
-          ),
+          ...withLineage,
+          roadmap: recomputeEligibility(setStatus(withLineage.roadmap, item.key, "DONE", detail)),
           checkpoints: state.checkpoints.filter((entry) => entry.roadmapKey !== item.key),
           resources: markSuccess(state.resources, usedResourceKey, now),
         });
@@ -976,12 +1115,8 @@ export class SupervisorService {
           `independent review returned CHANGES_REQUIRED: ${outcome.findings.join("; ")}`,
         );
         const next = await this.commit(state, {
-          ...withoutClaim,
-          roadmap: setImplementer(
-            setStatus(state.roadmap, item.key, "ELIGIBLE", detail),
-            item.key,
-            usedResourceKey,
-          ),
+          ...withLineage,
+          roadmap: setStatus(withLineage.roadmap, item.key, "ELIGIBLE", detail),
           resources: markSuccess(state.resources, usedResourceKey, now),
         });
         void next;
@@ -1004,8 +1139,8 @@ export class SupervisorService {
         // reality is exactly what TASK-004 round 2 forbade.
         const detail = boundedDiagnostic(outcome.detail);
         const next = await this.commit(state, {
-          ...withoutClaim,
-          roadmap: setRunConfig(setStatus(state.roadmap, item.key, "ELIGIBLE", detail), item.key, reconciled),
+          ...withLineage,
+          roadmap: setStatus(withLineage.roadmap, item.key, "ELIGIBLE", detail),
           // NEW-SEC-1: a checkpoint's text comes from an executor, so it is
           // bounded and redacted like every other untrusted string before it
           // becomes durable state. "Bounded checkpoint" was the design claim;
@@ -1047,7 +1182,7 @@ export class SupervisorService {
         const reason: EscalationReason = verdict.allowed
           ? "HUMAN_DECISION_REQUIRED"
           : reasonForClass(verdict.actionClass);
-        const escalated = await this.escalate(withoutClaim, item.key, reason, humanAction, outcome.detail);
+        const escalated = await this.escalate(withLineage, item.key, reason, humanAction, outcome.detail);
         void escalated;
         return { kind: "WAITING_FOR_HUMAN", roadmapKey: item.key, reason, humanActionRequired: humanAction };
       }
@@ -1059,10 +1194,10 @@ export class SupervisorService {
           record.key === usedResourceKey ? this.applyClassification(record, classification, now) : record,
         );
         const waiting = await this.commit(state, {
-          ...withoutClaim,
+          ...withLineage,
           resources,
           roadmap: setStatus(
-            state.roadmap,
+            withLineage.roadmap,
             item.key,
             classification.state === "AUTH_REQUIRED" ? "WAITING_FOR_HUMAN_REQUIRED" : "WAITING_FOR_RESOURCE",
             boundedDiagnostic(classification.reason),
@@ -1203,6 +1338,12 @@ export class SupervisorService {
     );
     const excluded = new Set<string>();
     /**
+     * Computed before the row walk because the run-configuration cross-check
+     * above needs it, and that check must not depend on the mutable work class
+     * to decide whether it runs.
+     */
+    const chainImplementersEarly = implementersByRoadmapKey(state.provenance);
+    /**
      * Ancestors that DID AI work but recorded no implementer (F5-C4-1).
      *
      * The fifth review's counter-example: a DONE implementation item with no
@@ -1241,8 +1382,55 @@ export class SupervisorService {
        * A never-started ancestor (no attempts, not DONE, not BLOCKED) genuinely
        * has no implementer to record, and is not ambiguous.
        */
-      if (key !== item.key && requiresAi(entry.workClass)) {
-        const workHappened = entry.status === "DONE" || entry.status === "BLOCKED" || (entry.attempts ?? 0) > 0;
+      /**
+       * INCLUDES THE ITEM UNDER REVIEW (round-4 CRITICAL).
+       *
+       * Recognition was applied only to ancestors, so the reviewed item's row
+       * and chain could agree on a resource that is not in the code-level
+       * catalog at all. That fake identity was dutifully excluded — and the
+       * REAL implementer, never named anywhere, stayed eligible. The reviewer
+       * had Codex review its own work through exactly that gap.
+       *
+       * An unrecognised implementer is not lineage; it is an unrecognised
+       * string sitting where lineage should be, and it is no less suspicious
+       * for being attached to the item being reviewed rather than to one of
+       * its ancestors.
+       */
+      /**
+       * `lastRunConfig` is consulted REGARDLESS of the mutable work class
+       * (round-7 CRITICAL).
+       *
+       * It records what actually ran. Relabelling an item `DETERMINISTIC`
+       * skipped the whole branch, so an ancestor whose row and chain named
+       * Claude while its run configuration named Codex was never cross-checked
+       * — and Codex reviewed it. A record of what ran does not stop being a
+       * record because a mutable field was edited.
+       */
+      const runConfigResource =
+        entry.lastRunConfig === undefined
+          ? undefined
+          : `${entry.lastRunConfig.effectiveProvider}:${entry.lastRunConfig.effectiveModel}`;
+      if (runConfigResource !== undefined) {
+        excluded.add(runConfigResource);
+        const namedAnywhere =
+          implementerHistory(entry).includes(runConfigResource) ||
+          (chainImplementersEarly?.get(key) ?? []).includes(runConfigResource);
+        if (!namedAnywhere && !ambiguous.includes(key)) {
+          ambiguous.push(key);
+        }
+      }
+
+      if (requiresAi(entry.workClass)) {
+        /**
+         * For the item under review, ATTEMPTS alone are not evidence that an
+         * implementer exists: a review that has been attempted once has run a
+         * reviewer, not an implementer. Its recorded identities are still
+         * checked below — what changes is only whether SILENCE is suspicious.
+         */
+        const workHappened =
+          key === item.key
+            ? entry.status === "DONE" || entry.status === "BLOCKED"
+            : entry.status === "DONE" || entry.status === "BLOCKED" || (entry.attempts ?? 0) > 0;
         const history = implementerHistory(entry);
         /**
          * R7-C4-1: a history entry that names no resource this installation
@@ -1272,12 +1460,45 @@ export class SupervisorService {
             ? undefined
             : `${entry.lastRunConfig.effectiveProvider}:${entry.lastRunConfig.effectiveModel}`;
         const contradicted = fromRunConfig !== undefined && !history.includes(fromRunConfig);
-        if (workHappened && (history.length === 0 || unrecognised.length > 0 || contradicted)) {
+        /**
+         * `workHappened` governs SILENCE, and nothing else.
+         *
+         * An empty history is only suspicious if work actually happened — a
+         * never-started item genuinely has no implementer to record. But a
+         * history naming something UNRECOGNISED, or contradicting the recorded
+         * run configuration, is suspicious on its own terms: those are
+         * assertions about who ran, and a wrong assertion does not become
+         * harmless because the item has not finished.
+         *
+         * The first version gated all three on `workHappened`, so the reviewed
+         * item — ELIGIBLE, so not "done" — could name a resource no catalog
+         * knows and be waved through, while the real implementer stayed
+         * eligible to review it.
+         */
+        const silentButShouldNotBe = workHappened && history.length === 0;
+        if (silentButShouldNotBe || unrecognised.length > 0 || contradicted) {
           ambiguous.push(key);
         }
       }
       queue.push(...entry.dependsOn);
     }
+    /**
+     * The item under review contributes its OWN run evidence (round-3 finding).
+     *
+     * The ancestor loop deliberately skips `item.key` for the ambiguity rules,
+     * which is right — an item is not its own ancestor. But its `lastRunConfig`
+     * still records a resource that has already run ON IT, and choosing that
+     * resource as its reviewer is the thing C4 forbids. Excluded rather than
+     * escalated: over-excluding costs a routing choice, under-excluding costs
+     * the gate.
+     */
+    const reviewed = byKey.get(item.key);
+    if (reviewed?.lastRunConfig !== undefined) {
+      excluded.add(
+        `${reviewed.lastRunConfig.effectiveProvider}:${reviewed.lastRunConfig.effectiveModel}`,
+      );
+    }
+
     // Belt and braces: a checkpoint may still name one for an in-flight item.
     // Every implementer finding is read, not merely the first — a rolled-over
     // session can accumulate more than one.
@@ -1288,6 +1509,199 @@ export class SupervisorService {
         }
       }
     }
+
+    /**
+     * THE SECOND SOURCE (TASK-008 AC-5, AC-6).
+     *
+     * Everything above reads `implementedByResourceKeys`, which lives in the
+     * same mutable row as the item itself — so a writer of the database edits
+     * lineage and the exclusion it produces in one move. The hash chain is a
+     * separate record of the same events, and this compares them.
+     *
+     * THREE OUTCOMES, and the middle one is the point:
+     *
+     *   - the chain does not verify at all -> every visited ancestor becomes
+     *     ambiguous. Lineage that cannot be vouched for is not lineage, and
+     *     AC-5 requires the review to wait for a human rather than proceed on
+     *     unverifiable history.
+     *   - the chain verifies but names an implementer the mutable row does not
+     *     (or vice versa) -> ambiguous. Two records disagreeing means at least
+     *     one is wrong, and nothing here can say which; picking the more
+     *     convenient one is how a forged row wins.
+     *   - both agree -> the exclusion stands, now with two independent records
+     *     behind it.
+     *
+     * NOT a replacement (AC-6): the catalog recognition, the `lastRunConfig`
+     * cross-check and the missing/unknown handling above all still run. A
+     * second lock on the door does not mean removing the first.
+     *
+     * The chain is tamper-EVIDENT only. An attacker who recomputes it after
+     * editing defeats this, and the module says so — what it stops is the
+     * corrupted row, the partial restore, the hand-edit "just fixing one
+     * field", which are the realistic cases.
+     */
+    /**
+     * ONE verification, then read it for every ancestor (AC-10).
+     *
+     * `undefined` means the chain does not verify, and it is the ONLY signal
+     * this loop acts on for AC-5 — deliberately one mechanism rather than two.
+     * An earlier version had a separate "chain broken" branch above this loop
+     * as well; mutation testing showed the two masking each other, so removing
+     * either left the behaviour intact and neither was load-bearing. Two
+     * guards that cover exactly the same case are not defence in depth, they
+     * are a test that passes for the wrong reason.
+     */
+    const chainImplementers = implementersByRoadmapKey(state.provenance);
+    const unknownImplementers = keysWithUnknownImplementer(state.provenance);
+
+    /**
+     * THE CHAIN DECIDES WHAT THE CHAIN IS ASKED ABOUT (round-5 CRITICAL).
+     *
+     * `visited` comes from walking `dependsOn`, which lives in the MUTABLE
+     * roadmap. So editing `B.dependsOn` to `[]` meant the chain entry naming
+     * who implemented `A` was never consulted — the chain stayed perfectly
+     * valid and was simply never asked. Mutable data decided whether immutable
+     * data was read, which is the third time that exact shape has produced a
+     * CRITICAL in this task.
+     *
+     * Every key the chain MENTIONS is examined, whatever the current edges say.
+     * A dependency edit can no longer hide lineage, because the lineage record
+     * itself supplies the list.
+     */
+    const chainKeys = new Set<string>([
+      ...visited,
+      ...state.provenance.map((entry) => entry.roadmapKey),
+    ]);
+    for (const key of chainKeys) {
+      const entry = byKey.get(key);
+      if (entry === undefined) {
+        /**
+         * The chain names an item the roadmap no longer contains. That is not
+         * nothing — it is a record of work on something that has since been
+         * removed or renamed, and its implementer must still be excluded.
+         */
+        for (const resource of chainImplementers?.get(key) ?? []) {
+          excluded.add(resource);
+        }
+        if (unknownImplementers.has(key) && !ambiguous.includes(key)) {
+          ambiguous.push(key);
+        }
+        continue;
+      }
+      /**
+       * NO `workClass` FILTER HERE (round-3 CRITICAL).
+       *
+       * `workClass` lives in the MUTABLE row. Using it to decide whether to
+       * consult the immutable record inverts the whole design: the reviewer
+       * relabelled an item `DETERMINISTIC`, the chain entry naming its
+       * implementer was skipped, and that implementer reviewed it. A record
+       * consulted only when another record permits it is not a second source.
+       *
+       * The chain is authoritative about who did work, whatever the row now
+       * says the work was.
+       */
+      if (unknownImplementers.has(key)) {
+        // The chain asserts work happened and does not say who did it. That is
+        // worse than no record, because something DID run.
+        if (!ambiguous.includes(key)) {
+          ambiguous.push(key);
+        }
+        continue;
+      }
+      /**
+       * THE ITEM UNDER REVIEW IS NOT SKIPPED (round-2 CRITICAL).
+       *
+       * The first version skipped `key === item.key`, mirroring the row-based
+       * loop above — but that loop already adds the item's OWN implementers to
+       * the exclusion set before its ambiguity check. Skipping the item here
+       * meant a chain entry saying "codex implemented B" was ignored when
+       * choosing who reviews B, and the reviewer showed codex then reviewing
+       * its own work with the mutable row left empty.
+       *
+       * Whoever implemented the item under review is exactly who must not
+       * review it. That is the entire point of C4.
+       */
+      if (chainImplementers === undefined) {
+        // AC-5: the record cannot be vouched for, so the lineage it describes
+        // is not lineage. The review waits for a human rather than proceeding
+        // on history nobody can verify.
+        if (!ambiguous.includes(key)) {
+          ambiguous.push(key);
+        }
+        continue;
+      }
+      const fromChain = chainImplementers.get(key) ?? [];
+      const fromRow = implementerHistory(entry);
+
+      /**
+       * The CHAIN's names are checked against the catalog too (round-6
+       * CRITICAL).
+       *
+       * Recognition lived inside the row-based branch, which is gated on the
+       * MUTABLE `workClass` — so relabelling an item `DETERMINISTIC` skipped it,
+       * and the chain cross-check never asked whether a name was recognisable
+       * at all. Two records agreeing on `not-a-catalog-resource` satisfied
+       * everything and the real implementer stayed eligible.
+       *
+       * Agreement between two rewritable records is not recognition. The
+       * catalog is code-level configuration and is the only answer to "could
+       * this have run here".
+       */
+      const unrecognisedInChain = fromChain.filter((resource) => !knownResourceKeys.has(resource));
+      if (unrecognisedInChain.length > 0 && !ambiguous.includes(key)) {
+        ambiguous.push(key);
+      }
+
+      /**
+       * SILENCE IS ONLY SILENCE WHEN THE WHOLE CHAIN IS EMPTY (round-1 finding).
+       *
+       * The first version skipped whenever THIS ITEM had no chain entry, and
+       * the reviewer turned that into a one-step bypass three ways: a chain
+       * holding a valid entry for a DIFFERENT roadmap key, a chain holding only
+       * `RUN_CONFIGURED` events, and — the one that matters — a chain with this
+       * item's entries simply deleted. All three left a populated, verifying
+       * chain that said nothing about the item, and all three advanced.
+       *
+       * A chain that EXISTS and does not mention an item whose row names
+       * implementers is not silence. It is the two records disagreeing, which
+       * is precisely what this cross-check exists to catch. Deleting entries
+       * must not be cheaper than editing them; tail truncation is a deletion.
+       *
+       * Genuine silence — an entirely empty chain — is still permitted, because
+       * a database written before TASK-008 has no entries for work already done
+       * and refusing every review would strand the roadmap this protects. That
+       * residue is recorded in docs/KNOWN-LIMITATIONS.md rather than hidden.
+       */
+      /**
+       * The same rule as above: an empty chain is legacy silence ONLY when no
+       * anchor claims otherwise. With an anchor, an empty chain is a deletion.
+       */
+      /**
+       * The same complete test as `brokenChainOutcome`: an empty chain is
+       * silence only when NO anchor claims otherwise, in either field.
+       */
+      if (chainIsLegacySilence(state)) {
+        continue;
+      }
+      if (fromChain.length === 0 && fromRow.length === 0) {
+        // Neither record claims an implementer, so there is nothing to
+        // disagree about and nothing to exclude.
+        continue;
+      }
+      const disagrees =
+        fromChain.some((resource) => !fromRow.includes(resource)) ||
+        fromRow.some((resource) => !fromChain.includes(resource));
+      if (disagrees && !ambiguous.includes(key)) {
+        ambiguous.push(key);
+      }
+      // A resource named by EITHER record is excluded. Exclusion is the safe
+      // direction: over-excluding costs a routing choice, under-excluding
+      // costs C4.
+      for (const resource of fromChain) {
+        excluded.add(resource);
+      }
+    }
+
     return { excluded: [...excluded], ambiguous };
   }
 
@@ -1297,6 +1711,125 @@ export class SupervisorService {
       .map((record) => record.retryAt)
       .filter((value): value is Timestamp => value !== undefined);
     return candidates.length === 0 ? undefined : Math.min(...candidates);
+  }
+
+  /**
+   * A chain that does not verify makes the state UNUSABLE FOR WRITING, because
+   * the repository refuses to persist it — correctly. Round-4 review then found
+   * the consequence: the tick's ordinary housekeeping write threw
+   * `SchemaIntegrityError`, so a supervisor whose durable history had been
+   * tampered with produced a stack trace, zero executor calls, and NO recorded
+   * escalation. Fail-closed has to mean the supervisor decided to stop, not
+   * that it fell over on the way to deciding.
+   *
+   * Detected on LOAD, before anything tries to write, and reported as the
+   * human-decision it is.
+   */
+  private roadmapCatalog(): readonly RoadmapItem[] {
+    return this.deps.roadmapCatalog ?? DEFAULT_ROADMAP;
+  }
+
+  /**
+   * Rebuilds the roadmap from the catalog, or refuses (TASK-012 AC-1/2/3/6).
+   *
+   * Returns the state every later step must use. A caller that read
+   * `state.roadmap` instead would be reading exactly the row this exists to
+   * distrust, so the reconciled state REPLACES it rather than sitting beside it.
+   */
+  private async catalogState(
+    state: SupervisorState,
+  ): Promise<{ readonly state: SupervisorState; readonly result?: TickResult }> {
+    const verdict = reconcileRoadmapWithCatalog(state.roadmap, this.roadmapCatalog());
+    if (!verdict.ok) {
+      return { state, result: this.structuralRefusal(state, verdict.problem) };
+    }
+    const implementedKeys = new Set(
+      state.provenance.filter((entry) => entry.kind === "IMPLEMENTED_BY").map((entry) => entry.roadmapKey),
+    );
+    const unproven = unprovenCompletion({ roadmap: verdict.roadmap, implementedKeys });
+    if (unproven !== undefined) {
+      return { state, result: this.unprovenRefusal(state, unproven) };
+    }
+    if (sameRoadmap(state.roadmap, verdict.roadmap)) {
+      return { state };
+    }
+    // The only change reconciliation can make without refusing is APPENDING
+    // catalog entries this installation has not seen — an ordinary upgrade.
+    return { state: await this.commit(state, { ...state, roadmap: verdict.roadmap }) };
+  }
+
+  /**
+   * A DIFFERENT refusal from the catalog mismatch, and worded differently.
+   *
+   * Not cosmetic: `boundedDiagnostic` truncates, so a shared preamble pushes the
+   * specific finding off the end of exactly the message an operator reads. The
+   * problem goes first, and the instruction follows it.
+   */
+  private unprovenRefusal(state: SupervisorState, problem: string): TickResult {
+    this.log(`[supervisor] completion without provenance: ${problem}`);
+    return {
+      kind: "WAITING_FOR_HUMAN",
+      roadmapKey: state.roadmap[0]?.key ?? "unknown",
+      reason: "HUMAN_DECISION_REQUIRED",
+      humanActionRequired: boundedDiagnostic(
+        `${problem}. Establish what actually ran, or restore the supervisor database from a known-good backup.`,
+      ),
+    };
+  }
+
+  private structuralRefusal(state: SupervisorState, problem: string): TickResult {
+    const action =
+      "The persisted roadmap does not match this installation's catalog, so what an item IS cannot be " +
+      `established from durable state. Restore the supervisor database from a known-good backup. Detail: ${problem}`;
+    this.log(`[supervisor] roadmap structure refused: ${problem}`);
+    return {
+      kind: "WAITING_FOR_HUMAN",
+      roadmapKey: state.roadmap[0]?.key ?? "unknown",
+      reason: "HUMAN_DECISION_REQUIRED",
+      humanActionRequired: boundedDiagnostic(action),
+    };
+  }
+
+  private brokenChainOutcome(state: SupervisorState): TickResult | undefined {
+    /**
+     * AN EMPTY CHAIN IS ONLY SILENCE IF NOTHING SAYS OTHERWISE (round-6
+     * CRITICAL).
+     *
+     * The early return skipped the anchor check whenever the chain was empty,
+     * so deleting the WHOLE chain — while leaving an anchor saying it had two
+     * entries — read as a legacy database with no history. The reviewer then
+     * had Codex review its own work.
+     *
+     * The anchor exists precisely to make deletion visible; letting the
+     * deletion decide whether the anchor is consulted inverts it. An empty
+     * chain with an anchor claiming entries is the loudest possible
+     * contradiction.
+     */
+    /**
+     * A zero-length anchor still ASSERTS SOMETHING (round-7 CRITICAL).
+     *
+     * The early return checked only the anchor's LENGTH, so an anchor claiming
+     * zero entries but a non-genesis head — a contradiction on its face —
+     * skipped verification entirely. An anchor is a claim about the whole
+     * chain, and half of the claim is the head.
+     */
+    if (chainIsLegacySilence(state)) {
+      return undefined;
+    }
+    const verdict = verifyAgainstAnchor(state.provenance, state.provenanceAnchor);
+    if (verdict.intact) {
+      return undefined;
+    }
+    const action =
+      "Durable provenance no longer verifies, so who implemented what cannot be established and no review " +
+      `can be trusted. Restore the supervisor database from a known-good backup. Detail: ${verdict.problem}`;
+    this.log(`[supervisor] provenance chain is broken: ${verdict.problem}`);
+    return {
+      kind: "WAITING_FOR_HUMAN",
+      roadmapKey: state.roadmap[0]?.key ?? "unknown",
+      reason: "HUMAN_DECISION_REQUIRED",
+      humanActionRequired: boundedDiagnostic(action),
+    };
   }
 
   private async escalate(
@@ -1732,6 +2265,113 @@ export function setImplementer(
         : [resourceKeyValue, ...history],
     };
   });
+}
+
+/**
+ * Appends the SECOND record of who implemented an item (TASK-008 AC-1, AC-6).
+ *
+ * Written at the same moment as `setImplementer`, from the same value, so the
+ * two records agree unless something later edits one of them — which is
+ * precisely the event the chain exists to make visible.
+ *
+ * OVERFLOW THROWS (round-1 review finding). The first version returned the old
+ * chain unchanged and called that fail-closed, which it was not: the caller
+ * committed the completion anyway, so the mutable row gained an implementer,
+ * the chain did not, and the two records silently diverged. "The cross-check
+ * will notice later" is not a response — it makes the NEXT review wait for a
+ * human because of a bookkeeping failure here, and loses the record of what
+ * actually ran.
+ *
+ * Dropping the oldest entry to make room is not an option either: that discards
+ * exactly the provenance an attacker most wants gone. So the write refuses, the
+ * tick fails, and an operator sees why.
+ */
+export class ProvenanceOverflowError extends Error {
+  constructor(reason: string) {
+    super(reason);
+    this.name = "ProvenanceOverflowError";
+  }
+}
+
+/**
+ * Whether an empty chain is genuine LEGACY SILENCE rather than a deletion.
+ *
+ * ONE implementation, because there were two (round-8 test-integrity note). The
+ * same three-part test was written out in `brokenChainOutcome` and again inside
+ * the reviewer-exclusion loop, and a reviewer's mutation of either copy left
+ * every test green — each was masked by the other. Two copies of a rule are two
+ * rules that can disagree, and a duplicated guard cannot be proven load-bearing
+ * because there is always another one behind it.
+ *
+ * A database written before TASK-008 has no entries for work already done, and
+ * refusing every review on that basis would strand the roadmap this protects. So
+ * an empty chain is permitted — but ONLY when no anchor says otherwise, in
+ * either field: an anchor claiming entries, or claiming none while naming a
+ * non-genesis head, is a contradiction and the loudest evidence of deletion
+ * there is. That residue is recorded in docs/KNOWN-LIMITATIONS.md.
+ */
+/** Whether two roadmaps are the same list, item for item and field for field. */
+function sameRoadmap(a: readonly RoadmapItem[], b: readonly RoadmapItem[]): boolean {
+  return (
+    a.length === b.length &&
+    a.every((item, index) => {
+      const other = b[index];
+      return other !== undefined && JSON.stringify(item) === JSON.stringify(other);
+    })
+  );
+}
+
+export function chainIsLegacySilence(state: {
+  readonly provenance: readonly ProvenanceEntry[];
+  readonly provenanceAnchor?: { readonly length: number; readonly headDigest: string };
+}): boolean {
+  if (state.provenance.length !== 0) {
+    return false;
+  }
+  const anchor = state.provenanceAnchor;
+  return anchor === undefined || (anchor.length === 0 && anchor.headDigest === GENESIS_DIGEST);
+}
+
+/**
+ * What the chain records about HOW a run ended.
+ *
+ * Keyed by outcome so hoisting the recording out of the branches does not cost
+ * the description each branch used to write. A `Record` rather than a switch so
+ * that a new `WorkOutcome` variant fails to COMPILE until someone says what it
+ * means for lineage.
+ */
+const LINEAGE_DETAIL: Record<WorkOutcome["kind"], string> = {
+  COMPLETED: "completed",
+  CHANGES_REQUIRED: "changes required",
+  CHECKPOINT: "checkpointed",
+  RESOURCE_FAILURE: "resource failure",
+  HUMAN_REQUIRED: "stopped for a human",
+};
+
+export function appendImplementerProvenance(
+  chain: readonly ProvenanceEntry[],
+  roadmapKey: string,
+  resourceKeyValue: string | undefined,
+  recordedAt: Timestamp,
+  detail: string,
+): readonly ProvenanceEntry[] {
+  if (resourceKeyValue === undefined) {
+    return chain;
+  }
+  const result = appendProvenance(chain, {
+    kind: "IMPLEMENTED_BY",
+    roadmapKey,
+    resourceKey: resourceKeyValue,
+    detail,
+    recordedAt,
+  });
+  if (!result.ok) {
+    throw new ProvenanceOverflowError(
+      `cannot record provenance for ${roadmapKey}: ${result.reason}. ` +
+        "Refusing to complete the item with only half its records written.",
+    );
+  }
+  return result.chain;
 }
 
 /** Records how many action attempts an item has consumed (F-6). */

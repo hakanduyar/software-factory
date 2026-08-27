@@ -16,6 +16,8 @@
  * green test suite.
  */
 
+import { chmodSync, existsSync, mkdirSync, statSync } from "node:fs";
+import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import {
@@ -27,6 +29,7 @@ import {
 import { encodeSupervisorState, parseSupervisorState } from "../../supervision/supervisorSerialization.js";
 import type { SupervisorRepository } from "../../supervision/supervisorPorts.js";
 import type { SupervisorState } from "../../supervision/supervisorTypes.js";
+import { verifyAgainstAnchor, type ProvenanceEntry } from "../../supervision/provenanceChain.js";
 
 /** Bumped whenever the persisted shape changes incompatibly. */
 export const SUPERVISOR_SCHEMA_VERSION = 1;
@@ -38,8 +41,161 @@ export interface SqliteSupervisorRepository extends SupervisorRepository {
   close(): void;
 }
 
+/** Owner-only: `rwx` for the directory, `rw-` for the files. */
+const DIRECTORY_MODE = 0o700;
+const FILE_MODE = 0o600;
+
+/**
+ * SQLite's sidecars. In WAL mode the `-wal` file holds committed data that has
+ * not yet been checkpointed into the main file, so leaving it world-readable
+ * would expose exactly what tightening the database was meant to protect.
+ */
+const SIDECAR_SUFFIXES = ["", "-wal", "-shm", "-journal"] as const;
+
+/**
+ * Restrict the database and its directory (AC-7).
+ *
+ * Applied on EVERY open, not only at creation. A file created before this code
+ * existed — or by a restore, a copy, or a `umask` that permitted more — would
+ * otherwise keep its original mode forever, and "we set it correctly when we
+ * made it" is not a statement about the file in front of you.
+ *
+ * WHAT THIS DOES NOT DO, stated because the task's own criteria forbid
+ * overclaiming: it raises the bar against OTHER local users and stray
+ * processes. It does nothing against the operator's own account, which owns
+ * the file and can chmod it back. The supervisor database remains part of the
+ * trusted computing base.
+ *
+ * POSIX modes are meaningless on Windows, where `chmod` silently does almost
+ * nothing; this is a Linux control and is not claimed as portable.
+ */
+/**
+ * VERIFIES, rather than assuming the chmod worked (round-1 review finding).
+ *
+ * The first version swallowed every `chmod` failure and carried on, so a
+ * database that could NOT be tightened was indistinguishable from one that had
+ * been. A control whose failure is silent is not a control — it is a comment.
+ *
+ * The check is on the RESULTING MODE, not on whether the call threw: `chmod`
+ * can succeed on a filesystem that ignores POSIX modes entirely, and the
+ * question that matters is whether the file is still group- or world-accessible
+ * afterwards.
+ */
+/**
+ * Every write must persist a chain that VERIFIES (round-2 findings 2 and 5).
+ *
+ * Comparing stored digests was not enough. The reviewer edited an entry's
+ * content while keeping its old digest and appended a valid entry after it:
+ * the prefix comparison saw matching digests and accepted, and the chain was
+ * broken on the next read. `create()` accepted an outright forged digest the
+ * same way, and a valid 10,001-entry chain was persisted for `verifyChain` to
+ * reject afterwards.
+ *
+ * Recomputing here is the only comparison that answers the real question — is
+ * what is about to be written internally consistent — and it enforces the
+ * maximum at the boundary where the data actually becomes durable, rather than
+ * at the point where someone later tries to read it.
+ */
+function assertChainPersistable(
+  chain: readonly ProvenanceEntry[],
+  anchor: { readonly length: number; readonly headDigest: string } | undefined,
+  operation: string,
+): void {
+  /**
+   * The ANCHOR is checked here too (round-9 CRITICAL).
+   *
+   * Verifying only the links let a caller persist a chain whose anchor said
+   * something else — or nothing at all — and the reader then had no record to
+   * compare against. Deleting the anchor was therefore a way to switch the
+   * truncation check off. Refusing at the write boundary means a state with a
+   * chain and no matching anchor cannot be created by this process at all; a
+   * reader that finds one knows it came from outside.
+   */
+  const verdict = verifyAgainstAnchor(chain, anchor);
+  if (!verdict.intact) {
+    throw new SchemaIntegrityError(
+      `refusing to ${operation} supervisor state: its provenance chain does not verify (${verdict.problem}). ` +
+        "A chain is written whole or not at all; persisting a broken one only defers the failure to a reader.",
+    );
+  }
+}
+
+export function assertRestricted(target: string, expected: number): void {
+  const mode = statSync(target).mode & 0o777;
+  if ((mode & 0o077) !== 0) {
+    throw new SchemaIntegrityError(
+      `refusing to use supervisor state at ${target}: it is group/world accessible (mode ${mode.toString(8)}) ` +
+        `and could not be restricted to ${expected.toString(8)}. Durable state that other local accounts can ` +
+        "read or write is not durable state this process can vouch for.",
+    );
+  }
+}
+
+function restrictPermissions(path: string): void {
+  const directory = dirname(path);
+  // `recursive` makes this idempotent, and `mode` applies only when it creates.
+  mkdirSync(directory, { recursive: true, mode: DIRECTORY_MODE });
+  try {
+    chmodSync(directory, DIRECTORY_MODE);
+  } catch {
+    // Swallowed only so the VERIFICATION below reports the real state; a throw
+    // here would hide whether the directory was already restrictive.
+  }
+  assertRestricted(directory, DIRECTORY_MODE);
+
+  for (const suffix of SIDECAR_SUFFIXES) {
+    const candidate = `${path}${suffix}`;
+    if (!existsSync(candidate)) {
+      continue;
+    }
+    try {
+      chmodSync(candidate, FILE_MODE);
+    } catch {
+      /* same reasoning as the directory */
+    }
+    assertRestricted(candidate, FILE_MODE);
+  }
+}
+
+/**
+ * Refuses a write whose provenance is not the stored chain plus zero or more
+ * new entries (AC-1).
+ *
+ * Compared by DIGEST rather than by deep equality: the digest already covers
+ * every field of the entry and its link to the one before, so a mismatch means
+ * the content changed however subtly. The sequence is checked too, because two
+ * entries could in principle share a digest only if the hash broke — and if
+ * that ever happens, failing closed on the position is the right answer.
+ */
+function assertProvenanceExtends(
+  previous: readonly { readonly sequence: number; readonly digest: string }[],
+  next: readonly { readonly sequence: number; readonly digest: string }[],
+): void {
+  if (next.length < previous.length) {
+    throw new SchemaIntegrityError(
+      `refusing to write supervisor state: provenance shrank from ${previous.length} to ${next.length} entries. ` +
+        "Recorded history is append-only; deleting it is exactly what the chain exists to make impossible.",
+    );
+  }
+  for (let index = 0; index < previous.length; index += 1) {
+    const before = previous[index]!;
+    const after = next[index]!;
+    if (before.digest !== after.digest || before.sequence !== after.sequence) {
+      throw new SchemaIntegrityError(
+        `refusing to write supervisor state: provenance entry ${index} was rewritten ` +
+          `(${before.digest} -> ${after.digest}). Existing entries are immutable once written.`,
+      );
+    }
+  }
+}
+
 export function createSqliteSupervisorRepository(path: string): SqliteSupervisorRepository {
+  // Before the open, so the directory exists and is already restricted when
+  // SQLite creates the file inside it.
+  restrictPermissions(path);
   const db = new DatabaseSync(path);
+  // ...and again after, because the file (and any sidecar) only exists now.
+  restrictPermissions(path);
   ensureSchema(db);
 
   const insert = db.prepare("INSERT INTO supervisor_state (id, version, data) VALUES (?, ?, ?)");
@@ -69,15 +225,60 @@ export function createSqliteSupervisorRepository(path: string): SqliteSupervisor
       }
       // Round-trip on write, so a value that could not be read back never
       // reaches the file in the first place.
-      const encoded = encodeSupervisorState(state);
-      parseSupervisorState(encoded, { version: state.version });
-      insert.run(SINGLETON_ID, state.version, encoded);
+      /**
+       * VERIFY AND STORE WHAT IS ACTUALLY SERIALIZED (round-3 findings).
+       *
+       * Checking the in-memory object was checking the wrong artefact twice
+       * over. An entry with a `toJSON()` returning edited content and the old
+       * digest passed every guard and landed in SQLite as a chain that does not
+       * verify; and an entry carrying an extra property persisted that property
+       * — a credential, in the reviewer's reproduction — because the parser
+       * drops unknown fields only AFTER the row is written.
+       *
+       * Parsing the encoded text and re-encoding the RESULT closes both: what
+       * is verified is what the bytes say, and what is stored contains only
+       * fields the parser recognises.
+       */
+      const canonical = encodeSupervisorState(parseSupervisorState(encodeSupervisorState(state), { version: state.version }));
+      (() => {
+        const parsed = parseSupervisorState(canonical, { version: state.version });
+        assertChainPersistable(parsed.provenance, parsed.provenanceAnchor, "create");
+      })();
+      insert.run(SINGLETON_ID, state.version, canonical);
       return state;
     },
 
     async compareAndSave(next: SupervisorState, expectedVersion: number): Promise<SupervisorState> {
-      const encoded = encodeSupervisorState(next);
-      parseSupervisorState(encoded, { version: next.version });
+      // Same reasoning as `create`: the bytes are the artefact.
+      const encoded = encodeSupervisorState(
+        parseSupervisorState(encodeSupervisorState(next), { version: next.version }),
+      );
+      const persisted = parseSupervisorState(encoded, { version: next.version });
+
+      /**
+       * APPEND-ONLY IS ENFORCED HERE, not merely intended (AC-1, round-1
+       * finding).
+       *
+       * `appendProvenance` preserved its input, but nothing stopped a caller
+       * saving a state whose provenance was shorter, edited, or empty — the
+       * reviewer wrote `compareAndSave({...state, provenance: []}, 1)` and it
+       * succeeded. A history that any write can truncate is not append-only,
+       * and the C4 cross-check that reads it is only as good as this.
+       *
+       * The stored chain must be a PREFIX of the incoming one: same entries, in
+       * the same order, with zero or more appended. That single rule refuses
+       * truncation, tail deletion, reordering and in-place edits together,
+       * which is why it is expressed as one comparison rather than four checks
+       * that could each be got wrong separately.
+       */
+      const stored = find.get(SINGLETON_ID) as Row | undefined;
+      if (stored !== undefined) {
+        const previous = parseSupervisorState(stored.data, { version: stored.version }).provenance;
+        // Prefix first, so a rewritten entry is reported as a rewrite rather
+        // than as a generic broken chain — the diagnosis an operator needs.
+        assertProvenanceExtends(previous, persisted.provenance);
+      }
+      assertChainPersistable(persisted.provenance, persisted.provenanceAnchor, "write");
 
       const result = update.run(next.version, encoded, SINGLETON_ID, expectedVersion);
       if (result.changes === 0) {

@@ -15,6 +15,7 @@
 import type { Timestamp } from "../domain/time.js";
 import type { AiRunConfigRecord } from "./modelEnforcement.js";
 import type { WorkClass } from "./modelRouting.js";
+import type { ProvenanceEntry } from "./provenanceChain.js";
 import type { ResourceRecord } from "./resourceTypes.js";
 
 // =====================================================================
@@ -268,6 +269,35 @@ export interface SupervisorState {
   /** When the next tick is worth running. Absent means "nothing scheduled". */
   readonly nextWakeAt?: Timestamp;
   readonly escalations: readonly HumanEscalation[];
+  /**
+   * Append-only, hash-chained provenance (TASK-008).
+   *
+   * A SECOND record of who implemented what, independent of the mutable
+   * `implementedByResourceKeys` carried on each roadmap item. Neither replaces
+   * the other: where they disagree the review fails closed, because two records
+   * that contradict each other mean at least one is wrong and nothing here can
+   * say which.
+   *
+   * Absent-means-empty on read, so a database written before this field existed
+   * still loads rather than being refused as corrupt.
+   *
+   * Tamper-EVIDENT, not tamper-proof — see `provenanceChain.ts`.
+   */
+  readonly provenance: readonly ProvenanceEntry[];
+  /**
+   * The chain's length and head digest, recorded SEPARATELY (TASK-008 AC-3).
+   *
+   * A hash chain cannot detect TAIL truncation on its own: a valid prefix is a
+   * valid chain, and round-5 review cut the tail and deleted the matching row
+   * so neither record mentioned the removed work. Detecting that needs
+   * something outside the chain to say how long it should be.
+   *
+   * This is the same "second source" idea the chain itself applies to the
+   * mutable row, one level up: an attacker must now edit the chain AND this
+   * anchor consistently. It is not a trust anchor — nothing here is signed —
+   * and it does not stop someone who updates both. It stops a truncation.
+   */
+  readonly provenanceAnchor?: { readonly length: number; readonly headDigest: string };
   readonly updatedAt: Timestamp;
 }
 

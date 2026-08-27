@@ -43,9 +43,15 @@ import {
 } from "../src/supervision/supervisorSerialization.js";
 import { resourceBindingHolds, selectNextItem } from "../src/supervision/supervisorService.js";
 import type { RoadmapItem } from "../src/supervision/supervisorTypes.js";
+import {
+  anchorFor,
+  appendProvenance,
+  type ProvenanceEntry,
+} from "../src/supervision/provenanceChain.js";
 import { cleanupTempDbs, tempDbPath } from "./support/factoryFixtures.js";
 import { createSqliteSupervisorRepository } from "../src/adapters/supervision/sqliteSupervisorRepository.js";
 import {
+  declarePersisted,
   newSupervisor,
   scriptedExecutor,
   scriptedProbe,
@@ -54,6 +60,27 @@ import {
 } from "./support/supervisorFixtures.js";
 
 after(cleanupTempDbs);
+
+/**
+ * A provenance chain naming `resource` as an implementer of `roadmapKey`.
+ *
+ * Needed since TASK-012 AC-6: a DONE item whose class requires AI, with nothing
+ * in the chain saying anything ran on it, is now a forged completion and is
+ * refused. These fixtures are about a LATER question — who may review it — so
+ * they have to get past that one first, with the record a real run would have
+ * left.
+ */
+function chainNaming(roadmapKey: string, resource: string): readonly ProvenanceEntry[] {
+  const appended = appendProvenance([], {
+    kind: "IMPLEMENTED_BY",
+    roadmapKey,
+    resourceKey: resource,
+    detail: "completed",
+    recordedAt: 1_000,
+  });
+  if (!appended.ok) throw new Error("fixture chain did not build");
+  return appended.chain;
+}
 
 const ONE_AI_ITEM: readonly RoadmapItem[] = [
   { key: "AI", title: "Needs a model", dependsOn: [], status: "PENDING", workClass: "NORMAL_IMPLEMENTATION", order: 1 },
@@ -167,9 +194,12 @@ describe("TASK-006 R7-C4-1: an unrecognised implementer fails closed", () => {
             implementedByResourceKeys: history,
           },
         ],
+        provenance: chainNaming("A", "claude-code:opus"),
+        provenanceAnchor: anchorFor(chainNaming("A", "claude-code:opus")),
       },
       state.version,
     );
+    await declarePersisted(supervisor);
     const result = await supervisor.service.tick();
     return { result, supervisor };
   }
@@ -216,6 +246,7 @@ describe("TASK-006 R7-DAG-1: a stored ELIGIBLE does not outrank the dependency g
       { ...state, version: state.version + 1, roadmap },
       state.version,
     );
+    await declarePersisted(supervisor);
 
     await supervisor.service.tick();
 

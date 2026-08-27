@@ -18,6 +18,7 @@ import { ConcurrencyError } from "../src/domain/errors.js";
 import { BACKOFF_LADDER_MS } from "../src/supervision/resourceTypes.js";
 import type { RoadmapItem } from "../src/supervision/supervisorTypes.js";
 import {
+  declarePersisted,
   manualClock,
   newSupervisor,
   scriptedExecutor,
@@ -256,6 +257,7 @@ describe("TASK-006 AC-9: waiting for a resource costs nothing", () => {
     // the five-minute rung forever.
     clock.advance(BACKOFF_LADDER_MS[0]! + 1);
     const restarted = newSupervisor({ clock, repository, probe, ownerId: "supervisor:restarted" });
+    await declarePersisted(restarted);
     await restarted.service.tick();
 
     state = (await repository.load())!;
@@ -364,6 +366,8 @@ describe("TASK-006 AC-16: a crash never duplicates external work", () => {
     );
 
     const restarted = newSupervisor({ repository, ownerId: "supervisor:fresh" });
+
+    await declarePersisted(restarted);
     const result = await restarted.service.tick();
 
     // CLAIMED proves nothing external happened, so retrying is safe.
@@ -398,6 +402,8 @@ describe("TASK-006 AC-16: a crash never duplicates external work", () => {
     );
 
     const restarted = newSupervisor({ repository, executor, ownerId: "supervisor:fresh" });
+
+    await declarePersisted(restarted);
     const result = await restarted.service.tick();
 
     assert.equal(result.kind, "RECOVERY_REQUIRED", "an unknowable outcome must not be repeated");
@@ -469,6 +475,7 @@ describe("TASK-006 AC-14: a full context rolls over without losing work", () => 
 
     // A brand-new process — no shared memory, no transcript — resumes it.
     const fresh = newSupervisor({ repository, executor, ownerId: "supervisor:new-session" });
+    await declarePersisted(fresh);
     const finished = await fresh.service.tick();
     assert.equal(finished.kind, "ADVANCED");
 

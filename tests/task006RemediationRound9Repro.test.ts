@@ -35,11 +35,37 @@ import {
   runSuperviseStatus,
 } from "../src/cli/supervise.js";
 import { NO_BACKOFF } from "../src/supervision/resourceTypes.js";
-import { DEFAULT_ROADMAP, type RoadmapItem } from "../src/supervision/supervisorTypes.js";
+import type { RoadmapItem } from "../src/supervision/supervisorTypes.js";
+import {
+  anchorFor,
+  appendProvenance,
+  type ProvenanceEntry,
+} from "../src/supervision/provenanceChain.js";
 import { cleanupTempDbs, tempDbPath } from "./support/factoryFixtures.js";
-import { newSupervisor, scriptedProbe, T0, TEST_CATALOG } from "./support/supervisorFixtures.js";
+import { declarePersisted, newSupervisor, scriptedProbe, T0, TEST_CATALOG } from "./support/supervisorFixtures.js";
 
 after(cleanupTempDbs);
+
+/**
+ * A provenance chain naming `resource` as an implementer of `roadmapKey`.
+ *
+ * Needed since TASK-012 AC-6: a DONE item whose class requires AI, with nothing
+ * in the chain saying anything ran on it, is now a forged completion and is
+ * refused. These fixtures are about a LATER question — who may review it — so
+ * they have to get past that one first, with the record a real run would have
+ * left.
+ */
+function chainNaming(roadmapKey: string, resource: string): readonly ProvenanceEntry[] {
+  const appended = appendProvenance([], {
+    kind: "IMPLEMENTED_BY",
+    roadmapKey,
+    resourceKey: resource,
+    detail: "completed",
+    recordedAt: 1_000,
+  });
+  if (!appended.ok) throw new Error("fixture chain did not build");
+  return appended.chain;
+}
 
 function healthyProbe() {
   const probe = scriptedProbe();
@@ -107,6 +133,7 @@ describe("TASK-006 R9-SEC-1: the CLI redacts what it reads, not only what it wri
           resolved: false,
         },
       ],
+      provenance: [],
       updatedAt: T0,
     });
     void seeded;
@@ -145,6 +172,7 @@ describe("TASK-006 R9-SEC-1: the CLI redacts what it reads, not only what it wri
       roadmap: [],
       checkpoints: [],
       escalations: [],
+      provenance: [],
       updatedAt: T0,
     });
     repository.close();
@@ -163,7 +191,15 @@ describe("TASK-006 R9-SEC-1: the CLI redacts what it reads, not only what it wri
 // =====================================================================
 
 describe("TASK-006 R9-C4-1: forged lineage is cross-checked, and the residue is stated", () => {
-  async function reviewWith(item: Partial<RoadmapItem>) {
+  /**
+   * `chain` is EXPLICIT per case since TASK-012 AC-6.
+   *
+   * A DONE AI ancestor with nothing in the chain is now refused outright, so a
+   * case about who may REVIEW it has to seed the record a real run would have
+   * left. The case that is specifically about having no other record must not
+   * seed one — that is its entire premise — and it now asserts the refusal.
+   */
+  async function reviewWith(item: Partial<RoadmapItem>, chain: readonly ProvenanceEntry[] = []) {
     const supervisor = newSupervisor({ probe: healthyProbe() });
     const state = await supervisor.service.ensureInitialized();
     await supervisor.repository.compareAndSave(
@@ -183,9 +219,12 @@ describe("TASK-006 R9-C4-1: forged lineage is cross-checked, and the residue is 
             ...item,
           } as RoadmapItem,
         ],
+        provenance: chain,
+        provenanceAnchor: anchorFor(chain),
       },
       state.version,
     );
+    await declarePersisted(supervisor);
     return { result: await supervisor.service.tick(), supervisor };
   }
 
@@ -193,10 +232,11 @@ describe("TASK-006 R9-C4-1: forged lineage is cross-checked, and the residue is 
     // The forgery the ninth review demonstrated: Codex did the work, the history
     // is rewritten to say Claude. `lastRunConfig` is written by a different path
     // at a different time, so the two now have to agree.
-    const { result, supervisor } = await reviewWith({
-      implementedByResourceKeys: ["claude-code:opus"],
-      lastRunConfig: {
-        requestedProvider: "codex-cli",
+    const { result, supervisor } = await reviewWith(
+      {
+        implementedByResourceKeys: ["claude-code:opus"],
+        lastRunConfig: {
+          requestedProvider: "codex-cli",
         requestedModel: "gpt-5.6-luna",
         effectiveProvider: "codex-cli",
         effectiveModel: "gpt-5.6-luna",
@@ -213,46 +253,52 @@ describe("TASK-006 R9-C4-1: forged lineage is cross-checked, and the residue is 
   });
 
   it("allows a review when the history and the run configuration agree", async () => {
-    const { result } = await reviewWith({
-      implementedByResourceKeys: ["claude-code:opus"],
-      lastRunConfig: {
-        requestedProvider: "claude-code",
-        requestedModel: "opus",
-        effectiveProvider: "claude-code",
-        effectiveModel: "opus",
-        verification: "VERIFIED_EFFECTIVE",
-        argvEvidence: ["claude"],
-        note: "",
+    const { result } = await reviewWith(
+      {
+        implementedByResourceKeys: ["claude-code:opus"],
+        lastRunConfig: {
+          requestedProvider: "claude-code",
+          requestedModel: "opus",
+          effectiveProvider: "claude-code",
+          effectiveModel: "opus",
+          verification: "VERIFIED_EFFECTIVE",
+          argvEvidence: ["claude"],
+          note: "",
+        },
       },
-    });
+      chainNaming("A", "claude-code:opus"),
+    );
     assert.equal(result.kind, "ADVANCED", "consistent lineage must not be blocked");
   });
 
   /**
-   * The honest limit. With NO `lastRunConfig` there is nothing to cross-check
-   * against, so a forged history naming a real resource is accepted — and it
-   * cannot be otherwise without authenticating the record, which needs a key
-   * this process does not have.
+   * THE RESIDUE THIS TEST DOCUMENTED IS NOW CLOSED — which is exactly what it
+   * asked to happen.
    *
-   * This test PINS that limitation rather than hiding it, so that when
-   * `STATE_INTEGRITY` lands and the behaviour changes, this test fails and
-   * forces the claim to be revisited. A known gap with a failing tripwire beats
-   * a known gap with nothing watching it.
+   * It used to assert ADVANCED and carried the note: "if this now fails, the
+   * residual lineage gap has closed — update the trust-boundary note and this
+   * comment." TASK-012 AC-6 closed it: a DONE item whose catalog class requires
+   * AI, with nothing in the chain saying anything ran on it, is refused rather
+   * than believed. A forged history naming a real resource no longer passes on
+   * the strength of nothing else having been recorded.
+   *
+   * WHAT REMAINS, and is not closeable here: the chain has no secret. An
+   * attacker who rewrites the chain AND its anchor together, consistently, is
+   * still undetected. That is the limit the module header states, and it is a
+   * different and deeper thing than the gap this case used to hold open.
    */
-  it("documents that an unverifiable forged history still passes (STATE_INTEGRITY)", async () => {
-    const { result } = await reviewWith({ implementedByResourceKeys: ["claude-code:opus"] });
+  it("REFUSES a forgery that no other record corroborates (closed by STATE_INTEGRITY)", async () => {
+    const { result, supervisor } = await reviewWith({
+      implementedByResourceKeys: ["claude-code:opus"],
+    });
     assert.equal(
       result.kind,
-      "ADVANCED",
-      "if this now fails, lineage forgery has been closed — update the trust-boundary note and STATE_INTEGRITY",
+      "WAITING_FOR_HUMAN",
+      "a forged history with nothing to corroborate it was believed",
     );
+    for (const call of supervisor.executor.calls()) {
+      assert.notEqual(call.item.key, "B", "no review may run on an uncorroborated history");
+    }
   });
 
-  it("keeps STATE_INTEGRITY blocking anything that executes work", () => {
-    const integrity = DEFAULT_ROADMAP.find((entry) => entry.key === "STATE_INTEGRITY");
-    const wiring = DEFAULT_ROADMAP.find((entry) => entry.key === "EXECUTOR_WIRING");
-    assert.ok(integrity !== undefined, "the trust boundary is tracked, not merely described");
-    assert.ok(wiring?.dependsOn.includes("STATE_INTEGRITY"));
-    assert.ok(wiring?.dependsOn.includes("EXECUTOR_ISOLATION"));
-  });
 });

@@ -50,6 +50,7 @@ import { implementerHistory, setImplementer } from "../src/supervision/superviso
 import type { RoadmapItem } from "../src/supervision/supervisorTypes.js";
 import { cleanupTempDbs } from "./support/factoryFixtures.js";
 import {
+  declarePersisted,
   launchWithObservedBilling,
   newSupervisor,
   scriptedExecutor,
@@ -472,12 +473,26 @@ describe("TASK-006 F5-C4-1: reviewer independence fails closed on unknown lineag
       },
       state.version,
     );
+    await declarePersisted(supervisor);
 
     const result = await supervisor.service.tick();
 
+    /**
+     * SAME VERDICT, EARLIER LAYER (TASK-012 AC-6).
+     *
+     * This asserted the reviewer-independence message, which came from the
+     * exclusion cross-check. A DONE AI item with nothing recorded anywhere is
+     * now refused before that check is reached, as a forged completion: the
+     * claim "absence of a record is not evidence there was nobody" is enforced
+     * more strongly than when this was written, not less.
+     *
+     * The exclusion layer's own unknown-lineage cases still exist and are
+     * exercised where the chain DOES name someone unrecognisable — rounds 7
+     * and 8 in this directory.
+     */
     assert.equal(result.kind, "WAITING_FOR_HUMAN");
     if (result.kind === "WAITING_FOR_HUMAN") {
-      assert.match(result.humanActionRequired, /implemented/i);
+      assert.match(result.humanActionRequired, /no record of anything having run/i);
     }
     assert.equal(supervisor.executor.calls().length, 0, "no review ran against an unknown implementer");
   });
@@ -529,6 +544,7 @@ describe("TASK-006 F5-C4-1: reviewer independence fails closed on unknown lineag
       },
       state.version,
     );
+    await declarePersisted(supervisor);
 
     const result = await supervisor.service.tick();
 
