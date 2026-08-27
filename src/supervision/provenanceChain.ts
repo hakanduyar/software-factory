@@ -84,11 +84,17 @@ function canonical(entry: Omit<ProvenanceEntry, "digest">): string {
    * exist. Escaping would also work, but it has to be exactly right in both
    * directions forever; this cannot be got subtly wrong.
    */
+  /**
+   * ABSENT is not EMPTY (round-2 finding). `entry.resourceKey ?? ""` gave an
+   * entry with no resource and an entry with an empty one the SAME digest, so
+   * one could be rewritten as the other and the chain still verified. The
+   * presence flag makes the distinction part of what is hashed.
+   */
   const fields = [
     String(entry.sequence),
     entry.kind,
     entry.roadmapKey,
-    entry.resourceKey ?? "",
+    entry.resourceKey === undefined ? "\u0000absent" : `\u0000present${entry.resourceKey}`,
     entry.detail,
     String(entry.recordedAt),
     entry.previousDigest,
@@ -111,6 +117,33 @@ export type AppendResult =
  * what is verified is exactly what is stored — sanitizing afterwards would make
  * every entry fail its own digest.
  */
+/**
+ * Refuses a string that cannot survive UTF-8 unchanged (round-2 finding).
+ *
+ * A lone surrogate is replaced by U+FFFD when encoded, so a string containing
+ * one hashes identically to the string that already had the replacement
+ * character — two different values, one digest. Node exposes the test directly.
+ */
+export function isHashable(value: string): boolean {
+  // Written out rather than using `String.prototype.isWellFormed`, which needs
+  // an ES2024 lib target this project does not otherwise require. Raising the
+  // whole target for one predicate would be a far larger change than the
+  // predicate itself.
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) {
+        return false; // a high surrogate with no low surrogate after it
+      }
+      index += 1; // a valid pair, consumed
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      return false; // a low surrogate with no high surrogate before it
+    }
+  }
+  return true;
+}
+
 export function appendProvenance(
   chain: readonly ProvenanceEntry[],
   event: {
@@ -126,6 +159,18 @@ export function appendProvenance(
       ok: false,
       reason: `provenance chain is at its maximum of ${MAX_CHAIN_ENTRIES} entries; refusing to append rather than discarding the oldest history`,
     };
+  }
+  for (const [field, value] of [
+    ["roadmapKey", event.roadmapKey],
+    ["detail", event.detail],
+    ["resourceKey", event.resourceKey ?? ""],
+  ] as const) {
+    if (!isHashable(value)) {
+      return {
+        ok: false,
+        reason: `provenance ${field} is not well-formed UTF-16; it would hash identically to a different string`,
+      };
+    }
   }
   const last = chain.at(-1);
   const withoutDigest: Omit<ProvenanceEntry, "digest"> = {

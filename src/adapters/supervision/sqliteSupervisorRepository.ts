@@ -29,6 +29,7 @@ import {
 import { encodeSupervisorState, parseSupervisorState } from "../../supervision/supervisorSerialization.js";
 import type { SupervisorRepository } from "../../supervision/supervisorPorts.js";
 import type { SupervisorState } from "../../supervision/supervisorTypes.js";
+import { verifyChain, type ProvenanceEntry } from "../../supervision/provenanceChain.js";
 
 /** Bumped whenever the persisted shape changes incompatibly. */
 export const SUPERVISOR_SCHEMA_VERSION = 1;
@@ -80,6 +81,31 @@ const SIDECAR_SUFFIXES = ["", "-wal", "-shm", "-journal"] as const;
  * question that matters is whether the file is still group- or world-accessible
  * afterwards.
  */
+/**
+ * Every write must persist a chain that VERIFIES (round-2 findings 2 and 5).
+ *
+ * Comparing stored digests was not enough. The reviewer edited an entry's
+ * content while keeping its old digest and appended a valid entry after it:
+ * the prefix comparison saw matching digests and accepted, and the chain was
+ * broken on the next read. `create()` accepted an outright forged digest the
+ * same way, and a valid 10,001-entry chain was persisted for `verifyChain` to
+ * reject afterwards.
+ *
+ * Recomputing here is the only comparison that answers the real question — is
+ * what is about to be written internally consistent — and it enforces the
+ * maximum at the boundary where the data actually becomes durable, rather than
+ * at the point where someone later tries to read it.
+ */
+function assertChainPersistable(chain: readonly ProvenanceEntry[], operation: string): void {
+  const verdict = verifyChain(chain);
+  if (!verdict.intact) {
+    throw new SchemaIntegrityError(
+      `refusing to ${operation} supervisor state: its provenance chain does not verify (${verdict.problem}). ` +
+        "A chain is written whole or not at all; persisting a broken one only defers the failure to a reader.",
+    );
+  }
+}
+
 export function assertRestricted(target: string, expected: number): void {
   const mode = statSync(target).mode & 0o777;
   if ((mode & 0o077) !== 0) {
@@ -187,6 +213,7 @@ export function createSqliteSupervisorRepository(path: string): SqliteSupervisor
       // reaches the file in the first place.
       const encoded = encodeSupervisorState(state);
       parseSupervisorState(encoded, { version: state.version });
+      assertChainPersistable(state.provenance, "create");
       insert.run(SINGLETON_ID, state.version, encoded);
       return state;
     },
@@ -214,8 +241,11 @@ export function createSqliteSupervisorRepository(path: string): SqliteSupervisor
       const stored = find.get(SINGLETON_ID) as Row | undefined;
       if (stored !== undefined) {
         const previous = parseSupervisorState(stored.data, { version: stored.version }).provenance;
+        // Prefix first, so a rewritten entry is reported as a rewrite rather
+        // than as a generic broken chain — the diagnosis an operator needs.
         assertProvenanceExtends(previous, next.provenance);
       }
+      assertChainPersistable(next.provenance, "write");
 
       const result = update.run(next.version, encoded, SINGLETON_ID, expectedVersion);
       if (result.changes === 0) {

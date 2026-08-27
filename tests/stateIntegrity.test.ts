@@ -479,9 +479,45 @@ describe("TASK-008 AC-8: tamper-EVIDENT is stated where an operator reads it", (
    * And when it is broken, "intact" must not be what the operator reads. A
    * status line that looks the same either way is a status line nobody checks.
    */
+  /**
+   * Tampered by writing the ROW DIRECTLY, because the repository now refuses to
+   * persist a chain that does not verify — which is the correct behaviour and
+   * makes `create()` the wrong way to build this fixture. An attacker with file
+   * access does exactly this: edits the stored JSON, bypassing every write-path
+   * guard. That is the case `supervise status` has to survive.
+   */
   it("reports a BROKEN chain as broken, not merely as fewer entries", async () => {
-    const tampered = chainFor("claude-code:opus").map((entry) => ({ ...entry, detail: "edited" }));
-    const output = await statusFor(tampered);
+    const { DatabaseSync } = await import("node:sqlite");
+    const dbPath = tempDbPath("t8-status-broken");
+    const repository = createSqliteSupervisorRepository(dbPath);
+    const seeded = await repository.create({
+      version: 1,
+      financialPolicy: { autonomousSpendAllowed: false, autonomousSpendLimit: 0 },
+      resources: [],
+      roadmap: [
+        { key: "A", title: "Implemented", dependsOn: [], status: "DONE", workClass: "NORMAL_IMPLEMENTATION", order: 1 },
+      ],
+      checkpoints: [],
+      escalations: [],
+      provenance: chainFor("claude-code:opus"),
+      updatedAt: 1_000,
+    });
+    repository.close();
+
+    const db = new DatabaseSync(dbPath);
+    const tamperedState = {
+      ...seeded,
+      provenance: seeded.provenance.map((entry) => ({ ...entry, detail: "edited after the fact" })),
+    };
+    db.prepare("UPDATE supervisor_state SET data = ? WHERE id = ?").run(
+      JSON.stringify(tamperedState),
+      "supervisor",
+    );
+    db.close();
+
+    const lines: string[] = [];
+    await runSuperviseStatus({ supervisorDbPath: dbPath, log: (line: string) => lines.push(line) });
+    const output = lines.join("\n");
     assert.match(output, /CHAIN BROKEN/);
     assert.ok(!/chain intact/.test(output), "a tampered chain must not read as intact");
     assert.match(output, /tamper-evident, not tamper-proof/);
@@ -685,13 +721,32 @@ describe("TASK-008 round 1: durable state enforces append-only (AC-1)", () => {
     }
   });
 
-  it("REFUSES a write that rewrites an existing entry", async () => {
+  /**
+   * Two shapes of rewrite, refused for two different reasons — both correct,
+   * and worth separating so a future change cannot lose one behind the other.
+   */
+  it("REFUSES a write whose entry keeps its digest but changes its content", async () => {
     const { repository, seeded } = await repoWithOneEntry();
     try {
-      const rewritten = seeded.provenance.map((entry) => ({ ...entry, detail: "edited", digest: "prov-forged" }));
+      // Digest UNCHANGED, content edited: the prefix comparison sees matching
+      // digests, so only recomputation catches this. It was the round-2 escape.
+      const rewritten = seeded.provenance.map((entry) => ({ ...entry, detail: "edited after the fact" }));
       await assert.rejects(
         repository.compareAndSave({ ...seeded, version: 2, provenance: rewritten }, 1),
-        /was rewritten/,
+        /does not verify/,
+      );
+    } finally {
+      repository.close();
+    }
+  });
+
+  it("REFUSES a write whose entry carries a forged digest", async () => {
+    const { repository, seeded } = await repoWithOneEntry();
+    try {
+      const forged = seeded.provenance.map((entry) => ({ ...entry, digest: "prov-forged" }));
+      await assert.rejects(
+        repository.compareAndSave({ ...seeded, version: 2, provenance: forged }, 1),
+        /is not a digest|was rewritten|does not verify/,
       );
     } finally {
       repository.close();
@@ -839,5 +894,224 @@ describe("TASK-008 round 1: a permission failure is REPORTED, not swallowed (AC-
     chmodSync(file, 0o600);
 
     assert.doesNotThrow(() => assertRestricted(file, 0o600), "a correctly restricted file must be accepted");
+  });
+});
+
+
+// =====================================================================
+// ROUND-2 REMEDIATION — the CRITICAL and four HIGHs
+// =====================================================================
+
+describe("TASK-008 round 2: the reviewed item's own implementer is excluded", () => {
+  /**
+   * THE CRITICAL. The chain cross-check skipped `key === item.key`, so a chain
+   * entry naming who implemented the item UNDER REVIEW was ignored entirely.
+   * With the mutable row left empty, the reviewer had codex implement B and
+   * then review B — the exact failure C4 exists to prevent.
+   */
+  it("REFUSES to let the chain-named implementer of B review B", async () => {
+    /**
+     * The fixture must make B the ONLY disagreement.
+     *
+     * My first version left the dependency A disagreeing too, so the run
+     * stopped for THAT reason and the test passed whether or not B was
+     * examined — mutation testing showed it surviving the exact regression it
+     * was written for. Here A's row and chain agree, so anything that stops
+     * the review can only be about B.
+     */
+    let chain: readonly ProvenanceEntry[] = [];
+    for (const [roadmapKey, resourceKey] of [
+      ["A", "claude-code:opus"],
+      ["B", "codex-cli:gpt-5.6-luna"],
+    ] as const) {
+      const appended = appendProvenance(chain, {
+        kind: "IMPLEMENTED_BY",
+        roadmapKey,
+        resourceKey,
+        detail: "implemented",
+        recordedAt: 1_000,
+      });
+      assert.equal(appended.ok, true);
+      if (!appended.ok) throw new Error("unreachable");
+      chain = appended.chain;
+    }
+
+    const { result, supervisor } = await reviewWith({
+      // A agrees with the chain; B's row says nothing while the chain says
+      // codex built it.
+      item: { implementedByResourceKeys: ["claude-code:opus"] },
+      provenance: chain,
+    });
+
+    assert.equal(
+      result.kind,
+      "WAITING_FOR_HUMAN",
+      "a chain naming who built the REVIEWED item must be read, not skipped",
+    );
+    for (const call of supervisor.executor.calls()) {
+      assert.notEqual(call.item.key, "B", "the reviewed item ran despite contradicted lineage");
+    }
+  });
+
+  /** ...and with both records agreeing about B, the review still proceeds. */
+  it("still ADVANCES when the chain and row agree about the reviewed item", async () => {
+    let chain: readonly ProvenanceEntry[] = [];
+    for (const [roadmapKey, resourceKey] of [["A", "claude-code:opus"]] as const) {
+      const appended = appendProvenance(chain, {
+        kind: "IMPLEMENTED_BY",
+        roadmapKey,
+        resourceKey,
+        detail: "implemented",
+        recordedAt: 1_000,
+      });
+      assert.equal(appended.ok, true);
+      if (!appended.ok) throw new Error("unreachable");
+      chain = appended.chain;
+    }
+
+    const { result } = await reviewWith({
+      item: { implementedByResourceKeys: ["claude-code:opus"] },
+      provenance: chain,
+    });
+    assert.equal(result.kind, "ADVANCED", "agreeing records must not block the review");
+  });
+});
+
+describe("TASK-008 round 2: the digest distinguishes what it must", () => {
+  const base = {
+    sequence: 0,
+    kind: "IMPLEMENTED_BY" as const,
+    roadmapKey: "A",
+    detail: "d",
+    recordedAt: 1,
+    previousDigest: GENESIS_DIGEST,
+  };
+
+  /** ABSENT and EMPTY were canonicalised identically through `?? ""`. */
+  it("gives different digests to an absent and an empty resourceKey", () => {
+    const absent = computeDigest(base);
+    const empty = computeDigest({ ...base, resourceKey: "" });
+    assert.notEqual(absent, empty, "absent and empty must not be interchangeable");
+  });
+
+  /**
+   * A lone surrogate becomes U+FFFD when encoded as UTF-8, so it would hash
+   * identically to a string that already contained the replacement character.
+   * Such an entry is refused rather than hashed.
+   */
+  it("REFUSES to append a string that cannot survive UTF-8 unchanged", () => {
+    const result = appendProvenance([], {
+      kind: "IMPLEMENTED_BY",
+      roadmapKey: "A",
+      resourceKey: "claude-code:opus",
+      detail: `lone surrogate: ${String.fromCharCode(0xd800)}`,
+      recordedAt: 1,
+    });
+    assert.equal(result.ok, false, "a non-well-formed string was hashed");
+    if (!result.ok) assert.match(result.reason, /well-formed/);
+  });
+
+  it("still accepts ordinary multibyte text", () => {
+    const result = appendProvenance([], {
+      kind: "IMPLEMENTED_BY",
+      roadmapKey: "A",
+      resourceKey: "claude-code:opus",
+      detail: "ünïcödé ✅ 日本語 🎉",
+      recordedAt: 1,
+    });
+    assert.equal(result.ok, true, "legitimate unicode must not be refused");
+  });
+});
+
+describe("TASK-008 round 2: a digest field must be a digest", () => {
+  /** A credential round-tripped through `digest`, which was a plain string. */
+  it("REFUSES a persisted entry whose digest carries credential-shaped text", () => {
+    const entry = {
+      ...chainFor("claude-code:opus")[0]!,
+      digest: "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    };
+    assert.throws(
+      () => parseSupervisorState(JSON.stringify(stateWith([entry])), { version: 1 }),
+      /is not a digest/,
+    );
+  });
+
+  it("REFUSES a previousDigest that is not a digest", () => {
+    const entry = { ...chainFor("claude-code:opus")[0]!, previousDigest: "whatever" };
+    assert.throws(
+      () => parseSupervisorState(JSON.stringify(stateWith([entry])), { version: 1 }),
+      /is not a digest/,
+    );
+  });
+
+  it("ACCEPTS the published genesis digest", () => {
+    const chain = chainFor("claude-code:opus");
+    assert.equal(chain[0]!.previousDigest, GENESIS_DIGEST);
+    assert.doesNotThrow(() => parseSupervisorState(JSON.stringify(stateWith([...chain])), { version: 1 }));
+  });
+});
+
+describe("TASK-008 round 2: the repository verifies what it persists", () => {
+  const validState = (provenance: readonly ProvenanceEntry[]) => ({
+    version: 1,
+    financialPolicy: { autonomousSpendAllowed: false, autonomousSpendLimit: 0 },
+    resources: [],
+    roadmap: [
+      { key: "A", title: "Implemented", dependsOn: [], status: "DONE" as const, workClass: "NORMAL_IMPLEMENTATION" as const, order: 1 },
+    ],
+    checkpoints: [],
+    escalations: [],
+    provenance,
+    updatedAt: 1_000,
+  });
+
+  /** `create()` accepted an outright forged chain and persisted it. */
+  it("REFUSES to CREATE state whose chain does not verify", async () => {
+    const dbPath = tempDbPath("t8-create-broken");
+    const repository = createSqliteSupervisorRepository(dbPath);
+    try {
+      const broken = chainFor("claude-code:opus").map((entry) => ({ ...entry, detail: "edited" }));
+      await assert.rejects(repository.create(validState(broken)), /does not verify/);
+    } finally {
+      repository.close();
+    }
+  });
+
+  /**
+   * A valid 10,001-entry chain was persisted, and only rejected later by a
+   * reader. The maximum belongs at the boundary where data becomes durable.
+   */
+  it("REFUSES to persist a chain over the maximum, rather than leaving it for a reader", async () => {
+    let chain: readonly ProvenanceEntry[] = [];
+    for (let index = 0; index < MAX_CHAIN_ENTRIES; index += 1) {
+      const appended = appendProvenance(chain, {
+        kind: "IMPLEMENTED_BY",
+        roadmapKey: "A",
+        resourceKey: "claude-code:opus",
+        detail: "filler",
+        recordedAt: index,
+      });
+      if (!appended.ok) throw new Error(`fixture failed at ${index}`);
+      chain = appended.chain;
+    }
+    const last = chain[chain.length - 1]!;
+    const extra: Omit<ProvenanceEntry, "digest"> = {
+      sequence: chain.length,
+      kind: "IMPLEMENTED_BY",
+      roadmapKey: "A",
+      resourceKey: "claude-code:opus",
+      detail: "one too many",
+      recordedAt: chain.length,
+      previousDigest: last.digest,
+    };
+    const overlong = [...chain, { ...extra, digest: computeDigest(extra) }];
+
+    const dbPath = tempDbPath("t8-create-overlong");
+    const repository = createSqliteSupervisorRepository(dbPath);
+    try {
+      await assert.rejects(repository.create(validState(overlong)), /does not verify|exceeds the maximum/);
+    } finally {
+      repository.close();
+    }
   });
 });

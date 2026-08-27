@@ -41,7 +41,12 @@ import {
 import { BILLING_MODES, type BillingMode } from "./financialSafety.js";
 import { CONFIG_VERIFICATIONS, type AiRunConfigRecord, type ConfigVerification } from "./modelEnforcement.js";
 import { WORK_CLASSES, type WorkClass } from "./modelRouting.js";
-import { PROVENANCE_KINDS, type ProvenanceEntry, type ProvenanceKind } from "./provenanceChain.js";
+import {
+  GENESIS_DIGEST,
+  PROVENANCE_KINDS,
+  type ProvenanceEntry,
+  type ProvenanceKind,
+} from "./provenanceChain.js";
 import { redactSecrets } from "../adapters/workers/environmentPolicy.js";
 import {
   BACKOFF_LADDER_MS,
@@ -407,6 +412,22 @@ function boundedProvenanceText(value: string, field: string, context: string): s
   return value;
 }
 
+/**
+ * A digest field must have the SHAPE of a digest (round-2 finding).
+ *
+ * `digest` and `previousDigest` were plain strings, so a credential could be
+ * persisted in one — the reviewer stored `sk-ant-api03-...` as a digest and it
+ * round-tripped. Bounding and redacting them would not be enough either: a
+ * digest is a derived value with exactly one legal form, and anything else is
+ * corruption rather than text to sanitize.
+ */
+function digestField(value: string, field: string, context: string): string {
+  if (value !== GENESIS_DIGEST && !/^prov-[0-9a-f]{64}$/.test(value)) {
+    corrupt(context, `field "${field}" is not a digest; a derived value has exactly one legal form`);
+  }
+  return value;
+}
+
 function parseProvenanceEntry(raw: unknown, index: number, context: string): ProvenanceEntry {
   const itemContext = `${context}.provenance[${index}]`;
   const row = asObject(raw, itemContext);
@@ -420,8 +441,8 @@ function parseProvenanceEntry(raw: unknown, index: number, context: string): Pro
     ...(resourceKeyValue === undefined ? {} : { resourceKey: resourceKeyValue }),
     detail: boundedProvenanceText(str(row, "detail", itemContext), "detail", itemContext),
     recordedAt: num(row, "recordedAt", itemContext),
-    previousDigest: str(row, "previousDigest", itemContext),
-    digest: str(row, "digest", itemContext),
+    previousDigest: digestField(str(row, "previousDigest", itemContext), "previousDigest", itemContext),
+    digest: digestField(str(row, "digest", itemContext), "digest", itemContext),
   };
 }
 

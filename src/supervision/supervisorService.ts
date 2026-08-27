@@ -1348,9 +1348,22 @@ export class SupervisorService {
     const chainImplementers = implementersByRoadmapKey(state.provenance);
     for (const key of visited) {
       const entry = byKey.get(key);
-      if (entry === undefined || key === item.key || !requiresAi(entry.workClass)) {
+      if (entry === undefined || !requiresAi(entry.workClass)) {
         continue;
       }
+      /**
+       * THE ITEM UNDER REVIEW IS NOT SKIPPED (round-2 CRITICAL).
+       *
+       * The first version skipped `key === item.key`, mirroring the row-based
+       * loop above — but that loop already adds the item's OWN implementers to
+       * the exclusion set before its ambiguity check. Skipping the item here
+       * meant a chain entry saying "codex implemented B" was ignored when
+       * choosing who reviews B, and the reviewer showed codex then reviewing
+       * its own work with the mutable row left empty.
+       *
+       * Whoever implemented the item under review is exactly who must not
+       * review it. That is the entire point of C4.
+       */
       if (chainImplementers === undefined) {
         // AC-5: the record cannot be vouched for, so the lineage it describes
         // is not lineage. The review waits for a human rather than proceeding
