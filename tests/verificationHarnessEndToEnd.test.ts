@@ -149,6 +149,28 @@ function runHarness(root: string): { status: number; output: string } {
  * verifier was handed.
  */
 function runWithShowConfigShim(root: string, answer: string): { status: number; output: string } {
+  /**
+   * The shimmed answer inherits the fixture's real `include` unless the caller
+   * set one.
+   *
+   * A `--showConfig` with NO `include` is not a realistic config: tsc then
+   * compiles everything under the project root, and the verifier correctly
+   * derives its source roots as `.`. These fixtures are about the `outDir`
+   * question and carry helper symlinks at the root, so an unrealistic shim made
+   * them fail for a reason unrelated to what they test — the fixture was wrong,
+   * not the guard.
+   */
+  const shown = JSON.parse(answer) as Record<string, unknown>;
+  if (shown["include"] === undefined && shown["files"] === undefined) {
+    const real = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as {
+      include?: readonly string[];
+    };
+    if (real.include !== undefined) {
+      shown["include"] = [...real.include];
+    }
+  }
+  const realisticAnswer = JSON.stringify(shown);
+
   const realNpx = spawnSync("sh", ["-c", "command -v npx"], { encoding: "utf8" }).stdout.trim();
   assert.ok(realNpx.length > 0, "the fixture needs a real npx to delegate to");
 
@@ -160,7 +182,7 @@ function runWithShowConfigShim(root: string, answer: string): { status: number; 
       "#!/bin/sh",
       'for a in "$@"; do',
       `  if [ "$a" = "--showConfig" ]; then cat <<'SHOWCONFIG'`,
-      answer,
+      realisticAnswer,
       "SHOWCONFIG",
       "    exit 0",
       "  fi",
@@ -1684,5 +1706,57 @@ describe("TASK-010 round 7: each readability layer is pinned separately", () => 
     } finally {
       chmodSync(join(root, "dist/hidden"), 0o755);
     }
+  });
+});
+
+
+// =====================================================================
+// ROUND-8 — the source roots are the config's, not a guess
+// =====================================================================
+
+describe("TASK-010 round 8: compiler inputs outside the assumed roots", () => {
+  /**
+   * THE CRITICAL. `SOURCE_ROOTS` was hard-coded to `["src", "tests"]` — a guess
+   * about this project's shape. Round-8 review put a compiler input somewhere
+   * else and it was compiled and executed with no objection. Hard-coding closed
+   * the two roots this repository happens to use and left the class open, which
+   * is the same mistake as filtering hardlinks by suffix, one level up.
+   *
+   * The roots now come from the effective tsconfig, which is what tsc actually
+   * reads.
+   */
+  it("REFUSES a linked source under a root the tsconfig declares but nobody hard-coded", () => {
+    const root = makeFixtureRepo();
+
+    // A third root, declared in the config exactly as a real project would.
+    mkdirSync(join(root, "extra"), { recursive: true });
+    writeFileSync(join(root, "extra/helper.ts"), "export const helper = 1;\n");
+    const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as {
+      include: string[];
+    };
+    tsconfig.include = [...tsconfig.include, "extra/**/*.ts"];
+    writeFileSync(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
+    assert.equal(runHarness(root).status, 0, "the fixture must pass before the link is planted");
+
+    const external = mkdtempSync(join(tmpdir(), "sf-extraroot-"));
+    created.push(external);
+    const outsider = join(external, "foreign.ts");
+    writeFileSync(outsider, "export const smuggled = 8;\n");
+    linkSync(outsider, join(root, "extra/foreign.ts"));
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, "a declared source root outside src/ and tests/ was never scanned");
+    assert.match(output, /foreign\.ts/);
+    assert.ok(!output.includes("tree-consistent"), "it must not claim consistency");
+  });
+
+  /** ...and an ordinary project with a linked node_modules still passes. */
+  it("does not report a symlinked node_modules as foreign source", () => {
+    const root = makeFixtureRepo();
+    // makeFixtureRepo already symlinks node_modules; with roots derived from a
+    // config that includes only src/ and tests/, it is out of scope anyway —
+    // this pins the exclusion for the case where a config declares no include
+    // and the root becomes ".".
+    assert.equal(runHarness(root).status, 0, "a linked node_modules was treated as foreign source");
   });
 });

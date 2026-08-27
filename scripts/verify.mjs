@@ -99,15 +99,46 @@ import { fileURLToPath } from "node:url";
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const OUTPUT_DIR = "dist";
 /**
- * Every directory this build compiles FROM.
+ * Which directories this build compiles FROM — DERIVED, not assumed.
  *
- * Written as one list because the round-4 CRITICAL came from having two: `src`
- * and `tests` were handled on separate lines, `tests` gained a root-symlink
- * check, `src` did not, and an entire symlinked `src` sailed through every
- * guard into a false success. A list is checked once; a pair of lines has to
- * be remembered twice.
+ * `["src", "tests"]` was a hard-coded guess about the project's shape, and
+ * round-8 review compiled and executed a file that simply lived somewhere else.
+ * Hard-coding closed the two roots this repository happens to use and left the
+ * class wide open — the same mistake as filtering hardlinks by suffix, one
+ * level up.
+ *
+ * The roots come from the effective tsconfig's `include`/`files`: the literal
+ * prefix of each pattern, up to the first glob. A pattern beginning with a glob
+ * roots at the repository itself. That is what tsc actually reads, which is the
+ * only thing worth scanning.
+ *
+ * Populated after the effective config is resolved; `sourceRoots()` is called
+ * only from code that runs after that point.
  */
-const SOURCE_ROOTS = ["src", "tests"];
+let SOURCE_ROOTS = ["src", "tests"];
+function deriveSourceRoots(config) {
+  const patterns = [
+    ...(Array.isArray(config?.include) ? config.include : []),
+    ...(Array.isArray(config?.files) ? config.files : []),
+  ].filter((pattern) => typeof pattern === "string");
+
+  const roots = new Set();
+  for (const pattern of patterns) {
+    const segments = pattern.replace(/\\/g, "/").replace(/^\.\//, "").split("/");
+    const literal = [];
+    for (const segment of segments) {
+      if (segment.includes("*") || segment.includes("?")) break;
+      literal.push(segment);
+    }
+    // A `files` entry names a FILE, so its directory is the root; a glob's
+    // literal prefix is already one.
+    const candidate = literal.length > 0 && literal[literal.length - 1].includes(".")
+      ? literal.slice(0, -1).join("/")
+      : literal.join("/");
+    roots.add(candidate.length === 0 ? "." : candidate);
+  }
+  return roots.size === 0 ? ["."] : [...roots].sort();
+}
 /** How long `--showConfig` may take before the run fails closed, saying so. */
 const CONFIG_TIMEOUT_MS = 120_000;
 const CHECKER_PATH = join(REPO_ROOT, OUTPUT_DIR, "src/verification/testArtifacts.js");
@@ -195,7 +226,7 @@ function findHardlinkedSources(directory) {
    * more than strictly necessary: a hardlink inside the repository is
    * indistinguishable from one pointing outside, so all are refused.
    */
-  return findHardlinkedUnder(directory);
+  return findHardlinkedUnder(directory, true);
 }
 
 /**
@@ -206,9 +237,18 @@ function findHardlinkedSources(directory) {
  * is not a source file, and it was overwritten by the build while the run
  * still reported the tree consistent (round-5 finding).
  */
-function findHardlinkedUnder(directory) {
+/**
+ * Directories no source scan should descend into.
+ *
+ * Relevant once a root can be `.`: tsc excludes `node_modules` by default, the
+ * output is build product audited by different rules, and `.git` holds no
+ * compilable source.
+ */
+const SKIP_IN_SOURCE_SCAN = new Set(["node_modules", ".git", OUTPUT_DIR]);
+
+function findHardlinkedUnder(directory, skipExcluded = false) {
   const found = [];
-  for (const rel of listFiles(directory)) {
+  for (const rel of listFiles(directory, skipExcluded)) {
     try {
       if (lstatSync(join(REPO_ROOT, rel)).nlink > 1) found.push(rel);
     } catch {
@@ -219,16 +259,13 @@ function findHardlinkedUnder(directory) {
 }
 
 /** Symlinked entries anywhere beneath a directory, as repo-relative paths. */
-function findSymlinks(directory, keep = () => true) {
+function findSymlinks(directory, keep = () => true, skipExcluded = false) {
   const found = [];
   const walk = (current) => {
     let entries;
     try {
       entries = readdirSync(current, { withFileTypes: true });
     } catch (error) {
-      // A directory that does not EXIST is genuinely empty; one that exists and
-      // cannot be READ is unknown, and the difference decides whether an
-      // unseen orphan can hide there.
       if (error?.code !== "ENOENT") {
         noteUnreadable(current);
       }
@@ -236,6 +273,18 @@ function findSymlinks(directory, keep = () => true) {
     }
     for (const entry of entries) {
       const full = join(current, entry.name);
+      /**
+       * Skipped by NAME before the link test, and only for SOURCE scans.
+       *
+       * Relevant once a root can be `.`: `node_modules` is commonly a symlink
+       * to a shared install, tsc excludes it by default, and reporting it as
+       * foreign source refuses an ordinary workspace. The OUTPUT scan passes
+       * `skipExcluded = false`, because a link under the output is exactly what
+       * it is looking for.
+       */
+      if (skipExcluded && SKIP_IN_SOURCE_SCAN.has(entry.name)) {
+        continue;
+      }
       const rel = relative(REPO_ROOT, full).replace(/\\/g, "/");
       if (entry.isSymbolicLink()) {
         if (keep(rel)) found.push(rel);
@@ -306,16 +355,13 @@ function sameDirectory(a, b) {
   return resolvedPath(a) === resolvedPath(b);
 }
 
-function listFiles(directory) {
+function listFiles(directory, skipExcluded = false) {
   const found = [];
   const walk = (current) => {
     let entries;
     try {
       entries = readdirSync(current, { withFileTypes: true });
     } catch (error) {
-      // A directory that does not EXIST is genuinely empty; one that exists and
-      // cannot be READ is unknown, and the difference decides whether an
-      // unseen orphan can hide there.
       if (error?.code !== "ENOENT") {
         noteUnreadable(current);
       }
@@ -323,6 +369,9 @@ function listFiles(directory) {
     }
     for (const entry of entries) {
       const full = join(current, entry.name);
+      if (skipExcluded && SKIP_IN_SOURCE_SCAN.has(entry.name)) {
+        continue;
+      }
       // Deliberately do NOT follow directory symlinks: a linked subtree is not
       // part of this build, and walking into it would pull someone else's
       // artifacts into the audit as though they belonged here.
@@ -469,6 +518,9 @@ if (configProblem !== undefined) {
   fail(`verification refused: ${configProblem}; refusing to build a configuration it cannot read`);
 }
 const noEmit = effectiveConfig.compilerOptions.noEmit === true;
+// The roots are a fact about the CONFIG, so they are derived the moment the
+// config is known and before anything scans a directory.
+SOURCE_ROOTS = deriveSourceRoots(effectiveConfig);
 /**
  * Refused BEFORE the build, and the wording says so (round-3 finding).
  *
@@ -523,7 +575,7 @@ if (isSymlink(join(REPO_ROOT, OUTPUT_DIR))) {
  * first, and it runs before the build too, because the build compiles the link.
  */
 const linkedSources = [
-  ...SOURCE_ROOTS.flatMap((root) => findSymlinks(root)),
+  ...SOURCE_ROOTS.flatMap((root) => findSymlinks(root, () => true, true)),
   ...SOURCE_ROOTS.flatMap((root) => findHardlinkedSources(root)),
 ].sort();
 if (linkedSources.length > 0) {
