@@ -24,7 +24,7 @@ import { createSequentialIdGenerator } from "../domain/ids.js";
 import { DEFAULT_ROUTING_POLICY } from "../supervision/modelRouting.js";
 import { parseFinancialPolicy } from "../supervision/financialSafety.js";
 import { boundedDiagnostic } from "../supervision/resourceClassifier.js";
-import { verifyChain } from "../supervision/provenanceChain.js";
+import { verifyAgainstAnchor } from "../supervision/provenanceChain.js";
 import { SupervisorService, type TickResult } from "../supervision/supervisorService.js";
 import type { WorkExecutionInput, WorkExecutor, WorkOutcome } from "../supervision/supervisorPorts.js";
 import { ESCALATION_REASONS, type EscalationReason, type SupervisorState } from "../supervision/supervisorTypes.js";
@@ -296,7 +296,18 @@ export async function runSuperviseStatus(options: SuperviseCliOptions = {}): Pro
      * changed. It can — by anyone who recomputes the chain. What "intact" means
      * is that nobody edited it WITHOUT recomputing.
      */
-    const chain = verifyChain(state.provenance);
+    /**
+     * VERIFIED AGAINST THE ANCHOR, not merely internally consistent (round-8
+     * HIGH).
+     *
+     * `verifyChain` asks whether every link still hashes to its successor. Tail
+     * TRUNCATION leaves that perfectly true — the reviewer removed the second
+     * of two entries from real SQLite and this line reported "1 entries, chain
+     * intact". The anchor is the only record that knows how long the chain was
+     * and what its head was, which is precisely why it exists, and the status
+     * command is where an operator looks to find out.
+     */
+    const chain = verifyAgainstAnchor(state.provenance, state.provenanceAnchor);
     log(
       `provenance     : ${state.provenance.length} entries, ${
         chain.intact ? "chain intact" : `CHAIN BROKEN — ${safe(chain.problem)}`

@@ -30,7 +30,7 @@
  */
 
 import assert from "node:assert/strict";
-import { statSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { dirname } from "node:path";
 import { after, describe, it } from "node:test";
 
@@ -51,9 +51,16 @@ import {
 } from "../src/supervision/provenanceChain.js";
 import { appendImplementerProvenance } from "../src/supervision/supervisorService.js";
 import { parseSupervisorState } from "../src/supervision/supervisorSerialization.js";
+import type { WorkOutcome } from "../src/supervision/supervisorPorts.js";
 import type { RoadmapItem } from "../src/supervision/supervisorTypes.js";
 import { cleanupTempDbs, tempDbPath } from "./support/factoryFixtures.js";
-import { newSupervisor, scriptedProbe, TEST_CATALOG } from "./support/supervisorFixtures.js";
+import {
+  newSupervisor,
+  scriptedExecutor,
+  scriptedProbe,
+  seedRoadmap,
+  TEST_CATALOG,
+} from "./support/supervisorFixtures.js";
 
 after(cleanupTempDbs);
 
@@ -1739,5 +1746,304 @@ describe("TASK-008 round 7: what actually ran is read whatever the row claims", 
         "the resource that actually ran was chosen as the reviewer",
       );
     }
+  });
+});
+
+// =====================================================================
+// ROUND-8 — a run is a run, and a corrupt record is an answer
+// =====================================================================
+
+describe("TASK-008 round 8: lineage on every path a worker can take", () => {
+  /**
+   * CRITICAL. `COMPLETED` and `CHANGES_REQUIRED` recorded who ran; `CHECKPOINT`
+   * and `RESOURCE_FAILURE` recorded nothing at all.
+   *
+   * The reviewer reproduced the consequence against real SQLite: A runs on
+   * `codex-cli:gpt-5.6-luna` and checkpoints, A later completes on
+   * `claude-code:sonnet`, and the persisted provenance names only the second.
+   * The first worker — which had a session, and may have changed the workspace
+   * — was then free to review B.
+   *
+   * Lineage is about who RAN. Whether the run finished is a different question
+   * and has never been the criterion.
+   */
+  async function chainKeysAfter(outcome: WorkOutcome): Promise<{
+    readonly entries: readonly ProvenanceEntry[];
+    readonly implementers: readonly string[];
+  }> {
+    const supervisor = newSupervisor({
+      probe: healthyProbe(),
+      executor: scriptedExecutor({ A: [outcome] }),
+    });
+    await seedRoadmap(supervisor, [
+      { key: "A", title: "First item", dependsOn: [], status: "PENDING", workClass: "NORMAL_IMPLEMENTATION", order: 1 },
+    ]);
+    await supervisor.service.tick();
+    const state = await supervisor.repository.load();
+    assert.ok(state !== undefined);
+    const item = state.roadmap.find((entry) => entry.key === "A");
+    assert.ok(item !== undefined);
+    return {
+      entries: state.provenance.filter((entry) => entry.roadmapKey === "A"),
+      implementers: item.implementedByResourceKeys ?? [],
+    };
+  }
+
+  it("records who ran when the session ROLLS OVER", async () => {
+    const { entries, implementers } = await chainKeysAfter({
+      kind: "CHECKPOINT",
+      detail: "context exhausted",
+      checkpoint: {
+        roadmapKey: "A",
+        actionId: "ignored",
+        requiredWorkClass: "NORMAL_IMPLEMENTATION",
+        iteration: 1,
+        nextAction: "resume",
+        findings: [],
+        completedVerification: [],
+        pendingVerification: [],
+        updatedAt: 1,
+      },
+    });
+    const implemented = entries.filter((entry) => entry.kind === "IMPLEMENTED_BY");
+    assert.ok(implemented.length > 0, "a worker checkpointed and the chain does not know it ran");
+    assert.ok(implementers.length > 0, "the row does not know it ran either");
+  });
+
+  it("records who ran when the provider FAILS", async () => {
+    const { entries, implementers } = await chainKeysAfter({
+      kind: "RESOURCE_FAILURE",
+      process: { terminationReason: "EXITED", exitCode: 1, stdout: "", stderr: "quota exhausted" },
+    });
+    const implemented = entries.filter((entry) => entry.kind === "IMPLEMENTED_BY");
+    assert.ok(implemented.length > 0, "a worker ran, failed, and the chain does not know it ran");
+    assert.ok(implementers.length > 0, "the row does not know it ran either");
+  });
+
+  /**
+   * The consequence, which is the only reason the record matters: a resource
+   * that only ever CHECKPOINTED on A must still be excluded from reviewing B.
+   */
+  it("excludes a worker whose only run on A was a checkpoint", async () => {
+    const supervisor = newSupervisor({
+      probe: healthyProbe(),
+      executor: scriptedExecutor({
+        A: [
+          {
+            kind: "CHECKPOINT",
+            detail: "context exhausted",
+            checkpoint: {
+              roadmapKey: "A",
+              actionId: "ignored",
+              requiredWorkClass: "NORMAL_IMPLEMENTATION",
+              iteration: 1,
+              nextAction: "resume",
+              findings: [],
+              completedVerification: [],
+              pendingVerification: [],
+              updatedAt: 1,
+            },
+          },
+        ],
+      }),
+    });
+    await seedRoadmap(supervisor, [
+      { key: "A", title: "First item", dependsOn: [], status: "PENDING", workClass: "NORMAL_IMPLEMENTATION", order: 1 },
+      { key: "B", title: "Review of A", dependsOn: ["A"], status: "PENDING", workClass: "INDEPENDENT_REVIEW", order: 2 },
+    ]);
+
+    await supervisor.service.tick(); // A checkpoints
+    const afterCheckpoint = await supervisor.repository.load();
+    assert.ok(afterCheckpoint !== undefined);
+    const checkpointed = (afterCheckpoint.roadmap.find((entry) => entry.key === "A")?.implementedByResourceKeys ?? [])[0];
+    assert.ok(checkpointed !== undefined, "nothing was recorded, so this proves nothing about exclusion");
+
+    await supervisor.service.tick(); // A completes
+    await supervisor.service.tick(); // B is reviewed
+
+    const reviewCall = supervisor.executor.callsFor("B")[0];
+    if (reviewCall !== undefined) {
+      const usedForReview = `${reviewCall.config?.effectiveProvider ?? ""}:${reviewCall.config?.effectiveModel ?? ""}`;
+      assert.notEqual(
+        usedForReview,
+        checkpointed,
+        "the worker that checkpointed on A reviewed the item that depends on A",
+      );
+    }
+  });
+});
+
+describe("TASK-008 round 8: the wake time cannot overrule the verdict", () => {
+  /**
+   * HIGH. `tick()` decided `WAITING_FOR_HUMAN` on a tampered chain and then
+   * always called `publishWake()`, which tried to WRITE — and the repository
+   * correctly refuses to persist an unverifiable chain, so the refusal was
+   * rethrown and the decision never reached the caller.
+   *
+   * The round-4 case missed this only because its fixture left `nextWakeAt`
+   * unset, so the wake computed to the same value and nothing was written. A
+   * stale one is what a real supervisor has after any waiting tick.
+   */
+  it("returns the decision even when the wake time is stale", async () => {
+    const { DatabaseSync } = await import("node:sqlite");
+    const dbPath = tempDbPath("t8-stale-wake");
+
+    const repository = createSqliteSupervisorRepository(dbPath);
+    const seeded = await repository.create({
+      version: 1,
+      financialPolicy: { autonomousSpendAllowed: false, autonomousSpendLimit: 0 },
+      resources: [],
+      roadmap: [
+        { key: "A", title: "Implemented", dependsOn: [], status: "DONE", workClass: "NORMAL_IMPLEMENTATION", order: 1 },
+      ],
+      checkpoints: [],
+      escalations: [],
+      provenance: chainFor("claude-code:opus"),
+      updatedAt: 1_000,
+    });
+    repository.close();
+
+    const db = new DatabaseSync(dbPath);
+    db.prepare("UPDATE supervisor_state SET data = ? WHERE id = ?").run(
+      JSON.stringify({
+        ...seeded,
+        // A wake time no recomputation will agree with, so the advisory write
+        // is definitely attempted.
+        nextWakeAt: 999_999_999,
+        provenance: seeded.provenance.map((entry) => ({ ...entry, detail: "edited on disk" })),
+      }),
+      "supervisor",
+    );
+    db.close();
+
+    const reopened = createSqliteSupervisorRepository(dbPath);
+    const supervisor = newSupervisor({ probe: healthyProbe(), repository: reopened });
+    try {
+      const result = await supervisor.service.tick();
+      assert.equal(result.kind, "WAITING_FOR_HUMAN", "the advisory wake write buried the verdict");
+      assert.equal(supervisor.executor.calls().length, 0);
+    } finally {
+      reopened.close();
+    }
+  });
+});
+
+describe("TASK-008 round 8: state that will not PARSE is a decision too", () => {
+  /**
+   * HIGH. AC-5 held for tampering the deserializer would accept. Writing
+   * `prov-forged` into a digest fails earlier than that — in parsing — and the
+   * supervisor died with `PersistenceCorruptionError` before deciding anything.
+   *
+   * A crash and a refusal are not the same event: one is a fault to debug, the
+   * other is a verdict with an instruction attached.
+   */
+  it("returns WAITING_FOR_HUMAN when the persisted digest is malformed", async () => {
+    const { DatabaseSync } = await import("node:sqlite");
+    const dbPath = tempDbPath("t8-unparseable");
+
+    const repository = createSqliteSupervisorRepository(dbPath);
+    const seeded = await repository.create({
+      version: 1,
+      financialPolicy: { autonomousSpendAllowed: false, autonomousSpendLimit: 0 },
+      resources: [],
+      roadmap: [
+        { key: "A", title: "Implemented", dependsOn: [], status: "DONE", workClass: "NORMAL_IMPLEMENTATION", order: 1 },
+      ],
+      checkpoints: [],
+      escalations: [],
+      provenance: chainFor("claude-code:opus"),
+      updatedAt: 1_000,
+    });
+    repository.close();
+
+    const db = new DatabaseSync(dbPath);
+    const forged = seeded.provenance.map((entry, index) =>
+      index === 0 ? { ...entry, digest: "prov-forged" } : entry,
+    );
+    db.prepare("UPDATE supervisor_state SET data = ? WHERE id = ?").run(
+      JSON.stringify({ ...seeded, provenance: forged }),
+      "supervisor",
+    );
+    db.close();
+
+    const reopened = createSqliteSupervisorRepository(dbPath);
+    const supervisor = newSupervisor({ probe: healthyProbe(), repository: reopened });
+    try {
+      const result = await supervisor.service.tick();
+      assert.equal(result.kind, "WAITING_FOR_HUMAN", "an unparseable record must produce a decision");
+      if (result.kind === "WAITING_FOR_HUMAN") {
+        assert.match(result.humanActionRequired, /could not|no longer parses/i);
+      }
+      assert.equal(supervisor.executor.calls().length, 0);
+    } finally {
+      reopened.close();
+    }
+  });
+
+  /**
+   * DELIBERATELY NARROW. A refusal to WRITE must keep propagating, or the
+   * conversion above would mask `runTick`'s own pre-write guard — the mistake
+   * this project keeps finding in other places.
+   */
+  it("does not convert a refusal to WRITE into a decision", async () => {
+    const source = readFileSync("src/supervision/supervisorService.ts", "utf8");
+    assert.match(source, /Only failures to READ are converted/);
+    assert.ok(
+      !/catch \(error\) \{[^}]*instanceof SchemaIntegrityError[^}]*\}\s*await this\.publishWake/s.test(source),
+      "tick() must not swallow a write refusal",
+    );
+  });
+});
+
+describe("TASK-008 round 8: status asks the anchor", () => {
+  /**
+   * HIGH. `verifyChain` asks whether every link still hashes to its successor,
+   * and tail TRUNCATION leaves that perfectly true. The reviewer removed the
+   * second of two entries from real SQLite and status reported
+   * "1 entries, chain intact".
+   *
+   * The anchor is the only record that knows how long the chain was. The
+   * existing status tests passed for the wrong reason: they edit CONTENT, which
+   * breaks the links, so they never needed the anchor at all.
+   */
+  it("reports a TRUNCATED chain as broken", async () => {
+    const { DatabaseSync } = await import("node:sqlite");
+    const dbPath = tempDbPath("t8-truncated-status");
+
+    const full = chainFor("claude-code:opus");
+    const extended = appendImplementerProvenance(full, "A", "codex-cli:gpt-5.6-luna", 2_000, "second run");
+    assert.ok(extended.length >= 2, "the fixture needs at least two entries to truncate one");
+
+    const repository = createSqliteSupervisorRepository(dbPath);
+    const seeded = await repository.create({
+      version: 1,
+      financialPolicy: { autonomousSpendAllowed: false, autonomousSpendLimit: 0 },
+      resources: [],
+      roadmap: [
+        { key: "A", title: "Implemented", dependsOn: [], status: "DONE", workClass: "NORMAL_IMPLEMENTATION", order: 1 },
+      ],
+      checkpoints: [],
+      escalations: [],
+      provenance: extended,
+      provenanceAnchor: anchorFor(extended),
+      updatedAt: 1_000,
+    });
+    repository.close();
+
+    const truncated = seeded.provenance.slice(0, -1);
+    assert.equal(verifyChain(truncated).intact, true, "truncation must leave the LINKS intact, or this proves nothing");
+
+    const db = new DatabaseSync(dbPath);
+    db.prepare("UPDATE supervisor_state SET data = ? WHERE id = ?").run(
+      JSON.stringify({ ...seeded, provenance: truncated }),
+      "supervisor",
+    );
+    db.close();
+
+    const lines: string[] = [];
+    await runSuperviseStatus({ supervisorDbPath: dbPath, log: (line: string) => lines.push(line) });
+    const output = lines.join("\n");
+    assert.match(output, /CHAIN BROKEN/, "a truncated chain read as intact");
+    assert.match(output, /tamper-evident, not tamper-proof/);
   });
 });

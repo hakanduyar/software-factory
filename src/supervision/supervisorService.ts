@@ -19,7 +19,12 @@
  *   - ambiguity fails closed rather than being retried.
  */
 
-import { ConcurrencyError, ValidationError } from "../domain/errors.js";
+import {
+  ConcurrencyError,
+  PersistenceCorruptionError,
+  SchemaIntegrityError,
+  ValidationError,
+} from "../domain/errors.js";
 import type { IdGenerator } from "../domain/ids.js";
 import type { Clock } from "../ports/clock.js";
 import type { Timestamp } from "../domain/time.js";
@@ -195,7 +200,41 @@ export class SupervisorService {
    * to reach it.
    */
   async tick(): Promise<TickResult> {
-    const result = await this.runTick();
+    let result: TickResult;
+    try {
+      result = await this.runTick();
+    } catch (error) {
+      /**
+       * A CORRUPT RECORD IS AN ANSWER, NOT AN EXCEPTION (round-8 HIGH).
+       *
+       * AC-5 requires tampering to produce a human decision. It did — as long
+       * as the tampering left something the DESERIALIZER would accept. Writing
+       * `prov-forged` into a digest instead failed earlier than that, in
+       * parsing, and the supervisor died with a `PersistenceCorruptionError`
+       * before it could decide anything. From the operator's side a crash and a
+       * refusal are not the same event: one is a fault to debug, the other is a
+       * verdict with an instruction attached.
+       *
+       * DELIBERATELY NARROW. Only failures to READ are converted. A refusal to
+       * WRITE keeps propagating, because that is the repository enforcing the
+       * chain and no caller should be able to mistake it for a decision — and
+       * because converting it here would mask `runTick`'s own step 0.
+       */
+      if (!(error instanceof PersistenceCorruptionError)) {
+        throw error;
+      }
+      this.log(`[supervisor] durable state could not be read: ${error.message}`);
+      return sanitizeTickResult({
+        kind: "WAITING_FOR_HUMAN",
+        roadmapKey: "unknown",
+        reason: "HUMAN_DECISION_REQUIRED",
+        humanActionRequired: boundedDiagnostic(
+          "Durable supervisor state no longer parses, so nothing about the roadmap, its provenance or its " +
+            "progress can be established. Restore the supervisor database from a known-good backup. " +
+            `Detail: ${error.message}`,
+        ),
+      });
+    }
     await this.publishWake();
     return sanitizeTickResult(result);
   }
@@ -246,7 +285,17 @@ export class SupervisorService {
   }
 
   private async publishWake(): Promise<void> {
-    const state = await this.deps.repository.load();
+    let state: SupervisorState | undefined;
+    try {
+      state = await this.deps.repository.load();
+    } catch (error) {
+      // Same rule, one step earlier: state too corrupt to READ is not this
+      // tick's verdict either, and `runTick` has already produced one.
+      if (!(error instanceof PersistenceCorruptionError)) {
+        throw error;
+      }
+      return;
+    }
     if (state === undefined) {
       return;
     }
@@ -257,12 +306,29 @@ export class SupervisorService {
     try {
       await this.commit(state, withWake(state, wake));
     } catch (error) {
-      // Advisory bookkeeping. Losing the CAS means another supervisor just
-      // wrote, and it will publish its own wake — that is not this tick's
-      // result to fail over.
-      if (!(error instanceof ConcurrencyError)) {
-        throw error;
+      /**
+       * ADVISORY BOOKKEEPING, and that has to mean it CANNOT decide the tick
+       * (round-8 HIGH).
+       *
+       * The rule was already written for `ConcurrencyError` and applied only to
+       * it. With a tampered chain the repository correctly REFUSES the write,
+       * and that refusal was rethrown from here — after `runTick` had already
+       * decided `WAITING_FOR_HUMAN` — so the fail-closed result the whole guard
+       * exists to produce never reached the caller.
+       *
+       * All three of these mean the same thing: the wake time could not be
+       * written. None of them is this tick's verdict. A refusal to write is
+       * still enforced everywhere it MATTERS — every substantive path commits
+       * through `commit`, where it is not swallowed.
+       */
+      if (error instanceof ConcurrencyError) {
+        return;
       }
+      if (error instanceof SchemaIntegrityError || error instanceof PersistenceCorruptionError) {
+        this.log(`[supervisor] could not publish the next wake time: ${error.message}`);
+        return;
+      }
+      throw error;
     }
   }
 
@@ -1037,7 +1103,11 @@ export class SupervisorService {
         const detail = boundedDiagnostic(outcome.detail);
         const next = await this.commit(state, {
           ...withoutClaim,
-          roadmap: setRunConfig(setStatus(state.roadmap, item.key, "ELIGIBLE", detail), item.key, reconciled),
+          roadmap: setImplementer(
+            setRunConfig(setStatus(state.roadmap, item.key, "ELIGIBLE", detail), item.key, reconciled),
+            item.key,
+            usedResourceKey,
+          ),
           // NEW-SEC-1: a checkpoint's text comes from an executor, so it is
           // bounded and redacted like every other untrusted string before it
           // becomes durable state. "Bounded checkpoint" was the design claim;
@@ -1059,6 +1129,31 @@ export class SupervisorService {
               : { resumedFromActionId: previousCheckpointActionId }),
           }),
           resources: markSuccess(state.resources, usedResourceKey, now),
+          /**
+           * LINEAGE IS ABOUT WHO RAN, NOT ABOUT WHO SUCCEEDED (round-8
+           * CRITICAL).
+           *
+           * `CHECKPOINT` persisted the checkpoint and the run config and
+           * recorded no implementer at all. A worker could therefore run on
+           * `codex-cli:gpt-5.6-luna`, exhaust its context, hand over to another
+           * worker that completed the item — and the durable record would name
+           * only the second. The first was then free to REVIEW dependent work,
+           * which is exactly what C4 forbids and exactly what this chain exists
+           * to prevent.
+           *
+           * A worker that ran may have changed the workspace. That is the whole
+           * criterion, and "did it finish" has nothing to do with it.
+           */
+          ...(() => {
+            const provenance = appendImplementerProvenance(
+              state.provenance,
+              item.key,
+              usedResourceKey,
+              now,
+              "checkpointed",
+            );
+            return { provenance, provenanceAnchor: anchorFor(provenance) };
+          })(),
         });
         void next;
         this.log(`[supervisor] ${item.key} rolled over to a new session: ${detail}`);
@@ -1093,12 +1188,37 @@ export class SupervisorService {
         const waiting = await this.commit(state, {
           ...withoutClaim,
           resources,
-          roadmap: setStatus(
-            state.roadmap,
+          /**
+           * A FAILED run is still a run (round-8 CRITICAL).
+           *
+           * `RESOURCE_FAILURE` recorded neither implementer nor provenance, so
+           * a worker that started, touched the workspace and then hit its quota
+           * left no trace — and reviewed the dependent item on the next tick.
+           * The reviewer reproduced exactly that sequence against real SQLite.
+           *
+           * `appendImplementerProvenance` and `setImplementer` are both no-ops
+           * when no resource was used, so DETERMINISTIC work is unaffected.
+           */
+          roadmap: setImplementer(
+            setStatus(
+              state.roadmap,
+              item.key,
+              classification.state === "AUTH_REQUIRED" ? "WAITING_FOR_HUMAN_REQUIRED" : "WAITING_FOR_RESOURCE",
+              boundedDiagnostic(classification.reason),
+            ),
             item.key,
-            classification.state === "AUTH_REQUIRED" ? "WAITING_FOR_HUMAN_REQUIRED" : "WAITING_FOR_RESOURCE",
-            boundedDiagnostic(classification.reason),
+            usedResourceKey,
           ),
+          ...(() => {
+            const provenance = appendImplementerProvenance(
+              state.provenance,
+              item.key,
+              usedResourceKey,
+              now,
+              `resource failure: ${classification.state}`,
+            );
+            return { provenance, provenanceAnchor: anchorFor(provenance) };
+          })(),
         });
 
         if (classification.state === "AUTH_REQUIRED") {
@@ -1577,11 +1697,7 @@ export class SupervisorService {
        * The same complete test as `brokenChainOutcome`: an empty chain is
        * silence only when NO anchor claims otherwise, in either field.
        */
-      const anchor = state.provenanceAnchor;
-      if (
-        state.provenance.length === 0 &&
-        (anchor === undefined || (anchor.length === 0 && anchor.headDigest === GENESIS_DIGEST))
-      ) {
+      if (chainIsLegacySilence(state)) {
         continue;
       }
       if (fromChain.length === 0 && fromRow.length === 0) {
@@ -1649,11 +1765,7 @@ export class SupervisorService {
      * skipped verification entirely. An anchor is a claim about the whole
      * chain, and half of the claim is the head.
      */
-    const anchor = state.provenanceAnchor;
-    const emptyAndUnclaimed =
-      state.provenance.length === 0 &&
-      (anchor === undefined || (anchor.length === 0 && anchor.headDigest === GENESIS_DIGEST));
-    if (emptyAndUnclaimed) {
+    if (chainIsLegacySilence(state)) {
       return undefined;
     }
     const verdict = verifyAgainstAnchor(state.provenance, state.provenanceAnchor);
@@ -2131,6 +2243,34 @@ export class ProvenanceOverflowError extends Error {
     super(reason);
     this.name = "ProvenanceOverflowError";
   }
+}
+
+/**
+ * Whether an empty chain is genuine LEGACY SILENCE rather than a deletion.
+ *
+ * ONE implementation, because there were two (round-8 test-integrity note). The
+ * same three-part test was written out in `brokenChainOutcome` and again inside
+ * the reviewer-exclusion loop, and a reviewer's mutation of either copy left
+ * every test green — each was masked by the other. Two copies of a rule are two
+ * rules that can disagree, and a duplicated guard cannot be proven load-bearing
+ * because there is always another one behind it.
+ *
+ * A database written before TASK-008 has no entries for work already done, and
+ * refusing every review on that basis would strand the roadmap this protects. So
+ * an empty chain is permitted — but ONLY when no anchor says otherwise, in
+ * either field: an anchor claiming entries, or claiming none while naming a
+ * non-genesis head, is a contradiction and the loudest evidence of deletion
+ * there is. That residue is recorded in docs/KNOWN-LIMITATIONS.md.
+ */
+export function chainIsLegacySilence(state: {
+  readonly provenance: readonly ProvenanceEntry[];
+  readonly provenanceAnchor?: { readonly length: number; readonly headDigest: string };
+}): boolean {
+  if (state.provenance.length !== 0) {
+    return false;
+  }
+  const anchor = state.provenanceAnchor;
+  return anchor === undefined || (anchor.length === 0 && anchor.headDigest === GENESIS_DIGEST);
 }
 
 export function appendImplementerProvenance(
