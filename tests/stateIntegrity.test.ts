@@ -38,7 +38,7 @@ import {
   assertRestricted,
   createSqliteSupervisorRepository,
 } from "../src/adapters/supervision/sqliteSupervisorRepository.js";
-import { runSuperviseStatus } from "../src/cli/supervise.js";
+import { runSuperviseRoadmap, runSuperviseStatus } from "../src/cli/supervise.js";
 import {
   anchorFor,
   appendProvenance,
@@ -52,7 +52,7 @@ import {
 import { appendImplementerProvenance } from "../src/supervision/supervisorService.js";
 import { parseSupervisorState } from "../src/supervision/supervisorSerialization.js";
 import type { WorkOutcome } from "../src/supervision/supervisorPorts.js";
-import type { RoadmapItem } from "../src/supervision/supervisorTypes.js";
+import { DEFAULT_ROADMAP, type RoadmapItem } from "../src/supervision/supervisorTypes.js";
 import { cleanupTempDbs, tempDbPath } from "./support/factoryFixtures.js";
 import {
   newSupervisor,
@@ -119,8 +119,14 @@ function chainFor(resource: string, recordedAt = 1_000): readonly ProvenanceEntr
 async function reviewWith(input: {
   readonly item: Partial<RoadmapItem>;
   readonly provenance?: readonly ProvenanceEntry[];
-  /** Record a matching anchor, so the chain is not read as legacy silence. */
-  readonly anchor?: boolean;
+  /**
+   * The ancestor's work class, DECLARED as well as persisted.
+   *
+   * `workClass` is a definition field, so setting it through `input.item` alone
+   * is tampering and TASK-012 refuses it — correctly. A case that wants a
+   * genuinely deterministic ancestor has to say so in the catalog too.
+   */
+  readonly ancestorWorkClass?: RoadmapItem["workClass"];
 }) {
   /**
    * The DEFINITION is declared in the catalog (TASK-012); the PROGRESS is
@@ -130,9 +136,10 @@ async function reviewWith(input: {
    * overrides a definition field through it is TAMPERING, and must fail closed
    * rather than quietly redefining what the item is.
    */
+  const ancestorWorkClass = input.ancestorWorkClass ?? "NORMAL_IMPLEMENTATION";
   const definitions: readonly RoadmapItem[] = [
     { key: "B", title: "Review of A", dependsOn: ["A"], status: "PENDING", workClass: "INDEPENDENT_REVIEW", order: 1 },
-    { key: "A", title: "Implemented", dependsOn: [], status: "PENDING", workClass: "NORMAL_IMPLEMENTATION", order: 2 },
+    { key: "A", title: "Implemented", dependsOn: [], status: "PENDING", workClass: ancestorWorkClass, order: 2 },
   ];
   const supervisor = newSupervisor({ probe: healthyProbe(), roadmap: definitions });
   const state = await supervisor.service.ensureInitialized();
@@ -147,16 +154,23 @@ async function reviewWith(input: {
           title: "Implemented",
           dependsOn: [],
           status: "DONE",
-          workClass: "NORMAL_IMPLEMENTATION",
+          workClass: ancestorWorkClass,
           order: 2,
           attempts: 1,
           ...input.item,
         } as RoadmapItem,
       ],
-      ...(input.provenance === undefined ? {} : { provenance: input.provenance }),
-      ...(input.anchor === true && input.provenance !== undefined
-        ? { provenanceAnchor: anchorFor(input.provenance) }
-        : {}),
+      /**
+       * The anchor is ALWAYS recorded (round-9 CRITICAL).
+       *
+       * It used to be opt-in, which mirrored production — and that was the
+       * defect: an optional anchor is one an attacker deletes. Production now
+       * writes one with every chain, so a fixture without one is a state that
+       * can no longer exist, and the `anchor` flag has nothing left to select.
+       */
+      ...(input.provenance === undefined
+        ? {}
+        : { provenance: input.provenance, provenanceAnchor: anchorFor(input.provenance) }),
     },
     state.version,
   );
@@ -194,12 +208,21 @@ describe("TASK-008 AC-6: two records of lineage, and what happens when they diff
   });
 
   /**
-   * Silence is not contradiction. A database written before this field existed
-   * has no entries for work already done, and refusing every review on that
-   * basis would strand the roadmap this was built to protect.
+   * Silence is not contradiction — for the EXCLUSION cross-check, which is the
+   * question this describe block is about: given an ancestor, who must not
+   * review it.
+   *
+   * NARROWED IN ROUND 9. The ancestor here is DETERMINISTIC, because an empty
+   * chain under a DONE *AI* ancestor is no longer silence at all: TASK-012 AC-6
+   * now reads it as a forged completion and refuses before this check is
+   * reached. That is a deliberate change and it is asserted directly in
+   * `tests/roadmapStructuralIntegrity.test.ts`; what survives here is the
+   * narrower claim, that an absent second record is not by itself a
+   * DISAGREEMENT.
    */
   it("treats an EMPTY chain as no evidence rather than as disagreement", async () => {
     const { result } = await reviewWith({
+      ancestorWorkClass: "DETERMINISTIC",
       item: { implementedByResourceKeys: ["claude-code:opus"] },
       provenance: [],
     });
@@ -487,6 +510,7 @@ describe("TASK-008 AC-8: tamper-EVIDENT is stated where an operator reads it", (
       checkpoints: [],
       escalations: [],
       provenance,
+      provenanceAnchor: anchorFor(provenance),
       updatedAt: 1_000,
     });
     repository.close();
@@ -532,6 +556,7 @@ describe("TASK-008 AC-8: tamper-EVIDENT is stated where an operator reads it", (
       checkpoints: [],
       escalations: [],
       provenance: chainFor("claude-code:opus"),
+      provenanceAnchor: anchorFor(chainFor("claude-code:opus")),
       updatedAt: 1_000,
     });
     repository.close();
@@ -712,9 +737,15 @@ describe("TASK-008 round 1: the six blocking findings", () => {
     assert.equal(result.kind, "WAITING_FOR_HUMAN", "tail deletion must not be cheaper than editing");
   });
 
-  /** ...and the empty-chain allowance still holds, so old databases still work. */
+  /**
+   * ...and the empty-chain allowance still holds for the EXCLUSION question,
+   * narrowed in round 9 to an ancestor whose class needs no AI. An empty chain
+   * under a DONE AI ancestor is now refused outright — see
+   * `tests/roadmapStructuralIntegrity.test.ts`.
+   */
   it("still ACCEPTS an entirely empty chain as genuine silence", async () => {
     const { result } = await reviewWith({
+      ancestorWorkClass: "DETERMINISTIC",
       item: { implementedByResourceKeys: ["claude-code:opus"] },
       provenance: [],
     });
@@ -736,6 +767,7 @@ describe("TASK-008 round 1: durable state enforces append-only (AC-1)", () => {
       checkpoints: [],
       escalations: [],
       provenance: chainFor("claude-code:opus"),
+      provenanceAnchor: anchorFor(chainFor("claude-code:opus")),
       updatedAt: 1_000,
     });
     return { repository, seeded };
@@ -797,7 +829,12 @@ describe("TASK-008 round 1: durable state enforces append-only (AC-1)", () => {
       });
       assert.equal(appended.ok, true);
       if (!appended.ok) throw new Error("unreachable");
-      const saved = await repository.compareAndSave({ ...seeded, version: 2, provenance: appended.chain }, 1);
+      const saved = await repository.compareAndSave(
+        // An append updates BOTH records, exactly as `withLineage` does in
+        // production: the anchor is part of the write, not a separate step.
+        { ...seeded, version: 2, provenance: appended.chain, provenanceAnchor: anchorFor(appended.chain) },
+        1,
+      );
       assert.equal(saved.provenance.length, 2, "appending must still be allowed");
     } finally {
       repository.close();
@@ -1094,6 +1131,7 @@ describe("TASK-008 round 2: the repository verifies what it persists", () => {
     checkpoints: [],
     escalations: [],
     provenance,
+    provenanceAnchor: anchorFor(provenance),
     updatedAt: 1_000,
   });
 
@@ -1252,6 +1290,7 @@ describe("TASK-008 round 3: what is stored is what was verified", () => {
     checkpoints: [],
     escalations: [],
     provenance,
+    provenanceAnchor: anchorFor(provenance),
     updatedAt: 1_000,
   });
 
@@ -1320,6 +1359,7 @@ describe("TASK-008 round 3: append-only is pinned by content, not only by digest
         checkpoints: [],
         escalations: [],
         provenance: chainFor("claude-code:opus"),
+        provenanceAnchor: anchorFor(chainFor("claude-code:opus")),
         updatedAt: 1_000,
       });
 
@@ -1395,6 +1435,7 @@ describe("TASK-008 round 4: an unrecognised identity is not lineage", () => {
           { key: "A", title: "Done", dependsOn: [], status: "DONE", workClass: "DETERMINISTIC", order: 2 },
         ],
         provenance: appended.chain,
+        provenanceAnchor: anchorFor(appended.chain),
       },
       state.version,
     );
@@ -1438,6 +1479,7 @@ describe("TASK-008 round 4: a broken chain on disk is a DECISION, not a crash", 
       checkpoints: [],
       escalations: [],
       provenance: chainFor("claude-code:opus"),
+      provenanceAnchor: anchorFor(chainFor("claude-code:opus")),
       updatedAt: 1_000,
     });
     repository.close();
@@ -1562,10 +1604,28 @@ describe("TASK-008 round 5: tail truncation is detected by an anchor", () => {
     assert.equal(verifyAgainstAnchor(chain, anchorFor(chain)).intact, true);
   });
 
-  /** An absent anchor is silence, so old databases still load. */
-  it("ACCEPTS a chain with no anchor recorded", () => {
+  /**
+   * INVERTED IN ROUND 9, and worth stating why rather than quietly editing.
+   *
+   * This asserted that an absent anchor is silence, so that a database written
+   * before anchors existed would still load. The reviewer then used exactly that
+   * allowance: truncate the chain, delete the matching row history, DELETE THE
+   * ANCHOR, and the tail implementer reviewed its own work. No digest had to be
+   * recomputed — the record that would have objected was simply removed.
+   *
+   * An optional guard is one an attacker turns off. Production writes an anchor
+   * with every chain now, so a non-empty chain without one is a contradiction.
+   */
+  it("REFUSES a non-empty chain with no anchor recorded", () => {
     const chain = chainFor("claude-code:opus");
-    assert.equal(verifyAgainstAnchor(chain, undefined).intact, true);
+    const verdict = verifyAgainstAnchor(chain, undefined);
+    assert.equal(verdict.intact, false, "deleting the anchor switched the truncation check off");
+    if (!verdict.intact) assert.match(verdict.problem, /no anchor was recorded/);
+  });
+
+  /** An EMPTY chain with no anchor is still a database with no history. */
+  it("ACCEPTS an empty chain with no anchor recorded", () => {
+    assert.equal(verifyAgainstAnchor([], undefined).intact, true);
   });
 });
 
@@ -1610,13 +1670,31 @@ describe("TASK-008 round 6: an empty chain does not escape its own anchor", () =
     assert.equal(supervisor.executor.calls().length, 0, "nothing may run on deleted history");
   });
 
-  /** ...and a genuinely legacy database — no chain, no anchor — still works. */
+  /**
+   * ...and a genuinely legacy database still works — NARROWED IN ROUND 9.
+   *
+   * "No chain, no anchor" is still not tampering. What changed is that it is no
+   * longer a free pass for a DONE item whose class needs AI: the reviewer built
+   * exactly that state, with forged completions, and watched the dependents run.
+   * TASK-012 AC-6 now refuses it, and the pair below says both halves out loud
+   * rather than leaving the second to be discovered.
+   */
   it("still ACCEPTS a database with neither chain nor anchor", async () => {
     const { result } = await reviewWith({
+      ancestorWorkClass: "DETERMINISTIC",
       item: { implementedByResourceKeys: ["claude-code:opus"] },
       provenance: [],
     });
     assert.equal(result.kind, "ADVANCED", "a genuinely legacy database must still advance");
+  });
+
+  it("REFUSES the same database when the DONE ancestor needed AI", async () => {
+    const { result, supervisor } = await reviewWith({
+      item: { implementedByResourceKeys: ["claude-code:opus"] },
+      provenance: [],
+    });
+    assert.equal(result.kind, "WAITING_FOR_HUMAN", "an empty chain excused a DONE AI ancestor");
+    assert.equal(supervisor.executor.calls().length, 0);
   });
 });
 
@@ -1702,6 +1780,7 @@ describe("TASK-008 round 7: a zero-length anchor still asserts something", () =>
   /** A genuinely empty state — zero length, genesis head — still advances. */
   it("ACCEPTS an empty chain whose anchor is consistent with being empty", async () => {
     const { result } = await reviewWith({
+      ancestorWorkClass: "DETERMINISTIC",
       item: { implementedByResourceKeys: ["claude-code:opus"] },
       provenance: [],
     });
@@ -1746,7 +1825,6 @@ describe("TASK-008 round 7: what actually ran is read whatever the row claims", 
         },
       },
       provenance: appended.chain,
-      anchor: true,
     });
 
     assert.equal(result.kind, "WAITING_FOR_HUMAN", "a relabelled row hid the run-configuration evidence");
@@ -1911,6 +1989,7 @@ describe("TASK-008 round 8: the wake time cannot overrule the verdict", () => {
       checkpoints: [],
       escalations: [],
       provenance: chainFor("claude-code:opus"),
+      provenanceAnchor: anchorFor(chainFor("claude-code:opus")),
       updatedAt: 1_000,
     });
     repository.close();
@@ -1964,6 +2043,7 @@ describe("TASK-008 round 8: state that will not PARSE is a decision too", () => 
       checkpoints: [],
       escalations: [],
       provenance: chainFor("claude-code:opus"),
+      provenanceAnchor: anchorFor(chainFor("claude-code:opus")),
       updatedAt: 1_000,
     });
     repository.close();
@@ -2059,3 +2139,246 @@ describe("TASK-008 round 8: status asks the anchor", () => {
     assert.match(output, /tamper-evident, not tamper-proof/);
   });
 });
+
+// =====================================================================
+// ROUND-9 — one place records lineage, and the public read path reconciles
+// =====================================================================
+
+describe("TASK-008 round 9: every path a worker can leave by records that it ran", () => {
+  /**
+   * HIGH. Round 8 fixed `CHECKPOINT` and `RESOURCE_FAILURE`; round 9 found
+   * `HUMAN_REQUIRED`, the unverified-`COMPLETED` refusal and the
+   * mismatched-identity refusal still recording nothing, and `lastRunConfig`
+   * missing from the two paths round 8 had just fixed.
+   *
+   * That is one defect, not five: lineage was written inside each outcome
+   * branch, so every branch was a fresh chance to forget. It is recorded once
+   * now, before the branches, on the only fact that decides it — a worker ran.
+   */
+  async function afterOutcome(outcome: WorkOutcome) {
+    const supervisor = newSupervisor({
+      probe: healthyProbe(),
+      executor: scriptedExecutor({ A: [outcome] }),
+    });
+    await seedRoadmap(supervisor, [
+      { key: "A", title: "First item", dependsOn: [], status: "PENDING", workClass: "NORMAL_IMPLEMENTATION", order: 1 },
+    ]);
+    await supervisor.service.tick();
+    const state = (await supervisor.repository.load())!;
+    const item = state.roadmap.find((entry) => entry.key === "A")!;
+    return {
+      provenance: state.provenance.filter((entry) => entry.kind === "IMPLEMENTED_BY" && entry.roadmapKey === "A"),
+      implementers: item.implementedByResourceKeys ?? [],
+      runConfig: item.lastRunConfig,
+      anchor: state.provenanceAnchor,
+    };
+  }
+
+  const CASES: readonly (readonly [string, WorkOutcome])[] = [
+    ["a human is required", { kind: "HUMAN_REQUIRED", action: { kind: "RUN_TESTS", description: "run the suite" }, detail: "needs a person" }],
+    ["review returned changes", { kind: "CHANGES_REQUIRED", findings: ["fix it"] }],
+    ["the provider failed", { kind: "RESOURCE_FAILURE", process: { terminationReason: "EXITED", exitCode: 1, stdout: "", stderr: "quota" } }],
+    ["it completed without saying what ran", { kind: "COMPLETED", detail: "done", reportedIdentity: {} }],
+  ];
+
+  for (const [label, outcome] of CASES) {
+    it(`records the implementer and the run configuration when ${label}`, async () => {
+      const after = await afterOutcome(outcome);
+      assert.ok(after.provenance.length > 0, "the chain does not know a worker ran");
+      assert.ok(after.implementers.length > 0, "the row does not know a worker ran");
+      assert.notEqual(after.runConfig, undefined, "the authorized configuration was not recorded");
+      assert.deepEqual(
+        after.anchor,
+        { length: after.anchor?.length ?? -1, headDigest: after.anchor?.headDigest ?? "" },
+        "an anchor must accompany the chain it describes",
+      );
+      assert.equal(after.anchor?.length, after.provenance.length, "the anchor disagrees with the chain it was written beside");
+    });
+  }
+
+  /** A worker that reports a DIFFERENT model still ran, so it is still recorded. */
+  it("records the implementer when the reported identity contradicts the request", async () => {
+    const after = await afterOutcome({
+      kind: "COMPLETED",
+      detail: "done",
+      reportedIdentity: { provider: "some-other-provider", model: "some-other-model" },
+    });
+    assert.ok(after.provenance.length > 0, "a contradicted run left no trace of having happened");
+    assert.ok(after.implementers.length > 0);
+  });
+});
+
+describe("TASK-008 round 9: the roadmap command does not repeat a forgery", () => {
+  /**
+   * HIGH. `sf supervise roadmap` read `state.roadmap` and printed it, so a
+   * forged title and order came straight back out of the tool an operator uses
+   * to check the roadmap: "999. LOCAL_24_7_RUNTIME  FORGED DATABASE TITLE".
+   *
+   * The tick refuses such a database, which is the important half. A public read
+   * path that presents the row as the definition undoes the point of having a
+   * catalog at all.
+   */
+  it("reports the disagreement instead of printing the persisted title", async () => {
+    const { DatabaseSync } = await import("node:sqlite");
+    const dbPath = tempDbPath("t8-forged-roadmap");
+
+    const repository = createSqliteSupervisorRepository(dbPath);
+    const seeded = await repository.create({
+      version: 1,
+      financialPolicy: { autonomousSpendAllowed: false, autonomousSpendLimit: 0 },
+      resources: [],
+      roadmap: DEFAULT_ROADMAP.map((item) => ({ ...item, dependsOn: [...item.dependsOn] })),
+      checkpoints: [],
+      escalations: [],
+      provenance: [],
+      updatedAt: 1_000,
+    });
+    repository.close();
+
+    const db = new DatabaseSync(dbPath);
+    db.prepare("UPDATE supervisor_state SET data = ? WHERE id = ?").run(
+      JSON.stringify({
+        ...seeded,
+        roadmap: seeded.roadmap.map((item) =>
+          item.key === "LOCAL_24_7_RUNTIME" ? { ...item, title: "FORGED DATABASE TITLE", order: 999 } : item,
+        ),
+      }),
+      "supervisor",
+    );
+    db.close();
+
+    const lines: string[] = [];
+    await runSuperviseRoadmap({ supervisorDbPath: dbPath, log: (line: string) => lines.push(line) });
+    const output = lines.join("\n");
+
+    assert.match(output, /DISAGREES WITH THIS INSTALLATION'S CATALOG/, "the forgery was printed as fact");
+    assert.match(output, /"title"/, "the disagreeing field must be named");
+
+    /**
+     * The LISTING is what must not repeat the forgery.
+     *
+     * The diagnostic above quotes the persisted value deliberately — an operator
+     * needs to see what the database claims in order to recognise it. What would
+     * be wrong is presenting that value as the item's title, on the line an
+     * operator reads as the roadmap.
+     */
+    const listed = lines.filter((line) => /^\s*\d+\.\s+LOCAL_24_7_RUNTIME/.test(line));
+    assert.equal(listed.length, 1, "the item must still be listed exactly once");
+    assert.ok(!(listed[0] ?? "").includes("FORGED DATABASE TITLE"), "the forged title was listed as the title");
+    assert.match(listed[0] ?? "", /Reliable restartable WSL2 runtime/, "the catalog's own title must be listed");
+    assert.ok(!(listed[0] ?? "").startsWith("999"), "the forged order was used for display");
+  });
+
+  /** NEGATIVE CONTROL: an untampered database prints normally. */
+  it("prints an untampered roadmap without complaint", async () => {
+    const dbPath = tempDbPath("t8-clean-roadmap");
+    const repository = createSqliteSupervisorRepository(dbPath);
+    await repository.create({
+      version: 1,
+      financialPolicy: { autonomousSpendAllowed: false, autonomousSpendLimit: 0 },
+      resources: [],
+      roadmap: DEFAULT_ROADMAP.map((item) => ({ ...item, dependsOn: [...item.dependsOn] })),
+      checkpoints: [],
+      escalations: [],
+      provenance: [],
+      updatedAt: 1_000,
+    });
+    repository.close();
+
+    const lines: string[] = [];
+    await runSuperviseRoadmap({ supervisorDbPath: dbPath, log: (line: string) => lines.push(line) });
+    const output = lines.join("\n");
+    assert.ok(!output.includes("DISAGREES"), "a legitimate roadmap was reported as forged");
+    assert.match(output, /LOCAL_24_7_RUNTIME/);
+  });
+});
+
+describe("TASK-008 round 9: deleting the anchor is not a way out", () => {
+  /**
+   * THE REVIEWER'S REPRODUCTION, end to end.
+   *
+   * A valid chain recorded two runs of `A` — first Codex, then Claude. Direct
+   * SQLite tampering removed the second provenance entry, removed Claude from
+   * the row's history, removed `lastRunConfig`, and REMOVED THE ANCHOR. The next
+   * tick advanced and handed the review of `B` to `claude-code:opus` — the
+   * deleted tail implementer, reviewing work it had done.
+   *
+   * No digest had to be recomputed. The record that would have objected was
+   * simply deleted, because an absent anchor was read as silence.
+   */
+  it("REFUSES a chain whose tail and anchor were deleted together", async () => {
+    const { DatabaseSync } = await import("node:sqlite");
+    const dbPath = tempDbPath("t8-anchor-deleted");
+
+    const first = chainNamingBoth();
+    const repository = createSqliteSupervisorRepository(dbPath);
+    const seeded = await repository.create({
+      version: 1,
+      financialPolicy: { autonomousSpendAllowed: false, autonomousSpendLimit: 0 },
+      resources: [],
+      roadmap: [
+        { key: "B", title: "Review of A", dependsOn: ["A"], status: "ELIGIBLE", workClass: "INDEPENDENT_REVIEW", order: 1 },
+        {
+          key: "A",
+          title: "Implemented",
+          dependsOn: [],
+          status: "DONE",
+          workClass: "NORMAL_IMPLEMENTATION",
+          order: 2,
+          attempts: 1,
+          implementedByResourceKeys: ["codex-cli:gpt-5.6-luna", "claude-code:opus"],
+        } as RoadmapItem,
+      ],
+      checkpoints: [],
+      escalations: [],
+      provenance: first,
+      provenanceAnchor: anchorFor(first),
+      updatedAt: 1_000,
+    });
+    repository.close();
+    assert.equal(seeded.provenance.length, 2, "the fixture needs two runs to delete one");
+
+    const db = new DatabaseSync(dbPath);
+    const { provenanceAnchor: _deleted, ...withoutAnchor } = seeded;
+    void _deleted;
+    db.prepare("UPDATE supervisor_state SET data = ? WHERE id = ?").run(
+      JSON.stringify({
+        ...withoutAnchor,
+        // The tail entry, the row's memory of Claude, and the anchor — all gone.
+        provenance: seeded.provenance.slice(0, 1),
+        roadmap: seeded.roadmap.map((item) =>
+          item.key === "A"
+            ? { ...item, implementedByResourceKeys: ["codex-cli:gpt-5.6-luna"], lastRunConfig: undefined }
+            : item,
+        ),
+      }),
+      "supervisor",
+    );
+    db.close();
+
+    const reopened = createSqliteSupervisorRepository(dbPath);
+    const supervisor = newSupervisor({
+      probe: healthyProbe(),
+      repository: reopened,
+      roadmap: [
+        { key: "B", title: "Review of A", dependsOn: ["A"], status: "PENDING", workClass: "INDEPENDENT_REVIEW", order: 1 },
+        { key: "A", title: "Implemented", dependsOn: [], status: "PENDING", workClass: "NORMAL_IMPLEMENTATION", order: 2 },
+      ],
+    });
+    try {
+      const result = await supervisor.service.tick();
+      assert.equal(result.kind, "WAITING_FOR_HUMAN", "deleting the anchor let the tail implementer review its own work");
+      for (const call of supervisor.executor.calls()) {
+        assert.notEqual(call.item.key, "B", "the review ran on a chain that had been cut");
+      }
+    } finally {
+      reopened.close();
+    }
+  });
+});
+
+/** Two recorded runs of `A`: Codex first, then Claude. */
+function chainNamingBoth(): readonly ProvenanceEntry[] {
+  const one = chainFor("codex-cli:gpt-5.6-luna");
+  return appendImplementerProvenance(one, "A", "claude-code:opus", 2_000, "completed");
+}

@@ -340,8 +340,34 @@ export function verifyAgainstAnchor(
   anchor: { readonly length: number; readonly headDigest: string } | undefined,
 ): ChainVerdict {
   const structural = verifyChain(chain);
-  if (!structural.intact || anchor === undefined) {
+  if (!structural.intact) {
     return structural;
+  }
+  if (anchor === undefined) {
+    /**
+     * AN ABSENT ANCHOR IS A DELETION (round-9 CRITICAL).
+     *
+     * This returned the structural verdict when no anchor was recorded, which
+     * made the anchor OPTIONAL from an attacker's point of view: the reviewer
+     * truncated the chain, deleted the matching row history, deleted the
+     * anchor, and the tail implementer went on to review its own work. No
+     * digest had to be recomputed — the record that would have objected was
+     * simply removed.
+     *
+     * A guard that can be switched off by deleting it is not a guard. An anchor
+     * is now written with every chain, so a non-empty chain WITHOUT one is a
+     * contradiction and says so. An empty chain with no anchor stays legitimate:
+     * that is a database with no history, which is the pre-TASK-008 case this
+     * has always allowed.
+     */
+    return chain.length === 0
+      ? structural
+      : {
+          intact: false,
+          problem:
+            `the chain has ${chain.length} entries but no anchor was recorded; an anchor is written with every ` +
+            "chain, so its absence means the record of how long the chain should be was removed",
+        };
   }
   const expected = anchorFor(chain);
   if (expected.length !== anchor.length) {

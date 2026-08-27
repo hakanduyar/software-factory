@@ -1001,9 +1001,45 @@ export class SupervisorService {
         : reported === undefined || Object.keys(reported).length === 0
           ? runConfig
           : reconcileReportedIdentity(runConfig, reported);
+    /**
+     * LINEAGE IS RECORDED ONCE, HERE (round-9 HIGH).
+     *
+     * Rounds 8 and 9 each found paths that ran a worker and recorded nothing:
+     * round 8 found `CHECKPOINT` and `RESOURCE_FAILURE`, and round 9 found
+     * `HUMAN_REQUIRED`, the unverified-`COMPLETED` refusal and the
+     * mismatched-identity refusal — plus `lastRunConfig` missing from the two
+     * paths round 8 had just fixed.
+     *
+     * That is not five bugs; it is one. Recording lineage inside each outcome
+     * branch means every new branch is a fresh opportunity to forget, and the
+     * reviewer will keep finding the ones that did. So it happens BEFORE the
+     * branches, on the single fact that decides it: a worker RAN.
+     *
+     * Everything below builds on `withLineage`, so a future branch cannot omit
+     * it by being written — only by deliberately reaching past it.
+     *
+     * Both helpers are no-ops when no resource was used, so DETERMINISTIC work
+     * is unaffected.
+     */
+    const lineageProvenance = appendImplementerProvenance(
+      state.provenance,
+      item.key,
+      usedResourceKey,
+      now,
+      LINEAGE_DETAIL[outcome.kind],
+    );
+    const withLineage: SupervisorState = {
+      ...withoutClaim,
+      roadmap: setRunConfig(setImplementer(state.roadmap, item.key, usedResourceKey), item.key, reconciled),
+      provenance: lineageProvenance,
+      // An anchor is written with EVERY chain, so that its absence is a
+      // detectable deletion rather than a permitted state (round-9 CRITICAL).
+      provenanceAnchor: anchorFor(lineageProvenance),
+    };
+
     if (reconciled?.verification === "MISMATCH") {
       const escalated = await this.escalate(
-        { ...withoutClaim, roadmap: setRunConfig(state.roadmap, item.key, reconciled) },
+        withLineage,
         item.key,
         "RECOVERY_REQUIRED",
         `Investigate ${item.key}: the worker reported running a different model/effort than was authorized. ${reconciled.note}`,
@@ -1034,7 +1070,7 @@ export class SupervisorService {
     if (outcome.kind === "COMPLETED" && runConfig !== undefined && !statesItsIdentity(reported)) {
       const humanAction = `Investigate ${item.key}: the worker reported COMPLETED without stating which provider/model it ran, so the authorized configuration cannot be confirmed.`;
       const escalated = await this.escalate(
-        { ...withoutClaim, roadmap: setRunConfig(state.roadmap, item.key, runConfig) },
+        withLineage,
         item.key,
         "RECOVERY_REQUIRED",
         humanAction,
@@ -1054,26 +1090,10 @@ export class SupervisorService {
         // N-2: the identity of whoever did the work outlives the item, so a
         // later review of anything depending on it can exclude them.
         const next = await this.commit(state, {
-          ...withoutClaim,
-          roadmap: recomputeEligibility(
-            setRunConfig(
-              setImplementer(setStatus(state.roadmap, item.key, "DONE", detail), item.key, usedResourceKey),
-              item.key,
-              reconciled,
-            ),
-          ),
+          ...withLineage,
+          roadmap: recomputeEligibility(setStatus(withLineage.roadmap, item.key, "DONE", detail)),
           checkpoints: state.checkpoints.filter((entry) => entry.roadmapKey !== item.key),
           resources: markSuccess(state.resources, usedResourceKey, now),
-          ...(() => {
-            const provenance = appendImplementerProvenance(
-              state.provenance,
-              item.key,
-              usedResourceKey,
-              now,
-              "completed",
-            );
-            return { provenance, provenanceAnchor: anchorFor(provenance) };
-          })(),
         });
         void next;
         this.log(`[supervisor] ${item.key} completed; dependents re-evaluated`);
@@ -1087,23 +1107,9 @@ export class SupervisorService {
           `independent review returned CHANGES_REQUIRED: ${outcome.findings.join("; ")}`,
         );
         const next = await this.commit(state, {
-          ...withoutClaim,
-          roadmap: setImplementer(
-            setStatus(state.roadmap, item.key, "ELIGIBLE", detail),
-            item.key,
-            usedResourceKey,
-          ),
+          ...withLineage,
+          roadmap: setStatus(withLineage.roadmap, item.key, "ELIGIBLE", detail),
           resources: markSuccess(state.resources, usedResourceKey, now),
-          ...(() => {
-            const provenance = appendImplementerProvenance(
-              state.provenance,
-              item.key,
-              usedResourceKey,
-              now,
-              "changes required",
-            );
-            return { provenance, provenanceAnchor: anchorFor(provenance) };
-          })(),
         });
         void next;
         return { kind: "ADVANCED", roadmapKey: item.key, actionId, detail };
@@ -1125,12 +1131,8 @@ export class SupervisorService {
         // reality is exactly what TASK-004 round 2 forbade.
         const detail = boundedDiagnostic(outcome.detail);
         const next = await this.commit(state, {
-          ...withoutClaim,
-          roadmap: setImplementer(
-            setRunConfig(setStatus(state.roadmap, item.key, "ELIGIBLE", detail), item.key, reconciled),
-            item.key,
-            usedResourceKey,
-          ),
+          ...withLineage,
+          roadmap: setStatus(withLineage.roadmap, item.key, "ELIGIBLE", detail),
           // NEW-SEC-1: a checkpoint's text comes from an executor, so it is
           // bounded and redacted like every other untrusted string before it
           // becomes durable state. "Bounded checkpoint" was the design claim;
@@ -1152,31 +1154,6 @@ export class SupervisorService {
               : { resumedFromActionId: previousCheckpointActionId }),
           }),
           resources: markSuccess(state.resources, usedResourceKey, now),
-          /**
-           * LINEAGE IS ABOUT WHO RAN, NOT ABOUT WHO SUCCEEDED (round-8
-           * CRITICAL).
-           *
-           * `CHECKPOINT` persisted the checkpoint and the run config and
-           * recorded no implementer at all. A worker could therefore run on
-           * `codex-cli:gpt-5.6-luna`, exhaust its context, hand over to another
-           * worker that completed the item — and the durable record would name
-           * only the second. The first was then free to REVIEW dependent work,
-           * which is exactly what C4 forbids and exactly what this chain exists
-           * to prevent.
-           *
-           * A worker that ran may have changed the workspace. That is the whole
-           * criterion, and "did it finish" has nothing to do with it.
-           */
-          ...(() => {
-            const provenance = appendImplementerProvenance(
-              state.provenance,
-              item.key,
-              usedResourceKey,
-              now,
-              "checkpointed",
-            );
-            return { provenance, provenanceAnchor: anchorFor(provenance) };
-          })(),
         });
         void next;
         this.log(`[supervisor] ${item.key} rolled over to a new session: ${detail}`);
@@ -1197,7 +1174,7 @@ export class SupervisorService {
         const reason: EscalationReason = verdict.allowed
           ? "HUMAN_DECISION_REQUIRED"
           : reasonForClass(verdict.actionClass);
-        const escalated = await this.escalate(withoutClaim, item.key, reason, humanAction, outcome.detail);
+        const escalated = await this.escalate(withLineage, item.key, reason, humanAction, outcome.detail);
         void escalated;
         return { kind: "WAITING_FOR_HUMAN", roadmapKey: item.key, reason, humanActionRequired: humanAction };
       }
@@ -1209,39 +1186,14 @@ export class SupervisorService {
           record.key === usedResourceKey ? this.applyClassification(record, classification, now) : record,
         );
         const waiting = await this.commit(state, {
-          ...withoutClaim,
+          ...withLineage,
           resources,
-          /**
-           * A FAILED run is still a run (round-8 CRITICAL).
-           *
-           * `RESOURCE_FAILURE` recorded neither implementer nor provenance, so
-           * a worker that started, touched the workspace and then hit its quota
-           * left no trace — and reviewed the dependent item on the next tick.
-           * The reviewer reproduced exactly that sequence against real SQLite.
-           *
-           * `appendImplementerProvenance` and `setImplementer` are both no-ops
-           * when no resource was used, so DETERMINISTIC work is unaffected.
-           */
-          roadmap: setImplementer(
-            setStatus(
-              state.roadmap,
-              item.key,
-              classification.state === "AUTH_REQUIRED" ? "WAITING_FOR_HUMAN_REQUIRED" : "WAITING_FOR_RESOURCE",
-              boundedDiagnostic(classification.reason),
-            ),
+          roadmap: setStatus(
+            withLineage.roadmap,
             item.key,
-            usedResourceKey,
+            classification.state === "AUTH_REQUIRED" ? "WAITING_FOR_HUMAN_REQUIRED" : "WAITING_FOR_RESOURCE",
+            boundedDiagnostic(classification.reason),
           ),
-          ...(() => {
-            const provenance = appendImplementerProvenance(
-              state.provenance,
-              item.key,
-              usedResourceKey,
-              now,
-              `resource failure: ${classification.state}`,
-            );
-            return { provenance, provenanceAnchor: anchorFor(provenance) };
-          })(),
         });
 
         if (classification.state === "AUTH_REQUIRED") {
@@ -1786,11 +1738,7 @@ export class SupervisorService {
     const implementedKeys = new Set(
       state.provenance.filter((entry) => entry.kind === "IMPLEMENTED_BY").map((entry) => entry.roadmapKey),
     );
-    const unproven = unprovenCompletion({
-      roadmap: verdict.roadmap,
-      implementedKeys,
-      legacySilence: chainIsLegacySilence(state),
-    });
+    const unproven = unprovenCompletion({ roadmap: verdict.roadmap, implementedKeys });
     if (unproven !== undefined) {
       return { state, result: this.unprovenRefusal(state, unproven) };
     }
@@ -2375,6 +2323,22 @@ export function chainIsLegacySilence(state: {
   const anchor = state.provenanceAnchor;
   return anchor === undefined || (anchor.length === 0 && anchor.headDigest === GENESIS_DIGEST);
 }
+
+/**
+ * What the chain records about HOW a run ended.
+ *
+ * Keyed by outcome so hoisting the recording out of the branches does not cost
+ * the description each branch used to write. A `Record` rather than a switch so
+ * that a new `WorkOutcome` variant fails to COMPILE until someone says what it
+ * means for lineage.
+ */
+const LINEAGE_DETAIL: Record<WorkOutcome["kind"], string> = {
+  COMPLETED: "completed",
+  CHANGES_REQUIRED: "changes required",
+  CHECKPOINT: "checkpointed",
+  RESOURCE_FAILURE: "resource failure",
+  HUMAN_REQUIRED: "stopped for a human",
+};
 
 export function appendImplementerProvenance(
   chain: readonly ProvenanceEntry[],

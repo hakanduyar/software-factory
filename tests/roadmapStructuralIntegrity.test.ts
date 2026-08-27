@@ -124,7 +124,18 @@ describe("TASK-012 AC-6: a forged completion does not make dependents eligible",
   it("REFUSES a DONE AI item that provenance knows nothing about", async () => {
     const catalog: readonly RoadmapItem[] = [
       ...CATALOG,
-      { key: "C", title: "Depends on the review", dependsOn: ["B"], status: "PENDING", workClass: "DETERMINISTIC", order: 3 },
+      {
+        key: "C",
+        title: "Depends on the review",
+        dependsOn: ["B"],
+        status: "PENDING",
+        workClass: "DETERMINISTIC",
+        order: 3,
+        // Declared, so that C can genuinely RUN. Without this the supervisor
+        // refuses deterministic work that declares nothing — and the case would
+        // pass for that reason instead of the one it names.
+        declaredActionKinds: ["RUN_TESTS"],
+      },
     ];
     const supervisor = newSupervisor({ probe: healthyProbe(), roadmap: catalog });
     await seedRoadmap(supervisor, catalog);
@@ -156,20 +167,21 @@ describe("TASK-012 AC-6: a forged completion does not make dependents eligible",
   });
 
   /**
-   * THE HONEST RESIDUE (AC-8), asserted rather than described: a database
-   * written before provenance existed has no entries for work already done, and
-   * refusing every such installation would strand the roadmap this protects.
+   * THE EXEMPTION IS GONE (round-9 CRITICAL).
+   *
+   * An empty chain used to skip this check entirely, on the reasoning that a
+   * pre-TASK-008 database has no entries for work already done. Sound about a
+   * legacy database, useless as a control: the same condition is one DELETE
+   * away, and the reviewer built a state with an empty chain, a genesis anchor
+   * and forged `DONE` rows, and watched every dependent run.
    */
-  it("still accepts a DONE item when the chain is entirely empty", () => {
-    assert.equal(
-      unprovenCompletion({
-        roadmap: [{ ...CATALOG[1]!, status: "DONE" }],
-        implementedKeys: new Set<string>(),
-        legacySilence: true,
-      }),
-      undefined,
-      "legacy silence must not be read as tampering",
-    );
+  it("REFUSES a DONE AI item even when the chain is entirely empty", () => {
+    const problem = unprovenCompletion({
+      roadmap: [{ ...CATALOG[1]!, status: "DONE" }],
+      implementedKeys: new Set<string>(),
+    });
+    assert.notEqual(problem, undefined, "an empty chain excused a forged completion");
+    assert.match(problem ?? "", /no record of anything having run/);
   });
 
   /** DETERMINISTIC work needs no AI, so nothing is expected to have run on it. */
@@ -180,10 +192,60 @@ describe("TASK-012 AC-6: a forged completion does not make dependents eligible",
           { key: "D", title: "Deterministic", dependsOn: [], status: "DONE", workClass: "DETERMINISTIC", order: 1 },
         ],
         implementedKeys: new Set<string>(),
-        legacySilence: false,
       }),
       undefined,
     );
+  });
+
+  /**
+   * NEGATIVE CONTROL, and the reason the check costs a fresh installation
+   * nothing: every catalog item ships PENDING, so a new database has nothing
+   * DONE and nothing to prove.
+   */
+  it("says nothing about a roadmap where nothing is DONE", () => {
+    assert.equal(unprovenCompletion({ roadmap: CATALOG, implementedKeys: new Set<string>() }), undefined);
+  });
+
+  /** THE REVIEWER'S REPRODUCTION, driven end to end through real state. */
+  it("REFUSES to advance a dependent of a forged DONE review, on a genesis chain", async () => {
+    const catalog: readonly RoadmapItem[] = [
+      ...CATALOG,
+      {
+        key: "C",
+        title: "Depends on the review",
+        dependsOn: ["B"],
+        status: "PENDING",
+        workClass: "DETERMINISTIC",
+        order: 3,
+        // Declared, so that C can genuinely RUN. Without this the supervisor
+        // refuses deterministic work that declares nothing — and the case would
+        // pass for that reason instead of the one it names.
+        declaredActionKinds: ["RUN_TESTS"],
+      },
+    ];
+    const supervisor = newSupervisor({ probe: healthyProbe(), roadmap: catalog });
+    await seedRoadmap(supervisor, catalog);
+
+    // Empty provenance, genesis anchor — exactly what a NEW database looks like.
+    const state = (await supervisor.repository.load())!;
+    await supervisor.repository.compareAndSave(
+      {
+        ...state,
+        version: state.version + 1,
+        roadmap: [
+          { ...catalog[0]!, status: "DONE" },
+          { ...catalog[1]!, status: "DONE" },
+          { ...catalog[2]!, status: "ELIGIBLE" },
+        ],
+        provenance: [],
+        provenanceAnchor: anchorFor([]),
+      },
+      state.version,
+    );
+
+    const result = await supervisor.service.tick();
+    assert.equal(result.kind, "WAITING_FOR_HUMAN", "a genesis chain excused two forged completions");
+    assert.equal(supervisor.executor.calls().length, 0, "the dependent ran on unproven work");
   });
 });
 
@@ -245,7 +307,29 @@ describe("TASK-012 AC-7: dependency edges come from the catalog", () => {
 });
 
 describe("TASK-012 AC-1/AC-2: every definition field, detected and named", () => {
-  for (const field of DEFINITION_FIELDS) {
+  /**
+   * THE TEST OWNS THIS LIST (round-9 HIGH).
+   *
+   * It used to iterate the implementation's own `DEFINITION_FIELDS`, so deleting
+   * a field from the production guard deleted its test with it: the reviewer
+   * removed `"title"` and the suite ran 18/18 green instead of failing. A test
+   * that derives its expectations from the code under test cannot detect that
+   * code shrinking.
+   *
+   * The literal below is the specification. The assertion after it pins the two
+   * together, so ADDING a field without a case here fails too.
+   */
+  const EXPECTED_DEFINITION_FIELDS = ["title", "workClass", "dependsOn", "order"] as const;
+
+  it("checks exactly the fields this suite covers", () => {
+    assert.deepEqual(
+      [...DEFINITION_FIELDS].sort(),
+      [...EXPECTED_DEFINITION_FIELDS].sort(),
+      "the implementation's definition fields and this suite's cases have drifted apart",
+    );
+  });
+
+  for (const field of EXPECTED_DEFINITION_FIELDS) {
     it(`detects a persisted ${field} that disagrees with the catalog`, () => {
       const edits: Record<string, unknown> = {
         title: "Renamed",
@@ -290,7 +374,7 @@ describe("TASK-012 AC-1/AC-2: every definition field, detected and named", () =>
       assert.deepEqual(item.implementedByResourceKeys, ["claude-code:opus"]);
     }
 
-    for (const field of DEFINITION_FIELDS) {
+    for (const field of EXPECTED_DEFINITION_FIELDS) {
       const edited = reconcileRoadmapWithCatalog(
         [{ ...CATALOG[0]!, [field]: field === "order" ? 42 : "changed" } as RoadmapItem],
         [CATALOG[0]!],

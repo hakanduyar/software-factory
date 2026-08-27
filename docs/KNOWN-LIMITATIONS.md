@@ -156,12 +156,29 @@ someone who recomputes it after editing. It catches the corrupted row, the
 partial restore, the hand-edit "just fixing one field" — the realistic cases —
 and not a determined forger.
 
-**And one gap the second record does not close:** an EMPTY chain is treated as
-silence rather than contradiction, because a database written before TASK-008
-has no entries for work already done. An attacker who can write the database can
-also delete the whole chain, which returns the system to the pre-TASK-008
-behaviour for that item. Refusing instead would strand every existing database;
-the trade-off was made deliberately and is flagged here rather than buried.
+**The gap that USED to be here, now closed (round 9).** An empty chain was
+treated as silence rather than contradiction, so deleting the whole chain
+returned the system to its pre-TASK-008 behaviour for every item. An independent
+review built exactly that state — empty chain, genesis anchor, forged `DONE`
+rows — and watched every dependent run.
+
+An exemption an attacker can satisfy is not an exemption. A `DONE` item whose
+class requires AI, with nothing in the chain saying anything ran on it, is now
+refused. Every roadmap item ships PENDING, so a fresh installation pays nothing
+for this; a genuinely pre-TASK-008 database pays one human decision before its
+dependents proceed, which is the correct price for an unverifiable history.
+
+**Deleting the ANCHOR is no longer a way out either.** `verifyAgainstAnchor`
+accepted an absent anchor as silence, so a reviewer truncated the chain, deleted
+the row's memory of the tail implementer, deleted the anchor, and that
+implementer went on to review its own work — no digest recomputation required.
+An anchor is written with every chain now, so its absence is a contradiction,
+and the repository refuses to persist a chain whose anchor disagrees with it.
+
+**What still remains:** the narrower allowance in the reviewer-exclusion path,
+where an empty chain is not read as a DISAGREEMENT about who implemented an
+ancestor whose class needs no AI. And the deeper limit below, which no amount of
+this closes.
 
 **What TASK-012 changed, and what it did not:** an item's DEFINITION — `key`,
 `title`, `workClass`, `dependsOn`, `order` — no longer comes from the database at

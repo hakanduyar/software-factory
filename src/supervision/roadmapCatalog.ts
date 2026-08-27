@@ -159,19 +159,32 @@ export function reconcileRoadmapWithCatalog(
  * row is how an unreviewed item satisfies its dependents. The chain is the
  * second record, and the two disagreeing is exactly the signal it exists for.
  *
- * `legacySilence` is passed in rather than recomputed here because it is a fact
- * about the whole state: a database written before TASK-008 has no entries for
- * work already done, and refusing every such installation would strand the
- * roadmap this protects. That residue is recorded in docs/KNOWN-LIMITATIONS.md.
+ * NO EMPTY-CHAIN EXEMPTION (round-9 CRITICAL).
+ *
+ * The first version skipped this check whenever the chain was empty, on the
+ * reasoning that a database written before TASK-008 has no entries for work
+ * already done. That reasoning is sound about a LEGACY database and useless as a
+ * control, because the same condition is one DELETE away: the reviewer created a
+ * state with an empty chain, a genesis anchor and forged `DONE` rows, and every
+ * dependent ran. An exemption an attacker can satisfy is not an exemption, it is
+ * the bypass with a justification attached.
+ *
+ * Every roadmap item this build ships starts PENDING, so a fresh installation
+ * has nothing DONE and nothing to prove — the check costs it nothing. What it
+ * does cost is a genuinely pre-TASK-008 database, which now needs a human
+ * decision once before its dependents proceed. That is the correct price: an
+ * unverifiable history is exactly the situation C1 reserves for a person, and
+ * the alternative is handing the same escape to anyone who can write the file.
+ *
+ * The reviewer-exclusion path keeps its own separate allowance
+ * (`chainIsLegacySilence`), which answers a different question — "who
+ * implemented this ancestor" rather than "did anything run at all" — and was
+ * adjudicated legitimate in that form by an earlier review.
  */
 export function unprovenCompletion(input: {
   readonly roadmap: readonly RoadmapItem[];
   readonly implementedKeys: ReadonlySet<string>;
-  readonly legacySilence: boolean;
 }): string | undefined {
-  if (input.legacySilence) {
-    return undefined;
-  }
   for (const item of input.roadmap) {
     if (item.status !== "DONE" || !requiresAi(item.workClass)) continue;
     if (input.implementedKeys.has(item.key)) continue;

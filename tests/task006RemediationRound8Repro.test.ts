@@ -43,6 +43,11 @@ import { createSqliteSupervisorRepository } from "../src/adapters/supervision/sq
 import { interpretClaudeAuthStatus } from "../src/supervision/resourceClassifier.js";
 import { NO_BACKOFF } from "../src/supervision/resourceTypes.js";
 import type { RoadmapItem } from "../src/supervision/supervisorTypes.js";
+import {
+  anchorFor,
+  appendProvenance,
+  type ProvenanceEntry,
+} from "../src/supervision/provenanceChain.js";
 import { cleanupTempDbs, tempDbPath } from "./support/factoryFixtures.js";
 import {
   declarePersisted,
@@ -55,6 +60,27 @@ import {
 } from "./support/supervisorFixtures.js";
 
 after(cleanupTempDbs);
+
+/**
+ * A provenance chain naming `resource` as an implementer of `roadmapKey`.
+ *
+ * Needed since TASK-012 AC-6: a DONE item whose class requires AI, with nothing
+ * in the chain saying anything ran on it, is now a forged completion and is
+ * refused. These fixtures are about a LATER question — who may review it — so
+ * they have to get past that one first, with the record a real run would have
+ * left.
+ */
+function chainNaming(roadmapKey: string, resource: string): readonly ProvenanceEntry[] {
+  const appended = appendProvenance([], {
+    kind: "IMPLEMENTED_BY",
+    roadmapKey,
+    resourceKey: resource,
+    detail: "completed",
+    recordedAt: 1_000,
+  });
+  if (!appended.ok) throw new Error("fixture chain did not build");
+  return appended.chain;
+}
 
 const ONE_AI_ITEM: readonly RoadmapItem[] = [
   { key: "AI", title: "Needs a model", dependsOn: [], status: "PENDING", workClass: "NORMAL_IMPLEMENTATION", order: 1 },
@@ -321,6 +347,8 @@ describe("TASK-006 R8-C4-1: persisted resource rows do not confer recognition", 
             implementedByResourceKeys: ["claude-code:opus"],
           },
         ],
+        provenance: chainNaming("A", "claude-code:opus"),
+        provenanceAnchor: anchorFor(chainNaming("A", "claude-code:opus")),
       },
       state.version,
     );

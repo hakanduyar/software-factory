@@ -24,6 +24,8 @@ import { createSequentialIdGenerator } from "../domain/ids.js";
 import { DEFAULT_ROUTING_POLICY } from "../supervision/modelRouting.js";
 import { parseFinancialPolicy } from "../supervision/financialSafety.js";
 import { boundedDiagnostic } from "../supervision/resourceClassifier.js";
+import { reconcileRoadmapWithCatalog } from "../supervision/roadmapCatalog.js";
+import { DEFAULT_ROADMAP } from "../supervision/supervisorTypes.js";
 import { verifyAgainstAnchor } from "../supervision/provenanceChain.js";
 import { SupervisorService, type TickResult } from "../supervision/supervisorService.js";
 import type { WorkExecutionInput, WorkExecutor, WorkOutcome } from "../supervision/supervisorPorts.js";
@@ -366,7 +368,37 @@ export async function runSuperviseRoadmap(options: SuperviseCliOptions = {}): Pr
     if (state === undefined) {
       return undefined;
     }
-    for (const item of [...state.roadmap].sort((a, b) => a.order - b.order)) {
+    /**
+     * RECONCILED BEFORE IT IS PRINTED (round-9 HIGH).
+     *
+     * This command read `state.roadmap` and printed it, so a forged title or
+     * order was displayed as fact — the reviewer wrote "999. LOCAL_24_7_RUNTIME
+     * FORGED DATABASE TITLE" into the database and read it straight back out of
+     * the tool an operator uses to check the roadmap.
+     *
+     * The tick refuses such a state, which is the important half; but a public
+     * read path that presents the row as the definition undoes the point of
+     * having a catalog. Where the two disagree this reports the disagreement and
+     * prints the CATALOG's definition, because that is the one that decides
+     * anything.
+     */
+    const reconciliation = reconcileRoadmapWithCatalog(state.roadmap, DEFAULT_ROADMAP);
+    if (!reconciliation.ok) {
+      log("");
+      log(`!! THE PERSISTED ROADMAP DISAGREES WITH THIS INSTALLATION'S CATALOG`);
+      log(`!! ${safe(reconciliation.problem)}`);
+      log(`!! The definitions below are the CATALOG's. The supervisor will not act on this database`);
+      log(`!! until it is restored; nothing here is evidence about what the persisted rows say.`);
+      log("");
+    }
+    const progressByKey = new Map(state.roadmap.map((item) => [item.key, item]));
+    const displayed = reconciliation.ok
+      ? reconciliation.roadmap
+      : DEFAULT_ROADMAP.map((declared) => {
+          const progress = progressByKey.get(declared.key);
+          return progress === undefined ? declared : { ...progress, ...declared, status: progress.status };
+        });
+    for (const item of [...displayed].sort((a, b) => a.order - b.order)) {
       log(`${String(item.order).padStart(2)}. ${safe(item.key).padEnd(26)} ${item.status.padEnd(26)} ${safe(item.title)}`);
       if (item.humanActionRequired !== undefined) {
         log(`    human: ${safe(item.humanActionRequired)}`);

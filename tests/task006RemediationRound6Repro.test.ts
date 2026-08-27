@@ -43,6 +43,11 @@ import {
 import { interpretClaudeAuthStatus } from "../src/supervision/resourceClassifier.js";
 import { DEFAULT_ROADMAP, type RoadmapItem } from "../src/supervision/supervisorTypes.js";
 import { implementerHistory, setImplementer } from "../src/supervision/supervisorService.js";
+import {
+  anchorFor,
+  appendProvenance,
+  type ProvenanceEntry,
+} from "../src/supervision/provenanceChain.js";
 import { cleanupTempDbs } from "./support/factoryFixtures.js";
 import {
   declarePersisted,
@@ -55,6 +60,27 @@ import {
 } from "./support/supervisorFixtures.js";
 
 after(cleanupTempDbs);
+
+/**
+ * A provenance chain naming `resource` as an implementer of `roadmapKey`.
+ *
+ * Needed since TASK-012 AC-6: a DONE item whose class requires AI, with nothing
+ * in the chain saying anything ran on it, is now a forged completion and is
+ * refused. These fixtures are about a LATER question — who may review it — so
+ * they have to get past that one first, with the record a real run would have
+ * left.
+ */
+function chainNaming(roadmapKey: string, resource: string): readonly ProvenanceEntry[] {
+  const appended = appendProvenance([], {
+    kind: "IMPLEMENTED_BY",
+    roadmapKey,
+    resourceKey: resource,
+    detail: "completed",
+    recordedAt: 1_000,
+  });
+  if (!appended.ok) throw new Error("fixture chain did not build");
+  return appended.chain;
+}
 
 const DENY = parseFinancialPolicy({ autonomousSpendAllowed: false, autonomousSpendLimit: 0 });
 
@@ -347,6 +373,8 @@ describe("TASK-006 F6-C4-2: unknown lineage fails closed on a selectable review"
             implementedByResourceKey: "claude-code:opus",
           },
         ],
+        provenance: chainNaming("A", "claude-code:opus"),
+        provenanceAnchor: anchorFor(chainNaming("A", "claude-code:opus")),
       },
       state.version,
     );

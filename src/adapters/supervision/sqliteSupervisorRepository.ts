@@ -29,7 +29,7 @@ import {
 import { encodeSupervisorState, parseSupervisorState } from "../../supervision/supervisorSerialization.js";
 import type { SupervisorRepository } from "../../supervision/supervisorPorts.js";
 import type { SupervisorState } from "../../supervision/supervisorTypes.js";
-import { verifyChain, type ProvenanceEntry } from "../../supervision/provenanceChain.js";
+import { verifyAgainstAnchor, type ProvenanceEntry } from "../../supervision/provenanceChain.js";
 
 /** Bumped whenever the persisted shape changes incompatibly. */
 export const SUPERVISOR_SCHEMA_VERSION = 1;
@@ -96,8 +96,22 @@ const SIDECAR_SUFFIXES = ["", "-wal", "-shm", "-journal"] as const;
  * maximum at the boundary where the data actually becomes durable, rather than
  * at the point where someone later tries to read it.
  */
-function assertChainPersistable(chain: readonly ProvenanceEntry[], operation: string): void {
-  const verdict = verifyChain(chain);
+function assertChainPersistable(
+  chain: readonly ProvenanceEntry[],
+  anchor: { readonly length: number; readonly headDigest: string } | undefined,
+  operation: string,
+): void {
+  /**
+   * The ANCHOR is checked here too (round-9 CRITICAL).
+   *
+   * Verifying only the links let a caller persist a chain whose anchor said
+   * something else — or nothing at all — and the reader then had no record to
+   * compare against. Deleting the anchor was therefore a way to switch the
+   * truncation check off. Refusing at the write boundary means a state with a
+   * chain and no matching anchor cannot be created by this process at all; a
+   * reader that finds one knows it came from outside.
+   */
+  const verdict = verifyAgainstAnchor(chain, anchor);
   if (!verdict.intact) {
     throw new SchemaIntegrityError(
       `refusing to ${operation} supervisor state: its provenance chain does not verify (${verdict.problem}). ` +
@@ -226,7 +240,10 @@ export function createSqliteSupervisorRepository(path: string): SqliteSupervisor
        * fields the parser recognises.
        */
       const canonical = encodeSupervisorState(parseSupervisorState(encodeSupervisorState(state), { version: state.version }));
-      assertChainPersistable(parseSupervisorState(canonical, { version: state.version }).provenance, "create");
+      (() => {
+        const parsed = parseSupervisorState(canonical, { version: state.version });
+        assertChainPersistable(parsed.provenance, parsed.provenanceAnchor, "create");
+      })();
       insert.run(SINGLETON_ID, state.version, canonical);
       return state;
     },
@@ -261,7 +278,7 @@ export function createSqliteSupervisorRepository(path: string): SqliteSupervisor
         // than as a generic broken chain — the diagnosis an operator needs.
         assertProvenanceExtends(previous, persisted.provenance);
       }
-      assertChainPersistable(persisted.provenance, "write");
+      assertChainPersistable(persisted.provenance, persisted.provenanceAnchor, "write");
 
       const result = update.run(next.version, encoded, SINGLETON_ID, expectedVersion);
       if (result.changes === 0) {
