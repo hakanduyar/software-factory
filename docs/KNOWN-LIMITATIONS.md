@@ -135,9 +135,10 @@ is given `HOME` on purpose, and an executor must not be.
 
 ## L-4 — Implementer lineage is tamper-evident, not tamper-proof
 
-**Status:** NARROWED by TASK-008 (`feat/state-integrity-rebased`, `7f5e96a`),
-IMPLEMENTED and AWAITING INDEPENDENT REVIEW. Adjudicated a legitimate boundary
-by independent review in its original form (TASK-006 round 10).
+**Status:** NARROWED by TASK-008 and again by TASK-012
+(`feat/state-integrity-rebased`, `b207ded`), IMPLEMENTED and AWAITING
+INDEPENDENT REVIEW. Adjudicated a legitimate boundary by independent review in
+its original form (TASK-006 round 10).
 
 Lineage is a recorded historical fact living in a database, and there is no key
 on this machine to authenticate it. Catalog recognition, a cross-check against
@@ -162,9 +163,24 @@ also delete the whole chain, which returns the system to the pre-TASK-008
 behaviour for that item. Refusing instead would strand every existing database;
 the trade-off was made deliberately and is flagged here rather than buried.
 
+**What TASK-012 changed, and what it did not:** an item's DEFINITION — `key`,
+`title`, `workClass`, `dependsOn`, `order` — no longer comes from the database at
+all. It comes from a code-level catalog, and a persisted row that disagrees fails
+closed naming the field. That closes two bypasses a database writer had which the
+chain could not see, because they forged what an item IS rather than what
+happened to it: relabelling an `INDEPENDENT_REVIEW` item `DETERMINISTIC` to skip
+review, and writing `DONE` onto an unreviewed item so its dependents proceed.
+
+PROGRESS fields — `status`, `attempts`, implementer history, `lastRunConfig`,
+diagnostics — remain mutable and remain in the trusted computing base. The
+definition is now out of reach; the record of what happened is not, and that is
+the whole of what this entry has always been about.
+
 **The contrast worth remembering:** spending authority has no equivalent
 weakness, because F-1 made it impossible to EXPRESS in data — no row can grant
-it, so no row has to be trusted. Lineage cannot be built that way.
+it, so no row has to be trusted. Lineage cannot be built that way. The
+DEFINITION now can be, and is: it is no longer stored anywhere an attacker can
+reach.
 
 **Consequence:** the supervisor database is part of the trusted computing base.
 
@@ -231,3 +247,87 @@ practice.
 
 **What would close it:** observing and recording real rate-limit output from each
 provider, then promoting the signature from PROVISIONAL to MEASURED.
+
+---
+
+## L-7 — `declaredActionKinds` is a definition field TASK-012 does not enforce
+
+**Status:** OPEN, deliberate and scoped. Recorded at implementation time
+(TASK-012, `feat/state-integrity-rebased`), not discovered later.
+
+TASK-012 moved an item's DEFINITION out of the database: `key`, `title`,
+`workClass`, `dependsOn` and `order` come from a code-level catalog, and a
+persisted row disagreeing with it fails closed.
+
+`declaredActionKinds` belongs on that list by exactly the same argument — it is a
+decision recorded in source, not a fact about progress — and it is NOT checked
+against the catalog. Its five siblings are the fields the demonstrated bypasses
+used, and TASK-012's acceptance criteria were frozen around them before
+implementation began. Widening a frozen scope mid-implementation is what C2
+forbids, so the gap is written down instead of quietly closed.
+
+**What it means concretely.** Something able to write the database can add or
+remove entries from an item's `declaredActionKinds`, and the pre-launch gate runs
+over whatever the row declares:
+
+- ADDING a kind makes the gate stricter, which is the closed direction.
+- REMOVING a kind from an AI item skips the pre-launch check for that kind.
+- REMOVING every kind from a DETERMINISTIC item does NOT get past the gate:
+  deterministic work that declares nothing is refused outright, because work that
+  never declared anything can never be asked about.
+
+It confers no authority. The action a worker actually reports is evaluated again
+by `evaluateFinancialSafety` against the policy, not against the item, so the
+realistic consequence is a lost EARLY refusal — the supervisor launching work it
+would have declined to start, and then declining it one step later.
+
+**What would close it:** adding the field to `DEFINITION_FIELDS` in
+`src/supervision/roadmapCatalog.ts` and declaring it on the catalog entries that
+use it. A small change, and a planning decision rather than an implementer's.
+
+**Kept honest by:** the header comment of `src/supervision/roadmapCatalog.ts`
+names this residue and points here, and `tests/roadmapStructuralIntegrity.test.ts`
+asserts the naming is present — so deleting the note fails a test.
+
+---
+
+## L-8 — Some guards are unreachable through the public path, and say so
+
+**Status:** OPEN, deliberate. Each instance is stated in its own source file;
+this entry exists so the pattern is findable in one place.
+
+Three guards cannot be reached through the interface their callers use, so no
+test can prove them load-bearing. Independent review mutated each one and the
+suite stayed green — correctly. Rather than deleting them or implying a tested
+guarantee, each says plainly what it is:
+
+- `onlyKeys` in `src/supervision/executorProtocol.ts` inspects OWN property names
+  including non-enumerable ones. The only entry point takes TEXT, and
+  `JSON.parse` cannot produce a non-enumerable own property, so it is
+  indistinguishable from `Object.keys` in practice. What actually defends the
+  parser is the allowlist, which is tested.
+- The catalog rebuild in `src/supervision/roadmapCatalog.ts` returns definition
+  fields from the catalog rather than the row. Any row that DIFFERS is refused
+  first, so the two can never disagree on a path that returns a value.
+- The post-build `assessMountTopology` call in `scripts/verify.mjs` runs after a
+  pre-build refusal that already rejects a mounted output, and creating a mount
+  needs privileges no fixture has. Its DECISION is proven by the pure tests; the
+  call exists so a future reordering still meets a tested guard before anything
+  is deleted.
+
+**Why they stay:** each is defence in depth against a future reordering, and each
+costs nothing. **Why this entry exists:** "defence in depth" is exactly what an
+untested guard looks like from the outside, and the difference between the two is
+a claim someone should be able to check.
+
+**What would close it:** for the first, an entry point accepting an
+already-parsed object — which nothing needs. For the second and third, a
+reordering that made them reachable, which would be a regression rather than a
+fix.
+
+**Kept honest by:** a fourth member of this list was found NOT to be unreachable.
+The post-build tree-safety wiring in `scripts/verify.mjs` had the same
+justification written beside it, and a build that plants its own symlink under
+the output directory does reach it — nothing privileged required. It has a test
+now. An unreachability claim is a claim like any other, and this one has already
+been wrong once.
