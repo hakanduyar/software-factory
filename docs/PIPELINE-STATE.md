@@ -3,18 +3,19 @@
 Where the autonomous review/remediation loop stands, recorded here rather than
 left in whatever conversation happened to be open. Written 2026-08-27.
 
-## Blocked on: reviewer capability
+## Reviewer quota: do not trust the reset time it reports
 
-The independent reviewer (Codex CLI, `gpt-5.6-luna`, effort `xhigh`) has
-exhausted its **weekly** usage quota. The reported reset is
-**2026-09-01 17:43**.
+The independent reviewer (Codex CLI, `gpt-5.6-luna`, effort `xhigh`) exhausts its
+usage quota periodically. On 2026-08-27 it refused with "try again at Sep 1st,
+2026 5:43 PM" — and was available again the same evening, roughly five days
+early.
 
-No independent review can run until then, so ADR-0002 condition 3 — an
-independent reviewer at PASS or PASS_WITH_NON_BLOCKING_NOTES — cannot be
-satisfied, and **no branch may be integrated**. That is the gate working, not a
-failure.
+So the reported reset time is not evidence. **Probe rather than wait**: a
+one-token read-only call answers the only question that matters, which is whether
+a review can run right now. `scratchpad/review_scheduler2.sh` does exactly that
+on a five-minute loop, and is how the earlier queue eventually ran unattended.
 
-Not worked around, deliberately:
+Not worked around, and this stands whenever the quota is genuinely out:
 
 - Buying credits or upgrading is a purchase. `AUTONOMOUS_SPEND_LIMIT = 0`.
 - No alternative reviewer exists on this machine (`gemini`, `ollama`,
@@ -22,6 +23,10 @@ Not worked around, deliberately:
   stand in for the configured acceptance reviewer would be weakening reviewer
   independence to manufacture progress. An ADDITIONAL reviewer could only help;
   a SUBSTITUTE one is a different decision and belongs to the user.
+
+While the quota is out, ADR-0002 condition 3 — an independent reviewer at PASS
+or PASS_WITH_NON_BLOCKING_NOTES — cannot be satisfied, and **no branch may be
+integrated**. That is the gate working, not a failure.
 
 ## Branches, all pushed and matching origin
 
@@ -53,15 +58,17 @@ scarce resource.
 
 ## To resume
 
-1. Confirm the quota has reset.
+1. PROBE the quota; do not read the reset time it printed.
 2. Run the queued reviews. The prompts are written and the runner verifies the
    worktree is at the exact commit before launching:
    - `feat/executor-isolation` @ `790b840` — TASK-011 round 10, TASK-008 round
-     10, TASK-012 round 2.
+     10, TASK-012 round 2, as one review of the combined tree.
    - `fix/verify-path-equivalence` @ `88eaa8f` — round 10.
 3. On CHANGES_REQUIRED: remediate, verify, freeze, review again.
-4. On PASS with zero CRITICAL/HIGH and an explicit "Safe to commit: YES": check
-   the remaining ADR-0002 conditions before integrating.
+4. On PASS with zero CRITICAL/HIGH and an explicit "Safe to commit: YES": run
+   the ADR-0002 gate (`scratchpad/adr0002_gate.sh`) before integrating. It
+   reports and never acts, and it says UNVERIFIABLE-HERE for the conditions a
+   machine cannot check rather than scoring them as passes.
 
 `EXECUTOR_WIRING` stays forbidden until both prerequisites are accepted AND
 integrated. `LOCAL_24_7_RUNTIME` remains `PLATFORM_CAPABILITY_BLOCKED`.
