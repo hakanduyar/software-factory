@@ -16,12 +16,14 @@
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { after, describe, it } from "node:test";
 
 import {
   createIsolatedExecutor,
+  createIsolatedExecutorForTests,
   ISOLATED_EXECUTOR_ENV_ALLOWLIST,
+  type UnsafeTestOverrides,
 } from "../src/adapters/supervision/isolatedExecutor.js";
 import {
   buildExecutorRequest,
@@ -49,6 +51,30 @@ const ITEM: RoadmapItem = {
 
 const INPUT: WorkExecutionInput = { item: ITEM, actionId: "DETERMINISTIC_THING:RUN_DETERMINISTIC_WORK:a1" };
 
+/**
+ * Builds an executor for a throwaway child, granting ONLY that child's own
+ * directory.
+ *
+ * `readablePaths` is required by design (round-3 finding): the adapter used to
+ * derive the grant from the script path and handed out `/` for a child under
+ * `/tmp`. Every call site now says what it needs, which is the point.
+ */
+function executorFor(script: string, timeoutMs: number, overrides?: UnsafeTestOverrides) {
+  const options = { childScript: script, readablePaths: [dirname(script)], timeoutMs };
+  return overrides === undefined
+    ? createIsolatedExecutor(options)
+    : createIsolatedExecutorForTests(options, overrides);
+}
+
+/** The shipped child imports from the compiled tree, so it needs that grant. */
+function realChildExecutor(timeoutMs: number) {
+  return createIsolatedExecutor({
+    childScript: REAL_CHILD,
+    readablePaths: [join(process.cwd(), "dist")],
+    timeoutMs,
+  });
+}
+
 /** Writes a throwaway child script and returns its path. */
 function childScript(body: string): string {
   const dir = mkdtempSync(join(tmpdir(), "sf-exec-child-"));
@@ -72,7 +98,7 @@ describe("TASK-011 AC-1/AC-2: the executor runs elsewhere, without credentials",
          outcome: { kind: "COMPLETED", detail: "pid " + process.pid },
        }));`,
     );
-    const executor = createIsolatedExecutor({ childScript: script, timeoutMs: 30_000 });
+    const executor = executorFor(script, 30_000);
     const outcome = await executor.execute(INPUT);
 
     assert.equal(outcome.kind, "COMPLETED");
@@ -98,9 +124,7 @@ describe("TASK-011 AC-1/AC-2: the executor runs elsewhere, without credentials",
          outcome: { kind: "COMPLETED", detail: Object.keys(process.env).sort().join(",") },
        }));`,
     );
-    const executor = createIsolatedExecutor({
-      childScript: script,
-      timeoutMs: 30_000,
+    const executor = executorFor(script, 30_000, {
       sourceEnv: {
         ...process.env,
         ANTHROPIC_API_KEY: "sk-ant-api03-PLANTED-SECRET-VALUE-000000000000",
@@ -270,7 +294,7 @@ describe("TASK-011 AC-4: a child's response is parsed, not believed", () => {
 
 describe("TASK-011 AC-6/AC-7: nothing hangs, nothing is assumed successful", () => {
   async function outcomeFor(body: string, timeoutMs = 5_000) {
-    const executor = createIsolatedExecutor({ childScript: childScript(body), timeoutMs });
+    const executor = executorFor(childScript(body), timeoutMs);
     return executor.execute(INPUT);
   }
 
@@ -363,6 +387,7 @@ describe("TASK-011 AC-6/AC-7: nothing hangs, nothing is assumed successful", () 
   it("a child whose SCRIPT is missing fails closed", async () => {
     const executor = createIsolatedExecutor({
       childScript: "/nonexistent/child.mjs",
+      readablePaths: ["/nonexistent"],
       timeoutMs: 15_000,
     });
     const outcome = await executor.execute(INPUT);
@@ -380,10 +405,10 @@ describe("TASK-011 AC-6/AC-7: nothing hangs, nothing is assumed successful", () 
 describe("TASK-011 AC-8: a child's output is redacted before it goes anywhere", () => {
   it("redacts a credential the child prints", async () => {
     const leak = "sk-ant-api03-CHILDLEAKCHILDLEAKCHILDLEAK00";
-    const executor = createIsolatedExecutor({
-      childScript: childScript(`process.stderr.write("provider said ${leak}"); process.exit(1);`),
-      timeoutMs: 5_000,
-    });
+    const executor = executorFor(
+      childScript(`process.stderr.write("provider said ${leak}"); process.exit(1);`),
+      5_000,
+    );
     const outcome = await executor.execute(INPUT);
 
     assert.equal(outcome.kind, "RESOURCE_FAILURE");
@@ -460,7 +485,7 @@ describe("TASK-011 AC-12: the trust-boundary notes say what is now true", () => 
 
 describe("TASK-011: the shipped child process", () => {
   it("refuses AI work, because it holds no credentials by design", async () => {
-    const executor = createIsolatedExecutor({ childScript: REAL_CHILD, timeoutMs: 30_000 });
+    const executor = realChildExecutor(30_000);
     const outcome = await executor.execute({
       ...INPUT,
       item: { ...ITEM, workClass: "NORMAL_IMPLEMENTATION" },
@@ -477,7 +502,7 @@ describe("TASK-011: the shipped child process", () => {
    * real deterministic work is `EXECUTOR_WIRING`, which depends on this task.
    */
   it("does NOT report success for deterministic work nobody has wired yet", async () => {
-    const executor = createIsolatedExecutor({ childScript: REAL_CHILD, timeoutMs: 30_000 });
+    const executor = realChildExecutor(30_000);
     const outcome = await executor.execute(INPUT);
 
     assert.notEqual(outcome.kind, "COMPLETED", "it claimed work it did not do");
@@ -524,7 +549,7 @@ describe("TASK-011 round 1: a child cannot reach the provider credentials", () =
          outcome: { kind: "COMPLETED", detail: JSON.stringify(probe) },
        }));`,
     );
-    const executor = createIsolatedExecutor({ childScript: script, timeoutMs: 60_000 });
+    const executor = executorFor(script, 60_000);
     const outcome = await executor.execute(INPUT);
 
     assert.equal(outcome.kind, "COMPLETED", "the probe child must run");
@@ -555,7 +580,7 @@ describe("TASK-011 round 1: a child cannot reach the provider credentials", () =
          outcome: { kind: "COMPLETED", detail: verdict },
        }));`,
     );
-    const executor = createIsolatedExecutor({ childScript: script, timeoutMs: 60_000 });
+    const executor = executorFor(script, 60_000);
     const outcome = await executor.execute(INPUT);
 
     assert.equal(outcome.kind, "COMPLETED");
@@ -567,7 +592,11 @@ describe("TASK-011 round 1: a child cannot reach the provider credentials", () =
   /** A runtime that cannot enforce this must not be used as if it could. */
   it("REFUSES to construct an executor on a runtime without the permission model", () => {
     assert.throws(
-      () => createIsolatedExecutor({ childScript: "/tmp/whatever.mjs", nodePath: "/bin/true" }),
+      () =>
+        createIsolatedExecutorForTests(
+          { childScript: "/tmp/whatever.mjs", readablePaths: ["/tmp"] },
+          { nodePath: "/bin/true" },
+        ),
       /supports neither --permission/,
       "isolation that is claimed but not enforced is worse than none",
     );
@@ -603,7 +632,7 @@ describe("TASK-011 round 1: descendants do not outlive the wait (AC-7)", () => {
        setInterval(() => {}, 1000);`,
     );
 
-    const executor = createIsolatedExecutor({ childScript: script, timeoutMs: 1_200 });
+    const executor = executorFor(script, 1_200);
     const outcome = await executor.execute(INPUT);
     assert.equal(outcome.kind, "RESOURCE_FAILURE");
 
@@ -651,7 +680,7 @@ describe("TASK-011 round 2: the child cannot re-enter the supervisor", () => {
          outcome: { kind: "COMPLETED", detail: verdict },
        }));`,
     );
-    const executor = createIsolatedExecutor({ childScript: script, timeoutMs: 60_000 });
+    const executor = executorFor(script, 60_000);
     const outcome = await executor.execute(INPUT);
 
     assert.equal(outcome.kind, "COMPLETED", "the probe child must run");
@@ -678,9 +707,7 @@ describe("TASK-011 round 2: the child cannot re-enter the supervisor", () => {
          outcome: { kind: "COMPLETED", detail: Object.keys(process.env).sort().join(",") },
        }));`,
     );
-    const executor = createIsolatedExecutor({
-      childScript: script,
-      timeoutMs: 60_000,
+    const executor = executorFor(script, 60_000, {
       environmentPolicy: {
         allowedVars: ISOLATED_EXECUTOR_ENV_ALLOWLIST,
         extraVars: { HOME: "/home/injected", ANTHROPIC_API_KEY: "sk-ant-api03-INJECTED-VIA-EXTRAVARS" },
@@ -708,7 +735,7 @@ describe("TASK-011 round 2: the child cannot re-enter the supervisor", () => {
        process.on("SIGTERM", () => {});
        setInterval(() => {}, 1000);`,
     );
-    const executor = createIsolatedExecutor({ childScript: script, timeoutMs: 1_200 });
+    const executor = executorFor(script, 1_200);
     const started = Date.now();
     const outcome = await executor.execute(INPUT);
     const elapsed = Date.now() - started;

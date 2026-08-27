@@ -68,8 +68,8 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 
 import { buildWorkerEnvironment, redactSecrets, type EnvironmentPolicy } from "../workers/environmentPolicy.js";
 import {
@@ -160,10 +160,36 @@ export const DEFAULT_EXECUTOR_TIMEOUT_MS = 15 * 60 * 1000;
 export interface IsolatedExecutorOptions {
   /** Absolute path to the child entry script. */
   readonly childScript: string;
+  /**
+   * Directories and files the child may READ, beyond its own request.
+   *
+   * REQUIRED, and never derived from `childScript` (round-3 finding). The
+   * previous version granted `dirname(dirname(childScript))`, so a child
+   * placed directly under `/tmp` was granted `/` — and the reviewer read the
+   * real credential store through it with no wrapper and no custom
+   * environment. A capability computed from a path someone else chose is a
+   * capability someone else chose.
+   */
+  readonly readablePaths: readonly string[];
   readonly timeoutMs?: number;
-  readonly environmentPolicy?: EnvironmentPolicy;
-  /** Injected for tests; defaults to the running node binary. */
+}
+
+/**
+ * Capability overrides that exist ONLY for tests, and are named so.
+ *
+ * Round-3 review: `nodePath` and `environmentPolicy` were ordinary options, so
+ * a caller could hand over a runtime that merely CLAIMS to enforce permissions,
+ * or an `allowedVars` list naming `OPENAI_API_KEY`. Both restore exactly the
+ * capability this adapter exists to remove.
+ *
+ * They are not validated away, because a test genuinely needs them. They are
+ * moved behind a differently-named factory so that reaching them is a visible
+ * choice in the source rather than an option someone passes by accident — the
+ * same rule AC-11 applies to the in-process executor.
+ */
+export interface UnsafeTestOverrides {
   readonly nodePath?: string;
+  readonly environmentPolicy?: EnvironmentPolicy;
   readonly sourceEnv?: NodeJS.ProcessEnv;
 }
 
@@ -236,10 +262,52 @@ function permissionFlagFor(nodePath: string): string {
   );
 }
 
+/**
+ * Refuses a read grant that would hand back what the isolation removes.
+ *
+ * `/` and the home directory are the two that matter: either one contains the
+ * provider credential stores, and granting them makes every other control in
+ * this file decorative. Checked by RESOLUTION, so `/tmp/..` does not sneak past
+ * a string comparison.
+ */
+function assertGrantIsNarrow(paths: readonly string[]): void {
+  const home = resolve(homedir());
+  for (const candidate of paths) {
+    const granted = resolve(candidate);
+    if (granted === "/" || granted === home || home.startsWith(`${granted}/`)) {
+      throw new Error(
+        `refusing to run an isolated executor: it would be granted read access to ${granted}, which contains ` +
+          "the provider credential stores. A grant that wide removes the isolation it is part of.",
+      );
+    }
+  }
+}
+
+/**
+ * THE PRODUCTION FACTORY. No capability overrides, by construction.
+ */
 export function createIsolatedExecutor(options: IsolatedExecutorOptions): WorkExecutor {
+  return buildExecutor(options, {});
+}
+
+/**
+ * THE TEST FACTORY. Named unsafe because it is.
+ *
+ * Everything it accepts can defeat the isolation; that is why a test needs it
+ * and why production must not be able to reach it without saying so.
+ */
+export function createIsolatedExecutorForTests(
+  options: IsolatedExecutorOptions,
+  overrides: UnsafeTestOverrides = {},
+): WorkExecutor {
+  return buildExecutor(options, overrides);
+}
+
+function buildExecutor(options: IsolatedExecutorOptions, overrides: UnsafeTestOverrides): WorkExecutor {
   const timeoutMs = options.timeoutMs ?? DEFAULT_EXECUTOR_TIMEOUT_MS;
-  const policy = options.environmentPolicy ?? ISOLATED_EXECUTOR_ENVIRONMENT_POLICY;
-  const nodePath = options.nodePath ?? process.execPath;
+  const policy = overrides.environmentPolicy ?? ISOLATED_EXECUTOR_ENVIRONMENT_POLICY;
+  const nodePath = overrides.nodePath ?? process.execPath;
+  assertGrantIsNarrow([...options.readablePaths, options.childScript]);
   const permissionFlag = permissionFlagFor(nodePath);
   closeInspectorDoor();
 
@@ -260,10 +328,10 @@ export function createIsolatedExecutor(options: IsolatedExecutorOptions): WorkEx
           nodePath,
           [
             permissionFlag,
-            // Only the compiled tree the child must import, and its own
-            // request. Everything else — notably the provider credential
-            // stores under the home directory — is denied by the runtime.
-            `--allow-fs-read=${dirname(dirname(options.childScript))}`,
+            // EXACTLY what the caller declared, plus the child's own script
+            // and request. Nothing is inferred from a path, because the
+            // inference granted `/` for a child under /tmp.
+            ...options.readablePaths.map((path) => `--allow-fs-read=${path}`),
             `--allow-fs-read=${options.childScript}`,
             `--allow-fs-read=${requestPath}`,
             options.childScript,
@@ -419,7 +487,7 @@ export function createIsolatedExecutor(options: IsolatedExecutorOptions): WorkEx
        */
       const env = buildWorkerEnvironment(
         { allowedVars: policy.allowedVars },
-        options.sourceEnv ?? process.env,
+        overrides.sourceEnv ?? process.env,
       );
 
       /**
