@@ -67,8 +67,9 @@
  */
 
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import * as inspector from "node:inspector";
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
 import { buildWorkerEnvironment, redactSecrets, type EnvironmentPolicy } from "../workers/environmentPolicy.js";
@@ -144,6 +145,35 @@ export const PERMISSION_DENIED_CODE = "ERR_ACCESS_DENIED";
  * has one signal disposition, and a child spawned by any path can send the
  * signal.
  */
+/**
+ * An ALREADY-OPEN inspector is not closed by owning the signal (round-4
+ * CRITICAL).
+ *
+ * `closeInspectorDoor` stops SIGUSR1 from OPENING the inspector. It does
+ * nothing about a supervisor started with `--inspect`, where the port is
+ * already listening — and the reviewer connected to it and evaluated
+ * `process.env.OPENAI_API_KEY` in the parent.
+ *
+ * The inspector is closed if it is open. If it cannot be closed, this refuses
+ * to run rather than spawning a child into a process that is already
+ * remotely controllable: an isolated executor whose parent is open to
+ * evaluation is not isolated at all.
+ */
+function assertInspectorClosed(): void {
+  const url = inspector.url();
+  if (url === undefined) {
+    return;
+  }
+  inspector.close();
+  if (inspector.url() !== undefined) {
+    throw new Error(
+      "refusing to run an isolated executor: this process has an active inspector " +
+        `(${url}) that could not be closed. A child can connect to it and evaluate code here, ` +
+        "which defeats every restriction placed on the child.",
+    );
+  }
+}
+
 let inspectorDoorClosed = false;
 function closeInspectorDoor(): void {
   if (inspectorDoorClosed) return;
@@ -158,19 +188,15 @@ function closeInspectorDoor(): void {
 export const DEFAULT_EXECUTOR_TIMEOUT_MS = 15 * 60 * 1000;
 
 export interface IsolatedExecutorOptions {
-  /** Absolute path to the child entry script. */
-  readonly childScript: string;
   /**
-   * Directories and files the child may READ, beyond its own request.
+   * The repository being verified. EVERYTHING else is derived from it.
    *
-   * REQUIRED, and never derived from `childScript` (round-3 finding). The
-   * previous version granted `dirname(dirname(childScript))`, so a child
-   * placed directly under `/tmp` was granted `/` — and the reviewer read the
-   * real credential store through it with no wrapper and no custom
-   * environment. A capability computed from a path someone else chose is a
-   * capability someone else chose.
+   * Round-4 review: `childScript` and `readablePaths` were caller-supplied, and
+   * every one of them turned out to be a capability rather than a
+   * configuration. A parameter that can hand a child the credential store is
+   * not a parameter; production now supplies none.
    */
-  readonly readablePaths: readonly string[];
+  readonly repositoryRoot: string;
   readonly timeoutMs?: number;
 }
 
@@ -270,44 +296,100 @@ function permissionFlagFor(nodePath: string): string {
  * this file decorative. Checked by RESOLUTION, so `/tmp/..` does not sneak past
  * a string comparison.
  */
-function assertGrantIsNarrow(paths: readonly string[]): void {
-  const home = resolve(homedir());
+/** `realpath` where it exists; the lexical path where it does not. */
+function realOrUndefined(path: string): string | undefined {
+  try {
+    return realpathSync(path);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Every granted path must be INSIDE the tree being verified (round-4 finding).
+ *
+ * The first version was a denylist — `/`, the home directory, its ancestors —
+ * and a denylist on a capability is a list of the attacks someone already
+ * thought of. The reviewer granted `$HOME/.codex/auth.json` directly, then
+ * `*`, then `/proc`, and read credentials and the parent's environment through
+ * all three. None of them is `/` or `$HOME`.
+ *
+ * Containment is the only rule that holds: a child may read inside the
+ * repository and nowhere else. `*` is not a path and is refused by the same
+ * test, because it does not resolve inside anything.
+ */
+function assertGrantIsContained(paths: readonly string[], repositoryRoot: string): void {
+  const base = realOrUndefined(repositoryRoot) ?? resolve(repositoryRoot);
   for (const candidate of paths) {
-    const granted = resolve(candidate);
-    if (granted === "/" || granted === home || home.startsWith(`${granted}/`)) {
+    if (candidate.includes("*") || candidate.includes("?")) {
       throw new Error(
-        `refusing to run an isolated executor: it would be granted read access to ${granted}, which contains ` +
-          "the provider credential stores. A grant that wide removes the isolation it is part of.",
+        `refusing to run an isolated executor: read grant ${JSON.stringify(candidate)} is a pattern, not a path; ` +
+          "a wildcard grant is not something this adapter can reason about.",
+      );
+    }
+    const granted = realOrUndefined(resolve(candidate)) ?? resolve(candidate);
+    if (granted !== base && !granted.startsWith(`${base}/`)) {
+      throw new Error(
+        `refusing to run an isolated executor: read grant ${granted} is outside the repository (${base}). ` +
+          "A child may read the tree being verified and nothing else.",
       );
     }
   }
 }
 
 /**
- * THE PRODUCTION FACTORY. No capability overrides, by construction.
+ * THE PRODUCTION FACTORY. Derives every capability from the repository root.
  */
 export function createIsolatedExecutor(options: IsolatedExecutorOptions): WorkExecutor {
-  return buildExecutor(options, {});
+  const base = realOrUndefined(options.repositoryRoot) ?? resolve(options.repositoryRoot);
+  return buildExecutor(
+    {
+      repositoryRoot: base,
+      childScript: join(base, "dist/src/cli/isolatedExecutorChild.js"),
+      readablePaths: [join(base, "dist")],
+      ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
+    },
+    {},
+  );
 }
 
 /**
- * THE TEST FACTORY. Named unsafe because it is.
+ * THE TEST FACTORY. Named unsafe because everything it accepts is a capability.
  *
- * Everything it accepts can defeat the isolation; that is why a test needs it
- * and why production must not be able to reach it without saying so.
+ * A test genuinely needs to point at a throwaway child and to substitute a
+ * runtime; production must not be able to do either without saying so in the
+ * source. Containment is still enforced — a test that wants to read outside
+ * its own tree has to say which tree.
  */
 export function createIsolatedExecutorForTests(
-  options: IsolatedExecutorOptions,
+  options: ResolvedExecutorOptions,
   overrides: UnsafeTestOverrides = {},
 ): WorkExecutor {
   return buildExecutor(options, overrides);
 }
 
-function buildExecutor(options: IsolatedExecutorOptions, overrides: UnsafeTestOverrides): WorkExecutor {
+export interface ResolvedExecutorOptions {
+  readonly repositoryRoot: string;
+  readonly childScript: string;
+  readonly readablePaths: readonly string[];
+  readonly timeoutMs?: number;
+}
+
+function buildExecutor(options: ResolvedExecutorOptions, overrides: UnsafeTestOverrides): WorkExecutor {
   const timeoutMs = options.timeoutMs ?? DEFAULT_EXECUTOR_TIMEOUT_MS;
   const policy = overrides.environmentPolicy ?? ISOLATED_EXECUTOR_ENVIRONMENT_POLICY;
   const nodePath = overrides.nodePath ?? process.execPath;
-  assertGrantIsNarrow([...options.readablePaths, options.childScript]);
+  /**
+   * COPIED at construction, then used (round-4 finding).
+   *
+   * Validation read the caller's array and execution read it again, so a
+   * caller could pass a safe directory, wait for the check, and then mutate
+   * the array to `["*"]`. Check-then-use on mutable input checks nothing.
+   */
+  const readablePaths = Object.freeze([...options.readablePaths]);
+  const childScript = options.childScript;
+  assertGrantIsContained([...readablePaths, childScript], options.repositoryRoot);
+  assertInspectorClosed();
   const permissionFlag = permissionFlagFor(nodePath);
   closeInspectorDoor();
 
@@ -331,10 +413,10 @@ function buildExecutor(options: IsolatedExecutorOptions, overrides: UnsafeTestOv
             // EXACTLY what the caller declared, plus the child's own script
             // and request. Nothing is inferred from a path, because the
             // inference granted `/` for a child under /tmp.
-            ...options.readablePaths.map((path) => `--allow-fs-read=${path}`),
-            `--allow-fs-read=${options.childScript}`,
+            ...readablePaths.map((path) => `--allow-fs-read=${path}`),
+            `--allow-fs-read=${childScript}`,
             `--allow-fs-read=${requestPath}`,
-            options.childScript,
+            childScript,
             requestPath,
           ],
           {

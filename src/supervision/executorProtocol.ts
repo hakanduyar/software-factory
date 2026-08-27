@@ -67,12 +67,62 @@ export function buildExecutorRequest(input: WorkExecutionInput): ExecutorRequest
   // Constructed field by field, never spread from `input`. A spread would
   // forward whatever the caller's object happened to carry, which is how a
   // field nobody intended to expose crosses a trust boundary.
+  /**
+   * PROJECTED FIELD BY FIELD, at every level (round-4 finding).
+   *
+   * The first version copied `item`, `config` and `checkpoint` wholesale. It
+   * was "constructed explicitly" only at the top level, so anything nested
+   * inside them travelled — the reviewer put `databasePath` and a
+   * `financialPolicy` with `autonomousSpendAllowed: true` inside `item` and
+   * the child received both. A shallow projection across a trust boundary is
+   * not a projection; it is a spread with extra steps.
+   */
+  const item = input.item;
+  const config = input.config;
+  const checkpoint = input.checkpoint;
   return {
     protocol: EXECUTOR_PROTOCOL_VERSION,
-    item: input.item,
+    item: {
+      key: item.key,
+      title: item.title,
+      dependsOn: [...item.dependsOn],
+      status: item.status,
+      workClass: item.workClass,
+      order: item.order,
+      ...(item.attempts === undefined ? {} : { attempts: item.attempts }),
+      ...(item.detail === undefined ? {} : { detail: item.detail }),
+    },
     actionId: input.actionId,
-    ...(input.config === undefined ? {} : { config: input.config }),
-    ...(input.checkpoint === undefined ? {} : { checkpoint: input.checkpoint }),
+    ...(config === undefined
+      ? {}
+      : {
+          config: {
+            requestedProvider: config.requestedProvider,
+            requestedModel: config.requestedModel,
+            ...(config.requestedEffort === undefined ? {} : { requestedEffort: config.requestedEffort }),
+            effectiveProvider: config.effectiveProvider,
+            effectiveModel: config.effectiveModel,
+            ...(config.effectiveEffort === undefined ? {} : { effectiveEffort: config.effectiveEffort }),
+            verification: config.verification,
+            argvEvidence: [...config.argvEvidence],
+            note: config.note,
+          },
+        }),
+    ...(checkpoint === undefined
+      ? {}
+      : {
+          checkpoint: {
+            roadmapKey: checkpoint.roadmapKey,
+            actionId: checkpoint.actionId,
+            requiredWorkClass: checkpoint.requiredWorkClass,
+            iteration: checkpoint.iteration,
+            nextAction: checkpoint.nextAction,
+            findings: [...checkpoint.findings],
+            completedVerification: [...checkpoint.completedVerification],
+            pendingVerification: [...checkpoint.pendingVerification],
+            updatedAt: checkpoint.updatedAt,
+          },
+        }),
   };
 }
 

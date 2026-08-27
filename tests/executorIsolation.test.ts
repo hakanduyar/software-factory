@@ -14,8 +14,9 @@
  */
 
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, describe, it } from "node:test";
 
@@ -38,7 +39,6 @@ after(() => {
   for (const path of created) rmSync(path, { recursive: true, force: true });
 });
 
-const REAL_CHILD = join(process.cwd(), "dist/src/cli/isolatedExecutorChild.js");
 
 const ITEM: RoadmapItem = {
   key: "DETERMINISTIC_THING",
@@ -60,19 +60,22 @@ const INPUT: WorkExecutionInput = { item: ITEM, actionId: "DETERMINISTIC_THING:R
  * `/tmp`. Every call site now says what it needs, which is the point.
  */
 function executorFor(script: string, timeoutMs: number, overrides?: UnsafeTestOverrides) {
-  const options = { childScript: script, readablePaths: [dirname(script)], timeoutMs };
-  return overrides === undefined
-    ? createIsolatedExecutor(options)
-    : createIsolatedExecutorForTests(options, overrides);
+  // A throwaway child's own directory IS its repository for containment
+  // purposes: the grant must be inside the tree the executor was told about.
+  const options = {
+    repositoryRoot: dirname(script),
+    childScript: script,
+    readablePaths: [dirname(script)],
+    timeoutMs,
+  };
+  return createIsolatedExecutorForTests(options, overrides ?? {});
 }
 
 /** The shipped child imports from the compiled tree, so it needs that grant. */
 function realChildExecutor(timeoutMs: number) {
-  return createIsolatedExecutor({
-    childScript: REAL_CHILD,
-    readablePaths: [join(process.cwd(), "dist")],
-    timeoutMs,
-  });
+  // The PRODUCTION factory, given only the repository — everything else is
+  // derived, which is the point of round 4's change.
+  return createIsolatedExecutor({ repositoryRoot: process.cwd(), timeoutMs });
 }
 
 /** Writes a throwaway child script and returns its path. */
@@ -385,7 +388,8 @@ describe("TASK-011 AC-6/AC-7: nothing hangs, nothing is assumed successful", () 
    * is fine and the child entry point is not where it was expected.
    */
   it("a child whose SCRIPT is missing fails closed", async () => {
-    const executor = createIsolatedExecutor({
+    const executor = createIsolatedExecutorForTests({
+      repositoryRoot: "/nonexistent",
       childScript: "/nonexistent/child.mjs",
       readablePaths: ["/nonexistent"],
       timeoutMs: 15_000,
@@ -594,7 +598,7 @@ describe("TASK-011 round 1: a child cannot reach the provider credentials", () =
     assert.throws(
       () =>
         createIsolatedExecutorForTests(
-          { childScript: "/tmp/whatever.mjs", readablePaths: ["/tmp"] },
+          { repositoryRoot: "/tmp", childScript: "/tmp/whatever.mjs", readablePaths: ["/tmp"] },
           { nodePath: "/bin/true" },
         ),
       /supports neither --permission/,
@@ -729,10 +733,21 @@ describe("TASK-011 round 2: the child cannot re-enter the supervisor", () => {
    * fact, not of intent.
    */
   it("does not report a timeout until the child has actually exited", async () => {
+    /**
+     * The child takes a MEASURABLE time to die: it catches SIGTERM and exits
+     * 600ms later. Settling on actual exit therefore lands near 1800ms;
+     * settling at the timeout instant lands near 1200ms.
+     *
+     * The previous fixture ignored SIGTERM entirely and relied on the SIGKILL
+     * escalation two seconds later — which encoded an assumption about HOW the
+     * child dies rather than about waiting for it, and broke when the child
+     * happened to exit sooner. What is under test is that the outcome comes
+     * from the exit event, not from the timer.
+     */
     const script = childScript(
       `import { readFileSync } from "node:fs";
        JSON.parse(readFileSync(process.argv[2], "utf8"));
-       process.on("SIGTERM", () => {});
+       process.on("SIGTERM", () => { setTimeout(() => process.exit(0), 600); });
        setInterval(() => {}, 1000);`,
     );
     const executor = executorFor(script, 1_200);
@@ -754,9 +769,156 @@ describe("TASK-011 round 2: the child cannot re-enter the supervisor", () => {
      * was written to catch.
      */
     assert.ok(
-      elapsed >= 2_500,
-      `settled at ${elapsed}ms — before the child could have been killed, so "terminated" was not a fact`,
+      elapsed >= 1_600,
+      `settled at ${elapsed}ms — at the timeout instant rather than on the child's exit, ` +
+        'so "terminated" was a statement of intent rather than of fact',
     );
     assert.ok(elapsed < 20_000, `did not settle promptly: ${elapsed}ms`);
+  });
+});
+
+
+// =====================================================================
+// ROUND-4 — the adapter's own options were the attack surface
+// =====================================================================
+
+describe("TASK-011 round 4: a read grant must be contained, not merely not-root", () => {
+  /**
+   * The first guard was a DENYLIST — `/`, the home directory, its ancestors —
+   * and a denylist on a capability is a list of the attacks someone already
+   * thought of. The reviewer granted `$HOME/.codex/auth.json` directly, then
+   * `*`, then `/proc`, and read credentials and the parent's environment
+   * through all three. None of those is `/` or `$HOME`.
+   */
+  const outside = [
+    join(homedir(), ".codex/auth.json"),
+    join(homedir(), ".claude/.credentials.json"),
+    "/proc",
+    "/etc",
+  ];
+
+  for (const grant of outside) {
+    it(`REFUSES a grant outside the repository: ${grant}`, () => {
+      const script = childScript("export {};");
+      assert.throws(
+        () =>
+          createIsolatedExecutorForTests({
+            repositoryRoot: dirname(script),
+            childScript: script,
+            readablePaths: [grant],
+          }),
+        /outside the repository/,
+        `${grant} was accepted as a read grant`,
+      );
+    });
+  }
+
+  it("REFUSES a wildcard, which is not a path at all", () => {
+    const script = childScript("export {};");
+    assert.throws(
+      () =>
+        createIsolatedExecutorForTests({
+          repositoryRoot: dirname(script),
+          childScript: script,
+          readablePaths: ["*"],
+        }),
+      /is a pattern, not a path/,
+    );
+  });
+
+  /**
+   * CHECK-THEN-USE. Validation read the caller's array and execution read it
+   * again, so a caller could pass a safe directory, wait for the check, and
+   * then mutate the array. The grant is copied at construction.
+   */
+  it("uses the grant it VALIDATED, not the array the caller kept", async () => {
+    const script = childScript(
+      `import { readFileSync } from "node:fs";
+       import { homedir } from "node:os";
+       JSON.parse(readFileSync(process.argv[2], "utf8"));
+       let verdict = "DENIED";
+       try { readFileSync(homedir() + "/.codex/auth.json", "utf8"); verdict = "READABLE"; } catch {}
+       process.stdout.write(JSON.stringify({
+         protocol: ${EXECUTOR_PROTOCOL_VERSION},
+         outcome: { kind: "COMPLETED", detail: verdict },
+       }));`,
+    );
+    const mutable = [dirname(script)];
+    const executor = createIsolatedExecutorForTests({
+      repositoryRoot: dirname(script),
+      childScript: script,
+      readablePaths: mutable,
+      timeoutMs: 60_000,
+    });
+
+    // ...and now the caller changes its mind, after the check.
+    mutable.push("/");
+    mutable.push(homedir());
+
+    const outcome = await executor.execute(INPUT);
+    assert.equal(outcome.kind, "COMPLETED");
+    if (outcome.kind === "COMPLETED") {
+      assert.equal(outcome.detail, "DENIED", "the mutated grant took effect at execution time");
+    }
+  });
+});
+
+describe("TASK-011 round 4: the request carries nothing nested either", () => {
+  /**
+   * The projection was explicit at the TOP level only, so anything nested
+   * inside `item` travelled — the reviewer put `databasePath` and a
+   * `financialPolicy` with `autonomousSpendAllowed: true` inside it, and the
+   * child received both.
+   */
+  it("does not forward nested fields hidden inside the item", () => {
+    const contaminated = {
+      ...INPUT,
+      item: {
+        ...ITEM,
+        databasePath: "/home/hakanduyar/.factory/supervisor.db",
+        financialPolicy: { autonomousSpendAllowed: true, autonomousSpendLimit: 9_999 },
+      },
+    } as unknown as WorkExecutionInput;
+
+    const request = buildExecutorRequest(contaminated) as unknown as { item: Record<string, unknown> };
+    assert.ok(!("databasePath" in request.item), "the child was handed the database path");
+    assert.ok(!("financialPolicy" in request.item), "the child was handed the financial policy");
+  });
+});
+
+describe("TASK-011 round 4: an ALREADY-OPEN inspector is not a closed door", () => {
+  /**
+   * CRITICAL. Owning SIGUSR1 stops the inspector being OPENED; it does nothing
+   * about a supervisor started with `--inspect`, where the port is already
+   * listening. The reviewer connected to it and evaluated
+   * `process.env.OPENAI_API_KEY` in the parent.
+   *
+   * Driven in a REAL parent started with `--inspect`, because the property is
+   * about this process's own state and a mock cannot have an inspector.
+   */
+  it("closes an active inspector before spawning, or refuses to spawn", () => {
+    const probe = `
+      const inspector = require("node:inspector");
+      const { createIsolatedExecutorForTests } = require(${JSON.stringify(join(process.cwd(), "dist/src/adapters/supervision/isolatedExecutor.js"))});
+      const before = inspector.url();
+      let refused = false;
+      try {
+        createIsolatedExecutorForTests({ repositoryRoot: "/tmp", childScript: "/tmp/x.mjs", readablePaths: ["/tmp"] });
+      } catch { refused = true; }
+      const after = inspector.url();
+      console.log(JSON.stringify({ before: before !== undefined, after: after !== undefined, refused }));
+    `;
+    const result = spawnSync(process.execPath, ["--inspect=0", "-e", probe], {
+      encoding: "utf8",
+      env: { ...process.env },
+    });
+    const line = (result.stdout ?? "").trim().split("\n").pop() ?? "";
+    const verdict = JSON.parse(line) as { before: boolean; after: boolean; refused: boolean };
+
+    assert.equal(verdict.before, true, "the fixture must actually start with an inspector, or it proves nothing");
+    assert.ok(
+      !verdict.after || verdict.refused,
+      "an active inspector survived: a child can connect to it and evaluate code in the supervisor",
+    );
   });
 });
