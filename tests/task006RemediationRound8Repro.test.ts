@@ -45,6 +45,7 @@ import { NO_BACKOFF } from "../src/supervision/resourceTypes.js";
 import type { RoadmapItem } from "../src/supervision/supervisorTypes.js";
 import { cleanupTempDbs, tempDbPath } from "./support/factoryFixtures.js";
 import {
+  declarePersisted,
   newSupervisor,
   scriptedExecutor,
   scriptedProbe,
@@ -290,6 +291,7 @@ describe("TASK-006 R8-C4-1: persisted resource rows do not confer recognition", 
       },
       state.version,
     );
+    await declarePersisted(supervisor);
 
     const result = await supervisor.service.tick();
 
@@ -322,6 +324,7 @@ describe("TASK-006 R8-C4-1: persisted resource rows do not confer recognition", 
       },
       state.version,
     );
+    await declarePersisted(supervisor);
 
     const result = await supervisor.service.tick();
     assert.equal(result.kind, "ADVANCED", "a real lineage must not be blocked");

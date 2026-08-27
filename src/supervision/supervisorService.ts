@@ -19,6 +19,7 @@
  *   - ambiguity fails closed rather than being retried.
  */
 
+import { reconcileRoadmapWithCatalog, unprovenCompletion } from "./roadmapCatalog.js";
 import {
   ConcurrencyError,
   PersistenceCorruptionError,
@@ -99,6 +100,14 @@ export interface SupervisorServiceDeps {
     readonly model: string;
     readonly billingMode?: BillingMode;
   }[];
+  /**
+   * The roadmap's DEFINITION, from code (TASK-012 AC-4).
+   *
+   * Injectable for the same reason `resourceCatalog` is: a test declares its
+   * roadmap in code rather than smuggling one in through persisted state, which
+   * is precisely the channel this task closes.
+   */
+  readonly roadmapCatalog?: readonly RoadmapItem[];
   readonly log?: (line: string) => void;
   readonly ownerId?: string;
 }
@@ -172,7 +181,7 @@ export class SupervisorService {
         backoff: NO_BACKOFF,
         diagnostic: "never probed",
       })),
-      roadmap: [...DEFAULT_ROADMAP],
+      roadmap: this.roadmapCatalog().map((item) => ({ ...item, dependsOn: [...item.dependsOn] })),
       checkpoints: [],
       escalations: [],
       // A new installation starts from the published genesis with nothing
@@ -342,8 +351,22 @@ export class SupervisorService {
       return broken;
     }
 
+    /**
+     * 0b. THE DEFINITION COMES FROM CODE (TASK-012).
+     *
+     * Before anything reads `workClass` to decide whether review is required,
+     * or `dependsOn` to decide what is eligible, or `status` to decide that a
+     * dependency is satisfied. Those three reads are the whole attack surface
+     * the reviewer demonstrated, and every one of them happens below this line.
+     */
+    const catalogued = await this.catalogState(state);
+    if (catalogued.result !== undefined) {
+      return catalogued.result;
+    }
+    const defined = catalogued.state;
+
     // 1. Reconcile any claim left behind by a previous process.
-    const reconciled = await this.reconcileClaim(state);
+    const reconciled = await this.reconcileClaim(defined);
     if (reconciled.result !== undefined) {
       return reconciled.result;
     }
@@ -1742,6 +1765,75 @@ export class SupervisorService {
    * Detected on LOAD, before anything tries to write, and reported as the
    * human-decision it is.
    */
+  private roadmapCatalog(): readonly RoadmapItem[] {
+    return this.deps.roadmapCatalog ?? DEFAULT_ROADMAP;
+  }
+
+  /**
+   * Rebuilds the roadmap from the catalog, or refuses (TASK-012 AC-1/2/3/6).
+   *
+   * Returns the state every later step must use. A caller that read
+   * `state.roadmap` instead would be reading exactly the row this exists to
+   * distrust, so the reconciled state REPLACES it rather than sitting beside it.
+   */
+  private async catalogState(
+    state: SupervisorState,
+  ): Promise<{ readonly state: SupervisorState; readonly result?: TickResult }> {
+    const verdict = reconcileRoadmapWithCatalog(state.roadmap, this.roadmapCatalog());
+    if (!verdict.ok) {
+      return { state, result: this.structuralRefusal(state, verdict.problem) };
+    }
+    const implementedKeys = new Set(
+      state.provenance.filter((entry) => entry.kind === "IMPLEMENTED_BY").map((entry) => entry.roadmapKey),
+    );
+    const unproven = unprovenCompletion({
+      roadmap: verdict.roadmap,
+      implementedKeys,
+      legacySilence: chainIsLegacySilence(state),
+    });
+    if (unproven !== undefined) {
+      return { state, result: this.unprovenRefusal(state, unproven) };
+    }
+    if (sameRoadmap(state.roadmap, verdict.roadmap)) {
+      return { state };
+    }
+    // The only change reconciliation can make without refusing is APPENDING
+    // catalog entries this installation has not seen — an ordinary upgrade.
+    return { state: await this.commit(state, { ...state, roadmap: verdict.roadmap }) };
+  }
+
+  /**
+   * A DIFFERENT refusal from the catalog mismatch, and worded differently.
+   *
+   * Not cosmetic: `boundedDiagnostic` truncates, so a shared preamble pushes the
+   * specific finding off the end of exactly the message an operator reads. The
+   * problem goes first, and the instruction follows it.
+   */
+  private unprovenRefusal(state: SupervisorState, problem: string): TickResult {
+    this.log(`[supervisor] completion without provenance: ${problem}`);
+    return {
+      kind: "WAITING_FOR_HUMAN",
+      roadmapKey: state.roadmap[0]?.key ?? "unknown",
+      reason: "HUMAN_DECISION_REQUIRED",
+      humanActionRequired: boundedDiagnostic(
+        `${problem}. Establish what actually ran, or restore the supervisor database from a known-good backup.`,
+      ),
+    };
+  }
+
+  private structuralRefusal(state: SupervisorState, problem: string): TickResult {
+    const action =
+      "The persisted roadmap does not match this installation's catalog, so what an item IS cannot be " +
+      `established from durable state. Restore the supervisor database from a known-good backup. Detail: ${problem}`;
+    this.log(`[supervisor] roadmap structure refused: ${problem}`);
+    return {
+      kind: "WAITING_FOR_HUMAN",
+      roadmapKey: state.roadmap[0]?.key ?? "unknown",
+      reason: "HUMAN_DECISION_REQUIRED",
+      humanActionRequired: boundedDiagnostic(action),
+    };
+  }
+
   private brokenChainOutcome(state: SupervisorState): TickResult | undefined {
     /**
      * AN EMPTY CHAIN IS ONLY SILENCE IF NOTHING SAYS OTHERWISE (round-6
@@ -2262,6 +2354,17 @@ export class ProvenanceOverflowError extends Error {
  * non-genesis head, is a contradiction and the loudest evidence of deletion
  * there is. That residue is recorded in docs/KNOWN-LIMITATIONS.md.
  */
+/** Whether two roadmaps are the same list, item for item and field for field. */
+function sameRoadmap(a: readonly RoadmapItem[], b: readonly RoadmapItem[]): boolean {
+  return (
+    a.length === b.length &&
+    a.every((item, index) => {
+      const other = b[index];
+      return other !== undefined && JSON.stringify(item) === JSON.stringify(other);
+    })
+  );
+}
+
 export function chainIsLegacySilence(state: {
   readonly provenance: readonly ProvenanceEntry[];
   readonly provenanceAnchor?: { readonly length: number; readonly headDigest: string };

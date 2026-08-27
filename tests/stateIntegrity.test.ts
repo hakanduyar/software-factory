@@ -122,7 +122,19 @@ async function reviewWith(input: {
   /** Record a matching anchor, so the chain is not read as legacy silence. */
   readonly anchor?: boolean;
 }) {
-  const supervisor = newSupervisor({ probe: healthyProbe() });
+  /**
+   * The DEFINITION is declared in the catalog (TASK-012); the PROGRESS is
+   * persisted.
+   *
+   * `input.item` is applied only to the persisted row, deliberately: a case that
+   * overrides a definition field through it is TAMPERING, and must fail closed
+   * rather than quietly redefining what the item is.
+   */
+  const definitions: readonly RoadmapItem[] = [
+    { key: "B", title: "Review of A", dependsOn: ["A"], status: "PENDING", workClass: "INDEPENDENT_REVIEW", order: 1 },
+    { key: "A", title: "Implemented", dependsOn: [], status: "PENDING", workClass: "NORMAL_IMPLEMENTATION", order: 2 },
+  ];
+  const supervisor = newSupervisor({ probe: healthyProbe(), roadmap: definitions });
   const state = await supervisor.service.ensureInitialized();
   await supervisor.repository.compareAndSave(
     {

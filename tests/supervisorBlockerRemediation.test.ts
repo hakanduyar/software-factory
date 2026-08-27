@@ -51,7 +51,7 @@ describe("TASK-009 remediation: clearing a claim never clears a blocker", () => 
 
   /** Seeds an ACTIVE item holding an unlaunched CLAIMED action, then blocks it. */
   async function blockedWithClaim() {
-    const supervisor = newSupervisor({ probe: healthyProbe() });
+    const supervisor = newSupervisor({ probe: healthyProbe(), roadmap: ITEM });
     const seeded = await supervisor.service.ensureInitialized();
     await supervisor.repository.compareAndSave(
       {
@@ -105,7 +105,7 @@ describe("TASK-009 remediation: clearing a claim never clears a blocker", () => 
   it("still promotes an ordinary interrupted item, which is the point of clearing a claim", async () => {
     // The fix must not break the behaviour it is narrowing: an item with no
     // blocker still becomes ELIGIBLE when its unlaunched claim is cleared.
-    const supervisor = newSupervisor({ probe: healthyProbe() });
+    const supervisor = newSupervisor({ probe: healthyProbe(), roadmap: ITEM });
     const seeded = await supervisor.service.ensureInitialized();
     await supervisor.repository.compareAndSave(
       {

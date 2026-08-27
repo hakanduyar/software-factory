@@ -46,6 +46,7 @@ import type { RoadmapItem } from "../src/supervision/supervisorTypes.js";
 import { cleanupTempDbs, tempDbPath } from "./support/factoryFixtures.js";
 import { createSqliteSupervisorRepository } from "../src/adapters/supervision/sqliteSupervisorRepository.js";
 import {
+  declarePersisted,
   newSupervisor,
   scriptedExecutor,
   scriptedProbe,
@@ -170,6 +171,7 @@ describe("TASK-006 R7-C4-1: an unrecognised implementer fails closed", () => {
       },
       state.version,
     );
+    await declarePersisted(supervisor);
     const result = await supervisor.service.tick();
     return { result, supervisor };
   }
@@ -216,6 +218,7 @@ describe("TASK-006 R7-DAG-1: a stored ELIGIBLE does not outrank the dependency g
       { ...state, version: state.version + 1, roadmap },
       state.version,
     );
+    await declarePersisted(supervisor);
 
     await supervisor.service.tick();
 

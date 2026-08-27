@@ -45,6 +45,7 @@ import { DEFAULT_ROADMAP, type RoadmapItem } from "../src/supervision/supervisor
 import { implementerHistory, setImplementer } from "../src/supervision/supervisorService.js";
 import { cleanupTempDbs } from "./support/factoryFixtures.js";
 import {
+  declarePersisted,
   launchWithObservedBilling,
   newSupervisor,
   scriptedExecutor,
@@ -170,6 +171,7 @@ describe("TASK-006 F6-POL-1: a missing or corrupt policy denies everything", () 
       { ...state, version: state.version + 1, roadmap: ONE_AI_ITEM, financialPolicy: "corrupt" },
       state.version,
     );
+    await declarePersisted(supervisor);
 
     const result = await supervisor.service.tick();
     assert.equal(result.kind, "WAITING_FOR_HUMAN");
@@ -312,6 +314,7 @@ describe("TASK-006 F6-C4-2: unknown lineage fails closed on a selectable review"
         },
         state.version,
       );
+      await declarePersisted(supervisor);
 
       const result = await supervisor.service.tick();
 
@@ -347,6 +350,7 @@ describe("TASK-006 F6-C4-2: unknown lineage fails closed on a selectable review"
       },
       state.version,
     );
+    await declarePersisted(supervisor);
 
     const result = await supervisor.service.tick();
     assert.equal(result.kind, "ADVANCED", "a knowable lineage must not be blocked");

@@ -27,7 +27,7 @@ import type {
   WorkExecutor,
   WorkOutcome,
 } from "../../src/supervision/supervisorPorts.js";
-import type { RoadmapItem } from "../../src/supervision/supervisorTypes.js";
+import { DEFAULT_ROADMAP, type RoadmapItem } from "../../src/supervision/supervisorTypes.js";
 
 export const T0 = 1_800_000_000_000;
 
@@ -185,6 +185,15 @@ export interface TestSupervisor {
   readonly probe: ScriptedProbe;
   readonly executor: ScriptedExecutor;
   readonly clock: ManualClock;
+  /**
+   * This installation's ROADMAP CATALOG (TASK-012 AC-4).
+   *
+   * A live array the service holds by reference, so `seedRoadmap` can declare a
+   * test's roadmap in CODE — which is the whole point of the task: a roadmap
+   * that arrives only through persisted state is exactly what the supervisor
+   * now refuses. Production passes `DEFAULT_ROADMAP` and never mutates it.
+   */
+  readonly catalog: RoadmapItem[];
 }
 
 export interface NewSupervisorOptions {
@@ -229,8 +238,10 @@ export function newSupervisor(options: NewSupervisorOptions = {}): TestSuperviso
   const probe = options.probe ?? scriptedProbe();
   const executor = options.executor ?? scriptedExecutor();
 
+  const catalog: RoadmapItem[] = [...(options.roadmap ?? DEFAULT_ROADMAP)];
   const deps: SupervisorServiceDeps = {
     repository,
+    roadmapCatalog: catalog,
     probe,
     executor,
     clock: { now: () => clock.now() },
@@ -240,11 +251,48 @@ export function newSupervisor(options: NewSupervisorOptions = {}): TestSuperviso
     ...(options.ownerId === undefined ? {} : { ownerId: options.ownerId }),
     ...(options.log === undefined ? {} : { log: options.log }),
   };
-  return { service: new SupervisorService(deps), repository, probe, executor, clock };
+  return { service: new SupervisorService(deps), repository, probe, executor, clock, catalog };
 }
 
 /** Seeds state, then replaces the roadmap with the supplied one. */
 export async function seedRoadmap(
+  supervisor: TestSupervisor,
+  roadmap: readonly RoadmapItem[],
+): Promise<void> {
+  // DECLARED in the catalog as well as persisted. A roadmap that exists only in
+  // the database is the tampered case TASK-012 refuses, so a fixture that seeded
+  // one without declaring it would be testing the refusal, not the scenario.
+  supervisor.catalog.splice(0, supervisor.catalog.length, ...roadmap.map((item) => ({ ...item })));
+  const state = await supervisor.service.ensureInitialized();
+  await supervisor.repository.compareAndSave({ ...state, version: state.version + 1, roadmap }, state.version);
+}
+
+/**
+ * Declares whatever roadmap is currently persisted, without changing it.
+ *
+ * For a test that sets up state by writing the repository directly and whose
+ * subject is something else entirely — a backoff ladder, a claim, a probe. The
+ * roadmap it wrote is a legitimate one that simply was not declared, and this
+ * says so in one place a reader can see.
+ *
+ * A test that means to TAMPER with a definition does not call this. That is the
+ * whole distinction, and it is why this is an explicit call rather than
+ * something the fixture does silently on every write.
+ */
+export async function declarePersisted(supervisor: TestSupervisor): Promise<void> {
+  const state = await supervisor.repository.load();
+  if (state === undefined) return;
+  supervisor.catalog.splice(0, supervisor.catalog.length, ...state.roadmap.map((item) => ({ ...item })));
+}
+
+/**
+ * Persists a roadmap WITHOUT declaring it — the tampering TASK-012 exists for.
+ *
+ * Separate from `seedRoadmap` so that every use is a visible choice: a test that
+ * wants a legitimate roadmap says so, and a test that wants a forged one says
+ * that instead.
+ */
+export async function tamperRoadmap(
   supervisor: TestSupervisor,
   roadmap: readonly RoadmapItem[],
 ): Promise<void> {

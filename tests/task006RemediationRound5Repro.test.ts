@@ -50,6 +50,7 @@ import { implementerHistory, setImplementer } from "../src/supervision/superviso
 import type { RoadmapItem } from "../src/supervision/supervisorTypes.js";
 import { cleanupTempDbs } from "./support/factoryFixtures.js";
 import {
+  declarePersisted,
   launchWithObservedBilling,
   newSupervisor,
   scriptedExecutor,
@@ -472,6 +473,7 @@ describe("TASK-006 F5-C4-1: reviewer independence fails closed on unknown lineag
       },
       state.version,
     );
+    await declarePersisted(supervisor);
 
     const result = await supervisor.service.tick();
 
@@ -529,6 +531,7 @@ describe("TASK-006 F5-C4-1: reviewer independence fails closed on unknown lineag
       },
       state.version,
     );
+    await declarePersisted(supervisor);
 
     const result = await supervisor.service.tick();
 

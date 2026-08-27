@@ -37,7 +37,7 @@ import {
 import { NO_BACKOFF } from "../src/supervision/resourceTypes.js";
 import { DEFAULT_ROADMAP, type RoadmapItem } from "../src/supervision/supervisorTypes.js";
 import { cleanupTempDbs, tempDbPath } from "./support/factoryFixtures.js";
-import { newSupervisor, scriptedProbe, T0, TEST_CATALOG } from "./support/supervisorFixtures.js";
+import { declarePersisted, newSupervisor, scriptedProbe, T0, TEST_CATALOG } from "./support/supervisorFixtures.js";
 
 after(cleanupTempDbs);
 
@@ -188,6 +188,7 @@ describe("TASK-006 R9-C4-1: forged lineage is cross-checked, and the residue is 
       },
       state.version,
     );
+    await declarePersisted(supervisor);
     return { result: await supervisor.service.tick(), supervisor };
   }
 
