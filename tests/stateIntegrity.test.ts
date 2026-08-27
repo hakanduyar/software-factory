@@ -2382,3 +2382,91 @@ function chainNamingBoth(): readonly ProvenanceEntry[] {
   const one = chainFor("codex-cli:gpt-5.6-luna");
   return appendImplementerProvenance(one, "A", "claude-code:opus", 2_000, "completed");
 }
+
+describe("TASK-011 round 9: a worker that handed over mid-item is still excluded", () => {
+  /**
+   * THE REVIEWER'S REPRODUCTION, driven exactly as it was reported.
+   *
+   * R1 runs item A and CHECKPOINTS. R1 becomes unavailable. R2 resumes A and
+   * COMPLETES it. R1 becomes available again — and reviewed A's dependent,
+   * because the append-only history contained only the resource that FINISHED.
+   * `lastRunConfig` could not repair it either: it had been overwritten with R2.
+   *
+   * The defect was never in the executor adapter; it was in which supervisor
+   * paths recorded lineage. It is fixed by recording once, before the outcome
+   * branches, which is why this case lives beside the rest of that work.
+   */
+  it("does not let the checkpointing resource review the dependent", async () => {
+    const R1 = { provider: "claude-code", model: "sonnet" };
+    const R2 = { provider: "codex-cli", model: "gpt-5.6-luna" };
+    const probe = scriptedProbe();
+    const available = (entry: { provider: string; model: string }) =>
+      probe.set(entry.provider, entry.model, {
+        state: "AVAILABLE",
+        reason: "scripted",
+        billingMode: "INCLUDED_SUBSCRIPTION",
+      });
+    const unavailable = (entry: { provider: string; model: string }) =>
+      probe.set(entry.provider, entry.model, { state: "PROVIDER_UNAVAILABLE", reason: "scripted outage" });
+
+    // Only R1 can run at first, so the checkpoint is definitely R1's.
+    available(R1);
+    unavailable(R2);
+    probe.set("claude-code", "opus", { state: "PROVIDER_UNAVAILABLE", reason: "scripted outage" });
+
+    const supervisor = newSupervisor({
+      probe,
+      executor: scriptedExecutor({
+        A: [
+          {
+            kind: "CHECKPOINT",
+            detail: "context exhausted",
+            checkpoint: {
+              roadmapKey: "A",
+              actionId: "ignored",
+              requiredWorkClass: "NORMAL_IMPLEMENTATION",
+              iteration: 1,
+              nextAction: "resume",
+              findings: [],
+              completedVerification: [],
+              pendingVerification: [],
+              updatedAt: 1,
+            },
+          },
+        ],
+      }),
+    });
+    await seedRoadmap(supervisor, [
+      { key: "A", title: "First item", dependsOn: [], status: "PENDING", workClass: "NORMAL_IMPLEMENTATION", order: 1 },
+      { key: "B", title: "Review of A", dependsOn: ["A"], status: "PENDING", workClass: "INDEPENDENT_REVIEW", order: 2 },
+    ]);
+
+    await supervisor.service.tick(); // A checkpoints on R1
+    const checkpointed = supervisor.executor.callsFor("A").at(-1);
+    assert.ok(checkpointed !== undefined, "A must have run once");
+    const r1Key = `${R1.provider}:${R1.model}`;
+    assert.equal(
+      `${checkpointed.config?.effectiveProvider ?? ""}:${checkpointed.config?.effectiveModel ?? ""}`,
+      r1Key,
+      "the fixture must put the checkpoint on R1, or it proves nothing",
+    );
+
+    // R1 goes away; R2 resumes and finishes.
+    unavailable(R1);
+    available(R2);
+    await supervisor.service.tick();
+
+    // R1 comes back, and must NOT be handed the review of A's dependent.
+    available(R1);
+    await supervisor.service.tick();
+
+    for (const call of supervisor.executor.callsFor("B")) {
+      const used = `${call.config?.effectiveProvider ?? ""}:${call.config?.effectiveModel ?? ""}`;
+      assert.notEqual(used, r1Key, "the resource that checkpointed A reviewed the item that depends on A");
+    }
+
+    const state = (await supervisor.repository.load())!;
+    const history = state.roadmap.find((item) => item.key === "A")?.implementedByResourceKeys ?? [];
+    assert.ok(history.includes(r1Key), "the history forgot the resource that handed over");
+  });
+});

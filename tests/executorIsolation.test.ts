@@ -1389,7 +1389,20 @@ describe("TASK-011 round 8: everything a child says is redacted", () => {
     );
   });
 
-  it("redacts a credential inside a checkpoint", async () => {
+  /**
+   * REPLACED IN ROUND 9, because the case it replaced was invalid evidence.
+   *
+   * It sent a child `CHECKPOINT` response and claimed to test checkpoint
+   * redaction. The parser REFUSES `CHECKPOINT` from an isolated child by design
+   * — a child may not mint state the supervisor must own — so the response never
+   * became an outcome, and the adapter redacted the raw text through
+   * `processFailure` instead. Removing `redactDeep` left it passing. It was
+   * testing the refusal path while describing itself as testing redaction.
+   *
+   * What that path actually guarantees is worth pinning, so it is pinned here
+   * under its real name.
+   */
+  it("does not leak the contents of a response it REFUSES", async () => {
     const script = childScript(
       `import { readFileSync } from "node:fs";
        JSON.parse(readFileSync(process.argv[2], "utf8"));
@@ -1397,23 +1410,37 @@ describe("TASK-011 round 8: everything a child says is redacted", () => {
          protocol: ${EXECUTOR_PROTOCOL_VERSION},
          outcome: {
            kind: "CHECKPOINT",
-           detail: "rolling over",
-           checkpoint: {
-             roadmapKey: "DETERMINISTIC_THING",
-             actionId: "DETERMINISTIC_THING:RUN_DETERMINISTIC_WORK:a1",
-             requiredWorkClass: "DETERMINISTIC",
-             iteration: 1,
-             nextAction: "resume with ${LEAK}",
-             findings: [],
-             completedVerification: [],
-             pendingVerification: [],
-             updatedAt: 1,
-           },
+           detail: "rolling over with ${LEAK}",
+           checkpoint: { roadmapKey: "DETERMINISTIC_THING", nextAction: "resume with ${LEAK}" },
          },
        }));`,
     );
     const outcome = await executorFor(script, 30_000).execute(INPUT);
-    assert.ok(!JSON.stringify(outcome).includes(LEAK), "a credential left the adapter inside a checkpoint");
+    assert.equal(outcome.kind, "RESOURCE_FAILURE", "an isolated child may not report CHECKPOINT");
+    assert.ok(
+      !JSON.stringify(outcome).includes(LEAK),
+      "the refused response was handed back with its contents intact",
+    );
+  });
+
+  /**
+   * The two cases that genuinely need `redactDeep` are `reportedIdentity` and a
+   * CHILD-DECLARED `RESOURCE_FAILURE`, both above: they are the variants the
+   * previous two-branch redaction did not cover, and independent mutation
+   * confirms both fail when it is removed.
+   */
+  it("redacts a credential in review findings", async () => {
+    const script = childScript(
+      `import { readFileSync } from "node:fs";
+       JSON.parse(readFileSync(process.argv[2], "utf8"));
+       process.stdout.write(JSON.stringify({
+         protocol: ${EXECUTOR_PROTOCOL_VERSION},
+         outcome: { kind: "CHANGES_REQUIRED", findings: ["the key ${LEAK} is committed"] },
+       }));`,
+    );
+    const outcome = await executorFor(script, 30_000).execute(INPUT);
+    assert.equal(outcome.kind, "CHANGES_REQUIRED");
+    assert.ok(!JSON.stringify(outcome).includes(LEAK), "a credential left the adapter inside a finding");
   });
 });
 
