@@ -38,6 +38,9 @@
  * outcome; it cannot lie its way into a budget.
  */
 
+import { ROADMAP_STATUSES } from "./supervisorTypes.js";
+import { WORK_CLASSES } from "./modelRouting.js";
+import { CONFIG_VERIFICATIONS } from "./modelEnforcement.js";
 import type { SessionCheckpoint } from "./supervisorTypes.js";
 import type { WorkExecutionInput, WorkOutcome } from "./supervisorPorts.js";
 
@@ -74,25 +77,94 @@ export interface ExecutorRequest {
  * caller rather than a fact about the value: a malformed object in a `string`
  * field crosses the boundary just as an array element did.
  *
- * Round-7 finished the job. Fixing the two fields a reviewer named and leaving
- * the rest is fixing an instance and not a class — `actionId`, the provider and
- * model identities, and the checkpoint's `actionId` all carried objects
- * through. EVERY free-text scalar goes through this now; the only fields still
- * copied as declared are the literal UNIONS, which have no free text to hide in
- * and whose only consumer fails closed on an unrecognised value.
+ * Round-7 covered the remaining free-text scalars, and left the literal UNIONS
+ * copied as declared on the argument that a malformed value simply fails the
+ * child's one comparison. That argument answered the wrong question. The harm
+ * is not that the child MISREADS the value; it is that the OBJECT ARRIVES —
+ * the reviewer put `databasePath` and a `financialPolicy` with
+ * `autonomousSpendAllowed: true` into `status`, `workClass`, `verification` and
+ * `requiredWorkClass`, and a real child echoed all four back. Whether the child
+ * compares them is irrelevant to what it can now read.
+ *
+ * Round-8 therefore states ONE rule and applies it to every field: a value whose
+ * runtime type disagrees with its declared type is REFUSED, not corrected.
+ * Substituting `""` was the smaller version of the same mistake — a silent
+ * correction hides tampering just as effectively as accepting it, and there is
+ * no meaningless-but-valid member of a union to substitute anyway.
  */
-function asPlainString(value: unknown): string {
-  return typeof value === "string" ? value : "";
+export class ExecutorRequestError extends Error {
+  constructor(message: string) {
+    super(`refusing to send an executor request: ${message}`);
+    this.name = "ExecutorRequestError";
+  }
 }
 
 /**
- * A NUMBER field is copied on exactly the same strength as a string one, and an
- * object in a `number` field crosses the boundary exactly as far. Non-finite
- * values go too: `NaN` and `Infinity` do not survive JSON, so forwarding them
- * would put `null` in a field the child's parser declares numeric.
+ * Bounds, because a declared type says nothing about SIZE either (round-8 HIGH).
+ *
+ * Only the RESPONSE was limited. A 2,000,000-character title produced a
+ * 2,000,132-byte request, written to disk and handed to a child. Per-field and
+ * total limits are both needed: the first names the offender, the second stops
+ * a thousand small fields achieving the same thing.
  */
-function asPlainNumber(value: unknown): number {
-  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+export const MAX_REQUEST_FIELD_BYTES = 100_000;
+export const MAX_REQUEST_BYTES = 1_000_000;
+
+function requireString(value: unknown, field: string): string {
+  if (typeof value !== "string") {
+    throw new ExecutorRequestError(`${field} is ${value === null ? "null" : typeof value}, not a string`);
+  }
+  const bytes = Buffer.byteLength(value, "utf8");
+  if (bytes > MAX_REQUEST_FIELD_BYTES) {
+    throw new ExecutorRequestError(`${field} is ${bytes} bytes, over the ${MAX_REQUEST_FIELD_BYTES} limit`);
+  }
+  return value;
+}
+
+function requireNumber(value: unknown, field: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new ExecutorRequestError(`${field} is ${JSON.stringify(value)}, not a finite number`);
+  }
+  return value;
+}
+
+/**
+ * A union member, or a refusal.
+ *
+ * The allowed values come from the same exported constants the deserializer
+ * validates against, so the two cannot drift apart.
+ */
+function requireMember<T extends string>(value: unknown, allowed: readonly T[], field: string): T {
+  if (typeof value === "string" && (allowed as readonly string[]).includes(value)) {
+    return value as T;
+  }
+  throw new ExecutorRequestError(
+    `${field} is ${JSON.stringify(value)}, which is not one of ${allowed.join(", ")}`,
+  );
+}
+
+/** Every element of a declared string array, checked as a scalar would be. */
+function requireStrings(value: unknown, field: string): string[] {
+  if (!Array.isArray(value)) {
+    throw new ExecutorRequestError(`${field} is not an array`);
+  }
+  return value.map((entry, index) => requireString(entry, `${field}[${index}]`));
+}
+
+/**
+ * Serialises a request, refusing one that is too large to be reasonable.
+ *
+ * The check lives here rather than at the call site because the call site is
+ * where it was missing: the adapter wrote `JSON.stringify(buildExecutorRequest(...))`
+ * straight to disk.
+ */
+export function serializeExecutorRequest(request: ExecutorRequest): string {
+  const text = JSON.stringify(request);
+  const bytes = Buffer.byteLength(text, "utf8");
+  if (bytes > MAX_REQUEST_BYTES) {
+    throw new ExecutorRequestError(`request is ${bytes} bytes, over the ${MAX_REQUEST_BYTES} limit`);
+  }
+  return text;
 }
 
 export function buildExecutorRequest(input: WorkExecutionInput): ExecutorRequest {
@@ -115,51 +187,57 @@ export function buildExecutorRequest(input: WorkExecutionInput): ExecutorRequest
   return {
     protocol: EXECUTOR_PROTOCOL_VERSION,
     item: {
-      key: asPlainString(item.key),
-      title: asPlainString(item.title),
-      dependsOn: item.dependsOn.map(asPlainString),
+      key: requireString(item.key, "item.key"),
+      title: requireString(item.title, "item.title"),
+      dependsOn: requireStrings(item.dependsOn, "item.dependsOn"),
       /**
-       * "status" and "workClass" are literal UNIONS, not free text, so they are
-       * copied as declared. Coercing them to string breaks the contract, and
-       * substituting a fallback would silently change meaning — the child reads
-       * "workClass" for exactly one comparison, and a malformed value simply
-       * fails that comparison, which is already the closed direction.
+       * The UNIONS are checked against their own member lists (round-8
+       * CRITICAL). They were copied as declared on the argument that a
+       * malformed value merely fails the child's one comparison — true, and
+       * beside the point: the reviewer put an object carrying `databasePath`
+       * and `financialPolicy` into all four union fields and a real child
+       * echoed every one of them back. What matters is not whether the child
+       * understands the value but that the value ARRIVES.
        */
-      status: item.status,
-      workClass: item.workClass,
-      order: asPlainNumber(item.order),
-      ...(item.attempts === undefined ? {} : { attempts: asPlainNumber(item.attempts) }),
-      ...(item.detail === undefined ? {} : { detail: asPlainString(item.detail) }),
+      status: requireMember(item.status, ROADMAP_STATUSES, "item.status"),
+      workClass: requireMember(item.workClass, WORK_CLASSES, "item.workClass"),
+      order: requireNumber(item.order, "item.order"),
+      ...(item.attempts === undefined ? {} : { attempts: requireNumber(item.attempts, "item.attempts") }),
+      ...(item.detail === undefined ? {} : { detail: requireString(item.detail, "item.detail") }),
     },
-    actionId: asPlainString(input.actionId),
+    actionId: requireString(input.actionId, "actionId"),
     ...(config === undefined
       ? {}
       : {
           config: {
-            requestedProvider: asPlainString(config.requestedProvider),
-            requestedModel: asPlainString(config.requestedModel),
-            ...(config.requestedEffort === undefined ? {} : { requestedEffort: asPlainString(config.requestedEffort) }),
-            effectiveProvider: asPlainString(config.effectiveProvider),
-            effectiveModel: asPlainString(config.effectiveModel),
-            ...(config.effectiveEffort === undefined ? {} : { effectiveEffort: asPlainString(config.effectiveEffort) }),
-            verification: config.verification,
-            argvEvidence: config.argvEvidence.map(asPlainString),
-            note: asPlainString(config.note),
+            requestedProvider: requireString(config.requestedProvider, "config.requestedProvider"),
+            requestedModel: requireString(config.requestedModel, "config.requestedModel"),
+            ...(config.requestedEffort === undefined
+              ? {}
+              : { requestedEffort: requireString(config.requestedEffort, "config.requestedEffort") }),
+            effectiveProvider: requireString(config.effectiveProvider, "config.effectiveProvider"),
+            effectiveModel: requireString(config.effectiveModel, "config.effectiveModel"),
+            ...(config.effectiveEffort === undefined
+              ? {}
+              : { effectiveEffort: requireString(config.effectiveEffort, "config.effectiveEffort") }),
+            verification: requireMember(config.verification, CONFIG_VERIFICATIONS, "config.verification"),
+            argvEvidence: requireStrings(config.argvEvidence, "config.argvEvidence"),
+            note: requireString(config.note, "config.note"),
           },
         }),
     ...(checkpoint === undefined
       ? {}
       : {
           checkpoint: {
-            roadmapKey: asPlainString(checkpoint.roadmapKey),
-            actionId: asPlainString(checkpoint.actionId),
-            requiredWorkClass: checkpoint.requiredWorkClass,
-            iteration: asPlainNumber(checkpoint.iteration),
-            nextAction: asPlainString(checkpoint.nextAction),
-            findings: checkpoint.findings.map(asPlainString),
-            completedVerification: checkpoint.completedVerification.map(asPlainString),
-            pendingVerification: checkpoint.pendingVerification.map(asPlainString),
-            updatedAt: asPlainNumber(checkpoint.updatedAt),
+            roadmapKey: requireString(checkpoint.roadmapKey, "checkpoint.roadmapKey"),
+            actionId: requireString(checkpoint.actionId, "checkpoint.actionId"),
+            requiredWorkClass: requireMember(checkpoint.requiredWorkClass, WORK_CLASSES, "checkpoint.requiredWorkClass"),
+            iteration: requireNumber(checkpoint.iteration, "checkpoint.iteration"),
+            nextAction: requireString(checkpoint.nextAction, "checkpoint.nextAction"),
+            findings: requireStrings(checkpoint.findings, "checkpoint.findings"),
+            completedVerification: requireStrings(checkpoint.completedVerification, "checkpoint.completedVerification"),
+            pendingVerification: requireStrings(checkpoint.pendingVerification, "checkpoint.pendingVerification"),
+            updatedAt: requireNumber(checkpoint.updatedAt, "checkpoint.updatedAt"),
           },
         }),
   };
@@ -177,6 +255,16 @@ export function buildExecutorRequest(input: WorkExecutionInput): ExecutorRequest
  *
  * Deliberately checks OWN properties including non-enumerable ones, so a
  * response cannot smuggle a key past `Object.keys`.
+ *
+ * HONESTLY UNOBSERVABLE, and said so rather than implied by a green test.
+ * Round-8 review swapped this for `Object.keys` and every test still passed —
+ * correctly, because the only entry point takes TEXT and `JSON.parse` cannot
+ * produce a non-enumerable own property. What actually defends the parser here
+ * is the allowlist itself, which does have tests: `__proto__` and `constructor`
+ * arrive as ordinary own enumerable keys and are refused by either function.
+ * `getOwnPropertyNames` costs nothing and is strictly stronger if this is ever
+ * given an object built in-process, so it stays — as defence in depth, which is
+ * not the same claim as a tested guarantee.
  */
 function onlyKeys(row: Record<string, unknown>, allowed: readonly string[], where: string): string | undefined {
   for (const key of Object.getOwnPropertyNames(row)) {

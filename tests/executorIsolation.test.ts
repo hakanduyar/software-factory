@@ -15,7 +15,17 @@
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, linkSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  linkSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, describe, it } from "node:test";
@@ -29,7 +39,10 @@ import {
 import {
   buildExecutorRequest,
   parseExecutorResponse,
+  serializeExecutorRequest,
   EXECUTOR_PROTOCOL_VERSION,
+  MAX_REQUEST_BYTES,
+  MAX_REQUEST_FIELD_BYTES,
 } from "../src/supervision/executorProtocol.js";
 import type { RoadmapItem } from "../src/supervision/supervisorTypes.js";
 import type { WorkExecutionInput } from "../src/supervision/supervisorPorts.js";
@@ -1021,10 +1034,15 @@ describe("TASK-011 round 5: array elements are validated, not merely copied", ()
       },
     } as unknown as WorkExecutionInput;
 
-    const request = buildExecutorRequest(contaminated) as unknown as { item: { dependsOn: unknown[] } };
-    for (const entry of request.item.dependsOn) {
-      assert.equal(typeof entry, "string", "a non-string element crossed the boundary");
-    }
+    /**
+     * REFUSED, where round 5 only proved the object did not cross.
+     *
+     * Coercing it to `""` kept the child clean and told nobody that the caller's
+     * state was malformed — a silent correction hides tampering as effectively
+     * as accepting it. Round 8 states one rule for every field: a value whose
+     * runtime type disagrees with its declared type is refused.
+     */
+    assert.throws(() => buildExecutorRequest(contaminated), /item\.dependsOn\[0\] is object, not a string/);
   });
 });
 
@@ -1109,8 +1127,7 @@ describe("TASK-011 round 6: scalar fields are validated at runtime too", () => {
       },
     } as unknown as WorkExecutionInput;
 
-    const request = buildExecutorRequest(contaminated) as unknown as { item: { title: unknown } };
-    assert.equal(typeof request.item.title, "string", "an object crossed the boundary in a string field");
+    assert.throws(() => buildExecutorRequest(contaminated), /item\.title is object, not a string/);
   });
 });
 
@@ -1185,19 +1202,7 @@ describe("TASK-011 round 7: every scalar is validated, not just the two that wer
       },
     } as unknown as WorkExecutionInput;
 
-    const request = buildExecutorRequest(contaminated) as unknown as {
-      actionId: unknown;
-      config: { requestedProvider: unknown };
-    };
-    assert.equal(typeof request.actionId, "string", "an object crossed the boundary as actionId");
-    assert.equal(
-      typeof request.config.requestedProvider,
-      "string",
-      "an object crossed the boundary as a provider identity",
-    );
-    const serialized = JSON.stringify(request);
-    assert.ok(!serialized.includes("supervisor.db"), "the database path reached the child");
-    assert.ok(!serialized.includes("autonomousSpendAllowed"), "the financial policy reached the child");
+    assert.throws(() => buildExecutorRequest(contaminated), /actionId is object, not a string/);
   });
 
   /** A number field is copied on exactly the same strength as a string one. */
@@ -1207,7 +1212,274 @@ describe("TASK-011 round 7: every scalar is validated, not just the two that wer
       item: { ...ITEM, order: { databasePath: "/home/hakanduyar/.factory/supervisor.db" } as unknown as number },
     } as unknown as WorkExecutionInput;
 
-    const request = buildExecutorRequest(contaminated) as unknown as { item: { order: unknown } };
-    assert.equal(typeof request.item.order, "number", "an object crossed the boundary in a number field");
+    assert.throws(() => buildExecutorRequest(contaminated), /item\.order is .*not a finite number/);
+  });
+});
+
+// =====================================================================
+// ROUND-8 — the unions, the size, and what comes back
+// =====================================================================
+
+describe("TASK-011 round 8: union fields are checked against their members", () => {
+  /**
+   * CRITICAL. `status`, `workClass`, `verification` and `requiredWorkClass` were
+   * copied on the strength of their declaration, on the argument that a
+   * malformed value merely fails the child's one comparison.
+   *
+   * That answered the wrong question. The harm is not that the child MISREADS
+   * the value; it is that the OBJECT ARRIVES. The reviewer put the same payload
+   * into all four fields and a real child echoed every one of them back —
+   * whether it compares them is irrelevant to what it can read.
+   */
+  const PAYLOAD = {
+    databasePath: "/home/hakanduyar/.factory/supervisor.db",
+    financialPolicy: { autonomousSpendAllowed: true },
+  };
+
+  it("REFUSES an object in item.status", () => {
+    const contaminated = {
+      ...INPUT,
+      item: { ...ITEM, status: PAYLOAD as unknown as RoadmapItem["status"] },
+    } as unknown as WorkExecutionInput;
+    assert.throws(() => buildExecutorRequest(contaminated), /item\.status is .*not one of/);
+  });
+
+  it("REFUSES an object in item.workClass", () => {
+    const contaminated = {
+      ...INPUT,
+      item: { ...ITEM, workClass: PAYLOAD as unknown as RoadmapItem["workClass"] },
+    } as unknown as WorkExecutionInput;
+    assert.throws(() => buildExecutorRequest(contaminated), /item\.workClass is .*not one of/);
+  });
+
+  it("REFUSES an object in config.verification", () => {
+    const contaminated = {
+      ...INPUT,
+      config: {
+        requestedProvider: "p",
+        requestedModel: "m",
+        effectiveProvider: "p",
+        effectiveModel: "m",
+        verification: PAYLOAD,
+        argvEvidence: [],
+        note: "",
+      },
+    } as unknown as WorkExecutionInput;
+    assert.throws(() => buildExecutorRequest(contaminated), /config\.verification is .*not one of/);
+  });
+
+  it("REFUSES an object in checkpoint.requiredWorkClass", () => {
+    const contaminated = {
+      ...INPUT,
+      checkpoint: {
+        roadmapKey: "DETERMINISTIC_THING",
+        actionId: "a1",
+        requiredWorkClass: PAYLOAD,
+        iteration: 1,
+        nextAction: "continue",
+        findings: [],
+        completedVerification: [],
+        pendingVerification: [],
+        updatedAt: 1,
+      },
+    } as unknown as WorkExecutionInput;
+    assert.throws(() => buildExecutorRequest(contaminated), /checkpoint\.requiredWorkClass is .*not one of/);
+  });
+
+  /** A legitimate value must still pass, or the guard is just a refusal. */
+  it("accepts every declared member", () => {
+    const request = buildExecutorRequest(INPUT);
+    assert.equal(request.item.status, "ELIGIBLE");
+    assert.equal(request.item.workClass, "DETERMINISTIC");
+  });
+});
+
+describe("TASK-011 round 8: a request has a size", () => {
+  /**
+   * HIGH. Only the RESPONSE was bounded. A 2,000,000-character title produced
+   * and transmitted a 2,000,132-byte request — written to disk and handed to a
+   * child — because a declared type says nothing about size either.
+   */
+  it("REFUSES an oversized field, and names it", () => {
+    const contaminated = {
+      ...INPUT,
+      item: { ...ITEM, title: "x".repeat(MAX_REQUEST_FIELD_BYTES + 1) },
+    } as unknown as WorkExecutionInput;
+    assert.throws(() => buildExecutorRequest(contaminated), /item\.title is \d+ bytes, over the/);
+  });
+
+  it("REFUSES a request that is oversized in aggregate", () => {
+    // Every field is individually legal; together they are not. A per-field
+    // limit alone would let a thousand small fields do what one large one
+    // could not.
+    const chunk = "y".repeat(MAX_REQUEST_FIELD_BYTES - 1);
+    const many = Array.from({ length: Math.ceil(MAX_REQUEST_BYTES / chunk.length) + 1 }, () => chunk);
+    const bulky = {
+      ...INPUT,
+      checkpoint: {
+        roadmapKey: "DETERMINISTIC_THING",
+        actionId: "a1",
+        requiredWorkClass: "DETERMINISTIC",
+        iteration: 1,
+        nextAction: "continue",
+        findings: many,
+        completedVerification: [],
+        pendingVerification: [],
+        updatedAt: 1,
+      },
+    } as unknown as WorkExecutionInput;
+    assert.throws(
+      () => serializeExecutorRequest(buildExecutorRequest(bulky)),
+      /request is \d+ bytes, over the/,
+    );
+  });
+
+  it("does not spawn a child for a request it refuses", async () => {
+    const script = childScript("export {};");
+    const contaminated = {
+      ...INPUT,
+      item: { ...ITEM, title: "x".repeat(MAX_REQUEST_FIELD_BYTES + 1) },
+    } as unknown as WorkExecutionInput;
+    await assert.rejects(executorFor(script, 30_000).execute(contaminated), /over the/);
+  });
+});
+
+describe("TASK-011 round 8: everything a child says is redacted", () => {
+  /**
+   * AC-8 was met for the two places a leak had been demonstrated and nowhere
+   * else. Enumerating the variants is the mistake: the list is a subset of the
+   * type and becomes a smaller subset every time the type grows.
+   */
+  const LEAK = "sk-ant-api03-ROUND8LEAKLEAKLEAKLEAKLEAK";
+
+  it("redacts a credential in a reported identity", async () => {
+    const script = childScript(
+      `import { readFileSync } from "node:fs";
+       JSON.parse(readFileSync(process.argv[2], "utf8"));
+       process.stdout.write(JSON.stringify({
+         protocol: ${EXECUTOR_PROTOCOL_VERSION},
+         outcome: {
+           kind: "COMPLETED",
+           detail: "done",
+           reportedIdentity: { provider: "codex-cli", model: "${LEAK}" },
+         },
+       }));`,
+    );
+    const outcome = await executorFor(script, 30_000).execute(INPUT);
+    assert.ok(!JSON.stringify(outcome).includes(LEAK), "a credential left the adapter inside reportedIdentity");
+  });
+
+  it("redacts a credential a child puts in its OWN declared process output", async () => {
+    const script = childScript(
+      `import { readFileSync } from "node:fs";
+       JSON.parse(readFileSync(process.argv[2], "utf8"));
+       process.stdout.write(JSON.stringify({
+         protocol: ${EXECUTOR_PROTOCOL_VERSION},
+         outcome: {
+           kind: "RESOURCE_FAILURE",
+           process: { terminationReason: "EXITED", exitCode: 1, stdout: "${LEAK}", stderr: "also ${LEAK}" },
+         },
+       }));`,
+    );
+    const outcome = await executorFor(script, 30_000).execute(INPUT);
+    assert.equal(outcome.kind, "RESOURCE_FAILURE");
+    assert.ok(
+      !JSON.stringify(outcome).includes(LEAK),
+      "a child-DECLARED resource failure never passes through processFailure, so it was never redacted",
+    );
+  });
+
+  it("redacts a credential inside a checkpoint", async () => {
+    const script = childScript(
+      `import { readFileSync } from "node:fs";
+       JSON.parse(readFileSync(process.argv[2], "utf8"));
+       process.stdout.write(JSON.stringify({
+         protocol: ${EXECUTOR_PROTOCOL_VERSION},
+         outcome: {
+           kind: "CHECKPOINT",
+           detail: "rolling over",
+           checkpoint: {
+             roadmapKey: "DETERMINISTIC_THING",
+             actionId: "DETERMINISTIC_THING:RUN_DETERMINISTIC_WORK:a1",
+             requiredWorkClass: "DETERMINISTIC",
+             iteration: 1,
+             nextAction: "resume with ${LEAK}",
+             findings: [],
+             completedVerification: [],
+             pendingVerification: [],
+             updatedAt: 1,
+           },
+         },
+       }));`,
+    );
+    const outcome = await executorFor(script, 30_000).execute(INPUT);
+    assert.ok(!JSON.stringify(outcome).includes(LEAK), "a credential left the adapter inside a checkpoint");
+  });
+});
+
+describe("TASK-011 round 8: guards a reviewer's mutations survived", () => {
+  /**
+   * Removing `detached: true` left every test green.
+   *
+   * That option is what puts the child in its OWN process group, and the group
+   * is what the timeout kill targets: `signalGroup` sends to `-pid`, so without
+   * it the signal either finds no such group or — worse — the supervisor's own.
+   *
+   * The child cannot answer this question itself. Node has no `getpgrp`, and
+   * `/proc/self/stat` is outside its read grant, which is the isolation working
+   * as intended. So the question is asked one level out, of the process that is
+   * actually spawned: `nodePath` is an existing TEST-ONLY capability, and a
+   * wrapper occupying it records its own pid and process group before `exec`
+   * hands the same process to the real runtime — `exec` preserves both.
+   */
+  it("runs the child in its own process group", async () => {
+    const script = childScript(
+      `import { readFileSync } from "node:fs";
+       JSON.parse(readFileSync(process.argv[2], "utf8"));
+       process.stdout.write(JSON.stringify({
+         protocol: ${EXECUTOR_PROTOCOL_VERSION},
+         outcome: { kind: "COMPLETED", detail: "done" },
+       }));`,
+    );
+    const recordDir = mkdtempSync(join(tmpdir(), "sf-pgid-"));
+    created.push(recordDir);
+    const record = join(recordDir, "pgid.txt");
+    const wrapper = join(recordDir, "node-wrapper.sh");
+    writeFileSync(
+      wrapper,
+      [
+        "#!/bin/sh",
+        `printf '%s %s\n' "$$" "$(ps -o pgid= -p $$ | tr -d ' ')" >> ${JSON.stringify(record)}`,
+        `exec ${JSON.stringify(process.execPath)} "$@"`,
+        "",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+
+    const outcome = await executorFor(script, 30_000, { nodePath: wrapper }).execute(INPUT);
+    assert.equal(outcome.kind, "COMPLETED", "the wrapper must delegate to a working runtime");
+
+    const lines = readFileSync(record, "utf8").trim().split("\n").filter((line) => line.length > 0);
+    assert.ok(lines.length > 0, "the wrapper recorded nothing, so this proves nothing");
+    const last = lines[lines.length - 1] ?? "";
+    const [pid, pgid] = last.split(" ");
+    assert.ok(pid !== undefined && pgid !== undefined && pid.length > 0 && pgid.length > 0, last);
+    assert.equal(
+      pgid,
+      pid,
+      "the child shares the supervisor's process group, so the timeout kill would signal the supervisor",
+    );
+  });
+
+  /**
+   * Removing `Object.freeze` also left every test green. A frozen allowlist is
+   * the difference between a policy and a suggestion: anything holding the
+   * exported array could otherwise add a variable to it at runtime.
+   */
+  it("keeps the environment allowlist frozen", () => {
+    assert.equal(Object.isFrozen(ISOLATED_EXECUTOR_ENV_ALLOWLIST), true);
+    assert.throws(() => {
+      (ISOLATED_EXECUTOR_ENV_ALLOWLIST as string[]).push("ANTHROPIC_API_KEY");
+    }, TypeError);
   });
 });

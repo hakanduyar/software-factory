@@ -93,6 +93,7 @@ import { dirname, join, resolve } from "node:path";
 import { buildWorkerEnvironment, redactSecrets, type EnvironmentPolicy } from "../workers/environmentPolicy.js";
 import {
   buildExecutorRequest,
+  serializeExecutorRequest,
   parseExecutorResponse,
   MAX_RESPONSE_BYTES,
 } from "../../supervision/executorProtocol.js";
@@ -245,15 +246,37 @@ export interface UnsafeTestOverrides {
  * leaves a claim held with nothing to release it. The SUPERVISOR classifies
  * what a failure means about a resource; this only reports the process facts.
  */
-/** Applies the same redaction to a SUCCESSFUL outcome that failures already get. */
+/**
+ * Redacts EVERY string in an outcome, wherever it sits (round-8).
+ *
+ * The first version named `COMPLETED.detail` and `CHANGES_REQUIRED.findings` —
+ * the two places a leak had been demonstrated. The reviewer then used the
+ * others: `reportedIdentity`, a CHILD-DECLARED `RESOURCE_FAILURE` whose
+ * `process.stdout`/`stderr` never pass through `processFailure`, the whole of
+ * `CHECKPOINT`, and `HUMAN_REQUIRED.detail`. Each returned credential-shaped
+ * strings unchanged.
+ *
+ * Enumerating the variants was the mistake: the list is a subset of the type and
+ * silently becomes a smaller subset every time the type grows. Walking the value
+ * covers the ones that exist and the ones added later, and cannot fall behind.
+ *
+ * The outcome has already been parsed field by field by `parseExecutorResponse`,
+ * so this walks a validated shape — it is a redaction pass, not a sanitiser
+ * standing in for one.
+ */
+function redactDeep(value: unknown): unknown {
+  if (typeof value === "string") return redactSecrets(value);
+  if (Array.isArray(value)) return value.map((entry) => redactDeep(entry));
+  if (value !== null && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [key, nested] of Object.entries(value)) out[key] = redactDeep(nested);
+    return out;
+  }
+  return value;
+}
+
 function redactOutcome(outcome: WorkOutcome): WorkOutcome {
-  if (outcome.kind === "COMPLETED") {
-    return { ...outcome, detail: redactSecrets(outcome.detail) };
-  }
-  if (outcome.kind === "CHANGES_REQUIRED") {
-    return { ...outcome, findings: outcome.findings.map((finding) => redactSecrets(finding)) };
-  }
-  return outcome;
+  return redactDeep(outcome) as WorkOutcome;
 }
 
 function processFailure(
@@ -725,7 +748,7 @@ function buildExecutor(options: ResolvedExecutorOptions, overrides: UnsafeTestOv
        */
       const requestDir = mkdtempSync(join(tmpdir(), "sf-executor-"));
       const requestPath = join(requestDir, "request.json");
-      writeFileSync(requestPath, JSON.stringify(buildExecutorRequest(input)), { mode: 0o600 });
+      writeFileSync(requestPath, serializeExecutorRequest(buildExecutorRequest(input)), { mode: 0o600 });
 
       try {
         return await spawnChild(requestPath, env);
