@@ -1077,21 +1077,87 @@ describe("TASK-010 follow-up: equivalent outDir spellings are one directory", ()
    * refused outright by the raw-file check — a false positive with no attacker
    * involved and no misconfiguration.
    */
-  it("ACCEPTS an outDir inherited through extends", () => {
+  /**
+   * DISCLOSED: the first version of this test was VACUOUS and the independent
+   * review caught it. It wrote `outDir: "dist"` into the ROOT config as well as
+   * the base, so nothing was ever inherited — the raw check found what it
+   * always finds and the test passed without exercising the case it named. A
+   * genuinely inherited-only config was, at that moment, refused outright.
+   *
+   * The root config here declares NO `outDir` at all. If the raw-file check
+   * ever becomes load-bearing again, this fails.
+   */
+  it("ACCEPTS an outDir inherited through extends and named nowhere else", () => {
     const root = makeFixtureRepo();
-    writeFileSync(
-      join(root, "tsconfig.base.json"),
-      JSON.stringify({ compilerOptions: { outDir: "dist" } }, null, 2),
-    );
     const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as Record<
       string,
       unknown
     >;
-    (tsconfig["compilerOptions"] as Record<string, unknown>)["outDir"] = "dist";
+    const options = tsconfig["compilerOptions"] as Record<string, unknown>;
+
+    // The base carries outDir; the root carries everything else and never
+    // mentions it.
+    writeFileSync(
+      join(root, "tsconfig.base.json"),
+      JSON.stringify({ compilerOptions: { outDir: "dist" } }, null, 2),
+    );
+    delete options["outDir"];
+    tsconfig["extends"] = "./tsconfig.base.json";
+    writeFileSync(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
+
+    // The fixture must genuinely inherit: prove the root file is silent.
+    const written = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as {
+      compilerOptions: Record<string, unknown>;
+    };
+    assert.ok(
+      !("outDir" in written.compilerOptions),
+      "the fixture must not name outDir in the root file, or it tests nothing",
+    );
+
+    const { status, output } = runHarness(root);
+    assert.equal(status, 0, `an inherited-only outDir was wrongly refused:\n${output.slice(0, 500)}`);
+    assert.match(output, /verification complete/, "it must actually build and run, not merely exit 0");
+  });
+
+  /**
+   * ...and the guard must still catch a genuinely wrong inherited value, or
+   * tolerating absence would have opened a hole rather than closed a false
+   * positive.
+   */
+  it("still REFUSES an outDir inherited from a base that names the wrong directory", () => {
+    const root = makeFixtureRepo();
+    const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as Record<
+      string,
+      unknown
+    >;
+    const options = tsconfig["compilerOptions"] as Record<string, unknown>;
+
+    writeFileSync(
+      join(root, "tsconfig.base.json"),
+      JSON.stringify({ compilerOptions: { outDir: "build-output" } }, null, 2),
+    );
+    delete options["outDir"];
     tsconfig["extends"] = "./tsconfig.base.json";
     writeFileSync(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
 
     const { status, output } = runHarness(root);
-    assert.equal(status, 0, `an inherited outDir was wrongly refused:\n${output.slice(0, 500)}`);
+    assert.notEqual(status, 0, "an inherited mismatched outDir was accepted");
+    assert.ok(!output.includes("tree-consistent"), "it must not claim consistency");
+    /**
+     * Asserting the SPECIFIC refusal, not merely a non-zero exit. Mutation
+     * testing showed the loose version passing for the wrong reason: with the
+     * effective-outDir guard disabled the build lands in `build-output`, the
+     * checker import from `dist` then fails, and the run exits non-zero having
+     * caught nothing. "It failed" is not evidence that the guard under test is
+     * what failed it.
+     */
+    // `--showConfig` normalises the inherited value to `./build-output`, so the
+    // prefix is optional here. Matching the literal without it asserted a
+    // spelling tsc does not produce.
+    assert.match(
+      output,
+      /the effective tsconfig builds into "\.?\/?build-output", but verification manages/,
+      `expected the effective-outDir refusal, got:\n${output.slice(0, 500)}`,
+    );
   });
 });

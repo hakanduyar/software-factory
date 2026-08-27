@@ -208,16 +208,25 @@ function sameDirectory(a, b) {
   return resolvedPath(a) === resolvedPath(b);
 }
 
-/** The `outDir` tsconfig actually declares — not the one this script assumes. */
+/**
+ * The `outDir` the ROOT tsconfig names, or `undefined` when it names none.
+ *
+ * ABSENT IS NOT AN ERROR (round-2 finding on this fix). A config that inherits
+ * `outDir` through `extends` declares nothing here, and refusing it was a false
+ * positive with no attacker and no misconfiguration involved — the same class
+ * of defect as B14 itself, one layer up. The EFFECTIVE config resolves
+ * `extends` and is checked below; that is the authority, and it catches a real
+ * mismatch whether or not the root file mentions `outDir` at all.
+ *
+ * This early check therefore exists only to give a good diagnostic when the
+ * root file names a DIFFERENT directory. It cannot be the thing that decides.
+ */
 function declaredOutDir() {
   const raw = readFileSync(join(REPO_ROOT, "tsconfig.json"), "utf8");
   // tsconfig permits comments; JSON.parse does not.
   const stripped = raw.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
   const outDir = JSON.parse(stripped)?.compilerOptions?.outDir;
-  if (typeof outDir !== "string" || outDir.trim().length === 0) {
-    fail("tsconfig.json declares no outDir; verification cannot know where the build lands");
-  }
-  return outDir;
+  return typeof outDir === "string" && outDir.trim().length > 0 ? outDir : undefined;
 }
 
 function listFiles(directory) {
@@ -253,11 +262,17 @@ function build() {
 // Checked BEFORE building, and inline rather than through the tested checker,
 // because the checker is imported FROM the output directory — if that is not
 // where tsc writes, the import fails first and the operator gets a module-not-
-// found stack instead of the real diagnosis. Deliberately a plain string
-// comparison, with the substantive realpath/symlink rules still applied by the
-// tested function once the checker exists.
+// found stack instead of the real diagnosis.
+//
+// Compared by RESOLUTION, not as strings: `dist`, `./dist`, `dist/../dist`, a
+// trailing separator, an absolute path and a symlink alias all name the same
+// directory, and refusing any of them is a false positive.
+//
+// SKIPPED ENTIRELY when the root file declares no `outDir` — an `extends`-only
+// config is legitimate, and the effective check below is the authority in
+// every case anyway.
 const declared = declaredOutDir();
-if (!sameDirectory(declared, OUTPUT_DIR)) {
+if (declared !== undefined && !sameDirectory(declared, OUTPUT_DIR)) {
   fail(
     `verification refused: tsconfig builds into ${JSON.stringify(declared)} but verification manages ` +
       `${JSON.stringify(OUTPUT_DIR)}; they must be the same directory or stale artifacts elsewhere would be executed`,
@@ -502,7 +517,10 @@ const outputVerdict = checker.assessOutputDirectory({
   configuredOutputDirectory: OUTPUT_DIR,
   outputDirectory: join(REPO_ROOT, OUTPUT_DIR),
   realOutputDirectory: realOrUndefined(join(REPO_ROOT, OUTPUT_DIR)),
-  resolvedTsconfigOutDir: resolvedPath(declaredOutDir()),
+  // The EFFECTIVE outDir, which is validated above and always present. The raw
+  // file may legitimately declare none (an `extends`-only config), so reading
+  // it here would reintroduce the false positive this round removed.
+  resolvedTsconfigOutDir: resolvedPath(effectiveConfig.compilerOptions.outDir),
 });
 if (!outputVerdict.trusted) {
   fail(`verification refused: ${outputVerdict.reason}`);
