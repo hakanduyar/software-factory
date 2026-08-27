@@ -70,7 +70,21 @@ export interface ProvenanceEntry {
  * reasons unrelated to tampering — which trains everyone to ignore it.
  */
 function canonical(entry: Omit<ProvenanceEntry, "digest">): string {
-  return [
+  /**
+   * LENGTH-PREFIXED, not separator-joined (round-1 review finding).
+   *
+   * The first version joined fields with a NUL. A separator only works if it
+   * cannot occur INSIDE a field, and nothing guaranteed that: the reviewer
+   * moved a NUL into `resourceKey`, took the same bytes back out of `detail`,
+   * and produced a DIFFERENT entry with an IDENTICAL digest. A hash whose
+   * input boundaries are attacker-controlled is not a hash of the entry.
+   *
+   * Prefixing each field with its byte length makes the boundaries explicit,
+   * so no field content can be mistaken for structure — the reason netstrings
+   * exist. Escaping would also work, but it has to be exactly right in both
+   * directions forever; this cannot be got subtly wrong.
+   */
+  const fields = [
     String(entry.sequence),
     entry.kind,
     entry.roadmapKey,
@@ -78,7 +92,8 @@ function canonical(entry: Omit<ProvenanceEntry, "digest">): string {
     entry.detail,
     String(entry.recordedAt),
     entry.previousDigest,
-  ].join("\u0000");
+  ];
+  return fields.map((field) => `${Buffer.byteLength(field, "utf8")}:${field}`).join("");
 }
 
 export function computeDigest(entry: Omit<ProvenanceEntry, "digest">): string {

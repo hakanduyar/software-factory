@@ -14,10 +14,17 @@
  *     and not the other is visible; and
  *   - file permissions, which stop other local users and nothing else.
  *
- * Every test here drives the real supervisor and the real SQLite adapter. The
- * lesson of rounds 6, 8 and 10 was that mutating a guard's INPUT proves nothing
- * about the guard, so the tampering below is done to persisted state exactly as
- * an attacker with file access would.
+ * WHICH TESTS USE WHICH REPOSITORY — stated because round-1 review caught this
+ * file claiming more than it delivered. The AC-1 append-only cases and the AC-7
+ * permission cases drive the REAL SQLite adapter, because that is where those
+ * behaviours live. The reviewer-independence cases use `newSupervisor`, whose
+ * default repository is IN-MEMORY: the decision under test there is in the
+ * service, and the persisted round-trip is covered by
+ * `supervisorStateRoundTrip.test.ts` and `supervisorPersistence.test.ts`.
+ *
+ * The lesson of rounds 6, 8 and 10 was that mutating a guard's INPUT proves
+ * nothing about the guard, so the tampering below is done to state exactly as
+ * something with write access would.
  *
  * Offline: no provider is contacted, no model is invoked, no money can be spent.
  */
@@ -27,7 +34,10 @@ import { statSync } from "node:fs";
 import { dirname } from "node:path";
 import { after, describe, it } from "node:test";
 
-import { createSqliteSupervisorRepository } from "../src/adapters/supervision/sqliteSupervisorRepository.js";
+import {
+  assertRestricted,
+  createSqliteSupervisorRepository,
+} from "../src/adapters/supervision/sqliteSupervisorRepository.js";
 import { runSuperviseStatus } from "../src/cli/supervise.js";
 import {
   appendProvenance,
@@ -37,6 +47,8 @@ import {
   verifyChain,
   type ProvenanceEntry,
 } from "../src/supervision/provenanceChain.js";
+import { appendImplementerProvenance } from "../src/supervision/supervisorService.js";
+import { parseSupervisorState } from "../src/supervision/supervisorSerialization.js";
 import type { RoadmapItem } from "../src/supervision/supervisorTypes.js";
 import { cleanupTempDbs, tempDbPath } from "./support/factoryFixtures.js";
 import { newSupervisor, scriptedProbe, TEST_CATALOG } from "./support/supervisorFixtures.js";
@@ -53,6 +65,28 @@ function healthyProbe() {
     });
   }
   return probe;
+}
+
+/**
+ * A minimal, otherwise-valid persisted state carrying exactly `entries`.
+ *
+ * Built as raw JSON rather than through the repository, because these cases are
+ * about what the PARSER accepts from a row it did not write — a restore, an
+ * older build, or anything with file access.
+ */
+function stateWith(entries: readonly unknown[]): unknown {
+  return {
+    version: 1,
+    financialPolicy: { autonomousSpendAllowed: false, autonomousSpendLimit: 0 },
+    resources: [],
+    roadmap: [
+      { key: "A", title: "Implemented", dependsOn: [], status: "DONE", workClass: "NORMAL_IMPLEMENTATION", order: 1 },
+    ],
+    checkpoints: [],
+    escalations: [],
+    provenance: entries,
+    updatedAt: 1_000,
+  };
 }
 
 /** A chain naming `resource` as the implementer of item `A`. */
@@ -494,5 +528,316 @@ describe("TASK-008 AC-9: entries are bounded and redacted before they are hashed
     assert.equal(appended.ok, true);
     if (!appended.ok) throw new Error("unreachable");
     assert.ok(appended.chain[0]!.detail.length < 20_000, "an unbounded string must not reach durable state");
+  });
+});
+
+// =====================================================================
+// ROUND-1 REMEDIATION — every finding, driven the way the reviewer drove it
+// =====================================================================
+
+describe("TASK-008 round 1: the six blocking findings", () => {
+  /**
+   * AC-2 — the reviewer moved a NUL into `resourceKey` and took the same bytes
+   * out of `detail`, producing a DIFFERENT entry with an IDENTICAL digest. A
+   * separator only works if it cannot occur inside a field.
+   */
+  it("gives different digests to entries that differ only in field boundaries", () => {
+    const base = {
+      sequence: 0,
+      kind: "IMPLEMENTED_BY" as const,
+      roadmapKey: "A",
+      recordedAt: 1,
+      previousDigest: GENESIS_DIGEST,
+    };
+    const shifted = computeDigest({ ...base, resourceKey: "claude-code:opus\u0000done", detail: "tail" });
+    const original = computeDigest({ ...base, resourceKey: "claude-code:opus", detail: "done\u0000tail" });
+    assert.notEqual(shifted, original, "field boundaries must not be forgeable by moving a separator");
+  });
+
+  it("gives different digests when a field merely gains the length-prefix shape", () => {
+    const base = {
+      sequence: 0,
+      kind: "IMPLEMENTED_BY" as const,
+      roadmapKey: "A",
+      recordedAt: 1,
+      previousDigest: GENESIS_DIGEST,
+    };
+    assert.notEqual(
+      computeDigest({ ...base, detail: "4:abcd" }),
+      computeDigest({ ...base, detail: "abcd" }),
+      "content that looks like the encoding must not collide with the encoding",
+    );
+  });
+
+  /**
+   * AC-6 — the three bypasses. Each leaves a POPULATED, verifying chain that
+   * says nothing about the item under review, which the first version treated
+   * as silence.
+   */
+  it("REFUSES when the chain is populated but has no entry for this item", async () => {
+    const { result, supervisor } = await reviewWith({
+      item: { implementedByResourceKeys: ["claude-code:opus"] },
+      // a valid chain, entirely about a DIFFERENT roadmap key
+      provenance: (() => {
+        const appended = appendProvenance([], {
+          kind: "IMPLEMENTED_BY",
+          roadmapKey: "B",
+          resourceKey: "claude-code:opus",
+          detail: "elsewhere",
+          recordedAt: 1_000,
+        });
+        assert.equal(appended.ok, true);
+        if (!appended.ok) throw new Error("unreachable");
+        return appended.chain;
+      })(),
+    });
+    assert.equal(result.kind, "WAITING_FOR_HUMAN", "a populated chain missing this item is a disagreement");
+    for (const call of supervisor.executor.calls()) {
+      assert.notEqual(call.item.key, "B");
+    }
+  });
+
+  it("REFUSES when the chain holds only non-implementation events", async () => {
+    const appended = appendProvenance([], {
+      kind: "RUN_CONFIGURED",
+      roadmapKey: "A",
+      resourceKey: "claude-code:opus",
+      detail: "configured",
+      recordedAt: 1_000,
+    });
+    assert.equal(appended.ok, true);
+    if (!appended.ok) throw new Error("unreachable");
+
+    const { result } = await reviewWith({
+      item: { implementedByResourceKeys: ["claude-code:opus"] },
+      provenance: appended.chain,
+    });
+    assert.equal(result.kind, "WAITING_FOR_HUMAN", "RUN_CONFIGURED is not an implementation record");
+  });
+
+  /**
+   * Tail deletion. `verifyChain` alone cannot see it — a truncated chain is a
+   * valid chain — so it is caught by the row/chain cross-check instead: the row
+   * still names an implementer the chain no longer mentions.
+   */
+  it("REFUSES a TAIL-TRUNCATED chain, which verifies on its own terms", async () => {
+    let chain = chainFor("codex-cli:gpt-5.6-luna", 1_000);
+    const second = appendProvenance(chain, {
+      kind: "IMPLEMENTED_BY",
+      roadmapKey: "A",
+      resourceKey: "claude-code:opus",
+      detail: "remediated",
+      recordedAt: 2_000,
+    });
+    assert.equal(second.ok, true);
+    if (!second.ok) throw new Error("unreachable");
+    chain = second.chain;
+
+    // Truncating the tail leaves a chain that verifies perfectly.
+    const truncated = chain.slice(0, 1);
+    assert.equal(verifyChain(truncated).intact, true, "the fixture must verify, or it proves nothing");
+
+    const { result } = await reviewWith({
+      item: { implementedByResourceKeys: ["codex-cli:gpt-5.6-luna", "claude-code:opus"] },
+      provenance: truncated,
+    });
+    assert.equal(result.kind, "WAITING_FOR_HUMAN", "tail deletion must not be cheaper than editing");
+  });
+
+  /** ...and the empty-chain allowance still holds, so old databases still work. */
+  it("still ACCEPTS an entirely empty chain as genuine silence", async () => {
+    const { result } = await reviewWith({
+      item: { implementedByResourceKeys: ["claude-code:opus"] },
+      provenance: [],
+    });
+    assert.equal(result.kind, "ADVANCED");
+  });
+});
+
+describe("TASK-008 round 1: durable state enforces append-only (AC-1)", () => {
+  async function repoWithOneEntry() {
+    const dbPath = tempDbPath("t8-append");
+    const repository = createSqliteSupervisorRepository(dbPath);
+    const seeded = await repository.create({
+      version: 1,
+      financialPolicy: { autonomousSpendAllowed: false, autonomousSpendLimit: 0 },
+      resources: [],
+      roadmap: [
+        { key: "A", title: "Implemented", dependsOn: [], status: "DONE", workClass: "NORMAL_IMPLEMENTATION", order: 1 },
+      ],
+      checkpoints: [],
+      escalations: [],
+      provenance: chainFor("claude-code:opus"),
+      updatedAt: 1_000,
+    });
+    return { repository, seeded };
+  }
+
+  it("REFUSES a write that deletes provenance", async () => {
+    const { repository, seeded } = await repoWithOneEntry();
+    try {
+      await assert.rejects(
+        repository.compareAndSave({ ...seeded, version: 2, provenance: [] }, 1),
+        /provenance shrank/,
+      );
+    } finally {
+      repository.close();
+    }
+  });
+
+  it("REFUSES a write that rewrites an existing entry", async () => {
+    const { repository, seeded } = await repoWithOneEntry();
+    try {
+      const rewritten = seeded.provenance.map((entry) => ({ ...entry, detail: "edited", digest: "prov-forged" }));
+      await assert.rejects(
+        repository.compareAndSave({ ...seeded, version: 2, provenance: rewritten }, 1),
+        /was rewritten/,
+      );
+    } finally {
+      repository.close();
+    }
+  });
+
+  it("PERMITS a write that appends", async () => {
+    const { repository, seeded } = await repoWithOneEntry();
+    try {
+      const appended = appendProvenance(seeded.provenance, {
+        kind: "IMPLEMENTED_BY",
+        roadmapKey: "A",
+        resourceKey: "codex-cli:gpt-5.6-luna",
+        detail: "later",
+        recordedAt: 2_000,
+      });
+      assert.equal(appended.ok, true);
+      if (!appended.ok) throw new Error("unreachable");
+      const saved = await repository.compareAndSave({ ...seeded, version: 2, provenance: appended.chain }, 1);
+      assert.equal(saved.provenance.length, 2, "appending must still be allowed");
+    } finally {
+      repository.close();
+    }
+  });
+});
+
+describe("TASK-008 round 1: overflow and persistence limits fail closed", () => {
+  /** AC-10 — the service-level append silently kept the old chain. */
+  it("THROWS rather than completing an item with only half its records written", () => {
+    const full = Array.from({ length: MAX_CHAIN_ENTRIES }, (_unused, index) => ({
+      sequence: index,
+      kind: "IMPLEMENTED_BY" as const,
+      roadmapKey: "A",
+      detail: "filler",
+      recordedAt: index,
+      previousDigest: GENESIS_DIGEST,
+      digest: "prov-filler",
+    }));
+    assert.throws(
+      () => appendImplementerProvenance(full, "A", "claude-code:opus", 1, "completed"),
+      /Refusing to complete the item with only half its records written/,
+    );
+  });
+
+  /** AC-9 — the parser accepted an unbounded and a secret-bearing detail. */
+  it("REFUSES a persisted entry whose detail is unbounded", () => {
+    const entry = { ...chainFor("claude-code:opus")[0]!, detail: "A".repeat(20_000) };
+    assert.throws(
+      () => parseSupervisorState(JSON.stringify(stateWith([entry])), { version: 1 }),
+      /over the 4096 limit/,
+    );
+  });
+
+  it("REFUSES a persisted entry carrying credential-shaped text", () => {
+    const entry = {
+      ...chainFor("claude-code:opus")[0]!,
+      detail: "token sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA leaked",
+    };
+    assert.throws(
+      () => parseSupervisorState(JSON.stringify(stateWith([entry])), { version: 1 }),
+      /credential-shaped text/,
+    );
+  });
+});
+
+describe("TASK-008 round 1: the maximum is enforced against a REAL chain", () => {
+  /**
+   * The round-1 reviewer showed my over-length fixture was built from fake
+   * digests, so it was already invalid and `verifyChain` refused it for the
+   * wrong reason — removing the maximum changed nothing and the guard looked
+   * load-bearing when it was not. This builds a genuinely valid over-length
+   * chain, which is slower and is the only thing that proves the clause.
+   */
+  it("REFUSES a VALID chain that is one entry too long", () => {
+    let chain: readonly ProvenanceEntry[] = [];
+    for (let index = 0; index < MAX_CHAIN_ENTRIES; index += 1) {
+      const appended = appendProvenance(chain, {
+        kind: "IMPLEMENTED_BY",
+        roadmapKey: "A",
+        resourceKey: "claude-code:opus",
+        detail: "filler",
+        recordedAt: index,
+      });
+      if (!appended.ok) throw new Error(`fixture failed at ${index}: ${appended.reason}`);
+      chain = appended.chain;
+    }
+    assert.equal(verifyChain(chain).intact, true, "the fixture must be VALID at the maximum");
+
+    // One more, built by hand so the append refusal is not what is under test.
+    const last = chain[chain.length - 1]!;
+    const extra: Omit<ProvenanceEntry, "digest"> = {
+      sequence: chain.length,
+      kind: "IMPLEMENTED_BY",
+      roadmapKey: "A",
+      resourceKey: "claude-code:opus",
+      detail: "one too many",
+      recordedAt: chain.length,
+      previousDigest: last.digest,
+    };
+    const overlong = [...chain, { ...extra, digest: computeDigest(extra) }];
+
+    const verdict = verifyChain(overlong);
+    assert.equal(verdict.intact, false, "a valid but over-length chain must still be refused");
+    if (!verdict.intact) assert.match(verdict.problem, /exceeds the maximum/);
+  });
+});
+
+describe("TASK-008 round 1: a permission failure is REPORTED, not swallowed (AC-7)", () => {
+  /**
+   * The first version swallowed every `chmod` failure and carried on, so a
+   * database that could NOT be tightened was indistinguishable from one that
+   * had been. A control whose failure is silent is not a control.
+   *
+   * Driven against the verification directly, because the only way to make
+   * `chmod` genuinely fail on this machine is to own the file as someone else
+   * — which a test cannot arrange without root. What CAN be arranged, and is
+   * what actually matters, is a file that is group/world accessible when the
+   * check runs.
+   */
+  it("REFUSES a database file that is still group/world accessible", async () => {
+    const { chmodSync, writeFileSync, mkdtempSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+
+    const dir = mkdtempSync(join(tmpdir(), "t8-perm-"));
+    const file = join(dir, "loose.db");
+    writeFileSync(file, "");
+    chmodSync(file, 0o666);
+
+    assert.throws(
+      () => assertRestricted(file, 0o600),
+      /group\/world accessible/,
+      "a world-readable database must be refused, not used",
+    );
+  });
+
+  it("ACCEPTS a file that is owner-only", async () => {
+    const { chmodSync, writeFileSync, mkdtempSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+
+    const dir = mkdtempSync(join(tmpdir(), "t8-perm-ok-"));
+    const file = join(dir, "tight.db");
+    writeFileSync(file, "");
+    chmodSync(file, 0o600);
+
+    assert.doesNotThrow(() => assertRestricted(file, 0o600), "a correctly restricted file must be accepted");
   });
 });

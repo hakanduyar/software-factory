@@ -1362,10 +1362,33 @@ export class SupervisorService {
       }
       const fromChain = chainImplementers.get(key) ?? [];
       const fromRow = implementerHistory(entry);
-      // An EMPTY chain entry is silence, not contradiction: a database
-      // predating TASK-008 has no entries for work already done, and refusing
-      // every review on that basis would strand the roadmap this protects.
-      if (fromChain.length === 0) {
+
+      /**
+       * SILENCE IS ONLY SILENCE WHEN THE WHOLE CHAIN IS EMPTY (round-1 finding).
+       *
+       * The first version skipped whenever THIS ITEM had no chain entry, and
+       * the reviewer turned that into a one-step bypass three ways: a chain
+       * holding a valid entry for a DIFFERENT roadmap key, a chain holding only
+       * `RUN_CONFIGURED` events, and — the one that matters — a chain with this
+       * item's entries simply deleted. All three left a populated, verifying
+       * chain that said nothing about the item, and all three advanced.
+       *
+       * A chain that EXISTS and does not mention an item whose row names
+       * implementers is not silence. It is the two records disagreeing, which
+       * is precisely what this cross-check exists to catch. Deleting entries
+       * must not be cheaper than editing them; tail truncation is a deletion.
+       *
+       * Genuine silence — an entirely empty chain — is still permitted, because
+       * a database written before TASK-008 has no entries for work already done
+       * and refusing every review would strand the roadmap this protects. That
+       * residue is recorded in docs/KNOWN-LIMITATIONS.md rather than hidden.
+       */
+      if (state.provenance.length === 0) {
+        continue;
+      }
+      if (fromChain.length === 0 && fromRow.length === 0) {
+        // Neither record claims an implementer, so there is nothing to
+        // disagree about and nothing to exclude.
         continue;
       }
       const disagrees =
@@ -1835,11 +1858,25 @@ export function setImplementer(
  * two records agree unless something later edits one of them — which is
  * precisely the event the chain exists to make visible.
  *
- * Overflow FAILS CLOSED by returning the chain unchanged: the append is
- * refused, the disagreement that creates will be caught by the cross-check, and
- * the review waits for a human. The alternative — dropping the oldest entry to
- * make room — would discard the provenance an attacker most wants gone.
+ * OVERFLOW THROWS (round-1 review finding). The first version returned the old
+ * chain unchanged and called that fail-closed, which it was not: the caller
+ * committed the completion anyway, so the mutable row gained an implementer,
+ * the chain did not, and the two records silently diverged. "The cross-check
+ * will notice later" is not a response — it makes the NEXT review wait for a
+ * human because of a bookkeeping failure here, and loses the record of what
+ * actually ran.
+ *
+ * Dropping the oldest entry to make room is not an option either: that discards
+ * exactly the provenance an attacker most wants gone. So the write refuses, the
+ * tick fails, and an operator sees why.
  */
+export class ProvenanceOverflowError extends Error {
+  constructor(reason: string) {
+    super(reason);
+    this.name = "ProvenanceOverflowError";
+  }
+}
+
 export function appendImplementerProvenance(
   chain: readonly ProvenanceEntry[],
   roadmapKey: string,
@@ -1857,7 +1894,13 @@ export function appendImplementerProvenance(
     detail,
     recordedAt,
   });
-  return result.ok ? result.chain : chain;
+  if (!result.ok) {
+    throw new ProvenanceOverflowError(
+      `cannot record provenance for ${roadmapKey}: ${result.reason}. ` +
+        "Refusing to complete the item with only half its records written.",
+    );
+  }
+  return result.chain;
 }
 
 /** Records how many action attempts an item has consumed (F-6). */

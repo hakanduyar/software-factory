@@ -16,7 +16,7 @@
  * green test suite.
  */
 
-import { chmodSync, existsSync, mkdirSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, statSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
@@ -68,6 +68,29 @@ const SIDECAR_SUFFIXES = ["", "-wal", "-shm", "-journal"] as const;
  * POSIX modes are meaningless on Windows, where `chmod` silently does almost
  * nothing; this is a Linux control and is not claimed as portable.
  */
+/**
+ * VERIFIES, rather than assuming the chmod worked (round-1 review finding).
+ *
+ * The first version swallowed every `chmod` failure and carried on, so a
+ * database that could NOT be tightened was indistinguishable from one that had
+ * been. A control whose failure is silent is not a control — it is a comment.
+ *
+ * The check is on the RESULTING MODE, not on whether the call threw: `chmod`
+ * can succeed on a filesystem that ignores POSIX modes entirely, and the
+ * question that matters is whether the file is still group- or world-accessible
+ * afterwards.
+ */
+export function assertRestricted(target: string, expected: number): void {
+  const mode = statSync(target).mode & 0o777;
+  if ((mode & 0o077) !== 0) {
+    throw new SchemaIntegrityError(
+      `refusing to use supervisor state at ${target}: it is group/world accessible (mode ${mode.toString(8)}) ` +
+        `and could not be restricted to ${expected.toString(8)}. Durable state that other local accounts can ` +
+        "read or write is not durable state this process can vouch for.",
+    );
+  }
+}
+
 function restrictPermissions(path: string): void {
   const directory = dirname(path);
   // `recursive` makes this idempotent, and `mode` applies only when it creates.
@@ -75,10 +98,11 @@ function restrictPermissions(path: string): void {
   try {
     chmodSync(directory, DIRECTORY_MODE);
   } catch {
-    // A directory owned by someone else cannot be tightened from here. Refusing
-    // to run would make the Factory unusable on a shared checkout; the
-    // permission state is reported rather than silently assumed.
+    // Swallowed only so the VERIFICATION below reports the real state; a throw
+    // here would hide whether the directory was already restrictive.
   }
+  assertRestricted(directory, DIRECTORY_MODE);
+
   for (const suffix of SIDECAR_SUFFIXES) {
     const candidate = `${path}${suffix}`;
     if (!existsSync(candidate)) {
@@ -88,6 +112,39 @@ function restrictPermissions(path: string): void {
       chmodSync(candidate, FILE_MODE);
     } catch {
       /* same reasoning as the directory */
+    }
+    assertRestricted(candidate, FILE_MODE);
+  }
+}
+
+/**
+ * Refuses a write whose provenance is not the stored chain plus zero or more
+ * new entries (AC-1).
+ *
+ * Compared by DIGEST rather than by deep equality: the digest already covers
+ * every field of the entry and its link to the one before, so a mismatch means
+ * the content changed however subtly. The sequence is checked too, because two
+ * entries could in principle share a digest only if the hash broke — and if
+ * that ever happens, failing closed on the position is the right answer.
+ */
+function assertProvenanceExtends(
+  previous: readonly { readonly sequence: number; readonly digest: string }[],
+  next: readonly { readonly sequence: number; readonly digest: string }[],
+): void {
+  if (next.length < previous.length) {
+    throw new SchemaIntegrityError(
+      `refusing to write supervisor state: provenance shrank from ${previous.length} to ${next.length} entries. ` +
+        "Recorded history is append-only; deleting it is exactly what the chain exists to make impossible.",
+    );
+  }
+  for (let index = 0; index < previous.length; index += 1) {
+    const before = previous[index]!;
+    const after = next[index]!;
+    if (before.digest !== after.digest || before.sequence !== after.sequence) {
+      throw new SchemaIntegrityError(
+        `refusing to write supervisor state: provenance entry ${index} was rewritten ` +
+          `(${before.digest} -> ${after.digest}). Existing entries are immutable once written.`,
+      );
     }
   }
 }
@@ -137,6 +194,28 @@ export function createSqliteSupervisorRepository(path: string): SqliteSupervisor
     async compareAndSave(next: SupervisorState, expectedVersion: number): Promise<SupervisorState> {
       const encoded = encodeSupervisorState(next);
       parseSupervisorState(encoded, { version: next.version });
+
+      /**
+       * APPEND-ONLY IS ENFORCED HERE, not merely intended (AC-1, round-1
+       * finding).
+       *
+       * `appendProvenance` preserved its input, but nothing stopped a caller
+       * saving a state whose provenance was shorter, edited, or empty — the
+       * reviewer wrote `compareAndSave({...state, provenance: []}, 1)` and it
+       * succeeded. A history that any write can truncate is not append-only,
+       * and the C4 cross-check that reads it is only as good as this.
+       *
+       * The stored chain must be a PREFIX of the incoming one: same entries, in
+       * the same order, with zero or more appended. That single rule refuses
+       * truncation, tail deletion, reordering and in-place edits together,
+       * which is why it is expressed as one comparison rather than four checks
+       * that could each be got wrong separately.
+       */
+      const stored = find.get(SINGLETON_ID) as Row | undefined;
+      if (stored !== undefined) {
+        const previous = parseSupervisorState(stored.data, { version: stored.version }).provenance;
+        assertProvenanceExtends(previous, next.provenance);
+      }
 
       const result = update.run(next.version, encoded, SINGLETON_ID, expectedVersion);
       if (result.changes === 0) {
