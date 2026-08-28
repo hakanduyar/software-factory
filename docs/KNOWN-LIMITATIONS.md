@@ -257,10 +257,24 @@ did not.
 a false positive; referred back to the reviewer for a judgement on the
 trade-off rather than settled unilaterally by the implementer.
 
-`scripts/verify.mjs` refuses any `.ts`/`.mts`/`.cts` under `tests/` whose link
-count exceeds one. A hardlink is indistinguishable from an ordinary file by
-name, type or `realpath`; link count is the only ordinary signal, and it cannot
-tell a hardlink pointing outside the repository from one pointing inside it.
+`scripts/verify.mjs` refuses any file whose link count exceeds one under the
+source roots it derives from `tsconfig.json`. A hardlink is indistinguishable
+from an ordinary file by name, type or `realpath`; link count is the only
+ordinary signal, and it cannot tell a hardlink pointing outside the repository
+from one pointing inside it.
+
+**The scope is wider than this entry used to say,** and round-14 review caught
+the understatement. The text described only `.ts`/`.mts`/`.cts` files under
+`tests/`. What `findHardlinkedUnder` actually walks is EVERY regular file
+beneath every derived root — `node_modules`, `.git` and the output directory
+excepted — and `linkedCompilerInputs` additionally covers each file tsc reports
+as an input together with its lexical ancestor directories. So a hardlinked
+fixture, JSON file or `.js` helper is refused too, not only a hardlinked
+TypeScript source.
+
+That is deliberately conservative, and stating it narrowly made the guard look
+cheaper than it is: the cost below lands on more trees than the old wording
+implied. Anyone weighing the trade-off should weigh the real scope.
 
 **The cost is real and it lands on valid trees.** A clean checkout copied with
 `cp -al` is refused — the reviewer demonstrated it. So, potentially, are

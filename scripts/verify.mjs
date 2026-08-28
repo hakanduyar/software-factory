@@ -205,6 +205,59 @@ function assertEverythingWasReadable(stage) {
   );
 }
 
+/**
+ * Entries that are neither directories, regular files nor symlinks — FIFOs,
+ * sockets, device nodes.
+ *
+ * THE SAME DEFECT AS `unreadable`, ONE CLASS OVER (round-14 review). The walk
+ * kept directories and `entry.isFile()` and silently dropped everything else, so
+ * a FIFO planted under `dist/` was not an orphan, not an expected artifact and
+ * not reported: the run exited 0. The reviewer demonstrated it and correctly
+ * scored it non-blocking, because a FIFO cannot execute through a
+ * source-derived runner — but "cannot execute" is not "is accounted for", and an
+ * audit that answers questions about the tree must not quietly answer them about
+ * the regular-file projection of the tree instead.
+ *
+ * `tsc` emits regular files only. Anything else under the output directory was
+ * put there by something that is not this build, which is the whole subject of
+ * TASK-010.
+ *
+ * Symlinks are deliberately NOT collected here: they are neither dropped nor
+ * ignored, they have dedicated detection with a better message
+ * (`findSymlinks`, `assertTreeIsSafe`), and noting them twice would report one
+ * problem as two.
+ */
+const irregular = [];
+function noteIrregular(path, kind) {
+  const rel = relative(REPO_ROOT, path).replace(/\\/g, "/");
+  const shown = `${rel.length === 0 ? "." : rel} (${kind})`;
+  if (!irregular.includes(shown)) {
+    irregular.push(shown);
+  }
+}
+
+/** Describes what an entry is, for a refusal a reader can act on. */
+function entryKind(entry) {
+  if (entry.isFIFO()) return "FIFO";
+  if (entry.isSocket()) return "socket";
+  if (entry.isBlockDevice()) return "block device";
+  if (entry.isCharacterDevice()) return "character device";
+  return "not a regular file";
+}
+
+/** Refuses if any scanned entry was neither a directory, a file nor a symlink. */
+function assertEverythingWasRegular(stage) {
+  if (irregular.length === 0) {
+    return;
+  }
+  fail(
+    `verification refused ${stage}: these entries are neither directories, regular files nor symlinks: ` +
+      `${irregular.sort().join(", ")}. The compiler emits regular files, so something other than this build ` +
+      "created them, and skipping them would audit the regular-file projection of the tree while reporting " +
+      "on the tree.",
+  );
+}
+
 function isSymlink(path) {
   try {
     return lstatSync(path).isSymbolicLink();
@@ -407,6 +460,10 @@ function listFiles(directory, skipExcluded = false) {
         walk(full);
       } else if (entry.isFile()) {
         found.push(relative(REPO_ROOT, full).replace(/\\/g, "/"));
+      } else if (!entry.isSymbolicLink()) {
+        // Neither a directory, a regular file nor a symlink. Not silently
+        // dropped — see `noteIrregular`.
+        noteIrregular(full, entryKind(entry));
       }
     }
   };
@@ -962,6 +1019,7 @@ if (outputLinksBeforeBuild.length > 0) {
 }
 
 assertEverythingWasReadable("before building");
+assertEverythingWasRegular("before building");
 
 // --- 3. build, and prove it actually emitted the checker ---------------------
 const buildStartedAt = Date.now();
@@ -1064,6 +1122,7 @@ function assertTreeIsSafe(stage, checkerIsFresh) {
   }
 
   assertEverythingWasReadable(stage);
+  assertEverythingWasRegular(stage);
 }
 assertTreeIsSafe("after building", checkerFreshlyEmitted);
 
@@ -1080,6 +1139,20 @@ const sourceTests = allSources.filter((path) => checker.isSourceTest(path));
 const generatedFiles = listFiles(OUTPUT_DIR);
 const compiledTests = generatedFiles.filter((path) => checker.isTestArtifact(path));
 assertEverythingWasReadable("before auditing");
+// NO `assertEverythingWasRegular` HERE, and the omission is deliberate.
+//
+// It was here, and measurement said it never fires. `irregular` accumulates and
+// is never cleared, so the pre-build call catches everything present before the
+// build, and the call inside `assertTreeIsSafe` catches everything the build
+// creates — including on the repair path, which re-enters it after the rebuild.
+// Nothing can appear in the window between that call and this line.
+//
+// Removing each of the three call sites in turn left the whole suite green,
+// because all three masked each other: the tests proved the PROPERTY and no call
+// site at all. The other two now have a case that names the stage they refuse
+// at, so each fails alone. This one had nothing that could fail for it, which is
+// the definition of a guard nobody can check — so it is deleted rather than kept
+// and described as defence in depth.
 let audit = checker.auditTestArtifacts({
   sourceTests,
   compiledTests,

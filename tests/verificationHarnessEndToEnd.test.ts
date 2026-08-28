@@ -402,13 +402,22 @@ describe("TASK-010 remediation: the harness itself, end to end", () => {
   });
 
   /**
-   * AC-1 proven at the harness level (review finding F).
+   * AC-1 at the harness level (review finding F) — and an honest statement of
+   * how far that goes.
    *
-   * Every earlier end-to-end case would still pass if `audit.expected` were
-   * swapped for `compiledTests`, because contaminated trees fail before
-   * execution and clean trees make the two lists identical. This one makes the
-   * lists DIFFER on a tree that is otherwise clean: a compiled artifact whose
-   * source exists is executed, and the reported count is the SOURCE count.
+   * This comment used to claim the case makes `audit.expected` and
+   * `compiledTests` DIFFER on an otherwise-clean tree. That is impossible, and
+   * round-14 review said so: execution is reached only after a CLEAN audit, and
+   * clean means those two lists are equal. No end-to-end case can distinguish
+   * them, because on every tree that runs they are the same argv.
+   *
+   * What this case does prove is that the count reported is the count DERIVED
+   * FROM SOURCE, and that adding a source file changes it — so discovery is not
+   * a glob over whatever happens to sit in the output directory. The part AC-1
+   * rests on is the AUDIT itself, whose removal fails several named regressions
+   * in this file and in tests/verificationArtifacts.test.ts.
+   *
+   * Recorded as a coverage limit in docs/KNOWN-LIMITATIONS.md L-8.
    */
   it("executes the source-derived set, and reports that count", () => {
     const root = makeFixtureRepo();
@@ -701,18 +710,21 @@ describe("TASK-010 round 2: paths are judged by what they resolve to", () => {
    * taken effect before the harness's refusal is believed; a test that silently
    * failed to mount would otherwise "pass" while proving nothing.
    *
-   * Skipped, loudly, where unprivileged user namespaces are unavailable. The
-   * pure decision tests still cover the logic there; only this wiring proof is
-   * environment-dependent, and that limitation is stated rather than hidden.
+   * Skipped, and COUNTED as skipped, where unprivileged user namespaces are
+   * unavailable. The pure decision tests still cover the logic there; only this
+   * wiring proof is environment-dependent, and that limitation is stated rather
+   * than hidden.
    */
-  it("REFUSES a real same-device bind-mounted output directory", () => {
+  it("REFUSES a real same-device bind-mounted output directory", (t) => {
     const namespaces = spawnSync("unshare", ["--user", "--map-root-user", "--mount", "true"], {
       encoding: "utf8",
     });
     if (namespaces.status !== 0) {
-      // Not an assertion-free pass: the reason is printed so a green run in a
-      // restricted environment cannot be mistaken for a proven guard.
-      console.error("SKIPPED: unprivileged user namespaces unavailable; bind-mount wiring not proven here");
+      // `t.skip`, not `console.error` plus a bare return (round-14 note 5). The
+      // earlier form printed a reason and then reported `pass 1, skipped 0`, so
+      // the summary a reader actually looks at claimed coverage this
+      // environment never obtained. A lost proof has to show in the counts.
+      t.skip("unprivileged user namespaces unavailable; bind-mount wiring not proven here");
       return;
     }
 
@@ -1425,14 +1437,13 @@ describe("TASK-010 round 5: a mount is not a directory just because it looks lik
    * from a check that covered one managed path and not its siblings.
    */
   for (const root of ["src", "tests"] as const) {
-    it(`REFUSES a real bind-mounted ${root} root before building`, () => {
+    it(`REFUSES a real bind-mounted ${root} root before building`, (t) => {
       const namespaces = spawnSync("unshare", ["--user", "--map-root-user", "--mount", "true"], {
         encoding: "utf8",
       });
       if (namespaces.status !== 0) {
-        // Printed, not silently skipped: a green run in a restricted
-        // environment must not be mistaken for a proven guard.
-        console.error(`SKIPPED: unprivileged user namespaces unavailable; ${root} bind-mount not proven here`);
+        // Counted as skipped rather than printed and passed — round-14 note 5.
+        t.skip(`unprivileged user namespaces unavailable; ${root} bind-mount not proven here`);
         return;
       }
 
@@ -1617,12 +1628,13 @@ describe("TASK-010 round 6: an ancestor mount is an ordinary workspace", () => {
    * together and stays consistent. Only a mount AT or INSIDE a managed path
    * splices foreign content in.
    */
-  it("ACCEPTS a repository that is itself a bind mount", () => {
+  it("ACCEPTS a repository that is itself a bind mount", (t) => {
     const namespaces = spawnSync("unshare", ["--user", "--map-root-user", "--mount", "true"], {
       encoding: "utf8",
     });
     if (namespaces.status !== 0) {
-      console.error("SKIPPED: unprivileged user namespaces unavailable; repository bind mount not proven here");
+      // Counted as skipped rather than printed and passed — round-14 note 5.
+      t.skip("unprivileged user namespaces unavailable; repository bind mount not proven here");
       return;
     }
 
@@ -2409,5 +2421,260 @@ describe("TASK-010 round 13: an artifact kind the configuration no longer emits"
     assert.match(output, /testArtifacts\.d\.ts/, "the stale declaration was never mentioned");
     assert.ok(!existsSync(stale), "AC-4: a kind this configuration does not emit survived the run");
     assert.equal(status, 0, `the repair cycle should converge:\n${output}`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ROUND-14 non-blocking note 6 — an entry that is neither file nor directory
+// ---------------------------------------------------------------------------
+
+/**
+ * The walk kept directories and `entry.isFile()` and dropped everything else.
+ * The reviewer planted a FIFO under `dist/` and the run exited 0: not an orphan,
+ * not an expected artifact, not mentioned.
+ *
+ * Correctly scored NON-BLOCKING — a FIFO cannot execute through a
+ * source-derived runner, so nothing was made to run by it. It is fixed anyway
+ * because "cannot execute" is not "is accounted for", and the audit reported on
+ * the tree having examined only the regular files in it. That is the
+ * unreadable-directory defect one class over, and that one was CRITICAL.
+ */
+describe("TASK-010 round 14: an entry that is neither a file nor a directory", () => {
+  /** True when a FIFO was created; false where the platform has no `mkfifo`. */
+  function makeFifo(path: string): boolean {
+    if (process.platform === "win32") {
+      return false;
+    }
+    return spawnSync("mkfifo", [path], { encoding: "utf8" }).status === 0;
+  }
+
+  it("REFUSES a FIFO planted under the output directory", (t) => {
+    const root = makeFixtureRepo();
+    assert.equal(runHarness(root).status, 0, "the fixture must pass before anything is planted");
+
+    const fifo = join(root, "dist/tests/pipe.test.js");
+    if (!makeFifo(fifo)) {
+      // COUNTED as skipped, not reported as passed. An environment that cannot
+      // create a FIFO must not present this coverage as obtained — which is
+      // round-14 note 5, applied here rather than only complained about.
+      t.skip("mkfifo unavailable on this platform; FIFO handling not proven here");
+      return;
+    }
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, `a FIFO under the output directory was ignored:\n${output}`);
+    assert.match(output, /pipe\.test\.js/, "the refusal must name the entry it refuses");
+    assert.match(output, /FIFO/, "and say what it is, so a reader can act on it");
+    // The STAGE, so this pins the PRE-BUILD call site rather than the property
+    // that some stage eventually notices. Without it the three call sites mask
+    // each other and any one of them satisfies this case -- measured, not
+    // assumed: removing each one alone left this green.
+    assert.match(output, /refused before building/, `expected the pre-build stage to catch it:\n${output}`);
+  });
+
+  /**
+   * The AFTER-BUILD call site, pinned the same way the readability one was.
+   *
+   * A FIFO planted before the run is caught pre-build, so it cannot distinguish
+   * the post-build call. This one is created BY the build — the case that call
+   * site exists for: output the pre-build inspection never saw, because it did
+   * not exist yet.
+   */
+  it("REFUSES a FIFO the BUILD creates, at the after-building stage", (t) => {
+    const root = makeFixtureRepo();
+    assert.equal(runHarness(root).status, 0, "the fixture must pass before the shim is used");
+    if (process.platform === "win32") {
+      t.skip("no mkfifo on this platform; build-created FIFO not proven here");
+      return;
+    }
+
+    const realNpx = spawnSync("sh", ["-c", "command -v npx"], { encoding: "utf8" }).stdout.trim();
+    assert.ok(realNpx.length > 0, "the fixture needs a real npx to delegate to");
+
+    const shimDir = mkdtempSync(join(tmpdir(), "sf-fifoshim-"));
+    created.push(shimDir);
+    writeFileSync(
+      join(shimDir, "npx"),
+      [
+        "#!/bin/sh",
+        "# Config and file-list queries pass straight through: making the FIFO",
+        "# during them would put it in the tree BEFORE the pre-build walk, which",
+        "# is the case the other test already covers.",
+        'for a in "$@"; do',
+        '  case "$a" in',
+        `    --showConfig|--listFilesOnly) exec ${realNpx} "$@" ;;`,
+        "  esac",
+        "done",
+        `${realNpx} "$@"`,
+        "rc=$?",
+        'if [ "$rc" -eq 0 ]; then',
+        "  mkdir -p dist/tests",
+        "  mkfifo dist/tests/emitted.test.js 2>/dev/null || true",
+        "fi",
+        'exit "$rc"',
+        "",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+
+    const result = spawnSync(process.execPath, ["scripts/verify.mjs"], {
+      cwd: root,
+      encoding: "utf8",
+      env: harnessEnv({ PATH: `${shimDir}:${process.env["PATH"] ?? ""}` }),
+    });
+    const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+
+    if (!existsSync(join(root, "dist/tests/emitted.test.js"))) {
+      t.skip("mkfifo unavailable inside the shim; build-created FIFO not proven here");
+      return;
+    }
+
+    assert.notEqual(result.status, 0, `a FIFO created by the build was accepted:\n${output}`);
+    assert.match(output, /emitted\.test\.js/, "the refusal must name it");
+    assert.match(
+      output,
+      /refused after building/,
+      `the post-build call site must be what caught it:\n${output}`,
+    );
+  });
+
+  /**
+   * The negative control must SUCCEED, not merely fail to refuse. Without it the
+   * case above is satisfied by a harness that refuses every tree.
+   */
+  it("still accepts a tree whose output holds only regular files", () => {
+    const root = makeFixtureRepo();
+    const { status, output } = runHarness(root);
+    assert.equal(status, 0, `an ordinary tree was refused:\n${output}`);
+    assert.match(output, /tree-consistent/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ROUND-14 non-blocking note 4 — proofs that pin a CALL SITE, not a property
+// ---------------------------------------------------------------------------
+
+/**
+ * Two guards were exercised only by tests a LATER guard also satisfies.
+ *
+ * Round-14 review removed the pre-build `linkedCompilerInputs()` call and the
+ * imported-symlink test stayed green, because the post-build safety check caught
+ * the same tree. It removed the post-build readability assertion and the run
+ * still refused, because the pre-audit readability check caught it. Both are
+ * real property tests and neither proves the call site it was credited to.
+ *
+ * A property test that any of three guards can satisfy tells you the property
+ * holds. It does not tell you the guard you are about to delete is the one
+ * holding it. These two ask the narrower question: WHERE did the refusal happen?
+ */
+describe("TASK-010 round 14: each refusal happens at the stage it claims", () => {
+  /**
+   * The pre-build call, pinned by the build NEVER RUNNING.
+   *
+   * A symlinked compiler input OUTSIDE every derived root is invisible to
+   * `findSymlinks`, which only walks the roots. `tsc --listFilesOnly` reports it,
+   * so `linkedCompilerInputs()` refuses before anything is built.
+   *
+   * Delete that call and the tree is still refused — by the post-build check,
+   * AFTER tsc has run and written `dist`. So the discriminator is not whether it
+   * refuses but whether `dist` exists afterwards, and that is a fact about the
+   * call site rather than about the property.
+   */
+  it("refuses a symlinked compiler input BEFORE building, not after", () => {
+    const root = makeFixtureRepo();
+    assert.equal(runHarness(root).status, 0, "the fixture must pass before the link is planted");
+    rmSync(join(root, "dist"), { recursive: true, force: true });
+
+    // Outside src/ and tests/, so no root walk sees it; imported by a test, so
+    // tsc compiles it anyway -- `include` does not stop an import.
+    const external = mkdtempSync(join(tmpdir(), "sf-callsite-"));
+    created.push(external);
+    const outsider = join(external, "smuggled.ts");
+    writeFileSync(outsider, "export const smuggled = 14;\n");
+    mkdirSync(join(root, "helpers"), { recursive: true });
+    symlinkSync(outsider, join(root, "helpers/smuggled.ts"));
+    writeFileSync(
+      join(root, "tests/sample.test.ts"),
+      [
+        'import assert from "node:assert/strict";',
+        'import { describe, it } from "node:test";',
+        'import { smuggled } from "../helpers/smuggled.js";',
+        'describe("sample", () => { it("passes", () => { assert.equal(smuggled, 14); }); });',
+        "",
+      ].join("\n"),
+    );
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, `a symlinked compiler input outside the roots was accepted:\n${output}`);
+    assert.match(output, /refused before building/, "the refusal must come from the PRE-build call");
+    assert.ok(
+      !existsSync(join(root, "dist")),
+      "the build ran before the tree was refused, so the pre-build call is not what refused it",
+    );
+  });
+
+  /**
+   * The post-build readability assertion, pinned by the STAGE IT NAMES.
+   *
+   * The unreadable directory has to appear DURING the build, or the pre-build
+   * readability check sees it first and the post-build one is never the guard
+   * under test. So the shim runs the real tsc and then locks a directory under
+   * the output — which is exactly the situation the post-build assertion exists
+   * for: a build that leaves the tree in a state nobody inspected before it ran.
+   */
+  it("reports an unreadable output directory created BY the build at the after-building stage", () => {
+    const root = makeFixtureRepo();
+    assert.equal(runHarness(root).status, 0, "the fixture must pass before the shim is used");
+
+    const realNpx = spawnSync("sh", ["-c", "command -v npx"], { encoding: "utf8" }).stdout.trim();
+    assert.ok(realNpx.length > 0, "the fixture needs a real npx to delegate to");
+
+    const shimDir = mkdtempSync(join(tmpdir(), "sf-lockshim-"));
+    created.push(shimDir);
+    writeFileSync(
+      join(shimDir, "npx"),
+      [
+        "#!/bin/sh",
+        "# Config and file-list queries pass straight through: locking during",
+        "# them would be caught by the PRE-build check and prove nothing.",
+        'for a in "$@"; do',
+        '  case "$a" in',
+        `    --showConfig|--listFilesOnly) exec ${realNpx} "$@" ;;`,
+        "  esac",
+        "done",
+        `${realNpx} "$@"`,
+        "rc=$?",
+        'if [ "$rc" -eq 0 ]; then',
+        "  mkdir -p dist/locked",
+        "  chmod 000 dist/locked",
+        "fi",
+        'exit "$rc"',
+        "",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+
+    const locked = join(root, "dist/locked");
+    try {
+      const result = spawnSync(process.execPath, ["scripts/verify.mjs"], {
+        cwd: root,
+        encoding: "utf8",
+        env: harnessEnv({ PATH: `${shimDir}:${process.env["PATH"] ?? ""}` }),
+      });
+      const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+
+      assert.notEqual(result.status, 0, `an unreadable directory under the output was accepted:\n${output}`);
+      assert.match(output, /could not be read/, "the refusal must be the readability one");
+      assert.match(
+        output,
+        /refused after building/,
+        `the post-build assertion must be what caught it, not a later stage:\n${output}`,
+      );
+    } finally {
+      // Restore the mode or the fixture cleanup cannot remove the tree.
+      if (existsSync(locked)) {
+        chmodSync(locked, 0o755);
+      }
+    }
   });
 });

@@ -31,22 +31,46 @@ Not worked around, and this stands whenever the quota is genuinely out:
 While the quota is out, ADR-0002 condition 3 cannot be satisfied and **no branch
 may be integrated**. That is the gate working, not a failure.
 
-## Branches, all pushed and matching origin
+## Branches — INTEGRATED 2026-08-28
 
-| Branch | Head | State |
-|---|---|---|
-| `feat/executor-isolation` | `8a34e5e` | TASK-011 + TASK-008 + TASK-012 + register. Round-10 findings answered. Awaiting round 11. |
-| `fix/verify-path-equivalence` | `8f4985e` | Verification harness. Round-10 findings answered. Awaiting round 11. |
-| `feat/state-integrity-rebased` | `c4e4054` | An ancestor of `feat/executor-isolation`; not reviewed separately any more. |
-| `docs/known-limitations` | `93c0653`+ | The limitations register and this file. Also an ancestor of the combined branch. |
-| `main` | `0087787` | Untouched. |
+Both branches reached a passing independent verdict and were integrated into
+`main` at `f712408` under ADR-0002. Nothing was force-pushed and no history was
+rewritten; `main` was fast-forwarded to an integration branch that had already
+passed the full suite, so it never sat half-merged.
 
-Review rounds so far: the verification harness has had ten, the supervisor work
-nine plus two on the combined tree. Every round has found something real, and
-the last two rounds each found a test of mine that was passing for the wrong
-reason — one of them passing BECAUSE of the defect being reported.
+| Branch | Head reviewed | Verdict | State |
+|---|---|---|---|
+| `feat/executor-isolation` | `507e30e` | PASS, safe to commit YES, 1651/1651 | Merged as `b73da45` |
+| `fix/verify-path-equivalence` | `fd626a5` | PASS_WITH_NON_BLOCKING_NOTES, safe to commit YES, 1511/1511 | Merged as `f712408` |
+| `feat/state-integrity-rebased` | `c4e4054` | — | An ancestor of `feat/executor-isolation`; never reviewed separately. |
+| `docs/known-limitations` | `d1595f2` | — | The limitations register and this file; an ancestor of both. |
+| `main` | `f712408` | — | 1721/1721 on the merged tree, verifier reports it tree-consistent. |
 
-`main` has not moved. Every branch merges onto it cleanly, and pairwise.
+The merged tree was tested before `main` moved, because neither reviewer saw it:
+1721 = `main`'s base plus both branches' additions, with nothing lost to the
+merge. The one merge conflict was in L-8 of the limitations register, where both
+branches had appended; it was resolved as a union, since this file records
+defects and dropping either side deletes the record of one.
+
+Review rounds to acceptance: seventeen on the supervisor work, fourteen on the
+verification harness. Every round found something real, and the later rounds
+almost all found a test of MINE that was passing for the wrong reason — one of
+them passing BECAUSE of the defect being reported.
+
+## What is unblocked now
+
+`EXECUTOR_WIRING` required `EXECUTOR_ISOLATION` and `STATE_INTEGRITY` to be both
+accepted AND integrated. Both now are, so it is permissible to start.
+
+The roadmap rows for those two stay `PENDING`, deliberately, and this is not an
+oversight to tidy up later. `unprovenCompletion` in
+`src/supervision/roadmapCatalog.ts` refuses a `DONE` item whose class needs AI
+when durable provenance holds no record of anything running on it, and it rests
+on the invariant that every item this build SHIPS starts `PENDING`. Shipping
+`DONE` rows for work done by the bootstrap engineer rather than by the
+supervisor's own executor would make every fresh installation fail that check on
+first run. The roadmap describes what the SUPERVISOR has executed; it is not a
+changelog of the bootstrap.
 
 ## Why executor-isolation now contains state-integrity
 
