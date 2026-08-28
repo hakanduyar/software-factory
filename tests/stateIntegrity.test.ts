@@ -15,7 +15,11 @@
  *   - file permissions, which stop other local users and nothing else.
  *
  * WHICH TESTS USE WHICH REPOSITORY — stated because round-1 review caught this
- * file claiming more than it delivered. The AC-1 append-only cases and the AC-7
+ * file claiming more than it delivered, and UPDATED in round 16 because the
+ * statement went stale: the four tamper modes, the anchor-deletion case and the
+ * reviewer-independence cases that need durable state now all drive REAL SQLite.
+ * What remains in-memory is the service-level branch the deserializer refuses to
+ * produce, and it says so in its own name. The AC-1 append-only cases and the AC-7
  * permission cases drive the REAL SQLite adapter, because that is where those
  * behaviours live. The reviewer-independence cases use `newSupervisor`, whose
  * default repository is IN-MEMORY: the decision under test there is in the
@@ -2848,16 +2852,42 @@ describe("TASK-008 round 13: the chain names an item the roadmap no longer has",
  */
 async function realDatabaseWithChain(label: string) {
   const dbPath = tempDbPath(label);
+  /**
+   * BOTH runs by the SAME resource, so a reviewer remains (round-16 finding).
+   *
+   * The routing policy allows exactly two resources to perform
+   * `INDEPENDENT_REVIEW`, and the fixture had `A` implemented by both — so C4
+   * correctly excluded every possible reviewer and the clean control stopped at
+   * WAITING_FOR_RESOURCE. It then "passed" only because it asserted the result
+   * was not a human refusal.
+   *
+   * Two entries are still needed for the delete and reorder modes; nothing
+   * requires them to name different resources.
+   */
   const first = chainFor("codex-cli:gpt-5.6-luna");
-  const chain = appendImplementerProvenance(first, "A", "claude-code:opus", 2_000, "completed");
+  const chain = appendImplementerProvenance(first, "A", "codex-cli:gpt-5.6-luna", 2_000, "completed again");
 
   const repository = createSqliteSupervisorRepository(dbPath);
   const seeded = await repository.create({
     version: 1,
     financialPolicy: { autonomousSpendAllowed: false, autonomousSpendLimit: 0 },
-    resources: [],
+    /**
+     * Seeded, or nothing can advance and the clean control proves nothing.
+     * `claude-code:sonnet` is the third reviewer: the other two implemented `A`
+     * and are correctly excluded from reviewing it.
+     */
+    resources: TEST_CATALOG.map((entry) => ({
+      provider: entry.provider,
+      model: entry.model,
+      key: `${entry.provider}:${entry.model}`,
+      state: "UNKNOWN_FAILURE" as const,
+      detectedAt: 1_000,
+      lastCheckedAt: 0,
+      backoff: { attempt: 0, delayMs: 0 },
+      diagnostic: "never probed",
+    })),
     roadmap: [
-      { key: "A", title: "Implemented", dependsOn: [], status: "DONE", workClass: "NORMAL_IMPLEMENTATION", order: 1, attempts: 1, implementedByResourceKeys: ["codex-cli:gpt-5.6-luna", "claude-code:opus"] } as RoadmapItem,
+      { key: "A", title: "Implemented", dependsOn: [], status: "DONE", workClass: "NORMAL_IMPLEMENTATION", order: 1, attempts: 1, implementedByResourceKeys: ["codex-cli:gpt-5.6-luna"] } as RoadmapItem,
       { key: "B", title: "Review of A", dependsOn: ["A"], status: "ELIGIBLE", workClass: "INDEPENDENT_REVIEW", order: 2 },
     ],
     checkpoints: [],
@@ -2904,10 +2934,32 @@ describe("TASK-008: the four tamper modes, every one through real SQLite", () =>
     ["reorder", (chain) => [chain[1], chain[0]]],
     [
       "append-with-wrong-digest",
-      (chain) => [
-        ...chain,
-        { ...chain[chain.length - 1], recordedAt: 3_000, detail: "appended without rehashing" },
-      ],
+      /**
+       * A GENUINE APPEND (round-16 finding).
+       *
+       * This copied the last entry unchanged — same `sequence`, same `digest` —
+       * so the refusal came from the sequence guard ("an entry was deleted or
+       * reordered"), and the broad regex below accepted it. The case named one
+       * guard and exercised another.
+       *
+       * A real append continues the sequence and hashes itself honestly; the
+       * ONLY thing wrong is the predecessor it claims. That is the mode the
+       * frozen plan asks for, and nothing else can produce that refusal.
+       */
+      (chain) => {
+        const last = chain[chain.length - 1]!;
+        const forged = {
+          sequence: last.sequence + 1,
+          kind: "IMPLEMENTED_BY" as const,
+          roadmapKey: "A",
+          resourceKey: "claude-code:opus",
+          detail: "appended onto a predecessor that is not the head",
+          recordedAt: 3_000,
+          // The head's digest is what this SHOULD be. It is not.
+          previousDigest: chain[0]!.digest,
+        };
+        return [...chain, { ...forged, digest: computeDigest(forged) }];
+      },
     ],
   ];
 
@@ -2932,6 +2984,22 @@ describe("TASK-008: the four tamper modes, every one through real SQLite", () =>
             /provenance|chain|parses/i,
             `the refusal for a ${mode} does not say it is about the log`,
           );
+          /**
+           * ...and named SPECIFICALLY where a mode has its own signature. A
+           * regex broad enough to accept every refusal accepts the wrong one
+           * too, which is how the append case came to be exercising the
+           * sequence guard.
+           */
+          if (mode === "append-with-wrong-digest") {
+            assert.match(
+              result.humanActionRequired,
+              /previous|predecessor/i,
+              "the append refusal does not name the predecessor it disagrees about",
+            );
+          }
+          if (mode === "delete" || mode === "reorder") {
+            assert.match(result.humanActionRequired, /deleted or reordered|sequence/i);
+          }
         }
         assert.equal(supervisor.executor.calls().length, 0, "work ran on a tampered log");
       } finally {
@@ -2940,7 +3008,19 @@ describe("TASK-008: the four tamper modes, every one through real SQLite", () =>
     });
   }
 
-  /** NEGATIVE CONTROL: the same real database, untampered, still advances. */
+  /**
+   * NEGATIVE CONTROL — and it has to ADVANCE, not merely fail to refuse
+   * (round-16 finding).
+   *
+   * It asserted `notEqual(WAITING_FOR_HUMAN)`, which `WAITING_FOR_RESOURCE`
+   * satisfies. The fixture seeded no resources, so the tick stopped with "no
+   * eligible resource for INDEPENDENT_REVIEW" and the control passed having
+   * demonstrated nothing about tampering.
+   *
+   * That is the same "not refused is not succeeded" mistake I fixed in the
+   * TASK-012 control two rounds ago, made again here. The fixture now seeds
+   * resources and the control asserts the review actually RAN.
+   */
   it("still advances on an untampered real database", async () => {
     const { dbPath } = await realDatabaseWithChain("t8-sqlite-clean");
     const reopened = createSqliteSupervisorRepository(dbPath);
@@ -2951,7 +3031,11 @@ describe("TASK-008: the four tamper modes, every one through real SQLite", () =>
     });
     try {
       const result = await supervisor.service.tick();
-      assert.notEqual(result.kind, "WAITING_FOR_HUMAN", "an untampered database was refused");
+      assert.equal(result.kind, "ADVANCED", "an untampered database did not advance");
+      assert.ok(
+        supervisor.executor.calls().length > 0,
+        "nothing reached the executor, so this control proves nothing about tampering",
+      );
     } finally {
       reopened.close();
     }

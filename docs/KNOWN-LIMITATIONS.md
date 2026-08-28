@@ -363,8 +363,14 @@ guarantee, each says plainly what it is:
   fields from the catalog rather than the row. Any row that DIFFERS is refused
   first, so the two can never disagree on a path that returns a value.
 - The post-build `assessMountTopology` call in `scripts/verify.mjs` runs after a
-  pre-build refusal that already rejects a mounted output, and creating a mount
-  needs privileges no fixture has. Its DECISION is proven by the pure tests; the
+  pre-build refusal that already rejects a mounted output.
+
+  The reason given here used to be "creating a mount needs privileges no fixture
+  has", and round-16 review showed that is wrong: a same-device bind mount can be
+  made in an unprivileged user and mount namespace, and a real test does exactly
+  that unskipped. The call is unreachable because the PRE-BUILD refusal fires
+  first, which is a claim about ordering rather than about privilege — a weaker
+  and more accurate reason than the one it replaces. Its DECISION is proven by the pure tests; the
   call exists so a future reordering still meets a tested guard before anything
   is deleted.
 
@@ -374,7 +380,14 @@ or dressed up:
 - The per-key `chainImplementers === undefined` branch in the reviewer-exclusion
   walk is GONE, replaced by a single assertion. Independent review measured it
   against `brokenChainOutcome` and found the two masking each other — removing
-  either left the suite green. They cover the same case because step 0 uses
+  either left the suite green AT THE TIME.
+
+  **That is no longer true of `brokenChainOutcome`, and this entry said it was
+  until round 16.** Once the four tamper modes were driven through real SQLite,
+  removing that guard failed all four of them while the clean control kept
+  passing. It is load-bearing now, and only the ASSERTION beside it remains
+  unreachable. A limitation register that describes a guard as untested after
+  the test exists is the same defect it was written to prevent, one level up. They cover the same case because step 0 uses
   `verifyAgainstAnchor`, which is strictly stronger than the structural check
   behind the `undefined`. There is one decision now and an assertion of the
   invariant it establishes, which throws rather than deciding: reaching it would
