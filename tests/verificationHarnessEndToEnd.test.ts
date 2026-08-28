@@ -2747,22 +2747,221 @@ describe("TASK-010 round 15: a source directory named like the output directory"
   });
 
   /**
-   * `node_modules` and `.git` stay name-matched at ANY depth, and that is a
-   * different claim rather than the same one relaxed: a nested `node_modules`
-   * IS a dependency install wherever it sits. If this starts failing, the fix
-   * has been over-applied and ordinary workspaces are being refused.
+   * THE CONTROL THAT WAS WRONG, kept here as the record of why.
+   *
+   * This case used to assert the opposite — that a hardlink under
+   * `src/vendor/node_modules` is ACCEPTED — on my reasoning that a nested
+   * `node_modules` is a dependency install wherever it sits, so the name
+   * identifies it. Round-16 review refuted that with a working exploit, and this
+   * test had passed only because its hardlinked dependency was never USED: a
+   * fixture satisfying an assertion for a reason unrelated to the claim, which
+   * is the fourth shape and the ninth time it has been mine.
+   *
+   * The name never made the CONTENT safe. Same error as `src/dist` in round 15
+   * and the skipped directory in round 11.
    */
-  it("does not refuse an ordinary nested node_modules", () => {
+  it("REFUSES a hardlink under a node_modules that is not the root install", () => {
     const root = makeFixtureRepo();
-    mkdirSync(join(root, "src/vendor/node_modules"), { recursive: true });
+    assert.equal(runHarness(root).status, 0, "the fixture must pass before the link is planted");
 
+    mkdirSync(join(root, "src/vendor/node_modules"), { recursive: true });
     const external = mkdtempSync(join(tmpdir(), "sf-nested-nm-"));
     created.push(external);
-    const dep = join(external, "index.js");
+    const dep = join(external, "payload.cjs");
     writeFileSync(dep, "module.exports = 1;\n");
-    linkSync(dep, join(root, "src/vendor/node_modules/index.js"));
+    linkSync(dep, join(root, "src/vendor/node_modules/payload.cjs"));
 
     const { status, output } = runHarness(root);
-    assert.equal(status, 0, `a nested node_modules was treated as foreign source:\n${output}`);
+    assert.notEqual(status, 0, `external code under a nested node_modules was accepted:\n${output}`);
+    assert.match(output, /payload\.cjs/, "the refusal must name the file it refuses");
+    assert.ok(!output.includes("tree-consistent"), "it must not also claim the tree is consistent");
+  });
+
+  /**
+   * THE ROUND-16 CRITICAL, end to end: the payload is not merely present, it
+   * RUNS.
+   *
+   * The reviewer hardlinked an external `.cjs` into `src/vendor/node_modules`,
+   * loaded it through `createRequire` from a file a source test imports, and the
+   * verifier exited 0 reporting `tree-consistent` while external code executed.
+   * No concurrency, no PATH manipulation — the ordinary path.
+   *
+   * `linkedCompilerInputs` did not cover it because it keeps only
+   * `.ts`/`.mts`/`.cts`, so a `.cjs` fell through exactly as the `.json` did.
+   */
+  it("REFUSES a hardlinked payload that a source test actually executes", () => {
+    const root = makeFixtureRepo();
+
+    mkdirSync(join(root, "src/vendor/node_modules"), { recursive: true });
+    const external = mkdtempSync(join(tmpdir(), "sf-exec-"));
+    created.push(external);
+    const marker = join(external, "EXECUTED");
+    const payload = join(external, "payload.cjs");
+    writeFileSync(
+      payload,
+      `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "yes");\nmodule.exports = 1;\n`,
+    );
+    linkSync(payload, join(root, "src/vendor/node_modules/payload.cjs"));
+
+    writeFileSync(
+      join(root, "src/loader.ts"),
+      [
+        'import { createRequire } from "node:module";',
+        "const req = createRequire(import.meta.url);",
+        'export const loaded = req("../../src/vendor/node_modules/payload.cjs") as number;',
+        "",
+      ].join("\n"),
+    );
+    writeFileSync(
+      join(root, "tests/loads.test.ts"),
+      [
+        'import assert from "node:assert/strict";',
+        'import { describe, it } from "node:test";',
+        'import { loaded } from "../src/loader.js";',
+        'describe("loads", () => { it("loaded", () => { assert.equal(loaded, 1); }); });',
+        "",
+      ].join("\n"),
+    );
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, `a hardlinked payload reached execution:\n${output}`);
+    assert.match(output, /payload\.cjs/, "the refusal must name the payload");
+    assert.ok(
+      !existsSync(marker),
+      "the payload EXECUTED — verification ran external code it had not audited",
+    );
+  });
+
+  /**
+   * THE CONTROL FOR OVER-APPLICATION IS NOT HERE, deliberately.
+   *
+   * A case was written here asserting that hardlinks inside the ROOT install are
+   * still accepted, and it was DELETED for doing real damage:
+   * `makeFixtureRepo` symlinks `node_modules` at the shared install, so
+   * `mkdirSync(join(root, "node_modules/pkg/..."))` wrote THROUGH the symlink
+   * into this repository's own `node_modules`. A fixture is supposed to be
+   * disposable; that one modified the tree under review. It also passed on a
+   * clean run and failed on the next, because the residue it left changed the
+   * result — a test whose outcome depends on whether it has been run before.
+   *
+   * What it was trying to prove is already proved, without writing anywhere:
+   * "passes with a symlinked node_modules when the root is the repository" and
+   * "still passes with a linked node_modules under a whole-repository root"
+   * both put `node_modules` genuinely in scope under a `.` root and require
+   * acceptance. Excluding nothing fails them, which is the control this branch
+   * needs. Two tests asserting one thing is coverage; three, one of which
+   * pollutes a shared directory, is a liability.
+   */
+});
+
+// ---------------------------------------------------------------------------
+// ROUND-16 finding 1 — an equivalent spelling of outDir must not be refused
+// ---------------------------------------------------------------------------
+
+/**
+ * `sameDirectory` accepts `dist`, `./dist`, an absolute path and a symlinked
+ * alias as ONE outDir, because that is what tsc obeys. The source scan did not
+ * agree: with a root of `.`, a `dist-alias -> dist` symlink was reported as a
+ * symlinked entry under the source roots and the run was refused before
+ * building. Two parts of the same program disagreeing about what the output
+ * directory is.
+ *
+ * The reviewer also showed why the EXISTING alias case could not catch this: it
+ * shims `--showConfig`, so only the EFFECTIVE configuration is aliased while the
+ * real build still reads `outDir: "dist"` from the fixture's raw tsconfig. This
+ * one writes a real tsconfig and makes a real symlink, so the build genuinely
+ * emits through the alias.
+ */
+describe("TASK-010 round 16: an aliased outDir is the same directory", () => {
+  it("ACCEPTS a real build whose outDir is a symlinked alias of the output", () => {
+    const root = makeFixtureRepo();
+    assert.equal(runHarness(root).status, 0, "the fixture must pass before it is aliased");
+
+    /**
+     * THE ROOT MUST BE `.`, or this case proves nothing.
+     *
+     * Written first with the fixture's own `src`/`tests` includes, it passed
+     * WITHOUT the fix — a `dist-alias` at the repository root is not under
+     * either root, so no scan ever looked at it. My own mutation run caught
+     * that: deleting the resolved-alias check left this green. The reviewer's
+     * reproduction used `include: ["**\/*.ts"]`, which makes the derived root
+     * `.` and puts the alias in scope, and that is the only arrangement in
+     * which the guard under test is reachable.
+     */
+    symlinkSync("dist", join(root, "dist-alias"));
+    const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as {
+      compilerOptions: Record<string, unknown>;
+      include?: string[];
+    };
+    tsconfig.compilerOptions["outDir"] = "dist-alias";
+    tsconfig.include = ["**/*.ts"];
+    writeFileSync(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
+
+    const { status, output } = runHarness(root);
+    assert.equal(status, 0, `an equivalent spelling of outDir was refused:\n${output}`);
+    assert.match(output, /tree-consistent/, "and the aliased build must still be audited");
+  });
+
+  /**
+   * An alias pointing OUTSIDE the repository stays refused.
+   *
+   * NOT the control against over-application, and saying so matters. I wrote it
+   * as one — "this fails if `sameDirectory` becomes 'it is a symlink, skip
+   * it'" — and mutation showed that claim is false: this case is refused by the
+   * `sameDirectory(options.outDir, OUTPUT_DIR)` CONFIG check long before any
+   * scan exclusion runs, so it passes under that mutation too. It still asserts
+   * something worth asserting; it just does not assert what its comment said.
+   *
+   * The real control is the case below, and finding it took a second mutation
+   * run. The obvious candidate — "REFUSES a symlinked individual test source" —
+   * does NOT fail when every symlink is excluded, because a symlinked `.test.ts`
+   * is a COMPILER INPUT and `linkedCompilerInputs` catches it independently of
+   * the scan. It is masked, exactly like the guards in round 14.
+   */
+  it("still REFUSES an outDir alias that resolves outside the repository", () => {
+    const root = makeFixtureRepo();
+    const external = mkdtempSync(join(tmpdir(), "sf-outalias-"));
+    created.push(external);
+
+    symlinkSync(external, join(root, "dist-alias"));
+    const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as {
+      compilerOptions: Record<string, unknown>;
+      include?: string[];
+    };
+    tsconfig.compilerOptions["outDir"] = "dist-alias";
+    tsconfig.include = ["**/*.ts"];
+    writeFileSync(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, `an outDir resolving outside the repository was accepted:\n${output}`);
+  });
+
+  /**
+   * THE CONTROL AGAINST OVER-APPLYING THE ALIAS RESOLUTION, and the only case
+   * that can detect it.
+   *
+   * A symlinked NON-COMPILER-INPUT under a source root is reported by
+   * `findSymlinks` and by nothing else: `linkedCompilerInputs` keeps only
+   * `.ts`/`.mts`/`.cts`, so a `.json` reaches the scan or reaches nothing. If
+   * the resolved-alias check ever becomes "it is a symlink, skip it", this is
+   * what fails — every other symlink case in this file is covered twice and
+   * stays green.
+   *
+   * It also closes a coverage gap that predates this branch: nothing proved
+   * `findSymlinks`' reach beyond compiler inputs was load-bearing.
+   */
+  it("REFUSES a symlinked non-source file under a source root", () => {
+    const root = makeFixtureRepo();
+    assert.equal(runHarness(root).status, 0, "the fixture must pass before the link is planted");
+
+    const external = mkdtempSync(join(tmpdir(), "sf-symjson-"));
+    created.push(external);
+    const outsider = join(external, "data.json");
+    writeFileSync(outsider, '{"external":true}\n');
+    symlinkSync(outsider, join(root, "src/data.json"));
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, `a symlinked non-source file was accepted:\n${output}`);
+    assert.match(output, /src\/data\.json/, "the refusal must name the link it refuses");
   });
 });

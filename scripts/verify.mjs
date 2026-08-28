@@ -328,32 +328,62 @@ function findHardlinkedSources(directory) {
 const SKIP_IN_SOURCE_SCAN = new Set(["node_modules", ".git", OUTPUT_DIR]);
 
 /**
- * Whether a source scan should refuse to descend into this directory.
+ * Whether a source scan should refuse to descend into this entry.
  *
- * THE OUTPUT DIRECTORY IS MATCHED BY PATH, NOT BY NAME (round-15 review).
+ * NOTHING HERE IS MATCHED BY NAME. That rule was wrong three times.
  *
- * `SKIP_IN_SOURCE_SCAN.has(entry.name)` skipped ANY directory called `dist`, at
- * any depth. `src/dist/` is not the build output — it is ordinary source that
- * happens to share a name — so a hardlinked `src/dist/data.json` was never
- * scanned and the run reported `tree-consistent`. The reviewer demonstrated it.
+ *   Round 11: a compiler input inside a directory skipped by name.
+ *   Round 15: `src/dist/data.json`, hardlinked, never scanned, run reported
+ *             `tree-consistent`.
+ *   Round 16: `src/vendor/node_modules/payload.cjs`, hardlinked from outside,
+ *             loaded through `createRequire` by a file a source test imports.
+ *             The verifier exited 0 and reported `tree-consistent` while
+ *             EXTERNAL CODE EXECUTED. CRITICAL, and demonstrated with no
+ *             concurrency and no PATH manipulation.
  *
- * That is the round-11 finding again: a skipped directory NAME is not a safe
- * directory. Round 11 closed it for compiler inputs via `linkedCompilerInputs`,
- * which is why this survived — a `.json` is not a compiler input, so it fell
- * through both.
+ * Round 15 fixed the output directory and I argued the `node_modules`/`.git`
+ * exemption was a different claim rather than the same one relaxed, because a
+ * nested `node_modules` "IS a dependency install wherever it sits". The reviewer
+ * was asked to judge that reasoning and refuted it: the NAME never made the
+ * CONTENT safe, which is the same error in all three rounds. `linkedCompilerInputs`
+ * did not cover it either, because it keeps only `.ts`/`.mts`/`.cts` and the
+ * payload was `.cjs` — so it fell through both guards exactly as `.json` did.
  *
- * `node_modules` and `.git` stay name-matched at any depth, and that is a
- * different claim rather than the same one relaxed: a nested `node_modules` IS a
- * dependency install and a nested `.git` IS a submodule's repository, at
- * whatever depth they appear. `dist` has no such property — only the configured
- * output path is build product. Anything tsc actually compiles inside those
- * directories is still covered by `linkedCompilerInputs`.
+ * What is excluded now is identity, not spelling:
+ *
+ *   - the package manager's install directory and everything beneath it, which
+ *     is the ROOT `node_modules` — nested copies inside it included, since npm
+ *     genuinely creates those. Hardlinks there are normal (npm's cache, pnpm's
+ *     store hardlink every package file), so scanning it would refuse ordinary
+ *     repositories for doing nothing wrong.
+ *   - the repository's own `.git`, on the same footing.
+ *   - the configured output directory, by RESOLVED PATH, so an equivalent
+ *     spelling is one answer. `sameDirectory` already accepts `dist`, `./dist`,
+ *     an absolute path and a symlinked alias as the same outDir; the scan has to
+ *     agree with it or a valid alias is refused (round-16 finding 1).
+ *
+ * A `node_modules` under a SOURCE ROOT is scanned. In a workspace layout that
+ * can mean scanning a package's own install, which is a real cost and belongs to
+ * the same trade-off L-6 already records for hardlinked trees. The cost of the
+ * alternative was measured, not guessed: it is arbitrary code execution.
  */
-function excludedFromSourceScan(relativePath, name) {
-  if (name === "node_modules" || name === ".git") {
+function excludedFromSourceScan(relativePath, entry) {
+  const first = relativePath.split("/")[0];
+  if (first === "node_modules" || first === ".git") {
     return true;
   }
-  return relativePath === OUTPUT_DIR || relativePath.startsWith(`${OUTPUT_DIR}/`);
+  if (relativePath === OUTPUT_DIR || relativePath.startsWith(`${OUTPUT_DIR}/`)) {
+    return true;
+  }
+  /**
+   * An equivalent SPELLING of the output directory — only worth resolving for
+   * something that could BE a directory. A regular file is never the outDir,
+   * and resolving every file would cost a syscall each to answer no.
+   */
+  if (entry !== undefined && (entry.isDirectory() || entry.isSymbolicLink())) {
+    return sameDirectory(relativePath, OUTPUT_DIR);
+  }
+  return false;
 }
 
 function findHardlinkedUnder(directory, skipExcluded = false) {
@@ -393,7 +423,7 @@ function findSymlinks(directory, keep = () => true, skipExcluded = false) {
        * it is looking for.
        */
       const rel = relative(REPO_ROOT, full).replace(/\\/g, "/");
-      if (skipExcluded && excludedFromSourceScan(rel, entry.name)) {
+      if (skipExcluded && excludedFromSourceScan(rel, entry)) {
         continue;
       }
       if (entry.isSymbolicLink()) {
@@ -479,7 +509,7 @@ function listFiles(directory, skipExcluded = false) {
     }
     for (const entry of entries) {
       const full = join(current, entry.name);
-      if (skipExcluded && excludedFromSourceScan(relative(REPO_ROOT, full).replace(/\\/g, "/"), entry.name)) {
+      if (skipExcluded && excludedFromSourceScan(relative(REPO_ROOT, full).replace(/\\/g, "/"), entry)) {
         continue;
       }
       // Deliberately do NOT follow directory symlinks: a linked subtree is not
