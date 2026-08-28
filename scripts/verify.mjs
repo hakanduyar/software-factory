@@ -618,6 +618,61 @@ if (isSymlink(join(REPO_ROOT, OUTPUT_DIR))) {
 }
 
 /**
+ * THE COMPILER'S OWN FILE LIST (round-10 CRITICAL).
+ *
+ * Globbing the derived roots was still a guess — a better one than
+ * `["src", "tests"]`, and still not what tsc reads. `exclude` was ignored
+ * entirely, so a test source the config EXCLUDES counted as current, and an old
+ * artifact at the same path was therefore explained by it. The reviewer excluded
+ * a test, planted its previous build output, and watched the stale artifact RUN
+ * while the harness reported success.
+ *
+ * Asking the compiler removes the last of the guessing. `--listFilesOnly`
+ * enumerates the actual program: `include` minus `exclude`, PLUS anything
+ * reachable by import — which matters, because `exclude` does not stop an
+ * excluded file being pulled in by an included one, and a glob-based answer gets
+ * that wrong in both directions.
+ *
+ * Filtered to this repository, because the list also names `lib.*.d.ts` and
+ * whatever `node_modules` types the program pulls in, and those are not this
+ * tree's source.
+ */
+function compilerInputs() {
+  let listed;
+  try {
+    listed = execFileSync("npx", ["tsc", "-p", "tsconfig.json", "--listFilesOnly"], {
+      cwd: REPO_ROOT,
+      encoding: "utf8",
+      timeout: CONFIG_TIMEOUT_MS,
+      maxBuffer: 64 * 1024 * 1024,
+    });
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    fail(
+      `verification refused: the compiler could not list its own inputs (${detail}); refusing to audit a tree ` +
+        "whose source set is unknown",
+    );
+  }
+  const inRepo = [];
+  for (const line of listed.split("\n")) {
+    const path = line.trim();
+    if (path.length === 0) continue;
+    const rel = relative(REPO_ROOT, resolve(REPO_ROOT, path)).replace(/\\/g, "/");
+    if (rel.startsWith("../") || rel.length === 0) continue;
+    if (rel.startsWith("node_modules/") || rel.startsWith(`${OUTPUT_DIR}/`)) continue;
+    // Declaration files are inputs but emit nothing, so they explain no artifact.
+    if (/\.d\.(ts|mts|cts)$/.test(rel)) continue;
+    if (!/\.(ts|mts|cts)$/.test(rel)) continue;
+    inRepo.push(rel);
+  }
+  if (inRepo.length === 0) {
+    fail("verification refused: the compiler reported no source files of its own in this repository");
+  }
+  return [...new Set(inRepo)].sort();
+}
+const allSources = compilerInputs();
+
+/**
  * Individual source links, refused BEFORE the build and BEFORE the checker is
  * imported (round-12 finding).
  *
@@ -629,9 +684,67 @@ if (isSymlink(join(REPO_ROOT, OUTPUT_DIR))) {
  * guard. The tested clause stays as defence in depth; this one exists to run
  * first, and it runs before the build too, because the build compiles the link.
  */
+/**
+ * EVERY COMPILER INPUT, whatever directory it sits in (round-11 CRITICAL).
+ *
+ * The walk skipped entries named `dist`, `.git` and `node_modules` AT EVERY
+ * DEPTH, before any link inspection. That exclusion exists so a `.` source root
+ * does not report an ordinary workspace as foreign — and it was a name filter
+ * over a set the compiler does not define, which is the subset-for-the-whole
+ * substitution this file keeps being caught by.
+ *
+ * The reviewer put `src/dist/evil.ts` in the tree, excluded it in tsconfig,
+ * imported it from a test — which makes tsc compile it anyway, `exclude` being
+ * about the initial file list rather than reachability — and hardlinked it to an
+ * external file. `tsc --listFilesOnly` listed it correctly. The link scan
+ * skipped it by directory name, and the external content executed under a
+ * "tree-consistent" report.
+ *
+ * So the scan is the UNION of two sets, and neither replaces the other:
+ *
+ *   - every file the compiler says it reads, with no name filtering at all,
+ *     because that set is defined by the program rather than by a path; and
+ *   - the directory walk, which still skips those names, because it covers
+ *     files that are NOT compiler inputs and would otherwise report an ordinary
+ *     `node_modules` as foreign source.
+ *
+ * The union is strictly larger than either, which is the only property that
+ * matters here.
+ *
+ * NO ANCESTOR-DIRECTORY CHECK, and the reason is measured rather than assumed.
+ * One was written here — walk each input's parent directories looking for a
+ * symlink — and a mutation showed it caught nothing the tree did not already
+ * catch. `tsc --showConfig` resolves `**` to a `files` list, so a symlinked
+ * directory holding compiler inputs becomes a DERIVED ROOT, and the root-symlink
+ * refusal above names it directly. Keeping an unreachable second copy would have
+ * meant a comment claiming a guard was doing work that a mutation says it is
+ * not.
+ */
+function linkedCompilerInputs() {
+  const found = [];
+  for (const rel of allSources) {
+    const absolute = join(REPO_ROOT, rel);
+    let stats;
+    try {
+      stats = lstatSync(absolute);
+    } catch (error) {
+      if (error?.code !== "ENOENT") noteUnreadable(absolute);
+      continue;
+    }
+    if (stats.isSymbolicLink() || stats.nlink > 1) {
+      found.push(rel);
+      continue;
+    }
+  }
+  return found;
+}
+
 const linkedSources = [
-  ...SOURCE_ROOTS.flatMap((root) => findSymlinks(root, () => true, true)),
-  ...SOURCE_ROOTS.flatMap((root) => findHardlinkedSources(root)),
+  ...new Set([
+    ...SOURCE_ROOTS.flatMap((root) => findSymlinks(root, () => true, true)),
+    ...SOURCE_ROOTS.flatMap((root) => findHardlinkedSources(root)),
+    ...linkedCompilerInputs(),
+  ]),
 ].sort();
 if (linkedSources.length > 0) {
   fail(
@@ -852,8 +965,11 @@ function assertTreeIsSafe(stage, checkerIsFresh) {
   // legitimate-hardlink false positive — applied consistently rather than to
   // whichever directory happened to be named first.
     symlinkedSources: [
-      ...SOURCE_ROOTS.flatMap((root) => findSymlinks(root, () => true, true)),
-      ...SOURCE_ROOTS.flatMap((root) => findHardlinkedSources(root)),
+      ...new Set([
+        ...SOURCE_ROOTS.flatMap((root) => findSymlinks(root, () => true, true)),
+        ...SOURCE_ROOTS.flatMap((root) => findHardlinkedSources(root)),
+        ...linkedCompilerInputs(),
+      ]),
     ].sort(),
     buildEmitsNothing: noEmit,
     checkerFreshlyEmitted: checkerIsFresh,
@@ -896,60 +1012,7 @@ assertTreeIsSafe("after building", checkerFreshlyEmitted);
  * test the config declares elsewhere was compiled, matched no source, and was
  * reported as an orphan of the tree that legitimately produced it.
  */
-/**
- * THE COMPILER'S OWN FILE LIST (round-10 CRITICAL).
- *
- * Globbing the derived roots was still a guess — a better one than
- * `["src", "tests"]`, and still not what tsc reads. `exclude` was ignored
- * entirely, so a test source the config EXCLUDES counted as current, and an old
- * artifact at the same path was therefore explained by it. The reviewer excluded
- * a test, planted its previous build output, and watched the stale artifact RUN
- * while the harness reported success.
- *
- * Asking the compiler removes the last of the guessing. `--listFilesOnly`
- * enumerates the actual program: `include` minus `exclude`, PLUS anything
- * reachable by import — which matters, because `exclude` does not stop an
- * excluded file being pulled in by an included one, and a glob-based answer gets
- * that wrong in both directions.
- *
- * Filtered to this repository, because the list also names `lib.*.d.ts` and
- * whatever `node_modules` types the program pulls in, and those are not this
- * tree's source.
- */
-function compilerInputs() {
-  let listed;
-  try {
-    listed = execFileSync("npx", ["tsc", "-p", "tsconfig.json", "--listFilesOnly"], {
-      cwd: REPO_ROOT,
-      encoding: "utf8",
-      timeout: CONFIG_TIMEOUT_MS,
-      maxBuffer: 64 * 1024 * 1024,
-    });
-  } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error);
-    fail(
-      `verification refused: the compiler could not list its own inputs (${detail}); refusing to audit a tree ` +
-        "whose source set is unknown",
-    );
-  }
-  const inRepo = [];
-  for (const line of listed.split("\n")) {
-    const path = line.trim();
-    if (path.length === 0) continue;
-    const rel = relative(REPO_ROOT, resolve(REPO_ROOT, path)).replace(/\\/g, "/");
-    if (rel.startsWith("../") || rel.length === 0) continue;
-    if (rel.startsWith("node_modules/") || rel.startsWith(`${OUTPUT_DIR}/`)) continue;
-    // Declaration files are inputs but emit nothing, so they explain no artifact.
-    if (/\.d\.(ts|mts|cts)$/.test(rel)) continue;
-    if (!/\.(ts|mts|cts)$/.test(rel)) continue;
-    inRepo.push(rel);
-  }
-  if (inRepo.length === 0) {
-    fail("verification refused: the compiler reported no source files of its own in this repository");
-  }
-  return [...new Set(inRepo)].sort();
-}
-const allSources = compilerInputs();
+
 const sourceTests = allSources.filter((path) => checker.isSourceTest(path));
 const generatedFiles = listFiles(OUTPUT_DIR);
 const compiledTests = generatedFiles.filter((path) => checker.isTestArtifact(path));
