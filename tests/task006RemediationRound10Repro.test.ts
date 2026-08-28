@@ -170,6 +170,7 @@ describe("TASK-006 R10-SEC-1: tick output redacts persisted identifiers too", ()
       ],
       checkpoints: [],
       escalations: [],
+      provenance: [],
       updatedAt: T0,
     });
     repository.close();
@@ -207,6 +208,7 @@ describe("TASK-006 R10-SEC-2: the top-level CLI error boundary redacts too", () 
       roadmap: [],
       checkpoints: [],
       escalations: [],
+      provenance: [],
       updatedAt: T0,
     });
     repository.close();

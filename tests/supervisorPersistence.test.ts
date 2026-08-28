@@ -59,6 +59,7 @@ function validState(overrides: Partial<SupervisorState> = {}): SupervisorState {
     ],
     checkpoints: [],
     escalations: [],
+    provenance: [],
     updatedAt: 100,
     ...overrides,
   };
@@ -326,6 +327,10 @@ describe("TASK-006: the production SQLite repository", () => {
         clock,
         executor,
         ownerId: "supervisor:second-process",
+        // TASK-012: a second PROCESS is the same INSTALLATION, so it runs the
+        // same code-level roadmap. A process whose catalog disagreed with the
+        // database would be refusing correctly.
+        roadmap: TWO_ITEM_ROADMAP,
       });
       const state = await reopened.load();
       assert.equal(state?.roadmap.find((item) => item.key === "A")?.status, "DONE", "the first item stayed DONE");

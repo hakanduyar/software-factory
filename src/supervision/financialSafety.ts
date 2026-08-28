@@ -437,12 +437,21 @@ export function mintedResourceKey(action: SupervisedAction): string | undefined 
  * A billing mode can no longer be passed as a bare string. It must arrive inside
  * an observation, minted here, bound to the provider and model it describes.
  *
- * HONEST LIMIT, in the same terms as `EXECUTOR_ISOLATION` and
- * `STATE_INTEGRITY`: this makes asserting "that resource is free" a deliberate,
+ * HONEST LIMIT: this makes asserting "that resource is free" a deliberate,
  * greppable act rather than an incidental argument. It does not make it
  * impossible — an in-process caller can still construct an observation, exactly
- * as it could construct anything else. Closing that needs the probe to be
- * outside this process, which is `EXECUTOR_ISOLATION`'s territory.
+ * as it could construct anything else.
+ *
+ * NARROWED BY TASK-011 (EXECUTOR_ISOLATION), and stated precisely rather than
+ * declared closed: the executor now runs in its own process with no credential
+ * store, so EXECUTOR code is no longer an in-process caller and cannot mint an
+ * observation at all. What remains is that anything running INSIDE the
+ * supervisor process still can. That is a smaller surface — supervisor code
+ * this repository owns and reviews — rather than the open-ended one it was when
+ * executors ran here too.
+ *
+ * What would close the residue entirely is moving the probe out of this process
+ * as well. Nothing does that today, and no comment here should imply otherwise.
  */
 export interface BillingObservation {
   readonly provider: string;
@@ -565,14 +574,29 @@ export function zeroCostCommandArgv(id: string): readonly string[] | undefined {
  * not because the command necessarily costs money, but because this gate cannot
  * know that it does not, and "do not guess that something is free" is the rule.
  *
- * HONEST BOUNDARY, unchanged since F-3 and restated because the fifth review was
- * right to press on it: the gate authorises a LAUNCH. It cannot police what
- * trusted in-process executor code does afterwards, any more than TASK-003's
+ * HONEST BOUNDARY, and it MOVED — this note said "later task" until TASK-011
+ * shipped, and a stale boundary note is a lie with a good excuse.
+ *
+ * What has not changed: the gate authorises a LAUNCH. It cannot police what
+ * trusted IN-PROCESS executor code does afterwards, any more than TASK-003's
  * `Worker` boundary can — an executor that can call `fetch` is not stopped by a
- * function in the same process. Genuinely enforcing that requires the executor
- * to run without the capability (separate process, restricted credentials), and
- * that is architecture for a later task, recorded in the TASK-006 document
- * rather than quietly assumed away.
+ * function in the same process.
+ *
+ * What HAS changed: `createIsolatedExecutor` exists (TASK-011). It runs the
+ * executor in a separate process with a filtered environment, a filesystem
+ * permission model, no inherited credentials and a closed inspector, so for
+ * work that goes through it the enforcement is no longer aspirational.
+ *
+ * What is STILL true, and is the reason this paragraph is not simply deleted:
+ * the isolated executor is not yet WIRED. `EXECUTOR_WIRING` depends on both
+ * `EXECUTOR_ISOLATION` and `STATE_INTEGRITY`, and until it lands the production
+ * CLI still uses the explicitly named `createUnimplementedExecutor`. So the gate
+ * is the only thing standing in front of the in-process path that exists today,
+ * exactly as this note has always said — and it will stop being the only thing
+ * when the wiring lands, not before.
+ *
+ * Network egress is NOT blocked even in the isolated child, and is recorded in
+ * docs/KNOWN-LIMITATIONS.md rather than assumed away.
  */
 export function verificationCommandAction(input: {
   readonly commandId: string;

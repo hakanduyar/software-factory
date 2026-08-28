@@ -49,6 +49,7 @@ import { NO_BACKOFF } from "../src/supervision/resourceTypes.js";
 import type { RoadmapItem } from "../src/supervision/supervisorTypes.js";
 import { cleanupTempDbs } from "./support/factoryFixtures.js";
 import {
+  declarePersisted,
   launchWithObservedBilling,
   newSupervisor,
   scriptedExecutor,
@@ -253,6 +254,7 @@ describe("TASK-006 F4-3: a forged fresh row cannot authorize a launch", () => {
       },
       state.version,
     );
+    await declarePersisted(supervisor);
   }
 
   it("re-probes before launching even when the row looks freshly confirmed", async () => {
@@ -484,6 +486,7 @@ describe("TASK-006 F4-6: a reviewer is excluded across the full lineage", () => 
       },
       state.version,
     );
+    await declarePersisted(supervisor);
 
     const result = await supervisor.service.tick();
 

@@ -15,6 +15,7 @@
 import type { Timestamp } from "../domain/time.js";
 import type { AiRunConfigRecord } from "./modelEnforcement.js";
 import type { WorkClass } from "./modelRouting.js";
+import type { ProvenanceEntry } from "./provenanceChain.js";
 import type { ResourceRecord } from "./resourceTypes.js";
 
 // =====================================================================
@@ -62,6 +63,26 @@ export interface RoadmapItem {
    * checkpoint that only sometimes does.
    */
   readonly attempts?: number;
+  /**
+   * How many of those attempts were CLAIMED and provably never launched.
+   *
+   * `attempts` is incremented when an action is claimed, one commit BEFORE the
+   * launch, so on its own it cannot distinguish "a worker ran" from "a
+   * supervisor died in the window between claiming and launching". That
+   * ambiguity was the reason a missing-lineage check could not key on it
+   * (round-11 review), and the reviewer's answer was better than the objection:
+   * claim reconciliation ALREADY proves the launch never happened, so it can
+   * say so durably.
+   *
+   * `attempts - unlaunchedAttempts` is therefore the number of attempts that
+   * actually reached a worker, and an item with more than zero of those and no
+   * lineage anywhere is a contradiction rather than a fresh item.
+   *
+   * Counted rather than subtracted from `attempts`, so the remediation budget
+   * still bounds a crash loop: an unlaunched attempt is not free, it just is not
+   * evidence that anything ran.
+   */
+  readonly unlaunchedAttempts?: number;
   /**
    * Action kinds this item's executor is expected to perform. Every one is put
    * through the financial gate BEFORE the executor is launched (finding F-3),
@@ -268,6 +289,35 @@ export interface SupervisorState {
   /** When the next tick is worth running. Absent means "nothing scheduled". */
   readonly nextWakeAt?: Timestamp;
   readonly escalations: readonly HumanEscalation[];
+  /**
+   * Append-only, hash-chained provenance (TASK-008).
+   *
+   * A SECOND record of who implemented what, independent of the mutable
+   * `implementedByResourceKeys` carried on each roadmap item. Neither replaces
+   * the other: where they disagree the review fails closed, because two records
+   * that contradict each other mean at least one is wrong and nothing here can
+   * say which.
+   *
+   * Absent-means-empty on read, so a database written before this field existed
+   * still loads rather than being refused as corrupt.
+   *
+   * Tamper-EVIDENT, not tamper-proof — see `provenanceChain.ts`.
+   */
+  readonly provenance: readonly ProvenanceEntry[];
+  /**
+   * The chain's length and head digest, recorded SEPARATELY (TASK-008 AC-3).
+   *
+   * A hash chain cannot detect TAIL truncation on its own: a valid prefix is a
+   * valid chain, and round-5 review cut the tail and deleted the matching row
+   * so neither record mentioned the removed work. Detecting that needs
+   * something outside the chain to say how long it should be.
+   *
+   * This is the same "second source" idea the chain itself applies to the
+   * mutable row, one level up: an attacker must now edit the chain AND this
+   * anchor consistently. It is not a trust anchor — nothing here is signed —
+   * and it does not stop someone who updates both. It stops a truncation.
+   */
+  readonly provenanceAnchor?: { readonly length: number; readonly headDigest: string };
   readonly updatedAt: Timestamp;
 }
 
@@ -293,11 +343,23 @@ export const DEFAULT_ROADMAP: readonly RoadmapItem[] = [
    * cannot restrain code that can already call `fetch` — the same boundary
    * TASK-003's `Worker` has. Closing it means the executor must run WITHOUT the
    * capability: its own process, its own credentials, only the operations the
-   * supervisor hands it. That is real work with real design choices, so it is a
-   * tracked roadmap item rather than a paragraph of reassurance, and it sits
-   * before anything is wired to actually execute autonomous work.
+   * supervisor hands it. That was tracked as a roadmap item rather than a
+   * paragraph of reassurance, and it sits before anything is wired to actually
+   * execute autonomous work.
+   *
+   * IMPLEMENTED on this branch: `createIsolatedExecutor` runs the executor in a
+   * separate process with a filtered environment, a filesystem permission model,
+   * no inherited credentials and a closed inspector. Not yet WIRED — production
+   * still uses the explicitly named `createUnimplementedExecutor` until
+   * `EXECUTOR_WIRING`, which is why the item's status below is still PENDING and
+   * why the financial gate is still the only thing in front of the in-process
+   * path.
+   *
+   * Network egress is NOT blocked in the isolated child, and same-UID signalling
+   * is not constrained; both are recorded in docs/KNOWN-LIMITATIONS.md as L-3
+   * and L-9.
    */
-  { key: "EXECUTOR_ISOLATION", title: "Run executors in a restricted process with no ambient network or billing capability", dependsOn: ["SUPERVISOR_SERVICE"], status: "PENDING", workClass: "ARCHITECTURE_SECURITY", order: 3 },
+  { key: "EXECUTOR_ISOLATION", title: "Run executors in a restricted process with no ambient billing capability (network egress is NOT blocked)", dependsOn: ["SUPERVISOR_SERVICE"], status: "PENDING", workClass: "ARCHITECTURE_SECURITY", order: 3 },
   /**
    * The second thing TASK-006 cannot close from inside itself (finding
    * R9-C4-1).
@@ -310,11 +372,19 @@ export const DEFAULT_ROADMAP: readonly RoadmapItem[] = [
    * by a different path, fail-closed on anything missing or contradictory) but
    * cannot make the record self-proving.
    *
-   * So the supervisor database is part of the trusted computing base, and making
-   * that defensible — restrictive file permissions, an append-only signed audit
-   * log, provenance held outside the mutable row — is real work with real design
-   * choices. It blocks EXECUTOR_WIRING alongside isolation, because C4 evidence
-   * matters most once the Factory is actually executing work.
+   * So the supervisor database is part of the trusted computing base.
+   *
+   * Most of that work is DONE on this branch and this note used to describe all
+   * of it as pending: the database and its directory are owner-only and verified
+   * on open, an append-only hash chain records the same events as the mutable
+   * row and is anchored so deletion is visible, and the roadmap's definition has
+   * moved out of the row into a code-level catalog.
+   *
+   * What is left is the part that needs something this machine does not have: a
+   * SECRET to sign the chain with, or an external witness to compare it against.
+   * That is `CLEAN_ROOM_CI`. The item still blocks EXECUTOR_WIRING alongside
+   * isolation, because C4 evidence matters most once the Factory is actually
+   * executing work.
    */
   { key: "STATE_INTEGRITY", title: "Protect supervisor state and provenance against tampering (permissions, append-only audit)", dependsOn: ["SUPERVISOR_SERVICE"], status: "PENDING", workClass: "ARCHITECTURE_SECURITY", order: 4 },
   // Isolation comes BEFORE wiring: nothing should be wired to execute
