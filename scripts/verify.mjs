@@ -327,6 +327,35 @@ function findHardlinkedSources(directory) {
  */
 const SKIP_IN_SOURCE_SCAN = new Set(["node_modules", ".git", OUTPUT_DIR]);
 
+/**
+ * Whether a source scan should refuse to descend into this directory.
+ *
+ * THE OUTPUT DIRECTORY IS MATCHED BY PATH, NOT BY NAME (round-15 review).
+ *
+ * `SKIP_IN_SOURCE_SCAN.has(entry.name)` skipped ANY directory called `dist`, at
+ * any depth. `src/dist/` is not the build output — it is ordinary source that
+ * happens to share a name — so a hardlinked `src/dist/data.json` was never
+ * scanned and the run reported `tree-consistent`. The reviewer demonstrated it.
+ *
+ * That is the round-11 finding again: a skipped directory NAME is not a safe
+ * directory. Round 11 closed it for compiler inputs via `linkedCompilerInputs`,
+ * which is why this survived — a `.json` is not a compiler input, so it fell
+ * through both.
+ *
+ * `node_modules` and `.git` stay name-matched at any depth, and that is a
+ * different claim rather than the same one relaxed: a nested `node_modules` IS a
+ * dependency install and a nested `.git` IS a submodule's repository, at
+ * whatever depth they appear. `dist` has no such property — only the configured
+ * output path is build product. Anything tsc actually compiles inside those
+ * directories is still covered by `linkedCompilerInputs`.
+ */
+function excludedFromSourceScan(relativePath, name) {
+  if (name === "node_modules" || name === ".git") {
+    return true;
+  }
+  return relativePath === OUTPUT_DIR || relativePath.startsWith(`${OUTPUT_DIR}/`);
+}
+
 function findHardlinkedUnder(directory, skipExcluded = false) {
   const found = [];
   for (const rel of listFiles(directory, skipExcluded)) {
@@ -363,10 +392,10 @@ function findSymlinks(directory, keep = () => true, skipExcluded = false) {
        * `skipExcluded = false`, because a link under the output is exactly what
        * it is looking for.
        */
-      if (skipExcluded && SKIP_IN_SOURCE_SCAN.has(entry.name)) {
+      const rel = relative(REPO_ROOT, full).replace(/\\/g, "/");
+      if (skipExcluded && excludedFromSourceScan(rel, entry.name)) {
         continue;
       }
-      const rel = relative(REPO_ROOT, full).replace(/\\/g, "/");
       if (entry.isSymbolicLink()) {
         if (keep(rel)) found.push(rel);
       } else if (entry.isDirectory()) {
@@ -450,7 +479,7 @@ function listFiles(directory, skipExcluded = false) {
     }
     for (const entry of entries) {
       const full = join(current, entry.name);
-      if (skipExcluded && SKIP_IN_SOURCE_SCAN.has(entry.name)) {
+      if (skipExcluded && excludedFromSourceScan(relative(REPO_ROOT, full).replace(/\\/g, "/"), entry.name)) {
         continue;
       }
       // Deliberately do NOT follow directory symlinks: a linked subtree is not

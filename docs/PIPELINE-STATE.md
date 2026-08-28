@@ -90,19 +90,28 @@ scarce resource.
 
 ## To resume
 
+Both queued reviews named here are DONE and their branches are integrated; the
+steps below are the standing procedure, not a work list. Round-15 review found
+this section still naming `8a34e5e` and `8f4985e` as pending after the table
+above had been updated to say they were merged — a document contradicting
+itself, which for an autonomous pipeline reading its own notes is a live hazard
+rather than untidiness.
+
 1. PROBE the quota; do not read the reset time it printed.
-2. Run the queued reviews. The prompts are written and the runner verifies the
-   worktree is at the exact commit before launching:
-   - `feat/executor-isolation` @ `8a34e5e` — one review of the combined tree.
-   - `fix/verify-path-equivalence` @ `8f4985e` — round 11.
+2. Run any queued review. The prompt names the exact commit, and the runner
+   fingerprints the repository before and after so a tree that moved during a
+   review is visible rather than assumed away.
 3. On CHANGES_REQUIRED: remediate, verify, freeze, review again.
 4. On PASS with zero CRITICAL/HIGH and an explicit "Safe to commit: YES": run
    the ADR-0002 gate (`scratchpad/adr0002_gate.sh`) before integrating. It
    reports and never acts, and it says UNVERIFIABLE-HERE for the conditions a
    machine cannot check rather than scoring them as passes.
 
-`EXECUTOR_WIRING` stays forbidden until both prerequisites are accepted AND
-integrated. `LOCAL_24_7_RUNTIME` remains `PLATFORM_CAPABILITY_BLOCKED`.
+Currently queued: `fix/review-notes-r14`, answering the round-14 non-blocking
+notes and the two round-15 blocking findings.
+
+`EXECUTOR_WIRING` is UNBLOCKED: both prerequisites are accepted and integrated.
+`LOCAL_24_7_RUNTIME` remains `PLATFORM_CAPABILITY_BLOCKED`.
 
 ## One finding answered with a limit rather than a fix
 

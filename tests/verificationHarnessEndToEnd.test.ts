@@ -2678,3 +2678,91 @@ describe("TASK-010 round 14: each refusal happens at the stage it claims", () =>
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// ROUND-15 blocking finding 2 — a skipped directory NAME is not a safe directory
+// ---------------------------------------------------------------------------
+
+/**
+ * The scan skipped ANY directory called `dist`, at any depth, so a hardlink in
+ * `src/dist/` was never looked at and the run reported `tree-consistent`. The
+ * reviewer demonstrated it with `src/dist/data.json` at `nlink=2`.
+ *
+ * This is the round-11 finding a second time: round 11 closed it for COMPILER
+ * INPUTS via `linkedCompilerInputs`, and a `.json` is not a compiler input, so
+ * it fell through both guards.
+ *
+ * It is also the defect I introduced by widening L-6 to claim every regular
+ * file under every derived root was scanned. The documentation was made to
+ * match what I believed the code did instead of what it did, which is the third
+ * of the four shapes -- a claim nothing tests.
+ */
+describe("TASK-010 round 15: a source directory named like the output directory", () => {
+  it("REFUSES a hardlinked file under src/dist, which is not the build output", () => {
+    const root = makeFixtureRepo();
+    assert.equal(runHarness(root).status, 0, "the fixture must pass before the link is planted");
+
+    const external = mkdtempSync(join(tmpdir(), "sf-srcdist-"));
+    created.push(external);
+    const outsider = join(external, "data.json");
+    writeFileSync(outsider, '{"smuggled":true}\n');
+
+    mkdirSync(join(root, "src/dist"), { recursive: true });
+    linkSync(outsider, join(root, "src/dist/data.json"));
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, `a hardlink under src/dist was never scanned:\n${output}`);
+    assert.match(output, /src\/dist\/data\.json/, "the refusal must name the file it refuses");
+    assert.ok(!output.includes("tree-consistent"), "it must not also claim the tree is consistent");
+  });
+
+  /**
+   * The control that keeps the fix from being a blanket "scan everything".
+   *
+   * The real output directory must STILL be skipped by source scans, or every
+   * build artifact is reported as foreign source and no tree ever verifies.
+   * This is the case that fails if the path check is replaced by scanning
+   * everything, so the fix cannot be over-applied without being noticed.
+   */
+  it("still skips the REAL output directory during the source scan", () => {
+    const root = makeFixtureRepo();
+    assert.equal(runHarness(root).status, 0, "a clean fixture must pass");
+
+    // A hardlink in the true output directory is the OUTPUT scan's business,
+    // and it is caught there -- by a refusal that names the output, not one
+    // that calls it foreign source.
+    const external = mkdtempSync(join(tmpdir(), "sf-realdist-"));
+    created.push(external);
+    const outsider = join(external, "artifact.js");
+    writeFileSync(outsider, "// external\n");
+    linkSync(outsider, join(root, "dist/artifact.js"));
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, "a hardlink under the real output directory was accepted");
+    assert.match(
+      output,
+      /linked entries under dist/,
+      `the output scan should be what objects, not the source scan:\n${output}`,
+    );
+  });
+
+  /**
+   * `node_modules` and `.git` stay name-matched at ANY depth, and that is a
+   * different claim rather than the same one relaxed: a nested `node_modules`
+   * IS a dependency install wherever it sits. If this starts failing, the fix
+   * has been over-applied and ordinary workspaces are being refused.
+   */
+  it("does not refuse an ordinary nested node_modules", () => {
+    const root = makeFixtureRepo();
+    mkdirSync(join(root, "src/vendor/node_modules"), { recursive: true });
+
+    const external = mkdtempSync(join(tmpdir(), "sf-nested-nm-"));
+    created.push(external);
+    const dep = join(external, "index.js");
+    writeFileSync(dep, "module.exports = 1;\n");
+    linkSync(dep, join(root, "src/vendor/node_modules/index.js"));
+
+    const { status, output } = runHarness(root);
+    assert.equal(status, 0, `a nested node_modules was treated as foreign source:\n${output}`);
+  });
+});

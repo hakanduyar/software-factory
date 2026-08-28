@@ -263,18 +263,35 @@ from an ordinary file by name, type or `realpath`; link count is the only
 ordinary signal, and it cannot tell a hardlink pointing outside the repository
 from one pointing inside it.
 
-**The scope is wider than this entry used to say,** and round-14 review caught
-the understatement. The text described only `.ts`/`.mts`/`.cts` files under
-`tests/`. What `findHardlinkedUnder` actually walks is EVERY regular file
-beneath every derived root — `node_modules`, `.git` and the output directory
-excepted — and `linkedCompilerInputs` additionally covers each file tsc reports
-as an input together with its lexical ancestor directories. So a hardlinked
-fixture, JSON file or `.js` helper is refused too, not only a hardlinked
-TypeScript source.
+**The scope is wider than this entry once said, and narrower than the correction
+first claimed.** Round-14 review caught an understatement — the text described
+only `.ts`/`.mts`/`.cts` files under `tests/` — and round-15 review caught the
+overstatement that replaced it.
 
-That is deliberately conservative, and stating it narrowly made the guard look
-cheaper than it is: the cost below lands on more trees than the old wording
-implied. Anyone weighing the trade-off should weigh the real scope.
+What `findHardlinkedUnder` walks is every regular file beneath every derived
+root, EXCEPT:
+
+- any directory named `node_modules` or `.git`, at any depth. A nested
+  `node_modules` is a dependency install and a nested `.git` is a submodule's
+  repository wherever they sit, so the name genuinely identifies them.
+- the configured output directory, matched BY PATH.
+
+The path match is the round-15 fix. The exclusion was by NAME, so `src/dist/`
+was skipped as though it were build output, and a hardlinked
+`src/dist/data.json` was never scanned — the reviewer planted one and the run
+reported `tree-consistent`. A `.json` is not a compiler input, so
+`linkedCompilerInputs` did not cover it either and it fell through both guards.
+That is the round-11 finding a second time: a skipped directory NAME is not a
+safe directory.
+
+`linkedCompilerInputs` additionally covers each file tsc reports as an input,
+together with its lexical ancestor directories, including inside the excluded
+directories above.
+
+Stating the scope narrowly made the guard look cheaper than it is; stating it as
+"every regular file" made it look stronger than it was. The cost below lands on
+whatever the real scope is, and that is what a reader weighing the trade-off
+needs.
 
 **The cost is real and it lands on valid trees.** A clean checkout copied with
 `cp -al` is refused — the reviewer demonstrated it. So, potentially, are
