@@ -1,0 +1,333 @@
+# Known limitations
+
+Things this system does NOT do, recorded where an operator will find them.
+
+A limitation that lives only in a review transcript is a limitation nobody knows
+about. Each entry says what is not covered, why it is not covered, what would
+close it, and how it is prevented from being forgotten.
+
+This register exists because the opposite failure — overstating what a control
+achieves — has been the single most repeated defect in this project's review
+history. Several entries below were written after a reviewer caught exactly that.
+
+---
+
+## L-1 — Supervisor state is not forward-compatible across schema additions
+
+**Status:** OPEN. Found in operation 2026-08-24, during cross-machine handoff.
+
+Adding a value to a persisted enum makes durable state unreadable by any build
+that predates the addition.
+
+Concretely: TASK-009 adds `PLATFORM_CAPABILITY_BLOCKED` to `ESCALATION_REASONS`
+and records a blocker with it. The database then contains a value that only a
+build carrying TASK-009 can parse. A build from `main` — which does not yet have
+TASK-009 — refuses the whole state file:
+
+```
+supervisor state.escalations[0]: field "reason" must be one of ..., got "PLATFORM_CAPABILITY_BLOCKED"
+```
+
+**This is correct fail-closed behaviour and should not be "fixed" by making the
+parser lenient.** An unrecognised value in security-relevant state must not be
+silently ignored or coerced — that is the rule every TASK-006 review round
+reinforced. The defect is not the refusal; it is that:
+
+1. durable state is coupled to *which branch is built*, so switching branches or
+   rolling back a deployment can leave the supervisor unable to read its own
+   database;
+2. the failure surfaces as a total refusal to start rather than as a specific,
+   actionable message about a version mismatch;
+3. there is no schema version on the state blob that would let a build say "this
+   was written by something newer than me" instead of "this row is corrupt" —
+   which are very different problems with very different remedies.
+
+**Why it is recorded here rather than fixed now:** it was found while a frozen
+independent review was running, and it will *appear* to resolve the moment
+TASK-009 integrates into `main` — which is exactly how a real defect gets lost.
+The underlying coupling survives that integration and will recur on the next
+enum addition.
+
+**What would close it:** a schema/compatibility version on the persisted state,
+so a build can distinguish "written by a newer version" (refuse, and say so
+clearly, with the version that wrote it) from "genuinely corrupt" (refuse, and
+say that instead). Candidate work for `STATE_INTEGRITY`, which already owns the
+durability of this file.
+
+**Workaround today:** delete `.factory/supervisor.db` and re-run
+`sf supervise tick` to re-seed from `DEFAULT_ROADMAP`, then re-record any
+blocker. Nothing of value is lost — the roadmap definition lives in source — but
+recorded blockers and escalation history are.
+
+---
+
+## L-2 — The verifier does not defend against a concurrent local adversary
+
+**Status:** ACCEPTED BOUNDARY. Adjudicated legitimate by independent review
+(TASK-010 round 4).
+
+`scripts/verify.mjs` defends against accidental contamination and
+misconfiguration: stale build output from another branch, a redirected or
+inherited `outDir`, `noEmit`, symlinks and hardlinks pulling in outside code, a
+bind-mounted output directory, and a run that would report success having
+executed nothing.
+
+It does **not** defend against an adversary with concurrent write access to the
+working tree, or control of `PATH`, during the run. Two such escapes were
+demonstrated: swapping `tests/` between the check and the build, and shadowing
+`npx` so nothing compiled while the stale checker's mtime was touched.
+
+**Why it is not closed:** such an adversary can already edit `src/`, replace
+`node`, or rewrite the verifier itself. No verifier running inside the tree it
+audits can defend against that, and building something that appears to would
+manufacture assurance without substance.
+
+**What would close it:** running verification in a clean checkout in an isolated
+environment — the `CLEAN_ROOM_CI` roadmap item.
+
+**Kept honest by:** the boundary is stated in `scripts/verify.mjs` and pinned by
+a test asserting that statement is present, so it cannot quietly disappear.
+
+---
+
+## L-3 — The executor's process is not a network sandbox
+
+**Status:** NARROWED by TASK-011 (`feat/executor-isolation`, `e3fe829`),
+IMPLEMENTED and AWAITING INDEPENDENT REVIEW. The original in-process form was
+adjudicated a legitimate boundary by independent review (TASK-006 round 7).
+
+**What it used to say:** the financial gate authorises a LAUNCH and cannot
+police what trusted in-process executor code does afterwards, because an
+in-process function cannot restrain code that can already call `fetch`.
+
+**What changed:** the executor now runs in a separate process with an explicit
+environment, a bounded request, a timeout, and strict parsing of everything it
+returns. It holds no credential store, and the response format has no field
+through which a child could grant itself authority.
+
+**What is STILL open, and is the reason this entry survives rather than being
+deleted:** raw network egress is **not blocked**. A child can still open a
+socket. Closing that needs an OS-level control — a network namespace, seccomp,
+or a firewall rule — and installing one needs a sudo password, which ADR-0002
+reserves to the human. Autonomous work cannot acquire it.
+
+**What is genuinely removed is BILLING capability**, which is the property
+`AUTONOMOUS_SPEND_LIMIT = 0` actually rests on: provider CLIs authenticate from
+credential stores under `HOME`/`CODEX_HOME`/`XDG_*`, the isolated allowlist
+omits all of them, and a process that cannot authenticate cannot cause a charge
+whether or not it can reach the network. A child reaching an unauthenticated
+endpoint is a real but much smaller problem than one that can spend money.
+
+**Consequence for the design:** the isolated child performs deterministic work
+only. An AI launch needs exactly the credential access it is denied, so launches
+stay with the supervisor behind the gate that authorises them — a deliberate
+division, not a missing feature.
+
+**Kept honest by:** `EXECUTOR_WIRING` depends on `EXECUTOR_ISOLATION`, and a test
+asserts that dependency. A second test reads the implementation source and fails
+if it ever claims to be sandboxed, or claims egress is blocked.
+
+**Watch for:** anyone merging the executor allowlist with the WORKER allowlist
+"for tidiness". The difference between those two lists IS this control; a worker
+is given `HOME` on purpose, and an executor must not be.
+
+---
+
+## L-4 — Implementer lineage is tamper-evident, not tamper-proof
+
+**Status:** NARROWED by TASK-008 and again by TASK-012
+(`feat/state-integrity-rebased`, `b207ded`), IMPLEMENTED and AWAITING
+INDEPENDENT REVIEW. Adjudicated a legitimate boundary by independent review in
+its original form (TASK-006 round 10).
+
+Lineage is a recorded historical fact living in a database, and there is no key
+on this machine to authenticate it. Catalog recognition, a cross-check against
+`lastRunConfig`, and fail-closed handling of anything missing or contradictory
+raise the cost of forgery; none of them make the record self-proving.
+
+**What changed:** there is now a SECOND record — an append-only hash chain
+written at the same moment as the mutable row. A row rewritten to name a
+different implementer contradicts the chain and the review waits for a human; a
+chain that does not verify makes every AI ancestor ambiguous. The database and
+its directory are also owner-only now, tightened on every open.
+
+**What is STILL open:** the chain has no secret, so it detects nothing against
+someone who recomputes it after editing. It catches the corrupted row, the
+partial restore, the hand-edit "just fixing one field" — the realistic cases —
+and not a determined forger.
+
+**And one gap the second record does not close:** an EMPTY chain is treated as
+silence rather than contradiction, because a database written before TASK-008
+has no entries for work already done. An attacker who can write the database can
+also delete the whole chain, which returns the system to the pre-TASK-008
+behaviour for that item. Refusing instead would strand every existing database;
+the trade-off was made deliberately and is flagged here rather than buried.
+
+**What TASK-012 changed, and what it did not:** an item's DEFINITION — `key`,
+`title`, `workClass`, `dependsOn`, `order` — no longer comes from the database at
+all. It comes from a code-level catalog, and a persisted row that disagrees fails
+closed naming the field. That closes two bypasses a database writer had which the
+chain could not see, because they forged what an item IS rather than what
+happened to it: relabelling an `INDEPENDENT_REVIEW` item `DETERMINISTIC` to skip
+review, and writing `DONE` onto an unreviewed item so its dependents proceed.
+
+PROGRESS fields — `status`, `attempts`, implementer history, `lastRunConfig`,
+diagnostics — remain mutable and remain in the trusted computing base. The
+definition is now out of reach; the record of what happened is not, and that is
+the whole of what this entry has always been about.
+
+**The contrast worth remembering:** spending authority has no equivalent
+weakness, because F-1 made it impossible to EXPRESS in data — no row can grant
+it, so no row has to be trusted. Lineage cannot be built that way. The
+DEFINITION now can be, and is: it is no longer stored anywhere an attacker can
+reach.
+
+**Consequence:** the supervisor database is part of the trusted computing base.
+
+**Kept honest by:** `EXECUTOR_WIRING` depends on `STATE_INTEGRITY` in
+`DEFAULT_ROADMAP`, and `tests/task006RemediationRound10Repro.test.ts` asserts
+that dependency, so nothing can be wired to execute autonomous work while this
+gap is open.
+
+**Also kept honest by:** `sf supervise status` prints the chain verdict with the
+words "tamper-evident, not tamper-proof" beside it, and a test fails if that
+wording disappears — so the distinction reaches an operator rather than living
+only in a source comment. `tests/task006RemediationRound9Repro.test.ts` still
+pins the residual forgery case and now states precisely what narrowed and what
+did not.
+
+---
+
+## L-6 — Verification refuses trees containing any hardlinked source
+
+**Status:** OPEN, deliberate. Raised by independent review (TASK-010 round 5) as
+a false positive; referred back to the reviewer for a judgement on the
+trade-off rather than settled unilaterally by the implementer.
+
+`scripts/verify.mjs` refuses any `.ts`/`.mts`/`.cts` under `tests/` whose link
+count exceeds one. A hardlink is indistinguishable from an ordinary file by
+name, type or `realpath`; link count is the only ordinary signal, and it cannot
+tell a hardlink pointing outside the repository from one pointing inside it.
+
+**The cost is real and it lands on valid trees.** A clean checkout copied with
+`cp -al` is refused — the reviewer demonstrated it. So, potentially, are
+hardlinking backup tools, some container layer implementations, and any workflow
+that de-duplicates files across checkouts.
+
+**Why it is still the policy:** the alternative — permitting hardlinks whose
+target resolves inside the repository — accepts precisely the case that cannot
+be told apart from the dangerous one. `npm test` is the default verification for
+every human and agent here, so a rule that is occasionally inconvenient was
+preferred to one that is sometimes wrong.
+
+**What would make this reconsiderable:** `CLEAN_ROOM_CI` exists to run
+verification in an environment the adversary is not in. Once it does, the local
+hardlink rule is defending much less and could reasonably become a warning.
+
+**Watch for:** if this begins refusing ordinary working copies, the cost has
+exceeded the benefit and the trade-off should be revisited — not worked around
+with a bypass flag. A bypass flag would delete the guard for everyone while
+appearing to keep it.
+
+---
+
+## L-5 — Provisional failure signatures are inert
+
+**Status:** OPEN, documented in TASK-006.
+
+Neither installed CLI documents its rate-limit or usage-limit output, so the
+signature table entries for those states are marked PROVISIONAL and do not fire.
+Real provider failures classify as `UNKNOWN_FAILURE` and take the bounded backoff
+ladder.
+
+This is deliberate: inventing a signature that has never been observed would be
+the "measured vs assumed" dishonesty this codebase repeatedly removes. The cost
+is that the more specific resource states are not currently reachable in
+practice.
+
+**What would close it:** observing and recording real rate-limit output from each
+provider, then promoting the signature from PROVISIONAL to MEASURED.
+
+---
+
+## L-7 — `declaredActionKinds` is a definition field TASK-012 does not enforce
+
+**Status:** OPEN, deliberate and scoped. Recorded at implementation time
+(TASK-012, `feat/state-integrity-rebased`), not discovered later.
+
+TASK-012 moved an item's DEFINITION out of the database: `key`, `title`,
+`workClass`, `dependsOn` and `order` come from a code-level catalog, and a
+persisted row disagreeing with it fails closed.
+
+`declaredActionKinds` belongs on that list by exactly the same argument — it is a
+decision recorded in source, not a fact about progress — and it is NOT checked
+against the catalog. Its five siblings are the fields the demonstrated bypasses
+used, and TASK-012's acceptance criteria were frozen around them before
+implementation began. Widening a frozen scope mid-implementation is what C2
+forbids, so the gap is written down instead of quietly closed.
+
+**What it means concretely.** Something able to write the database can add or
+remove entries from an item's `declaredActionKinds`, and the pre-launch gate runs
+over whatever the row declares:
+
+- ADDING a kind makes the gate stricter, which is the closed direction.
+- REMOVING a kind from an AI item skips the pre-launch check for that kind.
+- REMOVING every kind from a DETERMINISTIC item does NOT get past the gate:
+  deterministic work that declares nothing is refused outright, because work that
+  never declared anything can never be asked about.
+
+It confers no authority. The action a worker actually reports is evaluated again
+by `evaluateFinancialSafety` against the policy, not against the item, so the
+realistic consequence is a lost EARLY refusal — the supervisor launching work it
+would have declined to start, and then declining it one step later.
+
+**What would close it:** adding the field to `DEFINITION_FIELDS` in
+`src/supervision/roadmapCatalog.ts` and declaring it on the catalog entries that
+use it. A small change, and a planning decision rather than an implementer's.
+
+**Kept honest by:** the header comment of `src/supervision/roadmapCatalog.ts`
+names this residue and points here, and `tests/roadmapStructuralIntegrity.test.ts`
+asserts the naming is present — so deleting the note fails a test.
+
+---
+
+## L-8 — Some guards are unreachable through the public path, and say so
+
+**Status:** OPEN, deliberate. Each instance is stated in its own source file;
+this entry exists so the pattern is findable in one place.
+
+Three guards cannot be reached through the interface their callers use, so no
+test can prove them load-bearing. Independent review mutated each one and the
+suite stayed green — correctly. Rather than deleting them or implying a tested
+guarantee, each says plainly what it is:
+
+- `onlyKeys` in `src/supervision/executorProtocol.ts` inspects OWN property names
+  including non-enumerable ones. The only entry point takes TEXT, and
+  `JSON.parse` cannot produce a non-enumerable own property, so it is
+  indistinguishable from `Object.keys` in practice. What actually defends the
+  parser is the allowlist, which is tested.
+- The catalog rebuild in `src/supervision/roadmapCatalog.ts` returns definition
+  fields from the catalog rather than the row. Any row that DIFFERS is refused
+  first, so the two can never disagree on a path that returns a value.
+- The post-build `assessMountTopology` call in `scripts/verify.mjs` runs after a
+  pre-build refusal that already rejects a mounted output, and creating a mount
+  needs privileges no fixture has. Its DECISION is proven by the pure tests; the
+  call exists so a future reordering still meets a tested guard before anything
+  is deleted.
+
+**Why they stay:** each is defence in depth against a future reordering, and each
+costs nothing. **Why this entry exists:** "defence in depth" is exactly what an
+untested guard looks like from the outside, and the difference between the two is
+a claim someone should be able to check.
+
+**What would close it:** for the first, an entry point accepting an
+already-parsed object — which nothing needs. For the second and third, a
+reordering that made them reachable, which would be a regression rather than a
+fix.
+
+**Kept honest by:** a fourth member of this list was found NOT to be unreachable.
+The post-build tree-safety wiring in `scripts/verify.mjs` had the same
+justification written beside it, and a build that plants its own symlink under
+the output directory does reach it — nothing privileged required. It has a test
+now. An unreachability claim is a claim like any other, and this one has already
+been wrong once.
