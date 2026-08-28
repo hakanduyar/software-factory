@@ -343,9 +343,21 @@ export const DEFAULT_ROADMAP: readonly RoadmapItem[] = [
    * cannot restrain code that can already call `fetch` — the same boundary
    * TASK-003's `Worker` has. Closing it means the executor must run WITHOUT the
    * capability: its own process, its own credentials, only the operations the
-   * supervisor hands it. That is real work with real design choices, so it is a
-   * tracked roadmap item rather than a paragraph of reassurance, and it sits
-   * before anything is wired to actually execute autonomous work.
+   * supervisor hands it. That was tracked as a roadmap item rather than a
+   * paragraph of reassurance, and it sits before anything is wired to actually
+   * execute autonomous work.
+   *
+   * IMPLEMENTED on this branch: `createIsolatedExecutor` runs the executor in a
+   * separate process with a filtered environment, a filesystem permission model,
+   * no inherited credentials and a closed inspector. Not yet WIRED — production
+   * still uses the explicitly named `createUnimplementedExecutor` until
+   * `EXECUTOR_WIRING`, which is why the item's status below is still PENDING and
+   * why the financial gate is still the only thing in front of the in-process
+   * path.
+   *
+   * Network egress is NOT blocked in the isolated child, and same-UID signalling
+   * is not constrained; both are recorded in docs/KNOWN-LIMITATIONS.md as L-3
+   * and L-9.
    */
   { key: "EXECUTOR_ISOLATION", title: "Run executors in a restricted process with no ambient billing capability (network egress is NOT blocked)", dependsOn: ["SUPERVISOR_SERVICE"], status: "PENDING", workClass: "ARCHITECTURE_SECURITY", order: 3 },
   /**
@@ -360,11 +372,19 @@ export const DEFAULT_ROADMAP: readonly RoadmapItem[] = [
    * by a different path, fail-closed on anything missing or contradictory) but
    * cannot make the record self-proving.
    *
-   * So the supervisor database is part of the trusted computing base, and making
-   * that defensible — restrictive file permissions, an append-only signed audit
-   * log, provenance held outside the mutable row — is real work with real design
-   * choices. It blocks EXECUTOR_WIRING alongside isolation, because C4 evidence
-   * matters most once the Factory is actually executing work.
+   * So the supervisor database is part of the trusted computing base.
+   *
+   * Most of that work is DONE on this branch and this note used to describe all
+   * of it as pending: the database and its directory are owner-only and verified
+   * on open, an append-only hash chain records the same events as the mutable
+   * row and is anchored so deletion is visible, and the roadmap's definition has
+   * moved out of the row into a code-level catalog.
+   *
+   * What is left is the part that needs something this machine does not have: a
+   * SECRET to sign the chain with, or an external witness to compare it against.
+   * That is `CLEAN_ROOM_CI`. The item still blocks EXECUTOR_WIRING alongside
+   * isolation, because C4 evidence matters most once the Factory is actually
+   * executing work.
    */
   { key: "STATE_INTEGRITY", title: "Protect supervisor state and provenance against tampering (permissions, append-only audit)", dependsOn: ["SUPERVISOR_SERVICE"], status: "PENDING", workClass: "ARCHITECTURE_SECURITY", order: 4 },
   // Isolation comes BEFORE wiring: nothing should be wired to execute

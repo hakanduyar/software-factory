@@ -1346,9 +1346,19 @@ export class SupervisorService {
    * (R9-C4-1), and failing closed whenever any of it is missing, unrecognised or
    * contradictory. What is NOT claimed is that a determined writer of the
    * database is stopped. **The supervisor database is part of the trusted
-   * computing base**, and making it defensible — file permissions, an
-   * append-only signed audit log, or moving provenance out of the mutable row —
-   * is the `STATE_INTEGRITY` roadmap item, not a comment here.
+   * computing base.**
+   *
+   * WHAT `STATE_INTEGRITY` ALREADY DID, since this note used to defer all of it
+   * to a future task and that is no longer true: the database and its directory
+   * are owner-only, verified on every open; there is an append-only hash chain
+   * recording the same events as the mutable row, anchored by length and head so
+   * a deletion is visible; and the roadmap's DEFINITION has moved out of the
+   * mutable row into a code-level catalog (TASK-012).
+   *
+   * WHAT REMAINS, and is why the sentence above still stands: the chain has no
+   * SECRET, so it is tamper-EVIDENT and not tamper-proof, and the PROGRESS
+   * fields are still mutable. Signing, or an external witness, is
+   * `CLEAN_ROOM_CI` — not a comment here.
    *
    * N-2 already said C4 is a property of the LINEAGE rather than of one item.
    * The first fix walked one edge of that lineage; this walks all of it.

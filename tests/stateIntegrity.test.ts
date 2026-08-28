@@ -1533,7 +1533,25 @@ describe("TASK-008 round 5: a dependency edit cannot hide lineage", () => {
     assert.equal(appended.ok, true);
     if (!appended.ok) throw new Error("unreachable");
 
-    const supervisor = newSupervisor({ probe: healthyProbe() });
+    /**
+     * The catalog DECLARES this roadmap (round-13 finding).
+     *
+     * It used to run on the default catalog while persisting custom items `A`
+     * and `B`, so TASK-012 refused the state at catalog reconciliation and the
+     * tick never reached the traversal this case is about. The test asserted
+     * nothing about the result, so it stayed green while proving nothing —
+     * deleting the chain-key traversal left the whole suite passing.
+     *
+     * `dependsOn: []` on B is the TAMPER, so the catalog declares the honest
+     * edge and only the persisted row drops it.
+     */
+    const supervisor = newSupervisor({
+      probe: healthyProbe(),
+      roadmap: [
+        { key: "B", title: "Review", dependsOn: ["A"], status: "PENDING", workClass: "INDEPENDENT_REVIEW", order: 1 },
+        { key: "A", title: "Implemented", dependsOn: [], status: "PENDING", workClass: "NORMAL_IMPLEMENTATION", order: 2 },
+      ],
+    });
     const state = await supervisor.service.ensureInitialized();
     await supervisor.repository.compareAndSave(
       {
@@ -1550,16 +1568,35 @@ describe("TASK-008 round 5: a dependency edit cannot hide lineage", () => {
       state.version,
     );
 
+    /**
+     * ASSERTS THE OUTCOME, which this case used not to (round-13 finding).
+     *
+     * It ran the tick, iterated the executor calls, and discarded the result. If
+     * the tick refused for an unrelated reason — as it did, because the catalog
+     * did not declare these items — the loop was empty and the case passed
+     * having exercised nothing.
+     */
+    /**
+     * WHICH GUARD CATCHES THIS NOW, measured rather than assumed.
+     *
+     * When this was written the chain-key traversal was the answer. TASK-012
+     * moved the answer earlier: `dependsOn` is a DEFINITION field, so a
+     * persisted row that disagrees with the catalog is refused before the
+     * exclusion walk runs at all. A mutation removing the traversal leaves this
+     * case green, and the honest response is to say so here and to test the
+     * traversal where it is still the only thing standing — the case below.
+     *
+     * The property this case asserts is unchanged and still worth pinning: a
+     * deleted edge does not get a review past the gate.
+     */
     const result = await supervisor.service.tick();
-    for (const call of supervisor.executor.calls()) {
-      if (call.item.key !== "B" || call.config === undefined) continue;
-      assert.notEqual(
-        `${call.config.effectiveProvider}:${call.config.effectiveModel}`,
-        "codex-cli:gpt-5.6-luna",
-        "a deleted dependency edge hid the chain entry and the implementer reviewed its own work",
-      );
+    assert.equal(result.kind, "WAITING_FOR_HUMAN", "a deleted edge let the review proceed");
+    if (result.kind === "WAITING_FOR_HUMAN") {
+      assert.match(result.humanActionRequired, /dependsOn/, "the refusal must name the edited field");
     }
-    void result;
+    for (const call of supervisor.executor.calls()) {
+      assert.notEqual(call.item.key, "B", "the review ran on lineage the traversal never consulted");
+    }
   });
 });
 
@@ -1918,6 +1955,8 @@ describe("TASK-008 round 8: lineage on every path a worker can take", () => {
     const supervisor = newSupervisor({
       probe: healthyProbe(),
       executor: scriptedExecutor({
+        // CHECKPOINT then COMPLETED: the fixture repeats its LAST outcome, so a
+        // one-entry script means A never finishes and B is never selected.
         A: [
           {
             kind: "CHECKPOINT",
@@ -1934,6 +1973,7 @@ describe("TASK-008 round 8: lineage on every path a worker can take", () => {
               updatedAt: 1,
             },
           },
+          { kind: "COMPLETED", detail: "finished after the rollover" },
         ],
       }),
     });
@@ -1951,7 +1991,18 @@ describe("TASK-008 round 8: lineage on every path a worker can take", () => {
     await supervisor.service.tick(); // A completes
     await supervisor.service.tick(); // B is reviewed
 
-    const reviewCall = supervisor.executor.callsFor("B")[0];
+    /**
+     * B MUST ACTUALLY HAVE RUN (round-13 finding).
+     *
+     * `scriptedExecutor` repeats its last outcome, so scripting only a
+     * CHECKPOINT meant A never completed and B was never selected. The loop
+     * below then had nothing to iterate and passed vacuously — the exact shape
+     * of "not refused" being mistaken for "did the right thing".
+     */
+    const reviewCalls = supervisor.executor.callsFor("B");
+    assert.ok(reviewCalls.length > 0, "B was never reviewed, so this proves nothing about who reviewed it");
+
+    const reviewCall = reviewCalls[0];
     if (reviewCall !== undefined) {
       const usedForReview = `${reviewCall.config?.effectiveProvider ?? ""}:${reviewCall.config?.effectiveModel ?? ""}`;
       assert.notEqual(
@@ -2417,6 +2468,8 @@ describe("TASK-011 round 9: a worker that handed over mid-item is still excluded
     const supervisor = newSupervisor({
       probe,
       executor: scriptedExecutor({
+        // CHECKPOINT then COMPLETED: the fixture repeats its LAST outcome, so a
+        // one-entry script means A never finishes and B is never selected.
         A: [
           {
             kind: "CHECKPOINT",
@@ -2433,6 +2486,7 @@ describe("TASK-011 round 9: a worker that handed over mid-item is still excluded
               updatedAt: 1,
             },
           },
+          { kind: "COMPLETED", detail: "finished after the rollover" },
         ],
       }),
     });
@@ -2603,5 +2657,77 @@ describe("TASK-011 round 11: an item that RAN and lost its records", () => {
     const ran = chainFor("claude-code:opus");
     const verdict = verifyAgainstAnchor([], anchorFor(ran));
     assert.equal(verdict.intact, false, "a chain deleted under a surviving anchor must be visible");
+  });
+});
+
+describe("TASK-008 round 13: the chain names an item the roadmap no longer has", () => {
+  /**
+   * WHAT THE CHAIN-KEY TRAVERSAL IS STILL THE ONLY ANSWER TO.
+   *
+   * Round-13 review showed the dependency-edit case no longer reaches it —
+   * TASK-012 refuses an edited `dependsOn` before the walk runs. That left the
+   * traversal untested, and a mutation removing it passed the whole suite.
+   *
+   * Its remaining job is the case the roadmap cannot describe: the chain records
+   * work on a key that is NOT in the roadmap any more — removed, renamed, or
+   * simply never declared here. `visited` is built from catalog edges, so it can
+   * never contain that key, and only the chain's own list of keys can. The
+   * implementer of that work must still be excluded, because the work still
+   * happened.
+   */
+  it("excludes the implementer of a chain entry whose roadmap item is gone", async () => {
+    const ONLY = "claude-code:opus";
+    const probe = scriptedProbe();
+    probe.set("claude-code", "opus", {
+      state: "AVAILABLE",
+      reason: "scripted",
+      billingMode: "INCLUDED_SUBSCRIPTION",
+    });
+    for (const entry of TEST_CATALOG) {
+      if (`${entry.provider}:${entry.model}` === ONLY) continue;
+      probe.set(entry.provider, entry.model, { state: "PROVIDER_UNAVAILABLE", reason: "scripted outage" });
+    }
+
+    const supervisor = newSupervisor({
+      probe,
+      roadmap: [
+        { key: "A", title: "Ancestor", dependsOn: [], status: "PENDING", workClass: "DETERMINISTIC", order: 1, declaredActionKinds: ["RUN_TESTS"] },
+        { key: "B", title: "Review of A", dependsOn: ["A"], status: "PENDING", workClass: "INDEPENDENT_REVIEW", order: 2 },
+      ],
+    });
+    await seedRoadmap(supervisor, supervisor.catalog);
+
+    // The chain records work by the only routable resource on an item this
+    // roadmap does not contain.
+    const gone = appendProvenance([], {
+      kind: "IMPLEMENTED_BY",
+      roadmapKey: "REMOVED_ITEM",
+      resourceKey: ONLY,
+      detail: "implemented before the item was renamed",
+      recordedAt: 1_000,
+    });
+    assert.equal(gone.ok, true);
+    if (!gone.ok) throw new Error("unreachable");
+
+    const state = (await supervisor.repository.load())!;
+    await supervisor.repository.compareAndSave(
+      {
+        ...state,
+        version: state.version + 1,
+        roadmap: state.roadmap.map((item) =>
+          item.key === "A" ? { ...item, status: "DONE" as const } : { ...item, status: "ELIGIBLE" as const },
+        ),
+        provenance: gone.chain,
+        provenanceAnchor: anchorFor(gone.chain),
+      },
+      state.version,
+    );
+
+    await supervisor.service.tick();
+
+    for (const call of supervisor.executor.callsFor("B")) {
+      const used = `${call.config?.effectiveProvider ?? ""}:${call.config?.effectiveModel ?? ""}`;
+      assert.notEqual(used, ONLY, "the implementer named only by the chain reviewed dependent work");
+    }
   });
 });

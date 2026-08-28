@@ -358,7 +358,7 @@ describe("TASK-011 AC-6/AC-7: nothing hangs, nothing is assumed successful", () 
   });
 
   /**
-   * AC-7 — a child that ignores SIGTERM must not outlive the wait. The parent
+   * AC-7 — a child that handles SIGTERM and takes its time exiting must not outlive the wait. The parent
    * escalates to SIGKILL, so this returns rather than hanging on a child that
    * refuses to die politely.
    */
@@ -493,11 +493,32 @@ describe("TASK-011 AC-12: the trust-boundary notes say what is now true", () => 
     /architecture for a later task/,
     /architecture for a later roadmap item/,
     /is architecture for a later/,
+    // ...and the STATE_INTEGRITY half of the same class, which round 13 found
+    // still describing shipped work as pending. One list, so the next stale
+    // deferral of either kind fails the same case.
+    /is the `STATE_INTEGRITY` roadmap item, not a comment here/,
+    // Matched on a phrase unique to the STALE text, because the wording wraps
+    // across comment lines and a span-based pattern silently stopped matching.
+    /is real work with real design choices/,
+  ];
+
+  /**
+   * SCANNED WIDER THAN THE FILES THAT MAKE THE POSITIVE CLAIM.
+   *
+   * A stale deferral is stale wherever it sits, and round-13 review found one in
+   * `supervisorTypes.ts` — which this list did not cover, so a mutation
+   * reinstating it passed. The set of files that may not contain a false claim
+   * is larger than the set that must contain the true one.
+   */
+  const NOTES_THAT_MUST_NOT_BE_STALE = [
+    "src/supervision/financialSafety.ts",
+    "src/supervision/supervisorService.ts",
+    "src/supervision/supervisorTypes.ts",
   ];
 
   it("no longer claims process isolation is future work", async () => {
     const { readFileSync } = await import("node:fs");
-    for (const file of ["src/supervision/financialSafety.ts", "src/supervision/supervisorService.ts"]) {
+    for (const file of NOTES_THAT_MUST_NOT_BE_STALE) {
       const source = readFileSync(file, "utf8");
       for (const stale of STALE_FUTURE_WORK) {
         assert.ok(
@@ -1564,5 +1585,91 @@ describe("TASK-011 round 8: guards a reviewer's mutations survived", () => {
     assert.throws(() => {
       (ISOLATED_EXECUTOR_ENV_ALLOWLIST as string[]).push("ANTHROPIC_API_KEY");
     }, TypeError);
+  });
+});
+
+// =====================================================================
+// ROUND-13 — untested behaviour, and a citation that pointed at nothing
+// =====================================================================
+
+describe("TASK-011 round 13: the scratch directory outlives nothing", () => {
+  /**
+   * The `finally` that removes the request directory had no test: deleting the
+   * `rmSync` left the suite at 72/72. Correct code with no test is a coin toss
+   * about whether the next change keeps it.
+   *
+   * The interesting path is the REFUSAL, because that is the one that used to
+   * leak — building the request can refuse, and the refusal happened between
+   * `mkdtempSync` and the `try`.
+   */
+  it("removes the request directory when serialization is REFUSED", async () => {
+    const before = new Set(readdirSync(tmpdir()).filter((entry) => entry.startsWith("sf-executor-")));
+    const script = childScript("export {};");
+    const contaminated = {
+      ...INPUT,
+      item: { ...ITEM, title: "x".repeat(MAX_REQUEST_FIELD_BYTES + 1) },
+    } as unknown as WorkExecutionInput;
+
+    await assert.rejects(executorFor(script, 30_000).execute(contaminated), /over the/);
+
+    const after = readdirSync(tmpdir()).filter((entry) => entry.startsWith("sf-executor-"));
+    const leaked = after.filter((entry) => !before.has(entry));
+    assert.deepEqual(leaked, [], "a refused request left its scratch directory behind");
+  });
+
+  /** ...and on the ordinary path too, which is the case that always worked. */
+  it("removes the request directory after a successful run", async () => {
+    const before = new Set(readdirSync(tmpdir()).filter((entry) => entry.startsWith("sf-executor-")));
+    const script = childScript(
+      `import { readFileSync } from "node:fs";
+       JSON.parse(readFileSync(process.argv[2], "utf8"));
+       process.stdout.write(JSON.stringify({
+         protocol: ${EXECUTOR_PROTOCOL_VERSION},
+         outcome: { kind: "COMPLETED", detail: "done" },
+       }));`,
+    );
+    await executorFor(script, 30_000).execute(INPUT);
+
+    const after = readdirSync(tmpdir()).filter((entry) => entry.startsWith("sf-executor-"));
+    assert.deepEqual(
+      after.filter((entry) => !before.has(entry)),
+      [],
+      "a completed run left its scratch directory behind",
+    );
+  });
+});
+
+describe("TASK-011 round 13: a citation must point at something", () => {
+  /**
+   * Round-13 review found this file telling a reader that the same-UID
+   * signalling gap was recorded in the limitations register. It was not — L-3
+   * covers network egress only. A reference to a document that does not say what
+   * you claim is worse than no reference, because it looks like the thinking was
+   * written down.
+   *
+   * So every `L-n` this source cites is checked against the register. This is
+   * the test that would have caught it, which is the point: the previous round
+   * fixed a stale CLAIM, and this one fixes a claim about a DOCUMENT.
+   */
+  it("every limitation number the source cites exists in the register", async () => {
+    const { readFileSync } = await import("node:fs");
+    const register = readFileSync("docs/KNOWN-LIMITATIONS.md", "utf8");
+    const declared = new Set([...register.matchAll(/^## (L-\d+)/gm)].map((match) => match[1]));
+    assert.ok(declared.size > 0, "the register must declare some limitations, or this proves nothing");
+
+    const sources = [
+      "src/adapters/supervision/isolatedExecutor.ts",
+      "src/supervision/supervisorService.ts",
+      "src/supervision/roadmapCatalog.ts",
+    ];
+    for (const file of sources) {
+      const text = readFileSync(file, "utf8");
+      for (const match of text.matchAll(/\b(L-\d+)\b/g)) {
+        assert.ok(
+          declared.has(match[1]),
+          `${file} cites ${match[1]}, which docs/KNOWN-LIMITATIONS.md does not declare`,
+        );
+      }
+    }
   });
 });

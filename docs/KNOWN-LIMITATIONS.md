@@ -384,3 +384,41 @@ justification written beside it, and a build that plants its own symlink under
 the output directory does reach it — nothing privileged required. It has a test
 now. An unreachability claim is a claim like any other, and this one has already
 been wrong once.
+
+---
+
+## L-9 — The isolated child can be signalled by anything running as the same user
+
+**Status:** OPEN, deliberate. Raised by independent review (TASK-011) and
+recorded here after round-13 review found the source citing an entry that did
+not exist.
+
+The isolated executor runs the child in its own process group, closes the
+inspector, filters the environment and restricts filesystem access. None of that
+constrains a process running as the SAME UNIX USER.
+
+**What that means concretely:**
+
+- Anything running as this user can `SIGKILL` the supervisor while a child is
+  mid-run. The child is `detached`, so it survives its parent; the supervisor
+  records no outcome, and durable state keeps whatever it last committed. That
+  is a denial of service, not a bypass of the financial gate — a real
+  limitation, and a smaller one than a child that can spend money.
+- Equally, anything running as this user can signal the CHILD. The process group
+  makes the supervisor's own timeout kill reach descendants; it does not make
+  the group private.
+- `setsid` and PID namespaces would narrow this, and both need privileges or
+  installation this process does not have and must not acquire for itself.
+
+**Why it is not closed in-process:** a process cannot deny signals to another
+process with the same credentials. The boundary is the operating system's, and
+moving it needs a different user, a namespace, or a container — an OS-level
+control a human installs.
+
+**What would close it:** running the executor as a separate unprivileged user,
+or under a PID namespace. That is `CLEAN_ROOM_CI` territory, alongside the
+external witness L-4 needs.
+
+**Kept honest by:** `src/adapters/supervision/isolatedExecutor.ts` cites this
+entry by number, and a test asserts every limitation the source cites actually
+exists in this file — the check that would have caught the missing entry.

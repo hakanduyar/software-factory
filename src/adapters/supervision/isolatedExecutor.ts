@@ -80,8 +80,13 @@
  * real limitation, and a smaller one than a child that can spend money.
  *
  * The remaining egress and signalling gaps are recorded in
- * docs/KNOWN-LIMITATIONS.md on the docs/known-limitations branch, and close
- * with OS-level controls a human must install.
+ * docs/KNOWN-LIMITATIONS.md — egress as L-3, signalling as L-9 — and close with
+ * OS-level controls a human must install.
+ *
+ * That citation was checked against the file rather than asserted: round-13
+ * review found the same sentence pointing at a signalling entry that did not
+ * exist. A reference to a document that does not say what you claim is worse
+ * than no reference, because it looks like the thinking was written down.
  */
 
 import { spawn, spawnSync } from "node:child_process";
