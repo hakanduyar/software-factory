@@ -98,9 +98,112 @@ import { fileURLToPath } from "node:url";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const OUTPUT_DIR = "dist";
+/**
+ * Which directories this build compiles FROM — DERIVED, not assumed.
+ *
+ * `["src", "tests"]` was a hard-coded guess about the project's shape, and
+ * round-8 review compiled and executed a file that simply lived somewhere else.
+ * Hard-coding closed the two roots this repository happens to use and left the
+ * class wide open — the same mistake as filtering hardlinks by suffix, one
+ * level up.
+ *
+ * The roots come from the effective tsconfig's `include`/`files`: the literal
+ * prefix of each pattern, up to the first glob. A pattern beginning with a glob
+ * roots at the repository itself. That is what tsc actually reads, which is the
+ * only thing worth scanning.
+ *
+ * Populated after the effective config is resolved; `sourceRoots()` is called
+ * only from code that runs after that point.
+ */
+let SOURCE_ROOTS = ["src", "tests"];
+/** `rootDir` from the effective config: what the output layout is relative to. */
+let ROOT_DIR = ".";
+function deriveSourceRoots(config) {
+  const patterns = [
+    ...(Array.isArray(config?.include) ? config.include : []),
+    ...(Array.isArray(config?.files) ? config.files : []),
+  ].filter((pattern) => typeof pattern === "string");
+
+  const roots = new Set();
+  const outside = new Set();
+  for (const pattern of patterns) {
+    const segments = pattern.replace(/\\/g, "/").replace(/^\.\//, "").split("/");
+    const literal = [];
+    for (const segment of segments) {
+      if (segment.includes("*") || segment.includes("?")) break;
+      literal.push(segment);
+    }
+    // A `files` entry names a FILE, so its directory is the root; a glob's
+    // literal prefix is already one.
+    const candidate = literal.length > 0 && literal[literal.length - 1].includes(".")
+      ? literal.slice(0, -1).join("/")
+      : literal.join("/");
+    /**
+     * NORMALISED against the repository root (round-9 CRITICAL).
+     *
+     * A tsconfig may declare its includes ABSOLUTELY, and this returned the
+     * absolute path unchanged. Every caller then did `join(REPO_ROOT, root)`,
+     * which prefixed the repository a second time and produced a path that does
+     * not exist — so the symlink check, the hardlink scan and the mount check
+     * all ran against nothing and found nothing wrong. The reviewer pointed an
+     * absolute include at the fixture's own `src`, replaced `testArtifacts.ts`
+     * with a symlink to a module calling `process.exit(0)`, and the run exited 0
+     * WITH NO OUTPUT.
+     *
+     * `resolve` treats an absolute candidate as absolute and a relative one as
+     * relative to the repository, so both spellings land on the same directory;
+     * `relative` then puts it back in the form every caller expects.
+     */
+    const absolute = resolve(REPO_ROOT, candidate.length === 0 ? "." : candidate);
+    const rel = relative(REPO_ROOT, absolute).replace(/\\/g, "/");
+    if (rel.startsWith("../")) {
+      // The compiler reads from OUTSIDE the repository. Nothing here can scan
+      // it meaningfully, and a build that compiles foreign source is precisely
+      // what these guards exist to refuse.
+      outside.add(absolute);
+      continue;
+    }
+    roots.add(rel === "" ? "." : rel);
+  }
+  return { roots: roots.size === 0 ? ["."] : [...roots].sort(), outside: [...outside].sort() };
+}
 /** How long `--showConfig` may take before the run fails closed, saying so. */
 const CONFIG_TIMEOUT_MS = 120_000;
 const CHECKER_PATH = join(REPO_ROOT, OUTPUT_DIR, "src/verification/testArtifacts.js");
+
+/**
+ * Directories the walk COULD NOT READ (round-6 CRITICAL).
+ *
+ * Every walker caught `readdirSync` and returned nothing, so a subtree with
+ * mode 000 was indistinguishable from an empty one. The reviewer hid an orphan
+ * under `dist/hidden` and a test under `tests/hidden`, and the run reported
+ * "tree-consistent" and exited 0 — verification of the READABLE PROJECTION of
+ * the tree, presented as verification of the tree.
+ *
+ * Collected rather than thrown from inside the walk, so the refusal names
+ * every unreadable path at once instead of the first one; a reader fixing
+ * permissions wants the whole list.
+ */
+const unreadable = [];
+function noteUnreadable(path) {
+  const rel = relative(REPO_ROOT, path).replace(/\\/g, "/");
+  const shown = rel.length === 0 ? "." : rel;
+  if (!unreadable.includes(shown)) {
+    unreadable.push(shown);
+  }
+}
+
+/** Refuses if anything scanned so far could not be read. */
+function assertEverythingWasReadable(stage) {
+  if (unreadable.length === 0) {
+    return;
+  }
+  fail(
+    `verification refused ${stage}: these directories could not be read, so their contents are unknown: ` +
+      `${unreadable.sort().join(", ")}. An unreadable subtree is not an empty one, and treating it as empty ` +
+      "would verify only the part of the tree this process happens to be allowed to see.",
+  );
+}
 
 function isSymlink(path) {
   try {
@@ -137,9 +240,43 @@ function deviceOf(path) {
  * sometimes wrong.
  */
 function findHardlinkedSources(directory) {
+  /**
+   * EVERY file, not only `.ts`/`.mts`/`.cts` (round-7 CRITICAL).
+   *
+   * The suffix filter encoded an assumption about what tsc compiles, and the
+   * assumption was wrong: with `allowJs`, an external `foreign.js` hardlinked
+   * into `src/` was compiled, executed by a test, and the run exited 0 with
+   * "tree-consistent". `resolveJsonModule` and future options make the same
+   * mistake available again.
+   *
+   * What a compiler decides to read is not a fact this file can predict from a
+   * filename, so it stops guessing. The POLICY is unchanged and already refuses
+   * more than strictly necessary: a hardlink inside the repository is
+   * indistinguishable from one pointing outside, so all are refused.
+   */
+  return findHardlinkedUnder(directory, true);
+}
+
+/**
+ * ANY file beneath a directory with a link count above one.
+ *
+ * `findHardlinkedSources` filters by compilable suffix, which is right for a
+ * source root and wrong for build output: a hardlinked `dist/tests/x.test.js`
+ * is not a source file, and it was overwritten by the build while the run
+ * still reported the tree consistent (round-5 finding).
+ */
+/**
+ * Directories no source scan should descend into.
+ *
+ * Relevant once a root can be `.`: tsc excludes `node_modules` by default, the
+ * output is build product audited by different rules, and `.git` holds no
+ * compilable source.
+ */
+const SKIP_IN_SOURCE_SCAN = new Set(["node_modules", ".git", OUTPUT_DIR]);
+
+function findHardlinkedUnder(directory, skipExcluded = false) {
   const found = [];
-  for (const rel of listFiles(directory)) {
-    if (!rel.endsWith(".ts") && !rel.endsWith(".mts") && !rel.endsWith(".cts")) continue;
+  for (const rel of listFiles(directory, skipExcluded)) {
     try {
       if (lstatSync(join(REPO_ROOT, rel)).nlink > 1) found.push(rel);
     } catch {
@@ -150,17 +287,32 @@ function findHardlinkedSources(directory) {
 }
 
 /** Symlinked entries anywhere beneath a directory, as repo-relative paths. */
-function findSymlinks(directory, keep = () => true) {
+function findSymlinks(directory, keep = () => true, skipExcluded = false) {
   const found = [];
   const walk = (current) => {
     let entries;
     try {
       entries = readdirSync(current, { withFileTypes: true });
-    } catch {
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        noteUnreadable(current);
+      }
       return;
     }
     for (const entry of entries) {
       const full = join(current, entry.name);
+      /**
+       * Skipped by NAME before the link test, and only for SOURCE scans.
+       *
+       * Relevant once a root can be `.`: `node_modules` is commonly a symlink
+       * to a shared install, tsc excludes it by default, and reporting it as
+       * foreign source refuses an ordinary workspace. The OUTPUT scan passes
+       * `skipExcluded = false`, because a link under the output is exactly what
+       * it is looking for.
+       */
+      if (skipExcluded && SKIP_IN_SOURCE_SCAN.has(entry.name)) {
+        continue;
+      }
       const rel = relative(REPO_ROOT, full).replace(/\\/g, "/");
       if (entry.isSymbolicLink()) {
         if (keep(rel)) found.push(rel);
@@ -186,29 +338,68 @@ function realOrUndefined(path) {
   }
 }
 
-/** The `outDir` tsconfig actually declares — not the one this script assumes. */
-function declaredOutDir() {
-  const raw = readFileSync(join(REPO_ROOT, "tsconfig.json"), "utf8");
-  // tsconfig permits comments; JSON.parse does not.
-  const stripped = raw.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
-  const outDir = JSON.parse(stripped)?.compilerOptions?.outDir;
-  if (typeof outDir !== "string" || outDir.trim().length === 0) {
-    fail("tsconfig.json declares no outDir; verification cannot know where the build lands");
+/**
+ * The absolute path `candidate` names, resolved through links where possible.
+ *
+ * Two spellings name the same directory when they RESOLVE to the same place,
+ * not when their text matches. Comparing spellings refused every equivalent way
+ * of naming the managed directory: an absolute path, `dist/../dist`, a trailing
+ * separator, and a `dist-alias -> dist` symlink — the last of which is the
+ * managed directory itself under another name.
+ *
+ * `realpath` is preferred; a path that does not exist yet falls back to lexical
+ * resolution, which still normalises `..`, `./` and trailing separators.
+ */
+function resolvedPath(candidate) {
+  const absolute = resolve(REPO_ROOT, candidate);
+  const direct = realOrUndefined(absolute);
+  if (direct !== undefined) {
+    return direct;
   }
-  return outDir;
+  /**
+   * The path does not exist YET — but its parents might, and one of them might
+   * be a symlink (round-7 finding). With `workspace -> .` and no `dist` built,
+   * `workspace/dist` resolved lexically to a different directory than `dist`
+   * and was refused, even though tsc would write to exactly the managed one.
+   *
+   * So: resolve the longest EXISTING ancestor, then re-attach the remainder.
+   * Falls back to the lexical answer when nothing on the path exists, which is
+   * the same conservative result as before.
+   */
+  const parts = absolute.split("/");
+  const tail = [];
+  while (parts.length > 1) {
+    tail.unshift(parts.pop());
+    const real = realOrUndefined(parts.join("/") || "/");
+    if (real !== undefined) {
+      return [real.replace(/\/+$/, ""), ...tail].join("/");
+    }
+  }
+  return absolute;
 }
 
-function listFiles(directory) {
+/** True when two path spellings name one directory. */
+function sameDirectory(a, b) {
+  return resolvedPath(a) === resolvedPath(b);
+}
+
+function listFiles(directory, skipExcluded = false) {
   const found = [];
   const walk = (current) => {
     let entries;
     try {
       entries = readdirSync(current, { withFileTypes: true });
-    } catch {
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        noteUnreadable(current);
+      }
       return;
     }
     for (const entry of entries) {
       const full = join(current, entry.name);
+      if (skipExcluded && SKIP_IN_SOURCE_SCAN.has(entry.name)) {
+        continue;
+      }
       // Deliberately do NOT follow directory symlinks: a linked subtree is not
       // part of this build, and walking into it would pull someone else's
       // artifacts into the audit as though they belonged here.
@@ -227,22 +418,21 @@ function build() {
   execFileSync("npx", ["tsc", "-p", "tsconfig.json"], { cwd: REPO_ROOT, stdio: "inherit" });
 }
 
-// --- 1. does tsconfig build where we manage? ---------------------------------
-// Checked BEFORE building, and inline rather than through the tested checker,
-// because the checker is imported FROM the output directory — if that is not
-// where tsc writes, the import fails first and the operator gets a module-not-
-// found stack instead of the real diagnosis. Deliberately a plain string
-// comparison, with the substantive realpath/symlink rules still applied by the
-// tested function once the checker exists.
-const declared = declaredOutDir().replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, "");
-if (declared !== OUTPUT_DIR) {
-  fail(
-    `verification refused: tsconfig builds into ${JSON.stringify(declared)} but verification manages ` +
-      `${JSON.stringify(OUTPUT_DIR)}; they must be the same directory or stale artifacts elsewhere would be executed`,
-  );
-}
-
-// --- 2. refuse an unreasonable tree BEFORE building --------------------------
+// --- 1. refuse an unreasonable tree BEFORE building --------------------------
+//
+// THE RAW-TSCONFIG CHECK IS GONE (round-2 finding). It read the root file and
+// compared its `outDir` before resolving `extends`, and it was:
+//
+//   - the source of a false positive, refusing a legitimate `extends`-only
+//     config outright; and then, once that was fixed,
+//   - not load-bearing at all. Deleting it left the whole end-to-end suite
+//     green, because the EFFECTIVE check below runs before the build too and
+//     catches every mismatch the raw one could.
+//
+// Its stated justification was an earlier diagnostic than the checker import.
+// The effective check already provides that, so the raw one was two things at
+// once — a duplicate and a hazard. A guard nothing exercises is not defence in
+// depth; it is code that will be wrong one day with nothing to notice.
 // Building is itself a write through whatever these paths resolve to, so the
 // structural checks that do not need the compiled checker happen first. A
 // symlinked output directory was previously refused only AFTER the build had
@@ -323,7 +513,7 @@ const configProblem = (() => {
    * resolution rather than by string so that `dist`, `./dist` and an absolute
    * path are one answer, and a sibling like `dist-2` is not.
    */
-  if (resolve(REPO_ROOT, options.outDir) !== resolve(REPO_ROOT, OUTPUT_DIR)) {
+  if (!sameDirectory(options.outDir, OUTPUT_DIR)) {
     return (
       `the effective tsconfig builds into ${JSON.stringify(options.outDir)}, but verification manages ` +
       `${JSON.stringify(OUTPUT_DIR)}; the audit would examine a directory the build never wrote to`
@@ -356,12 +546,156 @@ if (configProblem !== undefined) {
   fail(`verification refused: ${configProblem}; refusing to build a configuration it cannot read`);
 }
 const noEmit = effectiveConfig.compilerOptions.noEmit === true;
-if (isSymlink(join(REPO_ROOT, "tests"))) {
-  fail("verification refused: the tests directory is a symlink; an external suite would be compiled and executed as though it belonged to this tree");
+// The roots are a fact about the CONFIG, so they are derived the moment the
+// config is known and before anything scans a directory.
+const derivedRoots = deriveSourceRoots(effectiveConfig);
+if (derivedRoots.outside.length > 0) {
+  fail(
+    `verification refused: the effective tsconfig compiles source from outside this repository ` +
+      `(${derivedRoots.outside.join(", ")}); nothing here can scan or vouch for it`,
+  );
+}
+SOURCE_ROOTS = derivedRoots.roots;
+/**
+ * The output layout is DERIVED too, for the same reason the roots are.
+ *
+ * `rootDir` decides where a source lands under `outDir`, so the audit cannot map
+ * one to the other without it. An absolute `rootDir` is normalised exactly as
+ * the roots are; one outside the repository is refused for the same reason.
+ */
+ROOT_DIR = (() => {
+  const declared = effectiveConfig.compilerOptions.rootDir;
+  if (declared === undefined) return ".";
+  if (typeof declared !== "string") {
+    fail(`verification refused: rootDir is ${JSON.stringify(declared)}, which is not a string`);
+  }
+  const rel = relative(REPO_ROOT, resolve(REPO_ROOT, declared)).replace(/\\/g, "/");
+  if (rel.startsWith("../")) {
+    fail(`verification refused: rootDir (${declared}) is outside this repository`);
+  }
+  return rel === "" ? "." : rel;
+})();
+/**
+ * DERIVED, like everything else about the layout (round-13 HIGH).
+ *
+ * `declaration`, `sourceMap` and `declarationMap` decide which artifact kinds
+ * the build produces. Without them the audit accepted a `.d.ts` as explained by
+ * its source even when nothing would emit one, so a declaration left behind by a
+ * previous configuration survived as "clean".
+ */
+const EMIT_LAYOUT = {
+  rootDir: ROOT_DIR,
+  outputDirectory: OUTPUT_DIR,
+  declaration: effectiveConfig.compilerOptions.declaration === true,
+  sourceMap: effectiveConfig.compilerOptions.sourceMap === true,
+  declarationMap: effectiveConfig.compilerOptions.declarationMap === true,
+};
+/**
+ * Refused BEFORE the build, and the wording says so (round-3 finding).
+ *
+ * The later `assessTreeSafety` clauses cover the same conditions, so removing
+ * these left their named tests green — but only because the build had ALREADY
+ * written through the link by the time the later guard ran. The reviewer found
+ * compiled checker and test files sitting in the external target of a symlinked
+ * `dist` after a "refused" run.
+ *
+ * That is the whole point of checking here: not to produce a different verdict,
+ * but to produce it before anything is written. The distinct wording lets a
+ * test pin THIS layer, and the regressions also assert the external target is
+ * still empty — which is the property that actually matters and cannot be
+ * satisfied by a later refusal.
+ */
+/**
+ * EVERY source root, not just `tests` (round-4 CRITICAL).
+ *
+ * `findSymlinks("src")` walks what is INSIDE `src`; it never asked whether
+ * `src` itself was a link. `tests` was checked here and `src` was not, so a
+ * repository whose entire `src` pointed elsewhere passed every guard: the
+ * external `testArtifacts.ts` was compiled and imported, and a module calling
+ * `process.exit(0)` at import time produced EXIT 0 WITH NO OUTPUT.
+ *
+ * A false success is the worst outcome this file can produce — worse than a
+ * crash, because nothing looks wrong. The asymmetry existed only because the
+ * two roots were written as separate lines instead of a list, which is exactly
+ * the kind of omission a list prevents and a pair of lines invites.
+ */
+for (const root of SOURCE_ROOTS) {
+  /**
+   * The root AND everything above it (round-12 CRITICAL). A root is checked for
+   * being a link; an ANCESTOR of a root is not a root, and was checked by
+   * nothing.
+   */
+  for (const linked of linkedAncestors(root)) {
+    fail(
+      `verification refused before building: ${linked} is a symlink and a derived source root sits inside it; ` +
+        "external code would be compiled and executed as though it belonged to this tree",
+    );
+  }
+  if (isSymlink(resolve(REPO_ROOT, root))) {
+    fail(
+      `verification refused before building: the ${root} directory is a symlink; external code would be ` +
+        "compiled and executed as though it belonged to this tree",
+    );
+  }
 }
 if (isSymlink(join(REPO_ROOT, OUTPUT_DIR))) {
-  fail("verification refused: the build output directory is a symlink; the build would write outside the repository");
+  fail("verification refused before building: the build output directory is a symlink; the build would write outside the repository");
 }
+
+/**
+ * THE COMPILER'S OWN FILE LIST (round-10 CRITICAL).
+ *
+ * Globbing the derived roots was still a guess — a better one than
+ * `["src", "tests"]`, and still not what tsc reads. `exclude` was ignored
+ * entirely, so a test source the config EXCLUDES counted as current, and an old
+ * artifact at the same path was therefore explained by it. The reviewer excluded
+ * a test, planted its previous build output, and watched the stale artifact RUN
+ * while the harness reported success.
+ *
+ * Asking the compiler removes the last of the guessing. `--listFilesOnly`
+ * enumerates the actual program: `include` minus `exclude`, PLUS anything
+ * reachable by import — which matters, because `exclude` does not stop an
+ * excluded file being pulled in by an included one, and a glob-based answer gets
+ * that wrong in both directions.
+ *
+ * Filtered to this repository, because the list also names `lib.*.d.ts` and
+ * whatever `node_modules` types the program pulls in, and those are not this
+ * tree's source.
+ */
+function compilerInputs() {
+  let listed;
+  try {
+    listed = execFileSync("npx", ["tsc", "-p", "tsconfig.json", "--listFilesOnly"], {
+      cwd: REPO_ROOT,
+      encoding: "utf8",
+      timeout: CONFIG_TIMEOUT_MS,
+      maxBuffer: 64 * 1024 * 1024,
+    });
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    fail(
+      `verification refused: the compiler could not list its own inputs (${detail}); refusing to audit a tree ` +
+        "whose source set is unknown",
+    );
+  }
+  const inRepo = [];
+  for (const line of listed.split("\n")) {
+    const path = line.trim();
+    if (path.length === 0) continue;
+    const rel = relative(REPO_ROOT, resolve(REPO_ROOT, path)).replace(/\\/g, "/");
+    if (rel.startsWith("../") || rel.length === 0) continue;
+    if (rel.startsWith("node_modules/") || rel.startsWith(`${OUTPUT_DIR}/`)) continue;
+    // Declaration files are inputs but emit nothing, so they explain no artifact.
+    if (/\.d\.(ts|mts|cts)$/.test(rel)) continue;
+    if (!/\.(ts|mts|cts)$/.test(rel)) continue;
+    inRepo.push(rel);
+  }
+  if (inRepo.length === 0) {
+    fail("verification refused: the compiler reported no source files of its own in this repository");
+  }
+  return [...new Set(inRepo)].sort();
+}
+const allSources = compilerInputs();
 
 /**
  * Individual source links, refused BEFORE the build and BEFORE the checker is
@@ -375,15 +709,109 @@ if (isSymlink(join(REPO_ROOT, OUTPUT_DIR))) {
  * guard. The tested clause stays as defence in depth; this one exists to run
  * first, and it runs before the build too, because the build compiles the link.
  */
+/**
+ * EVERY COMPILER INPUT, whatever directory it sits in (round-11 CRITICAL).
+ *
+ * The walk skipped entries named `dist`, `.git` and `node_modules` AT EVERY
+ * DEPTH, before any link inspection. That exclusion exists so a `.` source root
+ * does not report an ordinary workspace as foreign — and it was a name filter
+ * over a set the compiler does not define, which is the subset-for-the-whole
+ * substitution this file keeps being caught by.
+ *
+ * The reviewer put `src/dist/evil.ts` in the tree, excluded it in tsconfig,
+ * imported it from a test — which makes tsc compile it anyway, `exclude` being
+ * about the initial file list rather than reachability — and hardlinked it to an
+ * external file. `tsc --listFilesOnly` listed it correctly. The link scan
+ * skipped it by directory name, and the external content executed under a
+ * "tree-consistent" report.
+ *
+ * So the scan is the UNION of two sets, and neither replaces the other:
+ *
+ *   - every `.ts`/`.mts`/`.cts` file the compiler says it reads that lives in
+ *     this repository, excluding declaration files, `node_modules` and the
+ *     output directory. Narrower than "every compiler input", and said exactly:
+ *     with `allowJs` or `resolveJsonModule` a `.js` or `.json` input would not
+ *     be scanned here. That direction is CONSERVATIVE — such a file is not
+ *     matched by the walk's exclusions either, so it is still covered by the
+ *     other half of this union — but the claim is narrowed rather than left
+ *     overstated. The property that matters is that the set comes from the
+ *     program rather than from a path; and
+ *   - the directory walk, which still skips those names, because it covers
+ *     files that are NOT compiler inputs and would otherwise report an ordinary
+ *     `node_modules` as foreign source.
+ *
+ * The union is strictly larger than either, which is the only property that
+ * matters here.
+ *
+ * ANCESTORS ARE CHECKED, and this paragraph is the correction of a mistake worth
+ * recording rather than quietly undoing.
+ *
+ * An ancestor walk was written here, a mutation showed it caught nothing the
+ * suite already caught, and it was REMOVED on that evidence. Round-12 review
+ * then produced the case it existed for: `src` a symlink to an external
+ * directory, with `include` naming `src/foo/**` and `src/verification/...`. The
+ * derived roots are then `src/foo`, `src/verification` and `tests` — and `src`
+ * ITSELF is never a root, so the root-symlink refusal never looks at it. The
+ * walk starts below the link and `lstat` on each file follows it. The run exited
+ * 0, reported the tree consistent, and executed external code.
+ *
+ * The measurement was right about the case it measured and wrong as a
+ * generalisation: a symlinked directory that BECOMES a root is caught by the
+ * root check; a symlinked directory ABOVE every root is caught by nothing. "A
+ * mutation shows this is redundant" only ever means redundant for the cases the
+ * suite covers, and the question that should have followed it — what case would
+ * make it necessary? — was not asked.
+ *
+ * So every lexical ancestor of every derived root AND of every compiler input is
+ * inspected, up to the repository root.
+ */
+function linkedAncestors(relativePath) {
+  const found = [];
+  const parts = relativePath.split("/").filter((part) => part.length > 0 && part !== ".");
+  // STRICT ancestors. The path itself is judged by its own check, which says
+  // something more specific — "the tests directory is a symlink" reads better
+  // than "a root sits inside a symlink" when the root IS the symlink.
+  for (let depth = 1; depth < parts.length; depth += 1) {
+    const directory = parts.slice(0, depth).join("/");
+    if (isSymlink(resolve(REPO_ROOT, directory))) {
+      found.push(directory);
+      break;
+    }
+  }
+  return found;
+}
+
+function linkedCompilerInputs() {
+  const found = [];
+  for (const rel of allSources) {
+    const absolute = join(REPO_ROOT, rel);
+    let stats;
+    try {
+      stats = lstatSync(absolute);
+    } catch (error) {
+      if (error?.code !== "ENOENT") noteUnreadable(absolute);
+      continue;
+    }
+    found.push(...linkedAncestors(rel));
+    if (stats.isSymbolicLink() || stats.nlink > 1) {
+      found.push(rel);
+      continue;
+    }
+  }
+  return found;
+}
+
 const linkedSources = [
-  ...findSymlinks("src"),
-  ...findSymlinks("tests"),
-  ...findHardlinkedSources("src"),
-  ...findHardlinkedSources("tests"),
+  ...new Set([
+    ...SOURCE_ROOTS.flatMap((root) => findSymlinks(root, () => true, true)),
+    ...SOURCE_ROOTS.flatMap((root) => findHardlinkedSources(root)),
+    ...linkedCompilerInputs(),
+  ]),
 ].sort();
 if (linkedSources.length > 0) {
   fail(
-    `verification refused before building: symlinked or hardlinked entries under the source roots (src/, tests/): ` +
+    `verification refused before building: symlinked or hardlinked entries under the source roots ` +
+      `(${SOURCE_ROOTS.join(", ")}): ` +
       `${linkedSources.join(", ")}; source must live in this repository`,
   );
 }
@@ -398,13 +826,14 @@ if (outputDevice !== undefined && rootDevice !== undefined && outputDevice !== r
 // `rmSync(recursive)` deletes straight through it. The mount table is read
 // here, before anything is built or removed; the decision itself lives in the
 // tested checker and is applied once that exists (step 4).
-const mountInfo = (() => {
+function readMountInfo() {
   try {
     return readFileSync("/proc/self/mountinfo", "utf8");
   } catch {
     return undefined;
   }
-})();
+}
+const mountInfo = readMountInfo();
 
 /**
  * ...and refuse a mounted output BEFORE the build writes into it (round-12
@@ -422,23 +851,80 @@ const mountInfo = (() => {
  * under-matches is worse than no guard because it looks like one.
  */
 if (process.platform === "linux") {
-  const outputPath = (realOrUndefined(join(REPO_ROOT, OUTPUT_DIR)) ?? join(REPO_ROOT, OUTPUT_DIR)).replace(/\/+$/, "");
-  const earlyMountPoints = (mountInfo ?? "")
-    .split("\n")
-    .map((line) => line.trim().split(" ")[4])
-    .filter((point) => typeof point === "string" && point.startsWith("/"))
-    .map((point) => point.replace(/\\([0-7]{3})/g, (_m, o) => String.fromCharCode(Number.parseInt(o, 8))));
+  /**
+   * EVERY managed path, not just the output (round-5 CRITICAL).
+   *
+   * The guard asked only whether `dist` was a mount point. A bind-mounted
+   * `src/` therefore sailed past every source check — `isSymlink` says no, link
+   * counts say no, and `realpath` resolves inside the repository because a bind
+   * mount IS the path it is mounted at. The reviewer mounted an external `src`
+   * whose `testArtifacts.ts` began with `process.exit(0)`, and the run returned
+   * EXIT 0 WITH NO OUTPUT. A false pass, again, from a check that covered one
+   * path and not its siblings.
+   *
+   * The same list the source scan uses, so the two cannot drift apart.
+   */
+  const managedPaths = [OUTPUT_DIR, ...SOURCE_ROOTS].map((managed) => {
+    const absolute = resolve(REPO_ROOT, managed);
+    return { relative: managed, path: (realOrUndefined(absolute) ?? absolute).replace(/\/+$/, "") };
+  });
+  /**
+   * Rows are VALIDATED, not merely counted (round-9 HIGH).
+   *
+   * `split(" ")[4]` accepted `not a mountinfo row /unrelated` as a mount at
+   * `/unrelated`. Arbitrary text became a mount point, which is wrong in both
+   * directions: garbage rows kept the "could not be read" refusal below
+   * unreachable, and a table of garbage missing the real mount looked safe.
+   *
+   * Deliberately the same shape as `parseMountInfoRow` in the tested checker.
+   * This copy exists because this guard runs BEFORE anything is compiled, so
+   * the checker does not exist yet; the tested one remains the authority.
+   */
+  const earlyMountRow = (line) => {
+    const fields = line.split(" ").filter((field) => field.length > 0);
+    if (fields.length < 10) return undefined;
+    if (!/^\d+$/.test(fields[0] ?? "")) return undefined;
+    if (!/^\d+$/.test(fields[1] ?? "")) return undefined;
+    if (!/^\d+:\d+$/.test(fields[2] ?? "")) return undefined;
+    if (!(fields[3] ?? "").startsWith("/")) return undefined;
+    const point = fields[4] ?? "";
+    if (!point.startsWith("/")) return undefined;
+    const separator = fields.indexOf("-", 6);
+    if (separator === -1 || fields.length - separator < 4) return undefined;
+    return point.replace(/\\([0-7]{3})/g, (_m, o) => String.fromCharCode(Number.parseInt(o, 8)));
+  };
+  const earlyLines = (mountInfo ?? "").split("\n").map((line) => line.trim()).filter((line) => line.length > 0);
+  const earlyMountPoints = earlyLines.map(earlyMountRow).filter((point) => point !== undefined);
+  if (mountInfo !== undefined && earlyMountPoints.length !== earlyLines.length) {
+    fail(
+      "verification refused: the mount table (/proc/self/mountinfo) contains lines this verifier does not " +
+        "recognise as mountinfo rows, so the mount topology is not fully known",
+    );
+  }
   if (mountInfo === undefined || earlyMountPoints.length === 0) {
     fail("verification refused: the mount table (/proc/self/mountinfo) could not be read, so it is unknown whether the build output is a mount point");
   }
-  const offending = earlyMountPoints.find(
-    (point) => point === outputPath || point.startsWith(`${outputPath}/`),
-  );
-  if (offending !== undefined) {
-    fail(
-      `verification refused before building: the build output directory is or contains a mount point (${offending}); ` +
-        `the build would write into a separately mounted tree and a recursive delete would reach through it`,
+  for (const managed of managedPaths) {
+    /**
+     * AT or BELOW the managed path only (round-6 finding).
+     *
+     * The condition also matched ANCESTORS, so bind-mounting the whole
+     * repository onto its own path — an ordinary workspace layout — was
+     * refused with "dist is or contains a mount point". An ancestor mount
+     * splices nothing INTO the tree: everything below it moves together and
+     * stays consistent. What matters is a mount AT or INSIDE a managed path,
+     * which is exactly how foreign content gets spliced in.
+     */
+    const offending = earlyMountPoints.find(
+      (point) => point === managed.path || point.startsWith(`${managed.path}/`),
     );
+    if (offending !== undefined && offending !== "/") {
+      fail(
+        `verification refused before building: ${managed.relative} is or contains a mount point (${offending}); ` +
+          "a bind mount is indistinguishable from an ordinary directory by name, link count or realpath, so code " +
+          "from outside this tree would be compiled and executed as though it belonged to it",
+      );
+    }
   }
 }
 if (noEmit) {
@@ -450,6 +936,32 @@ if (noEmit) {
   // thing this one can report is that NOTHING WAS BUILT.
   fail("verification refused before building: tsconfig sets noEmit, so the build would produce nothing and any audit would run against whatever was already there");
 }
+
+/**
+ * Links UNDER the output directory, refused BEFORE the build (round-5 finding).
+ *
+ * These were scanned only after `tsc` ran, so a symlinked
+ * `dist/tests/whatever.test.js` was written THROUGH into an external file
+ * before anything objected: the run refused, and the damage was already done.
+ * A hardlinked artifact was worse — it was overwritten and the run still
+ * reported the tree consistent, because nothing looked at link counts under
+ * the output at all.
+ *
+ * Refusing here costs a walk of a directory that is usually small, and removes
+ * a write the later guard could only report.
+ */
+const outputLinksBeforeBuild = [
+  ...findSymlinks(OUTPUT_DIR),
+  ...findHardlinkedUnder(OUTPUT_DIR),
+].sort();
+if (outputLinksBeforeBuild.length > 0) {
+  fail(
+    `verification refused before building: linked entries under ${OUTPUT_DIR}: ` +
+      `${outputLinksBeforeBuild.join(", ")}; the build would write through them into files outside this tree`,
+  );
+}
+
+assertEverythingWasReadable("before building");
 
 // --- 3. build, and prove it actually emitted the checker ---------------------
 const buildStartedAt = Date.now();
@@ -470,71 +982,111 @@ if (!checkerFreshlyEmitted) {
 }
 const checker = await import(`file://${CHECKER_PATH}?t=${buildStartedAt}`);
 
-// --- 3b. the realpath-based output check, now that the checker exists -------
-// A path is judged by what it RESOLVES to, not by its name. `rmSync` does not
-// follow a symlinked `dist`, which looked safe — but `tsc`, this import and the
-// test runner all do.
-const outputVerdict = checker.assessOutputDirectory({
-  repositoryRoot: REPO_ROOT,
-  realRepositoryRoot: realOrUndefined(REPO_ROOT) ?? REPO_ROOT,
-  configuredOutputDirectory: OUTPUT_DIR,
-  outputDirectory: join(REPO_ROOT, OUTPUT_DIR),
-  realOutputDirectory: realOrUndefined(join(REPO_ROOT, OUTPUT_DIR)),
-  tsconfigOutDir: declaredOutDir(),
-});
-if (!outputVerdict.trusted) {
-  fail(`verification refused: ${outputVerdict.reason}`);
-}
+// --- 3b. output, mount and tree safety, together and REPEATABLY ------------
+// These used to be three separate blocks that ran once. They are one function
+// now, called after every build, because the repair rebuild is a build too —
+// see `assertTreeIsSafe`.
 
 // --- 4. the full tested safety judgement, now that the checker exists --------
-const safety = checker.assessTreeSafety({
-  testsRootIsSymlink: isSymlink(join(REPO_ROOT, "tests")),
-  outputIsSymlink: isSymlink(join(REPO_ROOT, OUTPUT_DIR)),
-  outputOnDifferentDevice:
-    outputDevice !== undefined && rootDevice !== undefined && outputDevice !== rootDevice,
+/**
+ * A FUNCTION, because it has to happen TWICE (round-10 HIGH).
+ *
+ * The repair cycle cleans and rebuilds, and the second build is a build like any
+ * other: the reviewer made it replace `dist` with a symlink to an external
+ * generated tree, and nothing looked again. The run reported success and
+ * executed the external tree's tests.
+ *
+ * The facts are gathered fresh on each call rather than reused, which is the
+ * whole point — a fact captured before the second build says nothing about
+ * after it.
+ */
+function assertTreeIsSafe(stage, checkerIsFresh) {
+  const safety = checker.assessTreeSafety({
+  /**
+   * EVERY derived root, not the one called `tests` (round-9).
+   *
+   * The pre-build loop already asks this of every root; this fact was still
+   * phrased as a question about one hard-coded directory, which is the same
+   * subset-for-the-whole substitution the roots themselves stopped making.
+   */
+  testsRootIsSymlink: SOURCE_ROOTS.some((root) => isSymlink(resolve(REPO_ROOT, root))),
+    outputIsSymlink: isSymlink(join(REPO_ROOT, OUTPUT_DIR)),
+    outputOnDifferentDevice: (() => {
+      const nowDevice = deviceOf(join(REPO_ROOT, OUTPUT_DIR));
+      return nowDevice !== undefined && rootDevice !== undefined && nowDevice !== rootDevice;
+    })(),
   // EVERY symlink under the output, not only those whose own name ends in
   // `.test.js` (round-3 finding B11). A symlinked DIRECTORY called
   // `foreign-output` was neither walked into nor reported, so an external
   // `ghost.test.js` inside it was invisible and the run reported a consistent
   // tree. Filtering by name meant the check only caught the shape of the escape
   // that had already been demonstrated.
-  symlinkedArtifacts: findSymlinks(OUTPUT_DIR),
+    symlinkedArtifacts: [...findSymlinks(OUTPUT_DIR), ...findHardlinkedUnder(OUTPUT_DIR)],
   // BOTH source roots (round-11 finding C). `src/` is compiled and executed
   // just as `tests/` is, and scanning only `tests/` enforced less than the
   // threat model above claims. Same policy, same already-documented
   // legitimate-hardlink false positive — applied consistently rather than to
   // whichever directory happened to be named first.
-  symlinkedSources: linkedSources,
-  buildEmitsNothing: noEmit,
-  checkerFreshlyEmitted,
-});
-if (!safety.safe) {
-  fail(`verification refused: ${safety.reason}`);
-}
+    symlinkedSources: [
+      ...new Set([
+        ...SOURCE_ROOTS.flatMap((root) => findSymlinks(root, () => true, true)),
+        ...SOURCE_ROOTS.flatMap((root) => findHardlinkedSources(root)),
+        ...linkedCompilerInputs(),
+      ]),
+    ].sort(),
+    buildEmitsNothing: noEmit,
+    checkerFreshlyEmitted: checkerIsFresh,
+  });
+  if (!safety.safe) {
+    fail(`verification refused ${stage}: ${safety.reason}`);
+  }
 
-// --- 4b. mount topology, the part `st_dev` cannot answer ---------------------
-// DEFENCE IN DEPTH, and deliberately unreachable through the ordinary path: the
-// pre-build refusal above already rejects a mounted output, so no fixture can
-// arrive here with one. Its reachability is stated here rather than implied by
-// a green test — the repository's established answer for a guard the public
-// path cannot reach (see `resourceBindingHolds`). The DECISION is proven by the
-// pure `assessMountTopology` tests, which mutation-check each clause; this call
-// exists so that a future reordering which weakens the early check still meets a
-// tested guard before anything is deleted.
-const mountVerdict = checker.assessMountTopology({
-  platform: process.platform,
-  mountInfo,
-  outputDirectory: join(REPO_ROOT, OUTPUT_DIR),
-  realOutputDirectory: realOrUndefined(join(REPO_ROOT, OUTPUT_DIR)),
-});
-if (!mountVerdict.safe) {
-  fail(`verification refused: ${mountVerdict.reason}`);
+  const outputVerdictNow = checker.assessOutputDirectory({
+    repositoryRoot: REPO_ROOT,
+    realRepositoryRoot: realOrUndefined(REPO_ROOT) ?? REPO_ROOT,
+    configuredOutputDirectory: OUTPUT_DIR,
+    outputDirectory: join(REPO_ROOT, OUTPUT_DIR),
+    realOutputDirectory: realOrUndefined(join(REPO_ROOT, OUTPUT_DIR)),
+    resolvedTsconfigOutDir: resolvedPath(effectiveConfig.compilerOptions.outDir),
+  });
+  if (!outputVerdictNow.trusted) {
+    fail(`verification refused ${stage}: ${outputVerdictNow.reason}`);
+  }
+
+  const mountNow = checker.assessMountTopology({
+    platform: process.platform,
+    mountInfo: readMountInfo(),
+    outputDirectory: join(REPO_ROOT, OUTPUT_DIR),
+    realOutputDirectory: realOrUndefined(join(REPO_ROOT, OUTPUT_DIR)),
+  });
+  if (!mountNow.safe) {
+    fail(`verification refused ${stage}: ${mountNow.reason}`);
+  }
+
+  assertEverythingWasReadable(stage);
 }
+assertTreeIsSafe("after building", checkerFreshlyEmitted);
 
 // --- 5. audit every artifact that could RUN, anywhere in the output ----------
-const sourceTests = listFiles("tests").filter((path) => path.endsWith(".test.ts"));
-const compiledTests = listFiles(OUTPUT_DIR).filter((path) => checker.isTestArtifact(path));
-let audit = checker.auditTestArtifacts({ sourceTests, compiledTests });
+/**
+ * DISCOVERED FROM THE DERIVED ROOTS (round-9 AC-1 finding).
+ *
+ * `listFiles("tests")` was the same hard-coded guess the roots used to be: a
+ * test the config declares elsewhere was compiled, matched no source, and was
+ * reported as an orphan of the tree that legitimately produced it.
+ */
+
+const sourceTests = allSources.filter((path) => checker.isSourceTest(path));
+const generatedFiles = listFiles(OUTPUT_DIR);
+const compiledTests = generatedFiles.filter((path) => checker.isTestArtifact(path));
+assertEverythingWasReadable("before auditing");
+let audit = checker.auditTestArtifacts({
+  sourceTests,
+  compiledTests,
+  sources: allSources,
+  generated: generatedFiles,
+  layout: EMIT_LAYOUT,
+});
 
 // --- 6. contaminated? report it, repair it, and re-audit the REBUILT tree ----
 // Bounded to exactly ONE repair cycle: clean, rebuild from source, re-audit.
@@ -562,8 +1114,20 @@ if (!audit.clean) {
   // the run with an uncaught exception. The exit code was non-zero either way,
   // which is why nothing noticed — but "fails closed" has to mean the verifier
   // decided to fail, not that it fell over on the way to deciding.
+  /**
+   * Removes the CONTENTS, not the directory (round-5 finding, and my own
+   * regression).
+   *
+   * Accepting a `dist-alias -> dist` spelling was right — refusing an
+   * equivalent name is a false positive. But cleanup then deleted `dist`
+   * itself, leaving the alias dangling and the rebuild failing with TS5033,
+   * which broke the convergence AC-4 requires. Emptying the directory achieves
+   * the same thing without invalidating any path that points at it.
+   */
   try {
-    rmSync(cleanVerdict.target, { recursive: true, force: true });
+    for (const entry of readdirSync(cleanVerdict.target)) {
+      rmSync(join(cleanVerdict.target, entry), { recursive: true, force: true });
+    }
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
     fail(`${diagnosis}\n\nThe stale output could NOT be removed: ${detail}`);
@@ -586,12 +1150,24 @@ if (!audit.clean) {
       return undefined;
     }
   })();
-  if (rebuiltChecker === undefined || rebuiltChecker.mtimeMs + 1000 < rebuildStartedAt) {
+  const rebuiltCheckerIsFresh =
+    rebuiltChecker !== undefined && rebuiltChecker.mtimeMs + 1000 >= rebuildStartedAt;
+  if (!rebuiltCheckerIsFresh) {
     fail(`${diagnosis}\n\nThe rebuild after cleaning did not emit the verification checker; refusing to report a tree it could not rebuild`);
   }
 
-  const rebuiltCompiled = listFiles(OUTPUT_DIR).filter((path) => checker.isTestArtifact(path));
-  audit = checker.auditTestArtifacts({ sourceTests, compiledTests: rebuiltCompiled });
+  // The second build is a build like any other, so it is judged like one.
+  assertTreeIsSafe("after the repair rebuild", rebuiltCheckerIsFresh);
+
+  const rebuiltGenerated = listFiles(OUTPUT_DIR);
+  const rebuiltCompiled = rebuiltGenerated.filter((path) => checker.isTestArtifact(path));
+  audit = checker.auditTestArtifacts({
+    sourceTests,
+    compiledTests: rebuiltCompiled,
+    sources: allSources,
+    generated: rebuiltGenerated,
+    layout: EMIT_LAYOUT,
+  });
   if (!audit.clean) {
     // Survived a clean rebuild from source. That is not another branch's
     // leftovers; the tree genuinely disagrees with itself.

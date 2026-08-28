@@ -54,6 +54,133 @@ export function isTestArtifact(path: string): boolean {
   return TEST_ARTIFACT_SUFFIXES.some((suffix) => path.endsWith(suffix));
 }
 
+/** Suffixes tsc compiles, and the JavaScript suffix each one emits. */
+const SOURCE_TO_OUTPUT: readonly (readonly [string, string])[] = Object.freeze([
+  [".mts", ".mjs"],
+  [".cts", ".cjs"],
+  [".ts", ".js"],
+]);
+
+/**
+ * Every suffix the build can EMIT, and the source suffix that produces it.
+ *
+ * Round-9 review (HIGH): the audit filtered the output through `isTestArtifact`,
+ * so a stale `dist/src/old-branch.js` sat there while the run reported
+ * `tree-consistent`. AC-4 asks for an equivalent final generated state, and a
+ * check that looks only at files whose names say `test` describes a subset while
+ * claiming the whole — the same error as the suffix-filtered hardlink scan and
+ * the hard-coded source roots, one level further out.
+ *
+ * Longest first, so `.d.ts.map` is not read as `.ts.map`.
+ */
+const OUTPUT_TO_SOURCE: readonly (readonly [string, string])[] = Object.freeze([
+  [".d.mts.map", ".mts"],
+  [".d.cts.map", ".cts"],
+  [".d.ts.map", ".ts"],
+  [".mjs.map", ".mts"],
+  [".cjs.map", ".cts"],
+  [".js.map", ".ts"],
+  [".d.mts", ".mts"],
+  [".d.cts", ".cts"],
+  [".d.ts", ".ts"],
+  [".mjs", ".mts"],
+  [".cjs", ".cts"],
+  [".js", ".ts"],
+]);
+
+export interface EmitLayout {
+  /** `rootDir` from the effective tsconfig; `"."` for a whole-repository root. */
+  readonly rootDir: string;
+  /** `outDir` from the effective tsconfig. */
+  readonly outputDirectory: string;
+  /**
+   * Which artifact KINDS this configuration actually emits (round-13 HIGH).
+   *
+   * A `.d.ts` was accepted as explained whenever its source existed, whatever
+   * the config said. So a declaration left by a build whose `declaration` has
+   * since been turned off survived as "clean" — the reviewer planted one, and
+   * the run exited 0 reporting `tree-consistent` with the stale file still
+   * there. A fresh clone has no such file, which is exactly what AC-4 forbids.
+   *
+   * The suffix table says what a source COULD produce; only the options say
+   * what it DOES. Both are needed, and the second was missing.
+   */
+  readonly declaration: boolean;
+  readonly sourceMap: boolean;
+  readonly declarationMap: boolean;
+}
+
+/** Whether `layout` emits the artifact kind ending in `suffix`. */
+function emitsSuffix(suffix: string, layout: EmitLayout): boolean {
+  if (suffix.endsWith(".d.ts.map") || suffix.endsWith(".d.mts.map") || suffix.endsWith(".d.cts.map")) {
+    return layout.declarationMap;
+  }
+  if (suffix.endsWith(".map")) {
+    return layout.sourceMap;
+  }
+  if (suffix.startsWith(".d.")) {
+    return layout.declaration;
+  }
+  // The JavaScript itself is emitted unless the build emits nothing at all,
+  // which is refused before the audit ever runs.
+  return true;
+}
+
+function rootPrefix(rootDir: string): string {
+  const root = stripTrailingSlash(normalise(rootDir));
+  return root === "" || root === "." ? "" : `${root}/`;
+}
+
+/**
+ * The primary JavaScript artifact a source is expected to produce.
+ *
+ * Round-9 review (AC-1): discovery was pinned to `tests/**\/*.test.ts`, so a
+ * test the CONFIG declares somewhere else was compiled, found no source, and was
+ * reported as an orphan. The mapping now takes the layout as an argument for the
+ * same reason the roots are derived: what the compiler reads is a fact about the
+ * configuration, not about this repository's habits.
+ */
+export function compiledPathForSource(sourceRelativePath: string, layout: EmitLayout): string {
+  const source = normalise(sourceRelativePath);
+  const prefix = rootPrefix(layout.rootDir);
+  if (prefix !== "" && !source.startsWith(prefix)) {
+    throw new Error(
+      `source ${JSON.stringify(sourceRelativePath)} is outside rootDir ${JSON.stringify(layout.rootDir)}`,
+    );
+  }
+  const withinRoot = source.slice(prefix.length);
+  const rule = SOURCE_TO_OUTPUT.find(([from]) => withinRoot.endsWith(from) && !withinRoot.endsWith(`.d${from}`));
+  if (rule === undefined) {
+    throw new Error(`not a compilable source path: ${JSON.stringify(sourceRelativePath)}`);
+  }
+  const out = stripTrailingSlash(normalise(layout.outputDirectory));
+  return `${out}/${withinRoot.slice(0, -rule[0].length)}${rule[1]}`;
+}
+
+/**
+ * The source a generated file must have come from, or `undefined` if nothing in
+ * this configuration could have produced it.
+ *
+ * `undefined` is the interesting answer: a file under the output directory that
+ * no source explains is stale, whatever it is called.
+ */
+export function sourceForGeneratedPath(
+  generatedRelativePath: string,
+  layout: EmitLayout,
+): string | undefined {
+  const generated = normalise(generatedRelativePath);
+  const out = `${stripTrailingSlash(normalise(layout.outputDirectory))}/`;
+  if (!generated.startsWith(out)) {
+    return undefined;
+  }
+  const withinOutput = generated.slice(out.length);
+  const rule = OUTPUT_TO_SOURCE.find(([from]) => withinOutput.endsWith(from) && emitsSuffix(from, layout));
+  if (rule === undefined) {
+    return undefined;
+  }
+  return `${rootPrefix(layout.rootDir)}${withinOutput.slice(0, -rule[0].length)}${rule[1]}`;
+}
+
 /** Normalises a path so Windows and POSIX separators compare equal. */
 function normalise(path: string): string {
   return path.replace(/\\/g, "/").replace(/^\.\//, "");
@@ -65,14 +192,42 @@ function normalise(path: string): string {
  * `tests/a/b.test.ts` → `dist/tests/a/b.test.js`, matching the tsconfig
  * `rootDir: "."` / `outDir: "dist"` layout this repository uses.
  */
-export function compiledPathForSourceTest(sourceRelativePath: string): string {
+export function compiledPathForSourceTest(
+  sourceRelativePath: string,
+  layout: EmitLayout = {
+    rootDir: ".",
+    outputDirectory: "dist",
+    declaration: true,
+    sourceMap: true,
+    declarationMap: false,
+  },
+): string {
   const normalised = normalise(sourceRelativePath);
-  if (!normalised.startsWith(`${SOURCE_TEST_ROOT}/`) || !normalised.endsWith(".test.ts")) {
+  if (!SOURCE_TEST_SUFFIXES.some((suffix) => normalised.endsWith(suffix))) {
     throw new Error(
-      `not a source test path: ${JSON.stringify(sourceRelativePath)} (expected ${SOURCE_TEST_ROOT}/**/*.test.ts)`,
+      `not a source test path: ${JSON.stringify(sourceRelativePath)} (expected a ${SOURCE_TEST_SUFFIXES.join("/")} file)`,
     );
   }
-  return `dist/${normalised.slice(0, -".ts".length)}.js`;
+  return compiledPathForSource(normalised, layout);
+}
+
+/**
+ * Test sources the runner recognises.
+ *
+ * `.mts`/`.cts` are here because the OUTPUT side has always accepted `.test.mjs`
+ * and `.test.cjs`: a discovery rule narrower than the artifact rule means a
+ * legitimate test compiles into something the audit then calls an orphan, which
+ * is a false positive rather than a false pass — but it is still the two halves
+ * disagreeing about the same question.
+ */
+export const SOURCE_TEST_SUFFIXES: readonly string[] = Object.freeze([
+  ".test.ts",
+  ".test.mts",
+  ".test.cts",
+]);
+
+export function isSourceTest(path: string): boolean {
+  return SOURCE_TEST_SUFFIXES.some((suffix) => normalise(path).endsWith(suffix));
 }
 
 export interface ArtifactAudit {
@@ -80,8 +235,15 @@ export interface ArtifactAudit {
   readonly expected: readonly string[];
   /** Compiled tests with NO corresponding source — a stale/foreign tree. */
   readonly orphaned: readonly string[];
-  /** Source tests with no compiled output — a partial or failed build. */
+  /** Sources with no compiled output — a partial or failed build. */
   readonly missing: readonly string[];
+  /**
+   * Generated files no source explains, excluding the test artifacts already
+   * listed as `orphaned` (round-9 HIGH). A stale `dist/src/old-branch.js` is
+   * imported by whatever still references it and is every bit as much "another
+   * branch's code running in this one" as a stale test is.
+   */
+  readonly staleOutput: readonly string[];
   readonly clean: boolean;
 }
 
@@ -95,21 +257,59 @@ export interface ArtifactAudit {
 export function auditTestArtifacts(input: {
   readonly sourceTests: readonly string[];
   readonly compiledTests: readonly string[];
+  /**
+   * EVERY compilable source under the derived roots, and EVERY file under the
+   * output directory. Required, not optional: an optional input is one a caller
+   * can forget, and the audit would then report a clean tree because it was
+   * handed nothing to object to.
+   */
+  readonly sources: readonly string[];
+  readonly generated: readonly string[];
+  readonly layout: EmitLayout;
 }): ArtifactAudit {
-  const expected = [...input.sourceTests].map(compiledPathForSourceTest).sort();
+  const layout = input.layout;
+  const expected = [...input.sourceTests].map((path) => compiledPathForSourceTest(path, layout)).sort();
   // Only genuine test artifacts count — but ALL of them, wherever they sit in
   // the output tree, not merely those under `dist/tests` (B4).
   const present = new Set(input.compiledTests.map(normalise).filter(isTestArtifact));
   const expectedSet = new Set(expected);
 
-  const missing = expected.filter((path) => !present.has(path));
   const orphaned = [...present].filter((path) => !expectedSet.has(path)).sort();
+
+  const sources = input.sources.map(normalise);
+  const sourceSet = new Set(sources);
+  const generated = new Set(input.generated.map(normalise));
+
+  // A source must produce at least its primary JavaScript. Sources the layout
+  // cannot map are reported rather than skipped, for the same reason: a file the
+  // audit cannot place is not a file it has checked.
+  const missing: string[] = [];
+  for (const source of sources) {
+    let primary: string;
+    try {
+      primary = compiledPathForSource(source, layout);
+    } catch {
+      missing.push(source);
+      continue;
+    }
+    if (!generated.has(primary)) missing.push(primary);
+  }
+
+  const orphanSet = new Set(orphaned);
+  const staleOutput = [...generated]
+    .filter((path) => !orphanSet.has(path))
+    .filter((path) => {
+      const source = sourceForGeneratedPath(path, layout);
+      return source === undefined || !sourceSet.has(source);
+    })
+    .sort();
 
   return {
     expected,
     orphaned,
-    missing,
-    clean: orphaned.length === 0 && missing.length === 0,
+    missing: missing.sort(),
+    staleOutput,
+    clean: orphaned.length === 0 && missing.length === 0 && staleOutput.length === 0,
   };
 }
 
@@ -226,7 +426,7 @@ export function assessTreeSafety(facts: TreeFacts): TreeSafetyVerdict {
   if (facts.symlinkedSources.length > 0) {
     return {
       safe: false,
-      reason: `symlinked or hardlinked entries under the source roots (src/, tests/): ${facts.symlinkedSources.join(", ")}; source must live in this repository`,
+      reason: `symlinked or hardlinked entries under the source roots: ${facts.symlinkedSources.join(", ")}; source must live in this repository`,
     };
   }
   if (facts.symlinkedArtifacts.length > 0) {
@@ -265,16 +465,30 @@ export function assessOutputDirectory(input: {
   readonly outputDirectory: string;
   /** `realpath` of the output directory, or `undefined` if it does not exist. */
   readonly realOutputDirectory: string | undefined;
-  /** The `outDir` tsconfig actually declares, relative to the repo root. */
-  readonly tsconfigOutDir: string;
+  /**
+   * The ABSOLUTE path the declared `outDir` resolves to — `realpath` where it
+   * exists, otherwise lexically resolved.
+   *
+   * Deliberately not the raw string. Comparing spellings refused every
+   * equivalent way of naming the same directory: an absolute path,
+   * `dist/../dist`, a trailing separator, and a `dist-alias -> dist` symlink.
+   * A verifier that rejects valid trees is its own failure mode — it teaches
+   * people to bypass verification, which is the habit this task exists to end.
+   *
+   * The caller resolves, because this function is pure and must stay testable
+   * without a filesystem; the RULE — that the two must be one directory —
+   * stays here, where it is tested.
+   */
+  readonly resolvedTsconfigOutDir: string;
 }): OutputDirectoryVerdict {
   const configured = normalise(input.configuredOutputDirectory).replace(/\/+$/, "");
-  const declared = normalise(input.tsconfigOutDir).replace(/^\.\//, "").replace(/\/+$/, "");
+  const managed = normalise(input.realOutputDirectory ?? input.outputDirectory).replace(/\/+$/, "");
+  const declared = normalise(input.resolvedTsconfigOutDir).replace(/\/+$/, "");
 
-  if (declared !== configured) {
+  if (declared !== managed) {
     return {
       trusted: false,
-      reason: `tsconfig builds into ${JSON.stringify(declared)} but verification manages ${JSON.stringify(configured)}; they must be the same directory or stale artifacts elsewhere would be executed`,
+      reason: `tsconfig builds into ${JSON.stringify(declared)} but verification manages ${JSON.stringify(managed)}; they must be the same directory or stale artifacts elsewhere would be executed`,
     };
   }
   if (normalise(input.repositoryRoot) !== normalise(input.realRepositoryRoot)) {
@@ -283,14 +497,27 @@ export function assessOutputDirectory(input: {
       reason: `the repository path resolves elsewhere (${input.realRepositoryRoot}); refusing to build or delete through a link`,
     };
   }
-  if (input.realOutputDirectory !== undefined) {
-    const expected = `${normalise(input.realRepositoryRoot).replace(/\/+$/, "")}/${configured}`;
-    if (normalise(input.realOutputDirectory).replace(/\/+$/, "") !== expected) {
-      return {
-        trusted: false,
-        reason: `${configured} resolves to ${input.realOutputDirectory}, outside the repository; refusing to build into or delete a linked directory`,
-      };
-    }
+  /**
+   * CONTAINMENT IS CHECKED WHETHER OR NOT THE OUTPUT EXISTS YET (round-2 note).
+   *
+   * The first version only compared when `realOutputDirectory` was defined, so
+   * an output path pointing outside the repository was trusted whenever the
+   * directory did not exist. The production caller cannot currently produce
+   * that combination — it fixes the path inside the repository and validates
+   * the effective `outDir` first — so the reviewer rated it non-blocking.
+   *
+   * It is closed anyway. "Unreachable from today's only caller" is a fact about
+   * the caller, not about this function, and this function is the reviewable
+   * rule. A second caller, or a change to the first, would inherit a hole that
+   * nothing here refuses.
+   */
+  const expected = `${normalise(input.realRepositoryRoot).replace(/\/+$/, "")}/${configured}`;
+  const effective = normalise(input.realOutputDirectory ?? input.outputDirectory).replace(/\/+$/, "");
+  if (effective !== expected) {
+    return {
+      trusted: false,
+      reason: `${configured} resolves to ${input.realOutputDirectory ?? input.outputDirectory}, outside the repository; refusing to build into or delete a linked directory`,
+    };
   }
   return { trusted: true, directory: input.outputDirectory };
 }
@@ -309,8 +536,14 @@ export function describeContamination(audit: ArtifactAudit): string | undefined 
   }
   if (audit.missing.length > 0) {
     lines.push(
-      `${audit.missing.length} source test(s) produced no compiled output — the build is incomplete:`,
+      `${audit.missing.length} source file(s) produced no compiled output — the build is incomplete:`,
       ...audit.missing.map((path) => `  missing: ${path}`),
+    );
+  }
+  if (audit.staleOutput.length > 0) {
+    lines.push(
+      `${audit.staleOutput.length} generated file(s) have no source in this tree — stale build output:`,
+      ...audit.staleOutput.map((path) => `  stale:   ${path}`),
     );
   }
   lines.push(
@@ -440,20 +673,66 @@ export interface MountPoint {
  * unparseable row must not blind the caller to every other mount. The CALLER
  * decides what an unreadable or empty table means, and it fails closed.
  */
-export function parseMountInfo(content: string): readonly MountPoint[] {
+export interface MountTable {
+  readonly mounts: readonly MountPoint[];
+  /** Lines this parser did not recognise as mountinfo rows. */
+  readonly malformed: readonly string[];
+}
+
+/**
+ * One mountinfo row, or `undefined` if the line is not one.
+ *
+ * Round-9 review (HIGH): the previous test was "at least five space-separated
+ * tokens, the fifth starting with `/`", and `not a mountinfo row /unrelated`
+ * satisfies it. Arbitrary text therefore became a MOUNT POINT, which matters in
+ * both directions: garbage rows made the "no readable entries" refusal
+ * unreachable, and a table of garbage that happened to omit the real mount was
+ * assessed as safe.
+ *
+ * Every mandatory field is now checked for its documented SHAPE — two decimal
+ * ids, a `major:minor` device, an absolute root and mount point, and the
+ * literal `-` separator with the three fields that must follow it.
+ */
+function parseMountInfoRow(line: string): MountPoint | undefined {
+  const fields = line.split(" ").filter((field) => field.length > 0);
+  // 6 mandatory + the `-` separator + fstype, source, super options.
+  if (fields.length < 10) return undefined;
+  const [mountId, parentId, deviceId, root, mountPoint] = fields;
+  if (mountId === undefined || !/^\d+$/.test(mountId)) return undefined;
+  if (parentId === undefined || !/^\d+$/.test(parentId)) return undefined;
+  if (deviceId === undefined || !/^\d+:\d+$/.test(deviceId)) return undefined;
+  if (root === undefined || !root.startsWith("/")) return undefined;
+  if (mountPoint === undefined || !mountPoint.startsWith("/")) return undefined;
+  // Optional fields (7+) are `tag[:value]` and are terminated by a literal `-`;
+  // none of them can BE `-`, so the first one from field 7 is the separator.
+  const separator = fields.indexOf("-", 6);
+  if (separator === -1 || fields.length - separator < 4) return undefined;
+  return { mountPoint: unescapeMountPath(mountPoint) };
+}
+
+/**
+ * Reads the table AND reports what it could not read.
+ *
+ * Skipping a malformed line quietly was the fail-open: the caller saw a shorter
+ * list and no indication that anything was missing from it. A caller that must
+ * fail closed needs to know the difference between "no mount is inside the
+ * output" and "some rows were not understood".
+ */
+export function readMountTable(content: string): MountTable {
   const mounts: MountPoint[] = [];
+  const malformed: string[] = [];
   for (const rawLine of content.split("\n")) {
     const line = rawLine.trim();
     if (line.length === 0) continue;
-    const fields = line.split(" ");
-    // Fields 1-5 are mandatory and positional; anything shorter is not a
-    // mountinfo row we can read.
-    if (fields.length < 5) continue;
-    const mountPoint = fields[4];
-    if (mountPoint === undefined || !mountPoint.startsWith("/")) continue;
-    mounts.push({ mountPoint: unescapeMountPath(mountPoint) });
+    const mount = parseMountInfoRow(line);
+    if (mount === undefined) malformed.push(line);
+    else mounts.push(mount);
   }
-  return mounts;
+  return { mounts, malformed };
+}
+
+export function parseMountInfo(content: string): readonly MountPoint[] {
+  return readMountTable(content).mounts;
 }
 
 /** Decodes the kernel's octal escapes for space, tab, newline and backslash. */
@@ -510,7 +789,18 @@ export function assessMountTopology(input: {
         "the mount table (/proc/self/mountinfo) could not be read, so it is unknown whether the build output is a mount point; refusing to run a destructive clean on an unanswerable question",
     };
   }
-  const mounts = parseMountInfo(input.mountInfo);
+  const table = readMountTable(input.mountInfo);
+  if (table.malformed.length > 0) {
+    const first = table.malformed[0] ?? "";
+    return {
+      safe: false,
+      reason:
+        `the mount table (/proc/self/mountinfo) contains ${table.malformed.length} line(s) this parser does not ` +
+        `recognise as mountinfo rows (first: ${JSON.stringify(first.slice(0, 120))}); the mount topology is ` +
+        "therefore not fully known, and an unanswerable safety question is not a pass",
+    };
+  }
+  const mounts = table.mounts;
   if (mounts.length === 0) {
     return {
       safe: false,

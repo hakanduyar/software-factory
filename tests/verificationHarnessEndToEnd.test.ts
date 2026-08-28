@@ -24,6 +24,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -148,6 +149,28 @@ function runHarness(root: string): { status: number; output: string } {
  * verifier was handed.
  */
 function runWithShowConfigShim(root: string, answer: string): { status: number; output: string } {
+  /**
+   * The shimmed answer inherits the fixture's real `include` unless the caller
+   * set one.
+   *
+   * A `--showConfig` with NO `include` is not a realistic config: tsc then
+   * compiles everything under the project root, and the verifier correctly
+   * derives its source roots as `.`. These fixtures are about the `outDir`
+   * question and carry helper symlinks at the root, so an unrealistic shim made
+   * them fail for a reason unrelated to what they test — the fixture was wrong,
+   * not the guard.
+   */
+  const shown = JSON.parse(answer) as Record<string, unknown>;
+  if (shown["include"] === undefined && shown["files"] === undefined) {
+    const real = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as {
+      include?: readonly string[];
+    };
+    if (real.include !== undefined) {
+      shown["include"] = [...real.include];
+    }
+  }
+  const realisticAnswer = JSON.stringify(shown);
+
   const realNpx = spawnSync("sh", ["-c", "command -v npx"], { encoding: "utf8" }).stdout.trim();
   assert.ok(realNpx.length > 0, "the fixture needs a real npx to delegate to");
 
@@ -159,7 +182,7 @@ function runWithShowConfigShim(root: string, answer: string): { status: number; 
       "#!/bin/sh",
       'for a in "$@"; do',
       `  if [ "$a" = "--showConfig" ]; then cat <<'SHOWCONFIG'`,
-      answer,
+      realisticAnswer,
       "SHOWCONFIG",
       "    exit 0",
       "  fi",
@@ -179,6 +202,51 @@ function runWithShowConfigShim(root: string, answer: string): { status: number; 
     status: result.status ?? -1,
     output: `${result.stdout ?? ""}${result.stderr ?? ""}`,
   };
+}
+
+/**
+ * Runs the harness with an `npx` that delegates everything to the real one and
+ * then runs `after` once the build has finished.
+ *
+ * This is the only way to reach the POST-BUILD guards. Every condition a fixture
+ * can set up beforehand is caught by the pre-build layer — correctly, since
+ * refusing before anything is written is the whole point — which left the later
+ * layer's wiring untestable, and a reviewer's mutation of it duly survived. A
+ * build that CREATES the condition is not an artificial case either: a compiler
+ * plugin, a postinstall script or a `prepare` hook can emit whatever it likes.
+ */
+function runWithBuildThatPlants(root: string, after: string): { status: number; output: string } {
+  const realNpx = spawnSync("sh", ["-c", "command -v npx"], { encoding: "utf8" }).stdout.trim();
+  assert.ok(realNpx.length > 0, "the fixture needs a real npx to delegate to");
+
+  const shimDir = mkdtempSync(join(tmpdir(), "sf-buildshim-"));
+  created.push(shimDir);
+  writeFileSync(
+    join(shimDir, "npx"),
+    [
+      "#!/bin/sh",
+      'for a in "$@"; do',
+      `  if [ "$a" = "--showConfig" ]; then exec ${realNpx} "$@"; fi`,
+      // ...and the file LISTING, which is a question rather than a build. Round
+      // 11 added `--listFilesOnly` before the first build, so without this the
+      // `after` action fires on it and a case meaning "on the second BUILD"
+      // silently acts one invocation early.
+      `  if [ "$a" = "--listFilesOnly" ]; then exec ${realNpx} "$@"; fi`,
+      "done",
+      `${realNpx} "$@" || exit $?`,
+      after,
+      "exit 0",
+      "",
+    ].join("\n"),
+    { mode: 0o755 },
+  );
+
+  const result = spawnSync(process.execPath, ["scripts/verify.mjs"], {
+    cwd: root,
+    encoding: "utf8",
+    env: harnessEnv({ PATH: `${shimDir}:${process.env["PATH"] ?? ""}` }),
+  });
+  return { status: result.status ?? -1, output: `${result.stdout ?? ""}${result.stderr ?? ""}` };
 }
 
 describe("TASK-010 remediation: the harness itself, end to end", () => {
@@ -258,23 +326,32 @@ describe("TASK-010 remediation: the harness itself, end to end", () => {
    * privileged setup: the source test exists and the build genuinely refuses to
    * emit it, exactly as a partial build would.
    */
+  /**
+   * REWRITTEN IN ROUND 10, because its fixture was the defect.
+   *
+   * It added a test source, EXCLUDED it in tsconfig, and expected the missing
+   * artifact to be a disagreement that survived the rebuild. That only worked
+   * because the source set was globbed from the filesystem and ignored
+   * `exclude` — the very hole round-10 review used to run a stale artifact. An
+   * excluded file is not a disagreement; it is a configuration change, and the
+   * tree without it is correct.
+   *
+   * A genuine survivor is one the REBUILD reproduces. A build that emits
+   * something no source explains does exactly that: cleaning removes it, the
+   * rebuild puts it back, and the second audit is entitled to conclude the tree
+   * disagrees with itself rather than that it is holding another branch's
+   * leftovers.
+   */
   it("FAILS CLOSED when a source/artifact disagreement survives a clean rebuild", () => {
     const root = makeFixtureRepo();
     assert.equal(runHarness(root).status, 0, "the fixture must pass first");
 
-    writeFileSync(
-      join(root, "tests/excluded.test.ts"),
-      'import { describe, it } from "node:test";\ndescribe("excluded", () => { it("never compiles", () => {}); });\n',
+    const { status, output } = runWithBuildThatPlants(
+      root,
+      'printf "export const ghost = 1;\\n" > dist/src/ghost.js',
     );
-    const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as {
-      exclude?: string[];
-    };
-    tsconfig.exclude = ["tests/excluded.test.ts"];
-    writeFileSync(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
-
-    const { status, output } = runHarness(root);
     assert.notEqual(status, 0, `a real disagreement must fail:\n${output}`);
-    assert.match(output, /excluded\.test/, "the missing artifact must be named");
+    assert.match(output, /ghost\.js/, "the unexplained artifact must be named");
     assert.match(output, /survived a clean rebuild/, "it must say why this is not merely stale output");
   });
 
@@ -510,12 +587,20 @@ describe("TASK-010 round 2: paths are judged by what they resolve to", () => {
     writeFileSync(join(root, "dist/tests/ghostFromAnotherBranch.test.js"), "// stale\n");
 
     // Removing `dist` needs write permission on its PARENT, not on itself.
-    chmodSync(root, 0o555);
+    /**
+     * The OUTPUT directory is made read-only, not its parent.
+     *
+     * Cleanup used to delete `dist` itself, so an unwritable parent was enough
+     * to make it fail. It now empties the directory instead — deleting `dist`
+     * left an accepted `dist-alias` dangling and broke convergence — so the
+     * condition that actually blocks cleanup is an unwritable `dist`.
+     */
+    chmodSync(join(root, "dist"), 0o555);
     let result: { status: number; output: string };
     try {
       result = runHarness(root);
     } finally {
-      chmodSync(root, 0o755);
+      chmodSync(join(root, "dist"), 0o755);
     }
 
     assert.notEqual(result.status, 0, "an unremovable stale tree reported success");
@@ -666,7 +751,7 @@ describe("TASK-010 round 2: paths are judged by what they resolve to", () => {
     // depth; a test that cannot tell them apart proves neither.
     assert.match(
       output,
-      /refused before building: the build output directory is or contains a mount point/,
+      /refused before building: dist is or contains a mount point/,
       "the refusal must come from the pre-build guard, before tsc writes through the mount",
     );
     // The mounted tree's contents must be intact: refusing means never deleting.
@@ -951,5 +1036,1378 @@ describe("TASK-010 round 2: paths are judged by what they resolve to", () => {
     assert.notEqual(status, 0, "a noEmit build produced a passing verification");
     assert.match(output, /noEmit/);
     assert.ok(!output.includes("tree-consistent"), "it must not claim consistency");
+  });
+});
+
+/**
+ * A directory is judged by what it RESOLVES to, not by how it is spelled.
+ *
+ * Independent review reproduced the opposite of the escapes this file mostly
+ * pins: paths that were CORRECT being refused. An absolute `outDir` naming the
+ * managed directory, `dist/../dist`, a trailing separator, and a
+ * `dist-alias -> dist` symlink were all rejected — the last being the managed
+ * directory itself under another name.
+ *
+ * This matters as much as an escape. A verifier that refuses valid trees is its
+ * own failure mode: it trains people to work around verification, which is the
+ * habit this task exists to end. Both directions are pinned, so the guard
+ * cannot be "fixed" into refusing everything.
+ */
+describe("TASK-010 follow-up: equivalent outDir spellings are one directory", () => {
+  it("ACCEPTS an absolute outDir naming the managed directory", () => {
+    const root = makeFixtureRepo();
+    assert.equal(runHarness(root).status, 0, "fixture must pass first");
+
+    const { status, output } = runWithShowConfigShim(
+      root,
+      JSON.stringify({ compilerOptions: { outDir: join(root, "dist"), noEmit: false } }),
+    );
+    assert.equal(status, 0, `an absolute outDir was wrongly refused:\n${output.slice(0, 500)}`);
+    assert.match(output, /verification complete/);
+  });
+
+  /**
+   * The check above shims `--showConfig`, which leaves the real `tsconfig.json`
+   * still saying `"dist"` — so it exercises only the EFFECTIVE comparison. The
+   * pre-build check reads the raw file, and mutation testing showed the shimmed
+   * case passing happily with the old raw string comparison restored.
+   *
+   * A test that claims to cover a guard and does not is worse than no test, so
+   * this one writes the absolute path into the file the guard actually reads.
+   */
+  it("ACCEPTS an absolute outDir written in the real tsconfig", () => {
+    const root = makeFixtureRepo();
+    const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as {
+      compilerOptions: Record<string, unknown>;
+    };
+    tsconfig.compilerOptions["outDir"] = join(root, "dist");
+    writeFileSync(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
+
+    const { status, output } = runHarness(root);
+    assert.equal(status, 0, `an absolute outDir in tsconfig was refused:\n${output.slice(0, 500)}`);
+    assert.match(output, /verification complete/);
+  });
+
+  it("ACCEPTS a traversal spelling written in the real tsconfig", () => {
+    const root = makeFixtureRepo();
+    const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as {
+      compilerOptions: Record<string, unknown>;
+    };
+    tsconfig.compilerOptions["outDir"] = "dist/../dist";
+    writeFileSync(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
+
+    const { status, output } = runHarness(root);
+    assert.equal(status, 0, `"dist/../dist" in tsconfig was refused:\n${output.slice(0, 500)}`);
+  });
+
+  it("ACCEPTS traversal and trailing-separator spellings", () => {
+    for (const spelling of ["dist/../dist", "dist/"]) {
+      const root = makeFixtureRepo();
+      assert.equal(runHarness(root).status, 0, `${spelling}: fixture must pass first`);
+
+      const { status, output } = runWithShowConfigShim(
+        root,
+        JSON.stringify({ compilerOptions: { outDir: spelling, noEmit: false } }),
+      );
+      assert.equal(status, 0, `${spelling} was wrongly refused:\n${output.slice(0, 500)}`);
+    }
+  });
+
+  /**
+   * The sharpest case: tsc writes THROUGH the alias into the very directory
+   * being audited, so there is nothing to refuse — but a lexical comparison
+   * cannot see that.
+   */
+  it("ACCEPTS a symlink alias that resolves into the managed directory", () => {
+    const root = makeFixtureRepo();
+    assert.equal(runHarness(root).status, 0, "fixture must pass first");
+    symlinkSync(join(root, "dist"), join(root, "dist-alias"), "dir");
+
+    const { status, output } = runWithShowConfigShim(
+      root,
+      JSON.stringify({ compilerOptions: { outDir: "dist-alias", noEmit: false } }),
+    );
+    assert.equal(status, 0, `a symlink alias into dist was wrongly refused:\n${output.slice(0, 500)}`);
+  });
+
+  it("still REFUSES a sibling directory", () => {
+    const root = makeFixtureRepo();
+    assert.equal(runHarness(root).status, 0, "fixture must pass first");
+
+    const { status, output } = runWithShowConfigShim(
+      root,
+      JSON.stringify({ compilerOptions: { outDir: "dist-2", noEmit: false } }),
+    );
+    assert.notEqual(status, 0, "a sibling output directory was accepted");
+    assert.ok(!output.includes("tree-consistent"), "it must not claim consistency");
+  });
+
+  it("still REFUSES an alias that resolves somewhere else entirely", () => {
+    const root = makeFixtureRepo();
+    assert.equal(runHarness(root).status, 0, "fixture must pass first");
+    const decoy = mkdtempSync(join(tmpdir(), "sf-decoy-out-"));
+    created.push(decoy);
+    symlinkSync(decoy, join(root, "dist-elsewhere"), "dir");
+
+    const { status, output } = runWithShowConfigShim(
+      root,
+      JSON.stringify({ compilerOptions: { outDir: "dist-elsewhere", noEmit: false } }),
+    );
+    assert.notEqual(status, 0, "an alias resolving outside the managed directory was accepted");
+    assert.ok(!output.includes("tree-consistent"), "it must not claim consistency");
+  });
+
+  /**
+   * A tsconfig that inherits `outDir` through `extends` without naming it was
+   * refused outright by the raw-file check — a false positive with no attacker
+   * involved and no misconfiguration.
+   */
+  /**
+   * DISCLOSED: the first version of this test was VACUOUS and the independent
+   * review caught it. It wrote `outDir: "dist"` into the ROOT config as well as
+   * the base, so nothing was ever inherited — the raw check found what it
+   * always finds and the test passed without exercising the case it named. A
+   * genuinely inherited-only config was, at that moment, refused outright.
+   *
+   * The root config here declares NO `outDir` at all. If the raw-file check
+   * ever becomes load-bearing again, this fails.
+   */
+  it("ACCEPTS an outDir inherited through extends and named nowhere else", () => {
+    const root = makeFixtureRepo();
+    const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as Record<
+      string,
+      unknown
+    >;
+    const options = tsconfig["compilerOptions"] as Record<string, unknown>;
+
+    // The base carries outDir; the root carries everything else and never
+    // mentions it.
+    writeFileSync(
+      join(root, "tsconfig.base.json"),
+      JSON.stringify({ compilerOptions: { outDir: "dist" } }, null, 2),
+    );
+    delete options["outDir"];
+    tsconfig["extends"] = "./tsconfig.base.json";
+    writeFileSync(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
+
+    // The fixture must genuinely inherit: prove the root file is silent.
+    const written = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as {
+      compilerOptions: Record<string, unknown>;
+    };
+    assert.ok(
+      !("outDir" in written.compilerOptions),
+      "the fixture must not name outDir in the root file, or it tests nothing",
+    );
+
+    const { status, output } = runHarness(root);
+    assert.equal(status, 0, `an inherited-only outDir was wrongly refused:\n${output.slice(0, 500)}`);
+    assert.match(output, /verification complete/, "it must actually build and run, not merely exit 0");
+  });
+
+  /**
+   * ...and the guard must still catch a genuinely wrong inherited value, or
+   * tolerating absence would have opened a hole rather than closed a false
+   * positive.
+   */
+  it("still REFUSES an outDir inherited from a base that names the wrong directory", () => {
+    const root = makeFixtureRepo();
+    const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as Record<
+      string,
+      unknown
+    >;
+    const options = tsconfig["compilerOptions"] as Record<string, unknown>;
+
+    writeFileSync(
+      join(root, "tsconfig.base.json"),
+      JSON.stringify({ compilerOptions: { outDir: "build-output" } }, null, 2),
+    );
+    delete options["outDir"];
+    tsconfig["extends"] = "./tsconfig.base.json";
+    writeFileSync(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, "an inherited mismatched outDir was accepted");
+    assert.ok(!output.includes("tree-consistent"), "it must not claim consistency");
+    /**
+     * Asserting the SPECIFIC refusal, not merely a non-zero exit. Mutation
+     * testing showed the loose version passing for the wrong reason: with the
+     * effective-outDir guard disabled the build lands in `build-output`, the
+     * checker import from `dist` then fails, and the run exits non-zero having
+     * caught nothing. "It failed" is not evidence that the guard under test is
+     * what failed it.
+     */
+    // `--showConfig` normalises the inherited value to `./build-output`, so the
+    // prefix is optional here. Matching the literal without it asserted a
+    // spelling tsc does not produce.
+    assert.match(
+      output,
+      /the effective tsconfig builds into "\.?\/?build-output", but verification manages/,
+      `expected the effective-outDir refusal, got:\n${output.slice(0, 500)}`,
+    );
+  });
+});
+
+// =====================================================================
+// ROUND-3 — the pre-build layer, pinned by what only it can guarantee
+// =====================================================================
+
+describe("TASK-010 round 3: nothing is written through a hostile path", () => {
+  /**
+   * These guards duplicate the later `assessTreeSafety` clauses on PURPOSE:
+   * one runs before the build, the other is the reviewable rule. Round-3
+   * review showed the duplication had made the earlier layer untestable —
+   * deleting it left the named tests green, because the later guard produced a
+   * refusal too. But by then `tsc` had already written through the symlink,
+   * and the reviewer found the compiled checker and test files sitting in the
+   * external target of a "refused" run.
+   *
+   * So these assert the property only the EARLY layer can provide: the outside
+   * directory is still EMPTY afterwards. A later refusal cannot satisfy that,
+   * which is what makes these regressions load-bearing where wording alone
+   * would not be.
+   */
+  function decoy(): string {
+    const dir = mkdtempSync(join(tmpdir(), "sf-decoy-target-"));
+    created.push(dir);
+    return dir;
+  }
+
+  /** A fixture has no `dist/` until something builds; absent counts as empty. */
+  function listing(path: string): readonly string[] {
+    try {
+      return readdirSync(path).sort();
+    } catch {
+      return [];
+    }
+  }
+
+  it("writes NOTHING into the target of a symlinked output directory", () => {
+    const root = makeFixtureRepo();
+    const target = decoy();
+    rmSync(join(root, "dist"), { recursive: true, force: true });
+    symlinkSync(target, join(root, "dist"), "dir");
+
+    const { status, output } = runHarness(root);
+
+    assert.notEqual(status, 0, "a symlinked output directory was accepted");
+    /**
+     * SUBSTANCE FIRST, wording second (round-4 finding).
+     *
+     * The first version asserted the message before the filesystem state, so a
+     * mutated run failed on the message and never reached the assertion that
+     * actually matters — the mutation proof was wording-driven, which is
+     * circular. Checking the emptiness first means removing the guard fails on
+     * the property, not on a string.
+     */
+    assert.deepEqual(
+      listing(target),
+      [],
+      "the build wrote through the symlink before the refusal — the early guard did not run first",
+    );
+    assert.match(
+      output,
+      /refused before building: the build output directory is a symlink/,
+      `the PRE-BUILD layer did not fire:\n${output.slice(0, 400)}`,
+    );
+  });
+
+  it("writes NOTHING when the tests directory is a symlink", () => {
+    const root = makeFixtureRepo();
+    const external = mkdtempSync(join(tmpdir(), "sf-ext-tests-"));
+    created.push(external);
+    writeFileSync(
+      join(external, "outsider.test.ts"),
+      ['import { it } from "node:test";', 'it("outsider", () => {});', ""].join("\n"),
+    );
+    rmSync(join(root, "tests"), { recursive: true, force: true });
+    symlinkSync(external, join(root, "tests"), "dir");
+    const distBefore = listing(join(root, "dist"));
+
+    const { status, output } = runHarness(root);
+
+    assert.notEqual(status, 0);
+    // Substance first — see the note above.
+    assert.deepEqual(
+      listing(join(root, "dist")),
+      distBefore,
+      "the external suite was compiled before the refusal",
+    );
+    assert.match(
+      output,
+      /refused before building: the tests directory is a symlink/,
+      `the PRE-BUILD layer did not fire:\n${output.slice(0, 400)}`,
+    );
+  });
+
+  it("writes NOTHING when a linked source is present under a source root", () => {
+    const root = makeFixtureRepo();
+    const external = mkdtempSync(join(tmpdir(), "sf-ext-src-"));
+    created.push(external);
+    const outsider = join(external, "foreign.ts");
+    writeFileSync(outsider, "export const smuggled = 9;\n");
+    symlinkSync(outsider, join(root, "src/foreign.ts"), "file");
+    const distBefore = listing(join(root, "dist"));
+
+    const { status, output } = runHarness(root);
+
+    assert.notEqual(status, 0);
+    // Substance first — see the note above.
+    assert.deepEqual(
+      listing(join(root, "dist")),
+      distBefore,
+      "the linked source was compiled before the refusal",
+    );
+    assert.match(output, /refused before building: symlinked or hardlinked entries/);
+  });
+});
+
+
+// =====================================================================
+// ROUND-4 CRITICAL — a symlinked source ROOT produced a FALSE SUCCESS
+// =====================================================================
+
+describe("TASK-010 round 4: an entire source root cannot be a link", () => {
+  /**
+   * `findSymlinks("src")` walked what was INSIDE `src` and never asked whether
+   * `src` itself was a link. `tests` was checked; `src` was not — two roots
+   * written as two lines, one of which grew a guard the other did not.
+   *
+   * The consequence was the worst outcome this script can produce: the
+   * external `testArtifacts.ts` was compiled and imported, and because a module
+   * calling `process.exit(0)` at import time wins before any later guard runs,
+   * the run EXITED 0 WITH NO OUTPUT. Not a crash — a false pass.
+   */
+  for (const root of ["src", "tests"] as const) {
+    it(`REFUSES a symlinked ${root} root, and does not exit 0`, () => {
+      const fixture = makeFixtureRepo();
+      const external = mkdtempSync(join(tmpdir(), `sf-external-${root}-`));
+      created.push(external);
+
+      // Mirror the real layout so the build would genuinely succeed if the
+      // link were followed — otherwise the refusal proves nothing.
+      cpSync(join(fixture, root), external, { recursive: true });
+      if (root === "src") {
+        // ...and make the external checker hostile, exactly as reproduced.
+        writeFileSync(
+          join(external, "verification/testArtifacts.ts"),
+          "process.exit(0);\nexport {};\n",
+        );
+      }
+      rmSync(join(fixture, root), { recursive: true, force: true });
+      symlinkSync(external, join(fixture, root), "dir");
+
+      const { status, output } = runHarness(fixture);
+
+      assert.notEqual(status, 0, `a symlinked ${root} root produced a SUCCESS`);
+      assert.ok(
+        !output.includes("tree-consistent"),
+        "it must not claim consistency about a tree it did not read",
+      );
+      assert.match(output, new RegExp(`refused before building: the ${root} directory is a symlink`));
+    });
+  }
+});
+
+
+// =====================================================================
+// ROUND-5 — a bind-mounted SOURCE root, and links under the output
+// =====================================================================
+
+describe("TASK-010 round 5: a mount is not a directory just because it looks like one", () => {
+  /**
+   * THE CRITICAL. The mount guard asked only whether `dist` was a mount point.
+   * A bind-mounted `src/` is invisible to every other check: `isSymlink` says
+   * no, link counts say no, and `realpath` resolves INSIDE the repository,
+   * because a bind mount IS the path it is mounted at.
+   *
+   * The reviewer mounted an external `src` whose `testArtifacts.ts` began with
+   * `process.exit(0)`. The run returned EXIT 0 WITH NO OUTPUT — a false pass,
+   * from a check that covered one managed path and not its siblings.
+   */
+  for (const root of ["src", "tests"] as const) {
+    it(`REFUSES a real bind-mounted ${root} root before building`, () => {
+      const namespaces = spawnSync("unshare", ["--user", "--map-root-user", "--mount", "true"], {
+        encoding: "utf8",
+      });
+      if (namespaces.status !== 0) {
+        // Printed, not silently skipped: a green run in a restricted
+        // environment must not be mistaken for a proven guard.
+        console.error(`SKIPPED: unprivileged user namespaces unavailable; ${root} bind-mount not proven here`);
+        return;
+      }
+
+      const fixture = makeFixtureRepo();
+      const external = mkdtempSync(join(tmpdir(), `sf-bind-${root}-`));
+      created.push(external);
+      // Mirror the real layout so the build would genuinely succeed if the
+      // mount were followed — otherwise the refusal proves nothing.
+      cpSync(join(fixture, root), external, { recursive: true });
+      if (root === "src") {
+        writeFileSync(join(external, "verification/testArtifacts.ts"), "process.exit(0);\nexport {};\n");
+      }
+
+      const script = [
+        "set -e",
+        `mount --bind ${JSON.stringify(external)} ${JSON.stringify(join(fixture, root))}`,
+        `grep -qF ${JSON.stringify(join(fixture, root))} /proc/self/mountinfo || { echo "BIND-DID-NOT-TAKE"; exit 97; }`,
+        `cd ${JSON.stringify(fixture)}`,
+        "set +e",
+        `${JSON.stringify(process.execPath)} scripts/verify.mjs`,
+        'echo "HARNESS-EXIT=$?"',
+      ].join("\n");
+
+      const result = spawnSync("unshare", ["--user", "--map-root-user", "--mount", "sh", "-c", script], {
+        encoding: "utf8",
+        env: harnessEnv(),
+      });
+      const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+
+      assert.doesNotMatch(output, /BIND-DID-NOT-TAKE/, "the fixture failed to bind-mount, so it proved nothing");
+      assert.match(output, /HARNESS-EXIT=1/, `a bind-mounted ${root} produced a SUCCESS:\n${output}`);
+      assert.match(output, new RegExp(`refused before building: ${root} is or contains a mount point`));
+      assert.ok(!output.includes("tree-consistent"), "it must not claim consistency");
+    });
+  }
+});
+
+describe("TASK-010 round 5: links under the output are refused before the build", () => {
+  /**
+   * These were scanned only AFTER `tsc` ran, so the build wrote THROUGH them
+   * first. The symlink case eventually refused with the damage already done;
+   * the hardlink case was not looked at all — the external file was
+   * overwritten and the run still reported the tree consistent.
+   *
+   * Asserted by the external file's CONTENT surviving, which only a pre-build
+   * refusal can achieve.
+   */
+  it("does not write through a symlinked artifact under the output", () => {
+    const root = makeFixtureRepo();
+    assert.equal(runHarness(root).status, 0, "the fixture must pass first");
+
+    const external = mkdtempSync(join(tmpdir(), "sf-outlink-"));
+    created.push(external);
+    const target = join(external, "external.js");
+    writeFileSync(target, "MARKER-MUST-SURVIVE");
+    rmSync(join(root, "dist/tests/sample.test.js"), { force: true });
+    symlinkSync(target, join(root, "dist/tests/sample.test.js"), "file");
+
+    const { status, output } = runHarness(root);
+
+    assert.notEqual(status, 0, "a symlinked artifact under the output was accepted");
+    assert.equal(
+      readFileSync(target, "utf8"),
+      "MARKER-MUST-SURVIVE",
+      "the build wrote through the symlink before the refusal",
+    );
+    assert.match(output, /refused before building: linked entries under dist/);
+  });
+
+  it("does not overwrite a HARDLINKED artifact under the output", () => {
+    const root = makeFixtureRepo();
+    assert.equal(runHarness(root).status, 0, "the fixture must pass first");
+
+    const external = mkdtempSync(join(tmpdir(), "sf-outhard-"));
+    created.push(external);
+    const target = join(external, "external.js");
+    writeFileSync(target, "MARKER-MUST-SURVIVE");
+    rmSync(join(root, "dist/tests/sample.test.js"), { force: true });
+    linkSync(target, join(root, "dist/tests/sample.test.js"));
+
+    const { status, output } = runHarness(root);
+
+    assert.notEqual(status, 0, "a hardlinked artifact under the output was accepted");
+    assert.equal(
+      readFileSync(target, "utf8"),
+      "MARKER-MUST-SURVIVE",
+      "the build overwrote the hardlinked external file",
+    );
+    assert.ok(!output.includes("tree-consistent"), "it must not claim consistency");
+  });
+});
+
+describe("TASK-010 round 5: an accepted alias still converges", () => {
+  /**
+   * My own regression. Accepting a `dist-alias -> dist` spelling was right —
+   * refusing an equivalent name is a false positive. But cleanup then deleted
+   * `dist` itself, leaving the alias dangling and the rebuild failing with
+   * TS5033, which breaks the convergence AC-4 requires.
+   */
+  it("converges when contaminated while the config names an alias", () => {
+    const root = makeFixtureRepo();
+    assert.equal(runHarness(root).status, 0, "the fixture must pass first");
+    symlinkSync(join(root, "dist"), join(root, "dist-alias"), "dir");
+    writeFileSync(join(root, "dist/tests/ghostFromAnotherBranch.test.js"), "// stale\n");
+
+    const { status, output } = runWithShowConfigShim(
+      root,
+      JSON.stringify({ compilerOptions: { outDir: "dist-alias", noEmit: false } }),
+    );
+
+    assert.equal(status, 0, `an aliased outDir did not converge:\n${output.slice(0, 600)}`);
+    assert.match(output, /verification complete/);
+  });
+});
+
+
+// =====================================================================
+// ROUND-6 — an unreadable subtree is not an empty one
+// =====================================================================
+
+describe("TASK-010 round 6: verification covers the tree, not its readable projection", () => {
+  /**
+   * THE CRITICAL. Every walker caught `readdirSync` and returned nothing, so a
+   * subtree with mode 000 was indistinguishable from an empty one. The reviewer
+   * hid an orphan under `dist/hidden` and a test under `tests/hidden`; the run
+   * reported "tree-consistent" and exited 0.
+   *
+   * That is verification of the part of the tree this process happens to be
+   * allowed to see, presented as verification of the tree.
+   */
+  it("REFUSES when a subtree under the output cannot be read", () => {
+    const root = makeFixtureRepo();
+    assert.equal(runHarness(root).status, 0, "the fixture must pass first");
+
+    mkdirSync(join(root, "dist/hidden"), { recursive: true });
+    writeFileSync(join(root, "dist/hidden/ghost.test.js"), "// stale\n");
+    chmodSync(join(root, "dist/hidden"), 0o000);
+    try {
+      const { status, output } = runHarness(root);
+      assert.notEqual(status, 0, "an unreadable subtree hid an orphan and the run reported success");
+      assert.match(output, /could not be read/);
+      assert.ok(!output.includes("tree-consistent"), "it must not claim consistency about what it could not see");
+    } finally {
+      chmodSync(join(root, "dist/hidden"), 0o755);
+    }
+  });
+
+  it("REFUSES when a subtree under a source root cannot be read", () => {
+    const root = makeFixtureRepo();
+    assert.equal(runHarness(root).status, 0, "the fixture must pass first");
+
+    mkdirSync(join(root, "tests/hidden"), { recursive: true });
+    writeFileSync(join(root, "tests/hidden/ghost.test.ts"), 'import { it } from "node:test";\nit("x", () => {});\n');
+    chmodSync(join(root, "tests/hidden"), 0o000);
+    try {
+      const { status, output } = runHarness(root);
+      assert.notEqual(status, 0, "an unreadable source subtree was silently omitted");
+      assert.match(output, /could not be read/);
+    } finally {
+      chmodSync(join(root, "tests/hidden"), 0o755);
+    }
+  });
+
+  /**
+   * A directory that does not EXIST is genuinely empty. Conflating the two
+   * would refuse every fresh checkout, where `dist` has not been built yet —
+   * which is exactly what the first version of this guard did.
+   */
+  it("does NOT refuse a fixture whose output directory has never been built", () => {
+    const root = makeFixtureRepo();
+    assert.equal(runHarness(root).status, 0, "a missing dist must not be treated as unreadable");
+  });
+});
+
+describe("TASK-010 round 6: an ancestor mount is an ordinary workspace", () => {
+  /**
+   * The mount condition also matched ANCESTORS, so bind-mounting the whole
+   * repository onto its own path — a normal layout — was refused with
+   * "dist is or contains a mount point".
+   *
+   * An ancestor mount splices nothing INTO the tree: everything below it moves
+   * together and stays consistent. Only a mount AT or INSIDE a managed path
+   * splices foreign content in.
+   */
+  it("ACCEPTS a repository that is itself a bind mount", () => {
+    const namespaces = spawnSync("unshare", ["--user", "--map-root-user", "--mount", "true"], {
+      encoding: "utf8",
+    });
+    if (namespaces.status !== 0) {
+      console.error("SKIPPED: unprivileged user namespaces unavailable; repository bind mount not proven here");
+      return;
+    }
+
+    const root = makeFixtureRepo();
+    const script = [
+      "set -e",
+      `mount --bind ${JSON.stringify(root)} ${JSON.stringify(root)}`,
+      `grep -qF ${JSON.stringify(root)} /proc/self/mountinfo || { echo "BIND-DID-NOT-TAKE"; exit 97; }`,
+      `cd ${JSON.stringify(root)}`,
+      "set +e",
+      `${JSON.stringify(process.execPath)} scripts/verify.mjs`,
+      'echo "HARNESS-EXIT=$?"',
+    ].join("\n");
+
+    const result = spawnSync("unshare", ["--user", "--map-root-user", "--mount", "sh", "-c", script], {
+      encoding: "utf8",
+      env: harnessEnv(),
+    });
+    const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+
+    assert.doesNotMatch(output, /BIND-DID-NOT-TAKE/, "the fixture failed to bind-mount, so it proved nothing");
+    assert.match(output, /HARNESS-EXIT=0/, `a repository-level bind mount was wrongly refused:\n${output.slice(0, 500)}`);
+  });
+});
+
+
+// =====================================================================
+// ROUND-7 — what a compiler reads is not predictable from a filename
+// =====================================================================
+
+describe("TASK-010 round 7: hardlinked sources of any kind", () => {
+  /**
+   * THE CRITICAL. The hardlink scan filtered by compilable SUFFIX, encoding an
+   * assumption about what tsc reads — and with `allowJs` the assumption was
+   * wrong. An external `foreign.js` hardlinked into `src/` was compiled,
+   * executed by a test, and the run exited 0 with "tree-consistent".
+   */
+  it("REFUSES a hardlinked .js source that allowJs makes compilable", () => {
+    const root = makeFixtureRepo();
+    const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as {
+      compilerOptions: Record<string, unknown>;
+      include: string[];
+    };
+    tsconfig.compilerOptions["allowJs"] = true;
+    tsconfig.include = [...tsconfig.include, "src/**/*.js"];
+    writeFileSync(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
+
+    const external = mkdtempSync(join(tmpdir(), "sf-alljs-"));
+    created.push(external);
+    const outsider = join(external, "foreign.js");
+    writeFileSync(outsider, "export const smuggled = 7;\n");
+    linkSync(outsider, join(root, "src/foreign.js"));
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, "a hardlinked .js source was compiled and executed");
+    assert.match(output, /foreign\.js/);
+    assert.ok(!output.includes("tree-consistent"), "it must not claim consistency");
+  });
+
+  /** ...and any other extension, because the filter is gone entirely. */
+  it("REFUSES a hardlinked file of an extension nobody anticipated", () => {
+    const root = makeFixtureRepo();
+    const external = mkdtempSync(join(tmpdir(), "sf-anyext-"));
+    created.push(external);
+    const outsider = join(external, "data.json");
+    writeFileSync(outsider, "{}\n");
+    linkSync(outsider, join(root, "src/data.json"));
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, "a hardlinked file was accepted because of its extension");
+    assert.match(output, /data\.json/);
+  });
+});
+
+describe("TASK-010 round 7: a path whose PARENT is a symlink", () => {
+  /**
+   * `resolvedPath` fell back to lexical resolution when the path did not exist
+   * yet, so with `workspace -> .` and no `dist` built, `workspace/dist`
+   * resolved somewhere other than `dist` and was refused — even though tsc
+   * would write to exactly the managed directory.
+   */
+  it("ACCEPTS an outDir reached through a symlinked parent, before dist exists", () => {
+    const root = makeFixtureRepo();
+    rmSync(join(root, "dist"), { recursive: true, force: true });
+    symlinkSync(root, join(root, "workspace"), "dir");
+
+    const { status, output } = runWithShowConfigShim(
+      root,
+      JSON.stringify({ compilerOptions: { outDir: "workspace/dist", noEmit: false } }),
+    );
+    assert.equal(status, 0, `a symlinked-parent outDir was wrongly refused:\n${output.slice(0, 500)}`);
+  });
+});
+
+describe("TASK-010 round 7: each readability layer is pinned separately", () => {
+  /**
+   * Round-7 review: removing EITHER readability assertion left both
+   * unreadable-subtree tests green, because the other caught it. Two guards
+   * covering one case is defence in depth; a test that cannot tell them apart
+   * proves neither.
+   *
+   * Each stage names itself, so each can be pinned by the message only it
+   * produces.
+   */
+  it("refuses BEFORE BUILDING when a source subtree is unreadable", () => {
+    const root = makeFixtureRepo();
+    mkdirSync(join(root, "tests/hidden"), { recursive: true });
+    writeFileSync(join(root, "tests/hidden/x.test.ts"), 'import { it } from "node:test";\nit("x", () => {});\n');
+    chmodSync(join(root, "tests/hidden"), 0o000);
+    try {
+      const { output } = runHarness(root);
+      assert.match(
+        output,
+        /refused before building: these directories could not be read/,
+        "the PRE-BUILD layer did not fire; the later one may be masking it",
+      );
+    } finally {
+      chmodSync(join(root, "tests/hidden"), 0o755);
+    }
+  });
+
+  it("refuses BEFORE AUDITING when the output becomes unreadable after the build", () => {
+    const root = makeFixtureRepo();
+    assert.equal(runHarness(root).status, 0, "the fixture must pass first");
+
+    // Readable while the source is scanned, unreadable by the time the output
+    // is audited: only the later layer can catch this.
+    mkdirSync(join(root, "dist/hidden"), { recursive: true });
+    writeFileSync(join(root, "dist/hidden/ghost.test.js"), "// stale\n");
+    chmodSync(join(root, "dist/hidden"), 0o000);
+    try {
+      const { status, output } = runHarness(root);
+      assert.notEqual(status, 0);
+      assert.match(output, /could not be read/);
+    } finally {
+      chmodSync(join(root, "dist/hidden"), 0o755);
+    }
+  });
+});
+
+
+// =====================================================================
+// ROUND-8 — the source roots are the config's, not a guess
+// =====================================================================
+
+describe("TASK-010 round 8: compiler inputs outside the assumed roots", () => {
+  /**
+   * THE CRITICAL. `SOURCE_ROOTS` was hard-coded to `["src", "tests"]` — a guess
+   * about this project's shape. Round-8 review put a compiler input somewhere
+   * else and it was compiled and executed with no objection. Hard-coding closed
+   * the two roots this repository happens to use and left the class open, which
+   * is the same mistake as filtering hardlinks by suffix, one level up.
+   *
+   * The roots now come from the effective tsconfig, which is what tsc actually
+   * reads.
+   */
+  it("REFUSES a linked source under a root the tsconfig declares but nobody hard-coded", () => {
+    const root = makeFixtureRepo();
+
+    // A third root, declared in the config exactly as a real project would.
+    mkdirSync(join(root, "extra"), { recursive: true });
+    writeFileSync(join(root, "extra/helper.ts"), "export const helper = 1;\n");
+    const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as {
+      include: string[];
+    };
+    tsconfig.include = [...tsconfig.include, "extra/**/*.ts"];
+    writeFileSync(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
+    assert.equal(runHarness(root).status, 0, "the fixture must pass before the link is planted");
+
+    const external = mkdtempSync(join(tmpdir(), "sf-extraroot-"));
+    created.push(external);
+    const outsider = join(external, "foreign.ts");
+    writeFileSync(outsider, "export const smuggled = 8;\n");
+    linkSync(outsider, join(root, "extra/foreign.ts"));
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, "a declared source root outside src/ and tests/ was never scanned");
+    assert.match(output, /foreign\.ts/);
+    assert.ok(!output.includes("tree-consistent"), "it must not claim consistency");
+  });
+
+  /** ...and an ordinary project with a linked node_modules still passes. */
+  it("does not report a symlinked node_modules as foreign source", () => {
+    const root = makeFixtureRepo();
+    // makeFixtureRepo already symlinks node_modules; with roots derived from a
+    // config that includes only src/ and tests/, it is out of scope anyway —
+    // this pins the exclusion for the case where a config declares no include
+    // and the root becomes ".".
+    assert.equal(runHarness(root).status, 0, "a linked node_modules was treated as foreign source");
+  });
+});
+
+// =====================================================================
+// ROUND-9 — an absolute root, a stale non-test file, and a post-build guard
+// =====================================================================
+
+describe("TASK-010 round 9: the config may spell its roots absolutely", () => {
+  /**
+   * CRITICAL. `deriveSourceRoots` returned an absolute include unchanged and
+   * every caller then did `join(REPO_ROOT, root)`, prefixing the repository a
+   * second time. The resulting path does not exist, so the symlink check, the
+   * hardlink scan and the mount check all ran against nothing and found nothing
+   * wrong. The reviewer pointed absolute includes at the fixture's own `src`,
+   * replaced `testArtifacts.ts` with a symlink to a module calling
+   * `process.exit(0)`, and the run EXITED 0 WITH NO OUTPUT.
+   *
+   * A false pass is the worst thing this file can produce. This is the third
+   * round in which the roots were the way in — hard-coded, then derived but not
+   * normalised — which is why the fix is normalisation rather than another
+   * special case.
+   */
+  it("REFUSES a symlinked source when the roots are declared as absolute paths", () => {
+    const root = makeFixtureRepo();
+    const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as {
+      include: string[];
+    };
+    tsconfig.include = [`${root}/src/**/*.ts`, `${root}/tests/**/*.ts`];
+    writeFileSync(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
+    assert.equal(runHarness(root).status, 0, "the fixture must pass before the link is planted");
+
+    const external = mkdtempSync(join(tmpdir(), "sf-absroot-"));
+    created.push(external);
+    const hostile = join(external, "testArtifacts.ts");
+    writeFileSync(hostile, "process.exit(0);\nexport const nothing = 0;\n");
+    rmSync(join(root, "src/verification/testArtifacts.ts"));
+    symlinkSync(hostile, join(root, "src/verification/testArtifacts.ts"));
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, "an absolute include left the source roots unscanned");
+    assert.ok(output.trim().length > 0, "it exited without saying anything, which is the false pass itself");
+    assert.match(output, /testArtifacts\.ts/);
+  });
+
+  /** ...and a config that compiles from OUTSIDE the repository is refused. */
+  it("REFUSES a config whose sources live outside the repository", () => {
+    const root = makeFixtureRepo();
+    const external = mkdtempSync(join(tmpdir(), "sf-outside-"));
+    created.push(external);
+    mkdirSync(join(external, "elsewhere"), { recursive: true });
+    writeFileSync(join(external, "elsewhere/thing.ts"), "export const thing = 1;\n");
+
+    const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as {
+      include: string[];
+    };
+    tsconfig.include = [...tsconfig.include, `${external}/elsewhere/**/*.ts`];
+    writeFileSync(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, "source outside the repository was compiled without objection");
+    assert.match(output, /outside this repository/);
+  });
+});
+
+describe("TASK-010 round 9: a test declared outside tests/", () => {
+  /**
+   * AC-1 FAIL. Discovery was pinned to `tests/**\/*.test.ts` while the roots were
+   * derived from the config, so the two halves disagreed: a test the config
+   * declares elsewhere was COMPILED, matched no discovered source, and was
+   * reported as an orphan of the tree that legitimately produced it. The run
+   * cleaned, rebuilt, produced it again, and failed.
+   *
+   * Discovery follows the same derived roots now, which is the only way the two
+   * halves can stay in agreement.
+   */
+  it("discovers and RUNS a test from a root the config declares", () => {
+    const root = makeFixtureRepo();
+    mkdirSync(join(root, "extra"), { recursive: true });
+    writeFileSync(
+      join(root, "extra/foreign.test.ts"),
+      [
+        'import assert from "node:assert/strict";',
+        'import { describe, it } from "node:test";',
+        'describe("declared elsewhere", () => { it("runs", () => { assert.equal(2, 2); }); });',
+        "",
+      ].join("\n"),
+    );
+    const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as {
+      include: string[];
+    };
+    tsconfig.include = [...tsconfig.include, "extra/**/*.ts"];
+    writeFileSync(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
+
+    const { status, output } = runHarness(root);
+    assert.equal(status, 0, `a config-declared test was rejected by its own tree:\n${output}`);
+    assert.match(output, /2 test files/, "the declared test was not discovered");
+    assert.match(output, /tree-consistent/);
+  });
+});
+
+describe("TASK-010 round 9: stale output that is not a test", () => {
+  /**
+   * HIGH. The audit filtered the output through `isTestArtifact`, so a planted
+   * `dist/src/old-branch.js` survived the run, which exited 0 and reported
+   * `tree-consistent`. AC-4 requires an equivalent final generated state, and a
+   * file another branch left behind is imported by whatever still references it.
+   */
+  it("names a stale non-test artifact, removes it, and still converges", () => {
+    const root = makeFixtureRepo();
+    assert.equal(runHarness(root).status, 0, "the fixture must pass before anything is planted");
+
+    const stale = join(root, "dist/src/old-branch.js");
+    writeFileSync(stale, "export const fromAnotherBranch = 1;\n");
+    assert.ok(existsSync(stale));
+
+    const { status, output } = runHarness(root);
+    assert.match(output, /old-branch\.js/, "the stale file was never mentioned");
+    assert.match(output, /stale build output/);
+    assert.equal(status, 0, `the repair cycle should converge:\n${output}`);
+    assert.ok(!existsSync(stale), "AC-4: the final generated state still contained another branch's output");
+  });
+});
+
+describe("TASK-010 round 9: a whole-repository source root", () => {
+  /**
+   * The `node_modules` exclusion had a test that passed for the wrong reason:
+   * its fixture declared `src/**\/*.ts` and `tests/**\/*.ts`, so the symlinked
+   * `node_modules` was never in scope and the exclusion was never exercised.
+   *
+   * A config whose include begins with a glob roots at the repository itself,
+   * which is when the exclusion actually decides anything.
+   */
+  it("passes with a symlinked node_modules when the root is the repository", () => {
+    const root = makeFixtureRepo();
+    const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as Record<string, unknown>;
+    tsconfig["include"] = ["**/*.ts"];
+    writeFileSync(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
+
+    const { status, output } = runHarness(root);
+    assert.equal(status, 0, `a linked node_modules under a "." root was treated as foreign source:\n${output}`);
+    assert.match(output, /tree-consistent/);
+  });
+});
+
+describe("TASK-010 round 9: the guard that runs AFTER the build", () => {
+  /**
+   * A reviewer's mutation of the post-build `assessTreeSafety` wiring survived,
+   * because every fixture condition is caught earlier by the pre-build layer.
+   * That is the right order and it left the later layer unproven.
+   *
+   * A build that plants the link itself is the case only the post-build scan can
+   * see — and it is not contrived: anything running as part of the build can
+   * write into the output directory.
+   */
+  it("REFUSES a symlink the BUILD placed under the output directory", () => {
+    const root = makeFixtureRepo();
+    const external = mkdtempSync(join(tmpdir(), "sf-postbuild-"));
+    created.push(external);
+    const outsider = join(external, "ghost.test.js");
+    writeFileSync(outsider, "export const ghost = 1;\n");
+
+    const { status, output } = runWithBuildThatPlants(
+      root,
+      `ln -s ${JSON.stringify(outsider)} dist/tests/planted.test.js`,
+    );
+    assert.notEqual(status, 0, "a symlink created during the build was never noticed");
+    assert.match(output, /planted\.test\.js/);
+    assert.ok(!output.includes("tree-consistent"), "it must not claim consistency");
+  });
+
+  /** The same shim, planting nothing, must still pass — or it proves nothing. */
+  it("passes when the build plants nothing", () => {
+    const root = makeFixtureRepo();
+    const { status, output } = runWithBuildThatPlants(root, "true");
+    assert.equal(status, 0, `the shim itself broke the run:\n${output}`);
+    assert.match(output, /tree-consistent/);
+  });
+});
+
+// =====================================================================
+// ROUND-10 — the compiler's own inputs, and a second build judged like a build
+// =====================================================================
+
+describe("TASK-010 round 10: an EXCLUDED source explains nothing", () => {
+  /**
+   * CRITICAL. The source set was globbed from the derived roots, which ignores
+   * `exclude` entirely — so a test the config excludes still counted as current,
+   * and an old artifact at the same path was therefore "explained" by it. The
+   * reviewer excluded a test, planted its previous build output, and the stale
+   * artifact RAN while the harness reported success.
+   *
+   * The set now comes from `tsc --listFilesOnly`: the actual program, which is
+   * `include` minus `exclude` PLUS whatever imports reach — a distinction a glob
+   * gets wrong in both directions.
+   */
+  it("REFUSES a stale artifact whose only explanation is an excluded source", () => {
+    const root = makeFixtureRepo();
+    assert.equal(runHarness(root).status, 0, "the fixture must pass before anything is planted");
+
+    // A second test, compiled once so that a real artifact exists...
+    writeFileSync(
+      join(root, "tests/excluded.test.ts"),
+      [
+        'import assert from "node:assert/strict";',
+        'import { describe, it } from "node:test";',
+        'describe("excluded", () => { it("passes", () => { assert.equal(1, 1); }); });',
+        "",
+      ].join("\n"),
+    );
+    assert.equal(runHarness(root).status, 0, "the second test must compile and pass first");
+    assert.ok(existsSync(join(root, "dist/tests/excluded.test.js")), "its artifact must exist");
+
+    // ...then excluded, leaving the artifact behind. Nothing compiles it now, so
+    // nothing explains it, and it must not be treated as current.
+    const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as {
+      exclude?: string[];
+    };
+    tsconfig.exclude = ["tests/excluded.test.ts"];
+    writeFileSync(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
+
+    const { status, output } = runHarness(root);
+    assert.match(output, /excluded\.test\.js/, "the unexplained artifact was never mentioned");
+    assert.ok(
+      !existsSync(join(root, "dist/tests/excluded.test.js")),
+      "the artifact an excluded source cannot explain is still in the final tree",
+    );
+    assert.equal(status, 0, `the repair cycle should converge:\n${output}`);
+  });
+
+  /** An import from an included file DOES make a file an input, exclude or not. */
+  it("still counts a file the program reaches by import", () => {
+    const root = makeFixtureRepo();
+    writeFileSync(join(root, "tests/helper.ts"), "export const helper = 41;\n");
+    writeFileSync(
+      join(root, "tests/sample.test.ts"),
+      [
+        'import assert from "node:assert/strict";',
+        'import { describe, it } from "node:test";',
+        'import { helper } from "./helper.js";',
+        'describe("sample", () => { it("passes", () => { assert.equal(helper + 1, 42); }); });',
+        "",
+      ].join("\n"),
+    );
+    const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as {
+      exclude?: string[];
+    };
+    // Excluded, and imported anyway — tsc compiles it, so the audit must expect
+    // its artifact rather than calling it an orphan.
+    tsconfig.exclude = ["tests/helper.ts"];
+    writeFileSync(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
+
+    const { status, output } = runHarness(root);
+    assert.equal(status, 0, `an imported-but-excluded file confused the audit:\n${output}`);
+    assert.match(output, /tree-consistent/);
+  });
+});
+
+describe("TASK-010 round 10: the repair rebuild is a build like any other", () => {
+  /**
+   * HIGH. After cleaning, the second build ran and only the AUDIT looked at the
+   * result — no output-link scan, no output-directory check, no mount check, no
+   * readability check. The reviewer made the second build replace `dist` with a
+   * symlink to an external generated tree; the run exited 0 and executed that
+   * tree's tests.
+   *
+   * The safety judgement is one function now, called after every build, and it
+   * gathers its facts fresh each time — a fact captured before the second build
+   * says nothing about after it.
+   */
+  it("REFUSES an output directory the SECOND build replaced with a symlink", () => {
+    const root = makeFixtureRepo();
+    const external = mkdtempSync(join(tmpdir(), "sf-second-build-"));
+    created.push(external);
+    mkdirSync(join(external, "tests"), { recursive: true });
+
+    // Build once, so there is a `dist` to contaminate.
+    assert.equal(runHarness(root).status, 0, "the fixture must pass before anything is planted");
+
+    // Contaminate, so the repair cycle definitely runs; then swap the output on
+    // the SECOND build only, using a marker the first build leaves behind.
+    writeFileSync(join(root, "dist/src/old-branch.js"), "export const stale = 1;\n");
+    /**
+     * The external tree is a COPY of what the build just produced, so the
+     * redirected output is complete and fresh.
+     *
+     * That matters: an empty external directory is caught one step earlier, by
+     * the "the rebuild did not emit the checker" guard, and the case would then
+     * prove that guard rather than this one. The reviewer's scenario is a
+     * redirect to a WORKING external generated tree, where the only thing wrong
+     * is that it is not this repository's.
+     */
+    const marker = join(root, ".second-build");
+    const { status, output } = runWithBuildThatPlants(
+      root,
+      `if [ -f ${JSON.stringify(marker)} ]; then cp -r dist/. ${JSON.stringify(external)}/ && ` +
+        `rm -rf dist && ln -s ${JSON.stringify(external)} dist; ` +
+        `else : > ${JSON.stringify(marker)}; fi`,
+    );
+
+    assert.notEqual(status, 0, "the second build redirected the output and nothing looked again");
+    assert.match(output, /after the repair rebuild/, "the refusal must say which stage caught it");
+  });
+});
+
+// =====================================================================
+// ROUND-11 — a skipped directory name is not a safe directory
+// =====================================================================
+
+describe("TASK-010 round 11: a compiler input inside a skipped directory", () => {
+  /**
+   * CRITICAL. The source scan skipped entries named `dist`, `.git` and
+   * `node_modules` AT EVERY DEPTH, before any link inspection. That exclusion
+   * exists for a good reason — a `.` source root must not report an ordinary
+   * workspace as foreign — and it was a name filter over a set the compiler does
+   * not define.
+   *
+   * The reviewer put `src/dist/evil.ts` in the tree, excluded it in tsconfig,
+   * imported it from a test (which makes tsc compile it anyway: `exclude` is
+   * about the initial file list, not reachability) and hardlinked it to an
+   * external file. `--listFilesOnly` listed it. The scan skipped it by directory
+   * name. The external content executed under a "tree-consistent" report.
+   */
+  it("REFUSES a hardlinked source under a directory the walk skips by name", () => {
+    const root = makeFixtureRepo();
+    const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as Record<string, unknown>;
+    tsconfig["include"] = ["**/*.ts"];
+    tsconfig["exclude"] = ["src/dist/**/*.ts"];
+    writeFileSync(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
+
+    mkdirSync(join(root, "src/dist"), { recursive: true });
+    writeFileSync(join(root, "src/dist/evil.ts"), "export const evil = 1;\n");
+    writeFileSync(
+      join(root, "tests/sample.test.ts"),
+      [
+        'import assert from "node:assert/strict";',
+        'import { describe, it } from "node:test";',
+        'import { evil } from "../src/dist/evil.js";',
+        'describe("sample", () => { it("passes", () => { assert.equal(evil, 1); }); });',
+        "",
+      ].join("\n"),
+    );
+    assert.equal(runHarness(root).status, 0, "the fixture must pass before the link is planted");
+
+    const external = mkdtempSync(join(tmpdir(), "sf-nested-skip-"));
+    created.push(external);
+    const outsider = join(external, "evil.ts");
+    writeFileSync(outsider, "export const evil = 1;\n");
+    rmSync(join(root, "src/dist/evil.ts"));
+    linkSync(outsider, join(root, "src/dist/evil.ts"));
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, "a hardlinked compiler input was skipped by its directory's name");
+    assert.match(output, /evil\.ts/);
+    assert.ok(!output.includes("tree-consistent"), "it must not claim consistency");
+  });
+
+  /**
+   * A symlinked DIRECTORY holding compiler inputs, in a place the walk skips by
+   * name — the same escape as the hardlink above, one level up.
+   *
+   * WHICH GUARD CATCHES IT, measured: not the compiler-input file scan, and not
+   * an ancestor-directory check (one was written, and a mutation showed it
+   * redundant, so it was removed). `tsc --showConfig` resolves `**` into a
+   * `files` list, so `src/dist/linked` becomes a DERIVED ROOT and the
+   * root-symlink refusal names it directly.
+   *
+   * The case stays because the PROPERTY is what matters — external code must not
+   * arrive through a directory the walk skips — and it is asserted end to end
+   * rather than attributed to a guard that a mutation contradicts.
+   */
+  it("REFUSES a compiler input reached through a symlinked directory the walk skips", () => {
+    const root = makeFixtureRepo();
+    const external = mkdtempSync(join(tmpdir(), "sf-linked-dir-"));
+    created.push(external);
+    writeFileSync(join(external, "helper.ts"), "export const helper = 1;\n");
+
+    const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as Record<string, unknown>;
+    tsconfig["include"] = ["**/*.ts"];
+    writeFileSync(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
+
+    mkdirSync(join(root, "src/dist"), { recursive: true });
+    symlinkSync(external, join(root, "src/dist/linked"), "dir");
+    writeFileSync(
+      join(root, "tests/sample.test.ts"),
+      [
+        'import assert from "node:assert/strict";',
+        'import { describe, it } from "node:test";',
+        'import { helper } from "../src/dist/linked/helper.js";',
+        'describe("sample", () => { it("passes", () => { assert.equal(helper, 1); }); });',
+        "",
+      ].join("\n"),
+    );
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, "external source arrived through a symlinked directory the walk skips");
+    assert.match(output, /linked/);
+  });
+
+  /** NEGATIVE CONTROL: an ordinary workspace is still not foreign source. */
+  it("still passes with a linked node_modules under a whole-repository root", () => {
+    const root = makeFixtureRepo();
+    const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as Record<string, unknown>;
+    tsconfig["include"] = ["**/*.ts"];
+    writeFileSync(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
+
+    const { status, output } = runHarness(root);
+    assert.equal(status, 0, `an ordinary workspace was refused:\n${output}`);
+    assert.match(output, /tree-consistent/);
+  });
+});
+
+describe("TASK-010 round 11: readability, AFTER the build for real", () => {
+  /**
+   * The existing "after the build" case created the unreadable directory BEFORE
+   * invoking the harness, so the PRE-build readability walk caught it — a test
+   * passing for a reason other than the one it claimed. Here the BUILD creates
+   * the condition, so only a check running afterwards can see it.
+   *
+   * WHAT THIS DOES AND DOES NOT PIN, measured rather than assumed: readability
+   * is asserted at more than one point after the build, so removing any single
+   * one of them leaves this green. It pins the PROPERTY — an unreadable
+   * directory the build leaves behind is refused — and not one call site. Said
+   * here because the alternative is a comment claiming a guard is tested when a
+   * mutation shows it is not.
+   */
+  it("REFUSES when the BUILD makes part of the output unreadable", () => {
+    const root = makeFixtureRepo();
+    const { status, output } = runWithBuildThatPlants(root, "mkdir -p dist/hidden && chmod 000 dist/hidden");
+    try {
+      assert.notEqual(status, 0, "a directory the build made unreadable was scanned as empty");
+      assert.match(output, /could not be read|unreadable/i);
+    } finally {
+      // Leave it removable, or the fixture cleanup fails.
+      try {
+        chmodSync(join(root, "dist/hidden"), 0o700);
+      } catch {
+        /* already gone */
+      }
+    }
+  });
+});
+
+// =====================================================================
+// ROUND-12 — a symlink ABOVE every root, and a test that proved nothing
+// =====================================================================
+
+describe("TASK-010 round 12: a symlinked ancestor of a derived root", () => {
+  /**
+   * CRITICAL, and the correction of a removal I made on incomplete evidence.
+   *
+   * Round 11 added an ancestor check, a mutation showed it caught nothing the
+   * suite already caught, and I removed it on that evidence. This is the case it
+   * existed for: `src` is a symlink to an external directory, and `include`
+   * names `src/foo/**` and `src/verification/...`, so the DERIVED ROOTS are
+   * `src/foo`, `src/verification` and `tests`. `src` itself is never a root, so
+   * the root-symlink refusal never looks at it; the walk starts below the link;
+   * and `lstat` on each file follows it. Exit 0, "tree-consistent", external code
+   * executed.
+   *
+   * The measurement was right about the case it measured and wrong as a
+   * generalisation. "A mutation shows this is redundant" means redundant for the
+   * cases the suite covers, and the question that should have followed — what
+   * case would make it necessary? — was not asked.
+   */
+  it("REFUSES when a directory ABOVE every derived root is a symlink", () => {
+    const root = makeFixtureRepo();
+    const external = mkdtempSync(join(tmpdir(), "sf-ancestor-"));
+    created.push(external);
+
+    // The external tree holds everything `src` used to.
+    mkdirSync(join(external, "verification"), { recursive: true });
+    mkdirSync(join(external, "foo"), { recursive: true });
+    cpSync(join(root, "src/verification/testArtifacts.ts"), join(external, "verification/testArtifacts.ts"));
+    writeFileSync(join(external, "foo/helper.ts"), "export const helper = 1;\n");
+
+    rmSync(join(root, "src"), { recursive: true, force: true });
+    symlinkSync(external, join(root, "src"), "dir");
+
+    // Roots that sit INSIDE the symlink, so none of them is the link itself.
+    const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as Record<string, unknown>;
+    tsconfig["include"] = ["src/foo/**/*.ts", "src/verification/testArtifacts.ts", "tests/**/*.ts"];
+    writeFileSync(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, "external source arrived through a symlink above every root");
+    assert.ok(output.trim().length > 0, "it exited silently, which is the false pass itself");
+    assert.match(output, /src/);
+    assert.ok(!output.includes("tree-consistent"), "it must not claim consistency");
+  });
+
+  /**
+   * THE CASE THE ROOT-SIDE ANCESTOR CHECK IS THE ONLY ANSWER TO.
+   *
+   * Mutation testing showed the reproduction above is caught by the INPUT scan's
+   * ancestor walk alone — removing the root loop's copy left it green. The
+   * lesson of this very round is not to delete a guard on that evidence without
+   * asking what case would need it, so: a declared root inside a symlink that
+   * holds no compiler inputs YET.
+   *
+   * The input scan never looks, because there is nothing under it to look at.
+   * The root loop does. Refusing is the closed direction — the config has
+   * declared that source will be compiled from inside a symlink, and "it is
+   * empty today" is not a property anyone maintains.
+   */
+  it("REFUSES when the config declares a root inside a symlink that holds no sources yet", () => {
+    const root = makeFixtureRepo();
+    const external = mkdtempSync(join(tmpdir(), "sf-empty-ancestor-"));
+    created.push(external);
+    mkdirSync(join(external, "none"), { recursive: true });
+
+    symlinkSync(external, join(root, "vendor"), "dir");
+    const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as Record<string, unknown>;
+    tsconfig["include"] = ["src/**/*.ts", "tests/**/*.ts", "vendor/none/**/*.ts"];
+    writeFileSync(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, "a declared root inside a symlink was accepted because it happened to be empty");
+    assert.match(output, /vendor/);
+  });
+
+  /**
+   * THE CASE THE INPUT-SIDE ANCESTOR CHECK IS THE ONLY ANSWER TO.
+   *
+   * The root-side walk covers ancestors of DECLARED roots. A file reached by
+   * IMPORT does not have to live under one: `exclude` does not stop an import,
+   * and neither does never having been declared. So `vendor` here is not a root
+   * — nothing in `include` mentions it — and the root-side walk never considers
+   * it. Only the input-side walk, over what the compiler says it actually reads,
+   * sees that the file arrives through a symlink.
+   *
+   * Asked BEFORE deciding whether the check was redundant, because last round I
+   * deleted its sibling on a mutation that only proved redundancy for the cases
+   * the suite happened to cover.
+   */
+  it("REFUSES an imported file that arrives through a symlink outside every declared root", () => {
+    const root = makeFixtureRepo();
+    const external = mkdtempSync(join(tmpdir(), "sf-imported-"));
+    created.push(external);
+    writeFileSync(join(external, "helper.ts"), "export const helper = 1;\n");
+
+    // `vendor` is a symlink and is NOT in `include`; the import is what pulls it
+    // into the program.
+    symlinkSync(external, join(root, "vendor"), "dir");
+    writeFileSync(
+      join(root, "tests/sample.test.ts"),
+      [
+        'import assert from "node:assert/strict";',
+        'import { describe, it } from "node:test";',
+        'import { helper } from "../vendor/helper.js";',
+        'describe("sample", () => { it("passes", () => { assert.equal(helper, 1); }); });',
+        "",
+      ].join("\n"),
+    );
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, "an imported file arrived through a symlink no declared root covers");
+    assert.match(output, /vendor/);
+  });
+
+  /** NEGATIVE CONTROL: nested roots with no symlink above them still pass. */
+  it("still passes when the same roots are ordinary directories", () => {
+    const root = makeFixtureRepo();
+    mkdirSync(join(root, "src/foo"), { recursive: true });
+    writeFileSync(join(root, "src/foo/helper.ts"), "export const helper = 1;\n");
+    const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as Record<string, unknown>;
+    tsconfig["include"] = ["src/foo/**/*.ts", "src/verification/testArtifacts.ts", "tests/**/*.ts"];
+    writeFileSync(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
+
+    const { status, output } = runHarness(root);
+    assert.equal(status, 0, `ordinary nested roots were refused:\n${output}`);
+    assert.match(output, /tree-consistent/);
+  });
+});
+
+describe("TASK-010 round 13: an artifact kind the configuration no longer emits", () => {
+  /**
+   * HIGH. `sourceForGeneratedPath` accepted `.d.ts`, `.d.ts.map` and `.js.map`
+   * whenever their source existed, without asking whether this configuration
+   * emits them. The reviewer built a fixture with neither `declaration` nor
+   * `sourceMap`, planted a `.d.ts`, and the run exited 0 reporting
+   * `tree-consistent` with the stale file still in place.
+   *
+   * A fresh clone has no such file. That is precisely what AC-4's "equivalent
+   * final generated state" forbids.
+   */
+  it("removes a declaration left by a configuration that no longer emits one", () => {
+    const root = makeFixtureRepo();
+    assert.equal(runHarness(root).status, 0, "the fixture must pass before anything is planted");
+
+    const stale = join(root, "dist/src/verification/testArtifacts.d.ts");
+    writeFileSync(stale, "export declare const stale: number;\n");
+    assert.ok(existsSync(stale));
+
+    const { status, output } = runHarness(root);
+    assert.match(output, /testArtifacts\.d\.ts/, "the stale declaration was never mentioned");
+    assert.ok(!existsSync(stale), "AC-4: a kind this configuration does not emit survived the run");
+    assert.equal(status, 0, `the repair cycle should converge:\n${output}`);
   });
 });
