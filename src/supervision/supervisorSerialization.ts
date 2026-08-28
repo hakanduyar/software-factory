@@ -237,6 +237,10 @@ function parseRoadmapItem(raw: unknown, index: number, context: string): Roadmap
 
   const detail = optionalStr(row, "detail", itemContext);
   const attempts = row["attempts"] === undefined ? undefined : nonNegativeInt(row, "attempts", itemContext);
+  const unlaunchedAttempts =
+    row["unlaunchedAttempts"] === undefined
+      ? undefined
+      : nonNegativeInt(row, "unlaunchedAttempts", itemContext);
   const declaredActionKinds =
     row["declaredActionKinds"] === undefined
       ? undefined
@@ -262,6 +266,7 @@ function parseRoadmapItem(raw: unknown, index: number, context: string): Roadmap
     workClass: oneOf<WorkClass>(row, "workClass", WORK_CLASSES, itemContext),
     order: nonNegativeInt(row, "order", itemContext),
     ...(attempts === undefined ? {} : { attempts }),
+    ...(unlaunchedAttempts === undefined ? {} : { unlaunchedAttempts }),
     ...(declaredActionKinds === undefined ? {} : { declaredActionKinds }),
     ...(implementedByResourceKey === undefined ? {} : { implementedByResourceKey }),
     ...(implementedByResourceKeys === undefined ? {} : { implementedByResourceKeys }),

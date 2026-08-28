@@ -200,12 +200,37 @@ export function unprovenCompletion(input: {
   readonly implementedKeys: ReadonlySet<string>;
 }): string | undefined {
   for (const item of input.roadmap) {
-    if (item.status !== "DONE" || !requiresAi(item.workClass)) continue;
+    if (!requiresAi(item.workClass)) continue;
     if (input.implementedKeys.has(item.key)) continue;
-    return (
-      `roadmap item ${JSON.stringify(item.key)} is marked DONE and its catalog class ${JSON.stringify(item.workClass)} ` +
-      "requires AI work, but durable provenance holds no record of anything having run on it"
-    );
+
+    if (item.status === "DONE") {
+      return (
+        `roadmap item ${JSON.stringify(item.key)} is marked DONE and its catalog class ${JSON.stringify(item.workClass)} ` +
+        "requires AI work, but durable provenance holds no record of anything having run on it"
+      );
+    }
+
+    /**
+     * AN ITEM THAT RAN AND IS NOT DONE (round-11 review).
+     *
+     * `DONE` was the only trigger, so an item left ELIGIBLE by a
+     * `CHANGES_REQUIRED` review was exempt — and deleting its lineage let the
+     * same resource review it again. The reviewer demonstrated exactly that.
+     *
+     * `attempts` alone could not be the trigger, because it is incremented when
+     * an action is CLAIMED, one commit before the launch. Now that
+     * reconciliation records the attempts it PROVED never launched, the
+     * difference is the number that reached a worker — and a worker that ran
+     * leaves lineage.
+     */
+    const launched = (item.attempts ?? 0) - (item.unlaunchedAttempts ?? 0);
+    if (launched > 0) {
+      return (
+        `roadmap item ${JSON.stringify(item.key)} has ${launched} attempt(s) that reached a worker and its catalog ` +
+        `class ${JSON.stringify(item.workClass)} requires AI work, but durable provenance holds no record of ` +
+        "anything having run on it"
+      );
+    }
   }
   return undefined;
 }

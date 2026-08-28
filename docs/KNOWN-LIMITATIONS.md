@@ -185,29 +185,32 @@ where an empty chain is not read as a DISAGREEMENT about who implemented an
 ancestor whose class needs no AI. And the deeper limit below, which no amount of
 this closes.
 
-**The reproduction that shows the floor**, from round-10 review, recorded so it
-is not rediscovered as though it were new:
+**The floor moved in round 11, and the entry that claimed otherwise was wrong.**
 
-1. `A` is deterministic; `B` is an `INDEPENDENT_REVIEW` depending on `A`.
-2. Only `claude-code:sonnet` is routable.
-3. `B` runs and returns `CHANGES_REQUIRED`, leaving `B` ELIGIBLE.
-4. Delete, by writing SQLite directly: `B`'s implementer history, its
-   `lastRunConfig`, the provenance chain, and the anchor.
-5. Tick. `B` runs again — on the resource that reviewed it before.
+Round-10 review deleted an item's implementer history, its `lastRunConfig`, the
+provenance chain and the anchor, and the resource that had just reviewed the item
+reviewed it again. This entry recorded that as the keyless floor: what remained,
+it said, was byte-for-byte a database where the work never happened.
 
-No digest is recomputed. What remains after step 4 is byte-for-byte what a
-database looks like where the work never happened, so there is nothing to
-detect. Every candidate survivor was checked and each is produced by ordinary
-operation: `lastSuccessAt` on the resource is written by a successful PROBE, not
-only by completed work; `attempts` is incremented when an action is CLAIMED,
-before anything launches, so a supervisor killed in that window would leave it
-set with no lineage; `detail` is free text.
+That was an overclaim, and round-11 review said so. `attempts` survives the
+deletion. The objection to using it was real — `attempts` is incremented when an
+action is CLAIMED, one commit before the launch, so a supervisor killed in that
+window would leave it set with no lineage — but the answer was better than the
+objection: claim reconciliation ALREADY proves the launch never happened, and can
+record it. Attempts that reached a worker are `attempts - unlaunchedAttempts`,
+and a worker that ran leaves lineage. The reproduction now fails closed, and a
+negative control pins that an ordinary crash before launch still resumes.
 
-An implementation of the `lastSuccessAt` check was written and REVERTED when
-three negative controls failed — an installation that had merely probed a
-provider was refused. A control that fires on ordinary operation is not a
-control, and shipping it would have made this entry read as closed while making
-the system less usable and no safer.
+What was tried and correctly rejected stays recorded, because the reasoning is
+the useful part: `lastSuccessAt` on the resource is written by a successful
+PROBE, not only by completed work — an implementation of that check was written
+and reverted when three negative controls failed. `detail` is free text.
+
+**The floor now:** deleting the progress counters as well. An attacker who
+removes `attempts` along with everything else leaves state that genuinely is
+consistent with a database where the work never happened, and no keyless scheme
+can tell those apart. That is a narrower limit than this entry used to claim, and
+it is the honest one.
 
 **What would actually close it:** a record the database writer cannot reach — a
 signature over the chain with a key held elsewhere, or an external witness.

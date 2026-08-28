@@ -372,6 +372,28 @@ export class SupervisorService {
     }
     let current = reconciled.state;
 
+    /**
+     * 1b. WORK THAT REACHED A WORKER MUST HAVE LEFT LINEAGE (round-11 review).
+     *
+     * AFTER reconciliation, deliberately. The signal is
+     * `attempts - unlaunchedAttempts`, and it is reconciliation that proves an
+     * attempt never launched — asking before it runs would refuse an item whose
+     * pending claim is about to be cleared as never-launched, which is an
+     * ordinary crash rather than a deletion.
+     *
+     * Before step 3, equally deliberately: eligibility and selection are what
+     * lineage protects, and both happen below.
+     */
+    const unproven = unprovenCompletion({
+      roadmap: current.roadmap,
+      implementedKeys: new Set(
+        current.provenance.filter((entry) => entry.kind === "IMPLEMENTED_BY").map((entry) => entry.roadmapKey),
+      ),
+    });
+    if (unproven !== undefined) {
+      return this.unprovenRefusal(current, unproven);
+    }
+
     // 2. Refresh only resources whose retry is actually due. A resource with a
     //    known retryAt in the future is deliberately NOT probed: probing early
     //    costs something and tells us nothing new.
@@ -437,9 +459,21 @@ export class SupervisorService {
           ? `[supervisor] clearing an unlaunched claim ${claim.actionId}; ${claim.roadmapKey} stays ${item?.status ?? "restricted"}`
           : `[supervisor] clearing an unlaunched claim ${claim.actionId}`,
       );
+      /**
+       * RECORDS WHAT IT JUST PROVED (round-11 review).
+       *
+       * This branch exists because the launch demonstrably did not happen. That
+       * fact was used and thrown away, which left `attempts` meaning "claimed"
+       * rather than "ran" — and a missing-lineage check therefore could not use
+       * it without refusing forever after an ordinary crash in this window.
+       *
+       * Written down, the ambiguity disappears: attempts that reached a worker
+       * are `attempts - unlaunchedAttempts`, and lineage is required for those.
+       */
+      const withUnlaunched = restricted ? state.roadmap : setStatus(state.roadmap, claim.roadmapKey, "ELIGIBLE");
       const cleared = await this.commit(state, {
         ...withoutClaim,
-        roadmap: restricted ? state.roadmap : setStatus(state.roadmap, claim.roadmapKey, "ELIGIBLE"),
+        roadmap: countUnlaunchedAttempt(withUnlaunched, claim.roadmapKey),
       });
       return { state: cleared };
     }
@@ -1743,13 +1777,6 @@ export class SupervisorService {
     if (!verdict.ok) {
       return { state, result: this.structuralRefusal(state, verdict.problem) };
     }
-    const implementedKeys = new Set(
-      state.provenance.filter((entry) => entry.kind === "IMPLEMENTED_BY").map((entry) => entry.roadmapKey),
-    );
-    const unproven = unprovenCompletion({ roadmap: verdict.roadmap, implementedKeys });
-    if (unproven !== undefined) {
-      return { state, result: this.unprovenRefusal(state, unproven) };
-    }
     if (sameRoadmap(state.roadmap, verdict.roadmap)) {
       return { state };
     }
@@ -2406,6 +2433,16 @@ export function appendImplementerProvenance(
     );
   }
   return result.chain;
+}
+
+/** Records that one claimed attempt provably never reached a worker. */
+export function countUnlaunchedAttempt(
+  roadmap: readonly RoadmapItem[],
+  key: string,
+): readonly RoadmapItem[] {
+  return roadmap.map((item) =>
+    item.key === key ? { ...item, unlaunchedAttempts: (item.unlaunchedAttempts ?? 0) + 1 } : item,
+  );
 }
 
 /** Records how many action attempts an item has consumed (F-6). */

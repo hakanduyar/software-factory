@@ -64,6 +64,26 @@ export interface RoadmapItem {
    */
   readonly attempts?: number;
   /**
+   * How many of those attempts were CLAIMED and provably never launched.
+   *
+   * `attempts` is incremented when an action is claimed, one commit BEFORE the
+   * launch, so on its own it cannot distinguish "a worker ran" from "a
+   * supervisor died in the window between claiming and launching". That
+   * ambiguity was the reason a missing-lineage check could not key on it
+   * (round-11 review), and the reviewer's answer was better than the objection:
+   * claim reconciliation ALREADY proves the launch never happened, so it can
+   * say so durably.
+   *
+   * `attempts - unlaunchedAttempts` is therefore the number of attempts that
+   * actually reached a worker, and an item with more than zero of those and no
+   * lineage anywhere is a contradiction rather than a fresh item.
+   *
+   * Counted rather than subtracted from `attempts`, so the remediation budget
+   * still bounds a crash loop: an unlaunched attempt is not free, it just is not
+   * evidence that anything ran.
+   */
+  readonly unlaunchedAttempts?: number;
+  /**
    * Action kinds this item's executor is expected to perform. Every one is put
    * through the financial gate BEFORE the executor is launched (finding F-3),
    * so the supervisor never starts work whose declared actions it would refuse.
