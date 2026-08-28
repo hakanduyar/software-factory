@@ -1,8 +1,15 @@
 /**
  * The isolated executor child process (TASK-011).
  *
- * Reads one `ExecutorRequest` from stdin, does the work, writes one response to
- * stdout, exits. It holds no credential store, no database path and no
+ * Reads one `ExecutorRequest` from the FILE named by `argv[2]`, does the work,
+ * writes one response to stdout, exits.
+ *
+ * Not stdin, and the distinction is load-bearing rather than incidental:
+ * TASK-004's unattended-execution invariant forbids any interactive-I/O
+ * primitive in this tree, and reading standard input is the one that hangs
+ * forever if a terminal is ever attached. This comment said "stdin" until
+ * round-12 review caught it — a description that contradicts the code is a
+ * small lie that makes the next reader distrust the rest. It holds no credential store, no database path and no
  * supervisor state — only what the request carries.
  *
  * ================================================================

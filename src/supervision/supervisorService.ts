@@ -739,14 +739,23 @@ export class SupervisorService {
      * from opt-in into the price of running at all. Every declared kind still
      * goes through the gate below before the executor is launched.
      *
-     * WHAT THIS DOES NOT DO, said plainly because the review was right to press:
-     * the executor is trusted in-process code, and an in-process function cannot
-     * stop code that can already call `fetch`. Real enforcement means running the
-     * executor without the capability — a separate process with restricted
-     * credentials — which is architecture for a later roadmap item and is
-     * recorded as such in the TASK-006 document. What this closes is the version
-     * of the hole the supervisor CAN close: work that never declared anything
-     * and was therefore never asked.
+     * WHAT THIS DOES NOT DO, and where that line has moved.
+     *
+     * The executor this service calls TODAY is in-process, and an in-process
+     * function cannot stop code that can already call `fetch`. What this closes
+     * is the version of the hole the supervisor CAN close: work that never
+     * declared anything and was therefore never asked.
+     *
+     * Real enforcement — a separate process with restricted credentials — is no
+     * longer "a later roadmap item": `createIsolatedExecutor` implements it
+     * (TASK-011, on this branch). It is not yet WIRED, because `EXECUTOR_WIRING`
+     * depends on both `EXECUTOR_ISOLATION` and `STATE_INTEGRITY` being accepted
+     * and integrated first, so production still uses the explicitly named
+     * `createUnimplementedExecutor`.
+     *
+     * That distinction is the whole of the honesty here: the mechanism exists,
+     * this path does not use it yet, and this note will be wrong the day the
+     * wiring lands if nobody updates it again.
      */
     if (!requiresAi(item.workClass) && (item.declaredActionKinds ?? []).length === 0) {
       const humanAction = `Declare the action kinds ${item.key} will perform (declaredActionKinds) before it can run; deterministic work that declares nothing cannot be gated.`;
@@ -2360,35 +2369,32 @@ export function chainIsLegacySilence(state: {
     return false;
   }
   /**
-   * WHY THERE IS NO THIRD CHECK HERE, and what was tried (round-10 HIGH).
+   * WHY AN EMPTY CHAIN IS STILL SILENCE HERE, and what changed under it.
    *
-   * The reviewer ran a review on the only routable resource, then deleted the
-   * item's implementer history, its `lastRunConfig`, the chain AND the anchor —
-   * and the same resource reviewed the item again, because what remained was
-   * byte-for-byte what a fresh installation looks like.
+   * This comment used to say that after deleting the implementer history, the
+   * `lastRunConfig`, the chain and the anchor, what remained was byte-for-byte a
+   * database where the work never happened — and that keying on `attempts` would
+   * strand an item after an ordinary crash before launch.
    *
-   * I tried to close it with a third record: `lastSuccessAt` on the resource,
-   * which the completion path writes and the deletion left behind. It is not a
-   * record of WORK. A successful PROBE writes the same field, so the check fired
-   * on any installation that had ever looked at a provider, and three negative
-   * controls in this suite failed immediately. That is the evidence, not a
-   * guess.
+   * BOTH HALVES ARE NOW FALSE, and the correction is elsewhere in this file.
+   * Round-11 review pointed out that `attempts` survives that deletion, and its
+   * answer to the crash objection was better than the objection: claim
+   * reconciliation ALREADY proves a launch never happened, so it records
+   * `unlaunchedAttempts`. `attempts - unlaunchedAttempts` is the number that
+   * reached a worker, and `unprovenCompletion` refuses an item that has more
+   * than zero of those and no lineage.
    *
-   * Every other survivor fails the same way. `attempts` is incremented when an
-   * action is CLAIMED, before anything launches, so a supervisor killed in that
-   * window would leave `attempts > 0` with no lineage and be refused forever.
-   * `detail` is free text an attacker writes anyway.
+   * So the deletion case is caught — by that check, not by this function. What
+   * this one still answers is narrower and unchanged: given an EMPTY chain with
+   * no anchor and nothing else contradicting it, is that legacy silence? Yes,
+   * because a database written before provenance existed looks exactly like
+   * that, and refusing every such installation would strand the roadmap this
+   * protects.
    *
-   * So this is the keyless limit, not a missing guard: after the chain, the
-   * anchor, the implementer history and the run configuration are all removed,
-   * the remaining state is CONSISTENT with a database where the work never
-   * happened, and no scheme without a secret or an external witness can tell
-   * those apart. Detecting it needs a record the attacker cannot reach, which is
-   * what CLEAN_ROOM_CI is for.
-   *
-   * Recorded as L-4 in docs/KNOWN-LIMITATIONS.md with the reviewer's exact
-   * reproduction, rather than left as a control that looks like it covers this
-   * and does not.
+   * The remaining floor is recorded in docs/KNOWN-LIMITATIONS.md L-4: an
+   * attacker who deletes the progress counters as well leaves state genuinely
+   * consistent with work never having happened, and no keyless scheme can tell
+   * those apart.
    */
   return true;
 }

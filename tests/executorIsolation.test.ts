@@ -478,21 +478,77 @@ describe("TASK-011 AC-12: the trust-boundary notes say what is now true", () => 
    * These notes are the project's memory of WHY a guard exists. Deleting one
    * when its task lands loses the reasoning; leaving it unchanged states
    * something false. Both are failures, so both are asserted against.
+   *
+   * REWRITTEN IN ROUND 12, because this suite was passing for the wrong reason.
+   * It searched only for phrases the remediation ADDED, so a file could carry
+   * the new sentence in one place and the stale "this is a later task" claim in
+   * another and still be green. The reviewer found exactly that: two notes still
+   * said process isolation was future work, and a third still stated a floor
+   * that the previous commit had made false.
+   *
+   * A note is a claim about the system. Asserting only that a true sentence is
+   * PRESENT is half a test; the other half is that the false one is ABSENT.
    */
-  it("records what narrowed AND what remains, in both places that pointed here", async () => {
-    const { readFileSync } = await import("node:fs");
+  const STALE_FUTURE_WORK = [
+    /architecture for a later task/,
+    /architecture for a later roadmap item/,
+    /is architecture for a later/,
+  ];
 
+  it("no longer claims process isolation is future work", async () => {
+    const { readFileSync } = await import("node:fs");
+    for (const file of ["src/supervision/financialSafety.ts", "src/supervision/supervisorService.ts"]) {
+      const source = readFileSync(file, "utf8");
+      for (const stale of STALE_FUTURE_WORK) {
+        assert.ok(
+          !stale.test(source),
+          `${file} still defers isolation to a later task (${String(stale)}); it exists on this branch`,
+        );
+      }
+    }
+  });
+
+  it("says the mechanism exists AND that it is not yet wired", async () => {
+    const { readFileSync } = await import("node:fs");
+    for (const file of ["src/supervision/financialSafety.ts", "src/supervision/supervisorService.ts"]) {
+      const source = readFileSync(file, "utf8");
+      assert.match(source, /createIsolatedExecutor/, `${file} must name the mechanism that now exists`);
+      assert.match(
+        source,
+        /EXECUTOR_WIRING/,
+        `${file} must say the mechanism is not yet wired, or it overstates what is true today`,
+      );
+    }
+  });
+
+  it("keeps the reasoning it narrowed rather than deleting it", async () => {
+    const { readFileSync } = await import("node:fs");
     const financial = readFileSync("src/supervision/financialSafety.ts", "utf8");
     assert.match(financial, /NARROWED BY TASK-011/, "the note must say the gap narrowed");
-    assert.match(financial, /What remains|residue/i, "...and must still state what it does not cover");
-    assert.ok(
-      !/EXECUTOR_ISOLATION`?'?s territory/.test(financial),
-      "the note must no longer defer to this task as future work",
-    );
+    assert.match(financial, /What remains|residue|STILL true/i, "...and must still state what it does not cover");
 
     const service = readFileSync("src/supervision/supervisorService.ts", "utf8");
     assert.match(service, /NARROWED BY TASK-011/);
     assert.match(service, /STILL a claim/, "the residual claim must not be quietly dropped");
+  });
+
+  /**
+   * The floor claim specifically: the previous commit made it false and left it
+   * in place. A note that a later change invalidates is the most dangerous kind,
+   * because it reads as considered.
+   */
+  it("does not still claim that keying on attempts would strand an item", async () => {
+    const { readFileSync } = await import("node:fs");
+    const service = readFileSync("src/supervision/supervisorService.ts", "utf8");
+    assert.ok(
+      !/would leave `attempts > 0` with no lineage and be refused forever/.test(service),
+      "the floor claim survived the change that disproved it",
+    );
+    assert.match(
+      service,
+      /unlaunchedAttempts/,
+      "the correction must name the mechanism that replaced the claim",
+    );
   });
 });
 

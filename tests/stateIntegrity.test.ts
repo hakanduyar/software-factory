@@ -2576,12 +2576,26 @@ describe("TASK-011 round 11: an item that RAN and lost its records", () => {
       seeded.version,
     );
 
+    /**
+     * ASSERTS THE RESUME, not merely the absence of a refusal (round-12 note).
+     *
+     * `notEqual(WAITING_FOR_HUMAN)` was satisfied by `WAITING_FOR_RESOURCE` too,
+     * so removing the resource refresh left this green while the item never
+     * reached an executor at all. "Not refused" is not "resumed".
+     */
     const result = await supervisor.service.tick();
     assert.notEqual(result.kind, "WAITING_FOR_HUMAN", "an ordinary crash before launch stranded the item");
 
     const after = (await supervisor.repository.load())!;
     const item = after.roadmap.find((entry) => entry.key === "A");
     assert.equal(item?.unlaunchedAttempts, 1, "reconciliation must record the attempt it proved never launched");
+
+    // The claim is cleared on this tick; the NEXT one is where it runs.
+    await supervisor.service.tick();
+    assert.ok(
+      supervisor.executor.callsFor("A").length > 0,
+      "the item was never refused and never resumed either — it simply stopped",
+    );
   });
 
   /** The PARTIAL deletion is still caught by the anchor, as before. */

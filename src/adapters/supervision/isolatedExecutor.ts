@@ -747,10 +747,18 @@ function buildExecutor(options: ResolvedExecutorOptions, overrides: UnsafeTestOv
        * scratch nobody deletes is how such things end up somewhere unexpected.
        */
       const requestDir = mkdtempSync(join(tmpdir(), "sf-executor-"));
-      const requestPath = join(requestDir, "request.json");
-      writeFileSync(requestPath, serializeExecutorRequest(buildExecutorRequest(input)), { mode: 0o600 });
-
+      /**
+       * The `try` starts at the directory, not at the spawn (round-12 note).
+       *
+       * Building the request can REFUSE — a malformed field, an oversized one —
+       * and that refusal happened between `mkdtempSync` and the `try`, so the
+       * directory outlived the process. Not a leak of anything sensitive, since
+       * nothing had been written into it yet, but scratch that nobody deletes is
+       * how a temp directory becomes a permanent one.
+       */
       try {
+        const requestPath = join(requestDir, "request.json");
+        writeFileSync(requestPath, serializeExecutorRequest(buildExecutorRequest(input)), { mode: 0o600 });
         return await spawnChild(requestPath, env);
       } finally {
         rmSync(requestDir, { recursive: true, force: true });
