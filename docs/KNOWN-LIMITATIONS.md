@@ -523,8 +523,14 @@ here rather than left implied by the fix.
 
 Round-17 review demonstrated that an external `.cjs`, hardlinked under the
 repository's own `node_modules` or `.git` and required from a source test, RAN
-while verification exited 0 and reported `tree-consistent`. That is closed:
-`hardlinksInsideRootInstalls` refuses any file with `nlink > 1` inside either.
+while verification exited 0 and reported `tree-consistent`.
+
+**Half of that is closed and half is not, and this entry said "either" for two
+rounds after it stopped being true.** `hardlinksInsideRootInstalls` refuses any
+file with `nlink > 1` inside `node_modules`. It does NOT scan `.git`: that scan
+made this repository refuse itself once a reviewer's submodule fixture raised
+its object link counts, and the reasoning is in L-11. The `.git` hardlink vector
+is therefore OPEN and belongs to L-11's class.
 
 **What it still does not see.** Only HARDLINKS are reported. A `node_modules`
 that is itself a symlink to an attacker-controlled directory has `nlink == 1`
@@ -636,14 +642,22 @@ So the open vector is wider than when this entry was written: a `.git` that is
 mounted, symlinked away from, or hardlinked into can supply code a source test
 imports. All of it is this one class.
 
-**What would close it:** `TASK-013` — verification in a fresh checkout and a
-fresh install, in an environment the adversary is not in, where the mount
-topology and the toolchain are established before the audited code has any say.
+**What would close it, and precisely how much:** `TASK-013` — verification in a
+fresh checkout and a fresh install, where the mount topology and the toolchain
+are established before the audited code has any say.
+
+That closes HOSTILE MATERIALISATION OF THE WORKING TREE: mounts, links and
+planted files that make the audited tree misrepresent itself. It does NOT make
+the environment trustworthy in general. A fresh `node_modules`, the `node`
+binary and `PATH` remain trusted computing base in the clean room exactly as
+they are here, and this entry is narrowed to say so — an earlier draft said the
+clean room "closes the broader class", which claimed more than a clean room can
+deliver.
 The roadmap's `CLEAN_ROOM_CI` remains the GitHub-based item downstream of
 `GITHUB_ORCHESTRATION`; TASK-013 is the dependency-safe local form of the same
 boundary.
 
-**Kept honest by:** `docs/tasks/TASK-013-clean-room-ci.md` records the criteria,
+**Kept honest by:** `docs/tasks/TASK-013-clean-room-verification.md` records the criteria,
 and this entry names the reproduction so nobody has to rediscover it. If a
 future change claims to close this class inside `verify.mjs`, that claim needs
 the reviewer's probe run against it, not an argument.

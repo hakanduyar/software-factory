@@ -87,13 +87,24 @@
  * nothing — but the sentence as written overstated it, which is the defect this
  * file keeps being corrected for.
  *
- * What is excluded is IDENTITY: the resolved output directory, and the
- * repository-ROOT `node_modules` and `.git` — whose CONTENTS are still scanned
- * for hardlinks. A `node_modules` symlinked at an attacker-controlled directory
- * is NOT detected, and that residue is L-10. A symlinked `.git` IS refused,
- * because L-10's reasoning does not extend to it: nothing legitimately imports
- * from `.git`, so it has no claim to be third-party code that executes by
- * design.
+ * What is excluded from the source walk is IDENTITY: the resolved output
+ * directory, and the repository-ROOT `node_modules` and `.git`.
+ *
+ * Of those two, only `node_modules` has its CONTENTS scanned for hardlinks.
+ * `.git` does not, and the reason is measured rather than argued: `git clone
+ * --local` and `git submodule` hardlink a repository's objects and raise the
+ * link count on BOTH sides, so a third party cloning this repository makes its
+ * `.git/objects` hardlinked. Scanning it made this repository refuse itself with
+ * 902 hardlinked objects after a reviewer built a submodule fixture in `/tmp`.
+ * An install is this project's own business; who clones it is not.
+ *
+ * A symlinked `.git` IS still refused — no false positives, no legitimate use.
+ *
+ * NOT COVERED, and stated here because the previous version of this paragraph
+ * claimed otherwise for two rounds: a `node_modules` symlinked at an
+ * attacker-controlled directory (L-10), and a `.git` that is mounted, symlinked
+ * away from, or hardlinked into (L-11). The second is the class TASK-013's clean
+ * room exists to close; no guard here is relaxed on the strength of that.
  *
  * PLATFORM BOUNDARY, stated so the claim matches the code: the bind-mount
  * guarantee is derived from `/proc/self/mountinfo` and is therefore LINUX-ONLY.
@@ -941,12 +952,16 @@ function linkedCompilerInputs() {
 }
 
 /**
- * HARDLINKS INSIDE THE ROOT `node_modules` AND `.git` (round-17 CRITICAL).
+ * HARDLINKS INSIDE THE ROOT `node_modules` (round-17 CRITICAL, narrowed in 19).
  *
- * Excluding those two from the source walk left an execution path open, and the
- * reviewer demonstrated it twice: an external `.cjs` hardlinked under either
- * one, required by a source test, RAN — while the run exited 0 and reported
- * `tree-consistent`.
+ * Excluding the root installs from the source walk left an execution path open,
+ * and the reviewer demonstrated it twice: an external `.cjs` hardlinked under
+ * `node_modules` or under `.git`, required by a source test, RAN — while the run
+ * exited 0 and reported `tree-consistent`.
+ *
+ * ONLY `node_modules` IS SCANNED. `.git` was scanned too and it broke this
+ * repository — see the reversal below. The `.git` execution vector is L-11 and
+ * belongs to TASK-013's clean room.
  *
  * I had defended the exemption on the ground that scanning would refuse
  * ordinary repositories, because npm's cache and pnpm's store hardlink package
@@ -989,40 +1004,43 @@ function linkedCompilerInputs() {
  *   refused the trees the pipeline actually verifies. A guard that refuses
  *   ordinary work gets disabled rather than obeyed.
  *
- * A gitfile is safe to skip because it is a FILE: `.git/payload.cjs` does not
- * resolve through it, so there is no directory to smuggle anything into.
+ * ONLY THE SYMLINK QUESTION IS LEFT (round-19 note). This returned a `walk`
+ * answer distinguishing a gitfile from a directory, and once `.git` stopped
+ * being scanned for hardlinks nothing read it. The reviewer forced every
+ * non-symlink result to `{ walk: true }` and both the gitfile and directory
+ * tests still passed, which is the definition of a distinction that decides
+ * nothing.
+ *
+ * The worktree behaviour it was written for is NOT lost: a gitfile is accepted
+ * because nothing here refuses it, and "ACCEPTS a checkout whose .git is a
+ * gitfile" still fails if that changes. What is gone is a computed answer with
+ * no reader.
  */
-function rootGitVerdict() {
+function refuseSymlinkedGit() {
   const gitPath = join(REPO_ROOT, ".git");
   let stats;
   try {
     stats = lstatSync(gitPath);
   } catch (error) {
     if (error?.code === "ENOENT") {
-      return { walk: false }; // not a git checkout at all; nothing to say
+      return undefined; // not a git checkout at all; nothing to say
     }
-    return { refuse: `.git could not be inspected (${error?.code ?? "unknown error"})` };
+    return `.git could not be inspected (${error?.code ?? "unknown error"})`;
   }
   if (stats.isSymbolicLink()) {
-    return {
-      refuse:
-        ".git is a symlink; nothing legitimately imports from it and a linked .git can " +
-        "carry code from outside this repository into a run that reports on this tree",
-    };
+    return (
+      ".git is a symlink; nothing legitimately imports from it and a linked .git can " +
+      "carry code from outside this repository into a run that reports on this tree"
+    );
   }
-  // A worktree or submodule gitfile. A file has no entries to walk, and no path
-  // resolves through it.
-  if (stats.isFile()) {
-    return { walk: false };
-  }
-  return { walk: stats.isDirectory() };
+  return undefined;
 }
 
 function hardlinksInsideRootInstalls() {
   const found = [];
-  const gitVerdict = rootGitVerdict();
-  if (gitVerdict.refuse !== undefined) {
-    fail(`verification refused before building: ${gitVerdict.refuse}`);
+  const gitRefusal = refuseSymlinkedGit();
+  if (gitRefusal !== undefined) {
+    fail(`verification refused before building: ${gitRefusal}`);
   }
   /**
    * `.git` IS NOT SCANNED FOR HARDLINKS, and this reversal was forced by
@@ -1057,7 +1075,6 @@ function hardlinksInsideRootInstalls() {
    * that a source test imports — is L-11, and belongs to TASK-013's clean room,
    * which is where the round-19 reviewer placed it.
    */
-  void gitVerdict;
   for (const name of ["node_modules"]) {
     /**
      * realpath, so a shared install reached through a symlink is still walked.
@@ -1127,7 +1144,7 @@ const linkedRootInstalls = hardlinksInsideRootInstalls();
 if (linkedRootInstalls.length > 0) {
   fail(
     `verification refused before building: hardlinked entries inside the repository's own ` +
-      `node_modules/.git: ${linkedRootInstalls.join(", ")}; their contents are outside this tree ` +
+      `node_modules: ${linkedRootInstalls.join(", ")}; their contents are outside this tree ` +
       "and a source file can require them, so the run would execute code the audit never saw",
   );
 }

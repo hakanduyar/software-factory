@@ -61,8 +61,18 @@ fresh in that directory. No file in the working tree is read by the verified run
 
 **AC-2.** The clean-room run reproduces L-11's reproduction and REFUSES it:
 with a bind-mounted `.git` supplying an external `.cjs` that a source test
-imports, the clean-room result is a failure, not `HARNESS-EXIT=0`. The
-reproduction is executed, not argued.
+imports, the clean-room result is a failure, not `HARNESS-EXIT=0`.
+
+Three conditions, because "the result is a failure" alone is satisfiable by a
+setup that merely broke:
+
+  1. the external execution marker is ABSENT afterwards — the payload did not
+     run on the way to the decision;
+  2. the failure names the reason, not merely a non-zero exit;
+  3. a CLEAN control, identical but for the planted payload, SUCCEEDS in the same
+     clean room and reports the same test count as an ordinary run.
+
+The reproduction is executed, not argued.
 
 **AC-3.** A tree that verifies normally also verifies in the clean room, and the
 reported test count is identical. A clean room that changes the result on a good
@@ -73,8 +83,43 @@ verification cannot be completed, the result is a failure naming which step
 failed. An incomplete clean-room run is never reported as a pass.
 
 **AC-5.** No existing guard in `scripts/verify.mjs` is weakened, removed or
-made conditional on the clean room existing. Proven by mutation: every guard
-listed in the round 15–19 evidence still fails the test that names it.
+made conditional on the clean room existing.
+
+FROZEN INVENTORY, because "every guard listed in the round 15–19 evidence" is
+not checkable and, read literally, would require restoring the `.git` hardlink
+scan that round 19 removed on evidence — a criterion contradicting the branch
+that wrote it. The guards this criterion protects are exactly these, each with
+the case that must fail when it is removed:
+
+  1. root-`node_modules` hardlink scan — "REFUSES a hardlinked payload inside
+     the root node_modules"
+  2. symlinked-`.git` refusal — "REFUSES a symlinked .git"
+  3. name-free source-scan exclusion (identity, not name) — "REFUSES a
+     hardlinked file under src/dist, which is not the build output"
+  4. compiler-input and ancestor mount check — "REFUSES a bind mount over an
+     imported directory outside every derived root"
+  5. pre-build irregular-entry check — "REFUSES a FIFO planted under the output
+     directory"
+  6. post-build irregular-entry check — "REFUSES a FIFO the BUILD creates, at
+     the after-building stage"
+  7. pre-build `linkedCompilerInputs` call — "refuses a symlinked compiler input
+     BEFORE building, not after"
+  8. post-build readability assertion — "reports an unreadable output directory
+     created BY the build at the after-building stage"
+  9. early mount-table completeness guard — "REFUSES an unparseable mount table,
+     and does so before the build runs"
+  10. symlinked non-compiler-input scan — "REFUSES a symlinked non-source file
+      under a source root"
+
+EXPLICITLY NOT IN THIS INVENTORY: the `.git` hardlink scan, removed in round 19
+because `git clone --local` and `git submodule` raise a repository's own object
+link counts, so it refused ordinary trees for a third party's action. Restoring
+it is not required by this criterion and would reintroduce that defect.
+
+VERIFICATION METHOD, frozen: for each entry, remove the guard from a disposable
+copy, confirm the mutation LANDED (mutated text present and original absent),
+build, and confirm the named case fails while the others still pass. A mutation
+that does not compile, or does not land, proves nothing.
 
 **AC-6.** The clean room does not require a network beyond the dependency
 install, does not require sudo, and does not require a paid service.

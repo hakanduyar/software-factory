@@ -3520,6 +3520,11 @@ describe("TASK-010 round 19: an unparseable mount table refuses BEFORE building"
     const script = [
       "set -e",
       `mount --bind ${JSON.stringify(fakeProc)} /proc`,
+      // The malformed case asserts its bind took effect; this one did not, which
+      // the round-19 reviewer noted. A control that silently ran against the
+      // REAL /proc would pass while testing nothing.
+      'grep -q "^[0-9]" /proc/self/mountinfo || { echo "FAKE-PROC-DID-NOT-TAKE"; exit 97; }',
+      `cmp -s /proc/self/mountinfo ${JSON.stringify(join(fakeProc, "self/mountinfo"))} || { echo "FAKE-PROC-NOT-OURS"; exit 96; }`,
       `cd ${JSON.stringify(root)} && node scripts/verify.mjs; echo "HARNESS-EXIT=$?"`,
     ].join("\n");
     const result = spawnSync("unshare", ["--user", "--map-root-user", "--mount", "sh", "-c", script], {
@@ -3528,6 +3533,10 @@ describe("TASK-010 round 19: an unparseable mount table refuses BEFORE building"
     });
     const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
 
+    assert.ok(
+      !output.includes("FAKE-PROC-DID-NOT-TAKE") && !output.includes("FAKE-PROC-NOT-OURS"),
+      `the control ran against the real /proc, so it tested nothing:\n${output}`,
+    );
     assert.match(output, /HARNESS-EXIT=0/, `a well-formed mount table was refused:\n${output}`);
   });
 });
