@@ -35,50 +35,52 @@ may be integrated**. That is the gate working, not a failure.
 
 | Branch | Head | State |
 |---|---|---|
-| `feat/executor-isolation` | `8a34e5e` | TASK-011 + TASK-008 + TASK-012 + register. Round-10 findings answered. Awaiting round 11. |
-| `fix/verify-path-equivalence` | `8f4985e` | Verification harness. Round-10 findings answered. Awaiting round 11. |
+| `feat/executor-isolation` | `507e30e` | TASK-011 + TASK-008 + TASK-012 + register. Round-16 findings addressed. Awaiting round 17. |
+| `fix/verify-path-equivalence` | `fd626a5` | Verification harness + register. Round-13 findings addressed. Awaiting round 14. |
 | `feat/state-integrity-rebased` | `c4e4054` | An ancestor of `feat/executor-isolation`; not reviewed separately any more. |
-| `docs/known-limitations` | `93c0653`+ | The limitations register and this file. Also an ancestor of the combined branch. |
+| `docs/known-limitations` | see below | The register and this file. An ancestor of both branches above. |
 | `main` | `0087787` | Untouched. |
 
-Review rounds so far: the verification harness has had ten, the supervisor work
-nine plus two on the combined tree. Every round has found something real, and
-the last two rounds each found a test of mine that was passing for the wrong
-reason — one of them passing BECAUSE of the defect being reported.
+`main` has not moved. Every branch merges onto it cleanly.
 
-`main` has not moved. Every branch merges onto it cleanly, and pairwise.
+Sixteen review rounds on the supervisor work, thirteen on the verification
+harness. Every round has found something real. Nothing has been integrated,
+because no round has yet returned PASS with an explicit "Safe to commit: YES" —
+which is the gate working, not the loop stalling.
 
-## Why executor-isolation now contains state-integrity
+## What the rounds have actually been finding
 
-TASK-011's round-9 review raised one blocking finding that was not about the
-executor at all: a resource that CHECKPOINTED work was missing from the
-append-only history, so the C4 exclusion walk could not exclude it and it
-reviewed work it had partly authored. The reviewer said the defect is in
-pre-existing supervisor logic and that it is a system-level acceptance failure
-regardless.
+Early rounds found defects in the CODE. The last several have almost entirely
+found defects in the EVIDENCE — tests that pass for a reason other than the one
+they name. That shift is worth knowing before reading any verdict here.
 
-STATE_INTEGRITY is the task that owns lineage and already fixes it, so the
-branches were merged rather than the fix copied: one implementation instead of
-two that can drift, `EXECUTOR_WIRING` already depends on both so they were
-always arriving together, and one review of the combined tree costs half of what
-two reviews of the same content would — which matters while the quota is the
-scarce resource.
+Four shapes recur, and the fourth is mine:
 
-## To resume
+1. A control TRUE of the mechanism and FALSE of the system — a subset described
+   as the whole. Suffix-filtered link scans, hard-coded then unnormalised scan
+   roots, an audit inspecting only files whose names said `test`.
+2. A control that can be switched off by DELETING something — an absent anchor
+   read as silence, an empty chain excusing a forged completion.
+3. A CLAIM a change has made false, left standing because nothing tests prose.
+   Including, twice, entries in the limitations register itself.
+4. A fixture that refuses for ANY reason satisfying an assertion that only checks
+   THAT it refused. Found nine times in my own tests, mostly by the reviewer.
 
-1. PROBE the quota; do not read the reset time it printed.
-2. Run the queued reviews. The prompts are written and the runner verifies the
-   worktree is at the exact commit before launching:
-   - `feat/executor-isolation` @ `8a34e5e` — one review of the combined tree.
-   - `fix/verify-path-equivalence` @ `8f4985e` — round 11.
-3. On CHANGES_REQUIRED: remediate, verify, freeze, review again.
-4. On PASS with zero CRITICAL/HIGH and an explicit "Safe to commit: YES": run
-   the ADR-0002 gate (`scratchpad/adr0002_gate.sh`) before integrating. It
-   reports and never acts, and it says UNVERIFIABLE-HERE for the conditions a
-   machine cannot check rather than scoring them as passes.
+## Working discipline these rounds produced
 
-`EXECUTOR_WIRING` stays forbidden until both prerequisites are accepted AND
-integrated. `LOCAL_24_7_RUNTIME` remains `PLATFORM_CAPABILITY_BLOCKED`.
+- **Assert the specific refusal, not that something refused.** A regex broad
+  enough to accept every refusal accepts the wrong one, and a fixture that fails
+  catalog reconciliation looks identical to one that fails the guard under test.
+- **A negative control must succeed, not merely fail to refuse.**
+  `notEqual(WAITING_FOR_HUMAN)` is satisfied by `WAITING_FOR_RESOURCE`.
+- **Confirm a mutation LANDED before believing a survivor.** Three of mine were
+  no-ops — a wrong anchor, a second call site, and once a check written the wrong
+  way round that printed "applied" for an untouched tree.
+- **"A mutation shows this is redundant" means redundant for the cases the suite
+  covers.** Deleting a guard on that basis cost a CRITICAL; the question that has
+  to follow is *what case would make it necessary?*
+- **Measure order, not wall-clock duration.** A timing threshold is a bet about
+  the machine, and it will eventually be lost under load.
 
 ## One finding answered with a limit rather than a fix
 
