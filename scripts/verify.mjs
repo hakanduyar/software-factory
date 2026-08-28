@@ -1024,8 +1024,41 @@ function hardlinksInsideRootInstalls() {
   if (gitVerdict.refuse !== undefined) {
     fail(`verification refused before building: ${gitVerdict.refuse}`);
   }
-  const roots = gitVerdict.walk === true ? ["node_modules", ".git"] : ["node_modules"];
-  for (const name of roots) {
+  /**
+   * `.git` IS NOT SCANNED FOR HARDLINKS, and this reversal was forced by
+   * evidence rather than argued (round 19).
+   *
+   * Round 17 added `.git` to this walk on a measurement — 0 hardlinked files in
+   * `.git`, so the guard looked free. It is not free, and the measurement was
+   * taken at the wrong moment. `git clone --local` and `git submodule` hardlink
+   * a repository's objects, which raises the link count on BOTH sides: the
+   * SOURCE repository's `.git/objects` become hardlinked by an action taken
+   * entirely outside it.
+   *
+   * Not hypothetical. The round-19 reviewer built a submodule fixture under
+   * `/tmp` while reviewing this branch, and this repository's own verification
+   * then refused with 902 hardlinked objects, sharing inodes with
+   * `/tmp/sf-review-layouts-.../super/.git/modules/sub/objects/...`. The guard
+   * broke the repository it protects, at a distance, because somebody cloned it
+   * — and would stay broken until an unrelated directory elsewhere was deleted.
+   *
+   * `node_modules` is KEPT, and the difference is the whole reason: an install
+   * is within this repository's control and measures 0 here, so its cost is
+   * this project's to bear. Who clones this repository is not.
+   *
+   * THIS IS NOT "WEAKENED BECAUSE A CLEAN ROOM WILL EXIST." That instruction is
+   * explicit and is respected — no guard is relaxed on the strength of future
+   * work. This one goes because it demonstrably refuses ordinary trees for a
+   * legitimate action by a third party, which is the definition of a guard that
+   * gets disabled rather than obeyed. A symlinked `.git` is STILL refused: that
+   * has no false positives and no legitimate use.
+   *
+   * The vector this leaves open — a linked or mounted `.git` supplying `.cjs`
+   * that a source test imports — is L-11, and belongs to TASK-013's clean room,
+   * which is where the round-19 reviewer placed it.
+   */
+  void gitVerdict;
+  for (const name of ["node_modules"]) {
     /**
      * realpath, so a shared install reached through a symlink is still walked.
      *

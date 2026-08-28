@@ -569,3 +569,81 @@ it is for the TOCTOU gaps the threat model already records.
 hardlink route is refused, including two cases whose assertion is that the
 payload's marker file was never written — the run refused it without executing
 it. Nothing proves the symlink route is refused, because it is not.
+
+---
+
+## L-11 — A mounted directory can supply code the verifier never audits
+
+**Status:** OPEN, ACCEPTED ARCHITECTURAL BOUNDARY. Found by independent review
+(round 19) and classified there as belonging to `CLEAN_ROOM_CI` rather than to
+another `scripts/verify.mjs` patch. The scope split was authorised by the human
+before this entry was written.
+
+A root `.git` DIRECTORY mounted from an external directory can dynamically
+supply `.cjs` code. The reviewer's same-device namespace probe produced
+`HARNESS-EXIT=0`, `tree-consistent`, and an external execution marker: the run
+executed code from outside the tree and reported the tree consistent.
+
+**Why this is not another guard.** A bind mount IS the path it is mounted at.
+`isSymlink` says no, link counts say no, `realpath` resolves inside the
+repository, and on the same device even the device-number comparison says no.
+The mount table is the only witness, and the verifier reads it from inside the
+environment being audited — an environment whose mount namespace, `/proc`, and
+`node` binary are all things an adversary at this level already controls. Each
+round of narrowing has also cost more legitimate layouts: `git clone --local` is
+refused today, and the previous attempt refused every `git worktree` in this
+repository, which is the failure mode where a guard gets disabled rather than
+obeyed.
+
+**The rule this entry encodes:**
+
+- `scripts/verify.mjs` = deterministic, fail-closed verification WITHIN its
+  documented threat model.
+- `CLEAN_ROOM_CI` = a fresh, frozen environment that closes the broader class of
+  "code from outside the audited tree reaches the run".
+
+**What is NOT weakened.** Every existing guard stays exactly as it is. Nothing
+here licenses relaxing the hardlink scan, the mount checks, the symlink
+refusals or the `.git` handling because a future clean room will exist. The
+boundary moves the CLASS that remains open; it does not reopen what is closed.
+
+**The four rounds that produced this, recorded because the pattern is the
+finding:** round 15 `src/dist`, round 16 nested `node_modules`, round 17 the
+root install, round 18 the worktree regression. Each fix was correct in
+isolation, each was introduced by the fix for the round before it, and each
+bought a narrower hole at the price of refusing more legitimate trees. That is
+what a boundary looks like from the inside before it is named.
+
+**A `.git` HARDLINK IS NOW ACCEPTED, and the reversal belongs in this entry.**
+
+Round 17 scanned `.git` for hardlinks, on a measurement of 0 hardlinked files.
+The measurement was taken at the wrong moment. `git clone --local` and
+`git submodule` hardlink a repository's objects, raising the link count on BOTH
+sides — so this repository's `.git/objects` became hardlinked because the
+round-19 reviewer made a submodule fixture under `/tmp` while reviewing the
+branch. Verification then refused its own repository with 902 hardlinked
+objects, and would have stayed refused until an unrelated directory elsewhere
+was deleted.
+
+A guard that breaks a repository because somebody else cloned it is not a guard.
+It was removed for that reason and NOT because a clean room is coming: no guard
+here is relaxed on the strength of future work. `node_modules` keeps its scan,
+because an install is this project's own business and measures 0 here, whereas
+who clones this repository is outside its control. A symlinked `.git` is still
+refused — no false positives, no legitimate use.
+
+So the open vector is wider than when this entry was written: a `.git` that is
+mounted, symlinked away from, or hardlinked into can supply code a source test
+imports. All of it is this one class.
+
+**What would close it:** `TASK-013` — verification in a fresh checkout and a
+fresh install, in an environment the adversary is not in, where the mount
+topology and the toolchain are established before the audited code has any say.
+The roadmap's `CLEAN_ROOM_CI` remains the GitHub-based item downstream of
+`GITHUB_ORCHESTRATION`; TASK-013 is the dependency-safe local form of the same
+boundary.
+
+**Kept honest by:** `docs/tasks/TASK-013-clean-room-ci.md` records the criteria,
+and this entry names the reproduction so nobody has to rediscover it. If a
+future change claims to close this class inside `verify.mjs`, that claim needs
+the reviewer's probe run against it, not an argument.

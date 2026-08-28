@@ -3053,7 +3053,27 @@ describe("TASK-010 round 17: hardlinks inside the repository's own node_modules 
     assert.ok(!output.includes("tree-consistent"), "and must not also claim consistency");
   });
 
-  it("REFUSES a hardlinked payload inside .git", () => {
+  /**
+   * A HARDLINK INSIDE `.git` IS ACCEPTED, and this case asserts the REVERSAL of
+   * what it asserted in round 17.
+   *
+   * It used to require a refusal. That policy broke this repository: `git clone
+   * --local` and `git submodule` hardlink a repository's objects, raising the
+   * link count on BOTH sides, so the SOURCE repo's `.git/objects` become
+   * hardlinked by an action taken outside it. The round-19 reviewer made a
+   * submodule fixture under `/tmp` and this repository's own verification then
+   * refused with 902 hardlinked objects — broken at a distance, by somebody
+   * cloning it, until an unrelated directory elsewhere was deleted.
+   *
+   * `node_modules` keeps its scan because an install is this project's own
+   * business. Who clones this repository is not.
+   *
+   * What this leaves open is L-11 and belongs to TASK-013's clean room. Saying
+   * so in a test that ACCEPTS the tree is deliberate: the register would
+   * otherwise be the only place recording that this vector is open, and a
+   * limitation with no test next to it is the kind that quietly disappears.
+   */
+  it("ACCEPTS a hardlinked object inside .git, because git itself creates them", () => {
     const root = makeFixtureRepo();
     mkdirSync(join(root, ".git/objects"), { recursive: true });
 
@@ -3064,8 +3084,11 @@ describe("TASK-010 round 17: hardlinks inside the repository's own node_modules 
     linkSync(payload, join(root, ".git/objects/payload.cjs"));
 
     const { status, output } = runHarness(root);
-    assert.notEqual(status, 0, `a hardlink inside .git was accepted:\n${output}`);
-    assert.match(output, /payload\.cjs/, "the refusal must name it");
+    assert.equal(
+      status,
+      0,
+      `a hardlink inside .git was refused, which breaks every repository someone has cloned locally:\n${output}`,
+    );
   });
 
   /**
@@ -3111,6 +3134,14 @@ describe("TASK-010 round 17: hardlinks inside the repository's own node_modules 
 
     const { status, output } = runHarness(root);
     assert.notEqual(status, 0, `the payload reached execution:\n${output}`);
+    // The REASON, not merely a refusal — round-19 HIGH. The reviewer showed an
+    // unrelated mutation satisfied this case, so it proved nothing about the
+    // guard it was written for.
+    assert.match(
+      output,
+      /hardlinked entries inside the repository's own/,
+      `refused, but not by the root-install guard:\n${output}`,
+    );
     assert.ok(
       !existsSync(marker),
       "the payload EXECUTED — verification ran code from outside the tree it audited",
@@ -3243,6 +3274,16 @@ describe("TASK-010 round 18: .git may be a file, must not be a symlink", () => {
 
     const { status, output } = runHarness(root);
     assert.notEqual(status, 0, `the .git payload reached execution:\n${output}`);
+    /**
+     * THE REASON, not merely a refusal (round-19 HIGH).
+     *
+     * This case asserted only a nonzero status and an absent marker, and the
+     * reviewer inserted an unrelated `fail()` before the `.git` guard: it still
+     * passed 1/1. A test written to prove a specific guard closed a specific
+     * exploit cannot be satisfied by the harness refusing for any reason at all
+     * — that is the fourth shape, in the test that exists to prove the fix.
+     */
+    assert.match(output, /\.git is a symlink/, `refused, but not by the .git guard:\n${output}`);
     assert.ok(!existsSync(marker), "the payload EXECUTED from a symlinked .git");
   });
 
@@ -3365,5 +3406,128 @@ describe("TASK-010 round 18: a mount over any compiler input, not just a root", 
 
     assert.ok(!output.includes("BIND-DID-NOT-TAKE"), `the bind mount never took effect:\n${output}`);
     assert.match(output, /HARNESS-EXIT=0/, `an ancestor mount was refused:\n${output}`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ROUND-19 — the early mount-table guard, exercised through the real script
+// ---------------------------------------------------------------------------
+
+/**
+ * The pre-build refusal for an unparseable mount table had no caller test.
+ *
+ * Round-19 review deleted it and the pure mount tests stayed green (57/57)
+ * while the verifier still failed — but LATER, after building. That difference
+ * is the entire purpose of the early guard: it refuses before `tsc` writes
+ * anything, and the ordering is what nothing was proving.
+ *
+ * INJECTED WITHOUT A TEST HOOK, deliberately. Adding an env var to point the
+ * verifier at a different mount table would create exactly the bypass surface
+ * this file spends its time refusing — a flag that disables a guard for
+ * everyone while appearing to keep it. Instead a user+mount namespace binds a
+ * prepared directory over `/proc`, so the real script reads a real file at the
+ * real path and nothing in production changes. Verified reachable before it was
+ * relied on: `node` runs and `npx tsc --version` still works under that /proc.
+ */
+describe("TASK-010 round 19: an unparseable mount table refuses BEFORE building", () => {
+  function namespacesAvailable(): boolean {
+    return (
+      spawnSync("unshare", ["--user", "--map-root-user", "--mount", "true"], { encoding: "utf8" })
+        .status === 0
+    );
+  }
+
+  it("REFUSES an unparseable mount table, and does so before the build runs", (t) => {
+    if (!namespacesAvailable()) {
+      t.skip("unprivileged user namespaces unavailable; mount-table wiring not proven here");
+      return;
+    }
+    const root = makeFixtureRepo();
+    rmSync(join(root, "dist"), { recursive: true, force: true });
+
+    const fakeProc = mkdtempSync(join(tmpdir(), "sf-fakeproc-"));
+    created.push(fakeProc);
+    mkdirSync(join(fakeProc, "self"), { recursive: true });
+    writeFileSync(
+      join(fakeProc, "self/mountinfo"),
+      "this is not a mountinfo row\nneither is this one\n",
+    );
+
+    const script = [
+      "set -e",
+      `mount --bind ${JSON.stringify(fakeProc)} /proc`,
+      'grep -q "not a mountinfo row" /proc/self/mountinfo || { echo "FAKE-PROC-DID-NOT-TAKE"; exit 97; }',
+      `cd ${JSON.stringify(root)} && node scripts/verify.mjs; echo "HARNESS-EXIT=$?"`,
+    ].join("\n");
+    const result = spawnSync("unshare", ["--user", "--map-root-user", "--mount", "sh", "-c", script], {
+      encoding: "utf8",
+      env: harnessEnv({ PATH: process.env["PATH"] ?? "" }),
+    });
+    const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+
+    assert.ok(
+      !output.includes("FAKE-PROC-DID-NOT-TAKE"),
+      `the malformed mount table was never in place, so nothing was tested:\n${output}`,
+    );
+    assert.ok(
+      !output.includes("HARNESS-EXIT=0"),
+      `an unparseable mount table was accepted:\n${output}`,
+    );
+    assert.match(
+      output,
+      /does not\s+recognise as mountinfo rows|not\s+recognise as mountinfo rows/,
+      `refused, but not by the mount-table guard:\n${output}`,
+    );
+    /**
+     * THE STAGE, which is the whole claim.
+     *
+     * Deleting the early guard still refuses — later, after the build. So the
+     * discriminator is not whether it refuses but whether `dist` exists
+     * afterwards, exactly as it was for the pre-build compiler-input check.
+     */
+    assert.ok(
+      !existsSync(join(root, "dist")),
+      `the build ran before the mount table was judged, so the EARLY guard is not what refused:\n${output}`,
+    );
+  });
+
+  /**
+   * NEGATIVE CONTROL: a well-formed mount table must still verify.
+   *
+   * Without it the case above is satisfied by a harness that refuses whenever
+   * /proc is bind-mounted at all, which would prove nothing about parsing.
+   */
+  it("still accepts a well-formed mount table under the same faked /proc", (t) => {
+    if (!namespacesAvailable()) {
+      t.skip("unprivileged user namespaces unavailable; control not proven here");
+      return;
+    }
+    const root = makeFixtureRepo();
+
+    const fakeProc = mkdtempSync(join(tmpdir(), "sf-goodproc-"));
+    created.push(fakeProc);
+    mkdirSync(join(fakeProc, "self"), { recursive: true });
+    /**
+     * A genuine copy of this machine's table: parseable, naming real mounts.
+     *
+     * `cpSync` does NOT work here and the control caught it: procfs reports
+     * size 0, so the copy arrived empty and the run refused with "the mount
+     * table could not be read" — a refusal from the wrong branch entirely.
+     * `readFileSync` reads to EOF regardless of the reported size.
+     */
+    writeFileSync(join(fakeProc, "self/mountinfo"), readFileSync("/proc/self/mountinfo", "utf8"));
+
+    const script = [
+      "set -e",
+      `mount --bind ${JSON.stringify(fakeProc)} /proc`,
+      `cd ${JSON.stringify(root)} && node scripts/verify.mjs; echo "HARNESS-EXIT=$?"`,
+    ].join("\n");
+    const result = spawnSync("unshare", ["--user", "--map-root-user", "--mount", "sh", "-c", script], {
+      encoding: "utf8",
+      env: harnessEnv({ PATH: process.env["PATH"] ?? "" }),
+    });
+    const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+
+    assert.match(output, /HARNESS-EXIT=0/, `a well-formed mount table was refused:\n${output}`);
   });
 });
