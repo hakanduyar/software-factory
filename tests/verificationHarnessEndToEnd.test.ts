@@ -1816,14 +1816,29 @@ describe("TASK-010 round 8: compiler inputs outside the assumed roots", () => {
     assert.ok(!output.includes("tree-consistent"), "it must not claim consistency");
   });
 
-  /** ...and an ordinary project with a linked node_modules still passes. */
+  /**
+   * ...and an ordinary project with a linked node_modules still passes.
+   *
+   * VACUOUS AS FIRST WRITTEN (round-17 review). Its own comment admitted
+   * `node_modules` was "out of scope anyway" with the fixture's `src`/`tests`
+   * includes, and then claimed to pin the `.`-root case regardless. The reviewer
+   * deleted the whole-root setup from the neighbouring control and it still
+   * passed 1/1, which is what a test proving nothing looks like.
+   *
+   * It needs the root to be `.`, or `node_modules` is never walked and the
+   * exclusion under test is never reached.
+   */
   it("does not report a symlinked node_modules as foreign source", () => {
     const root = makeFixtureRepo();
-    // makeFixtureRepo already symlinks node_modules; with roots derived from a
-    // config that includes only src/ and tests/, it is out of scope anyway —
-    // this pins the exclusion for the case where a config declares no include
-    // and the root becomes ".".
-    assert.equal(runHarness(root).status, 0, "a linked node_modules was treated as foreign source");
+    const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as {
+      include?: string[];
+    };
+    tsconfig.include = ["**/*.ts"];
+    writeFileSync(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
+
+    const { status, output } = runHarness(root);
+    assert.equal(status, 0, `a linked node_modules was treated as foreign source:\n${output}`);
+    assert.match(output, /tree-consistent/, "and the run must actually have audited the tree");
   });
 });
 
@@ -2963,5 +2978,184 @@ describe("TASK-010 round 16: an aliased outDir is the same directory", () => {
     const { status, output } = runHarness(root);
     assert.notEqual(status, 0, `a symlinked non-source file was accepted:\n${output}`);
     assert.match(output, /src\/data\.json/, "the refusal must name the link it refuses");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ROUND-17 CRITICAL — the root node_modules and .git were execution bypasses
+// ---------------------------------------------------------------------------
+
+/**
+ * Round 16 moved the exclusions from NAME to IDENTITY and I argued the
+ * repository-root `node_modules` and `.git` had to stay excluded, because npm's
+ * cache and pnpm's store hardlink package files and scanning would refuse
+ * ordinary repositories.
+ *
+ * The reviewer hardlinked an external `.cjs` under each of them, required it
+ * from a source test, and both RAN while the verifier exited 0 reporting
+ * `tree-consistent`. The defence I offered had never been measured: this
+ * repository has ZERO hardlinked files in `node_modules` and ZERO in `.git`, and
+ * scanning both takes 12ms. The cost I traded a code-execution hole for was, in
+ * the place it mattered, nothing.
+ *
+ * Only HARDLINKS are reported inside those two. A symlinked `node_modules` is an
+ * ordinary shared install — this fixture harness uses one — so the top-level
+ * entry is followed rather than refused, and symlinks inside it are skipped.
+ * What that leaves open is L-10.
+ */
+describe("TASK-010 round 17: hardlinks inside the repository's own node_modules and .git", () => {
+  /**
+   * A fixture with a REAL `node_modules`, not the shared symlink.
+   *
+   * Writing through the symlink is how an earlier test of mine modified this
+   * repository's own `node_modules`. A test that plants something under
+   * `node_modules` must own the directory it plants into.
+   */
+  function withRealNodeModules(root: string): void {
+    const nm = join(root, "node_modules");
+    rmSync(nm, { recursive: true, force: true });
+    mkdirSync(nm, { recursive: true });
+    /**
+     * EVERY package, linked individually.
+     *
+     * Symlinking only `@types` left `undici-types` unresolvable — `@types/node`
+     * depends on it — so the fixture failed to build and the precondition
+     * failed before anything was planted. Linking each top-level entry gives an
+     * ordinary install whose packages are symlinks (skipped by the hardlink
+     * walk, exactly as a shared install relies on) inside a directory the
+     * fixture owns, so a planted hardlink lands here and not in this
+     * repository's own `node_modules`.
+     */
+    for (const entry of readdirSync(join(REPO_ROOT, "node_modules"))) {
+      symlinkSync(join(REPO_ROOT, "node_modules", entry), join(nm, entry), "dir");
+    }
+  }
+
+  it("REFUSES a hardlinked payload inside the root node_modules", () => {
+    const root = makeFixtureRepo();
+    withRealNodeModules(root);
+    const before = runHarness(root);
+    assert.equal(
+      before.status,
+      0,
+      `a real (unlinked) node_modules must verify before anything is planted:\n${before.output}`,
+    );
+
+    const external = mkdtempSync(join(tmpdir(), "sf-rootnm-"));
+    created.push(external);
+    const payload = join(external, "payload.cjs");
+    writeFileSync(payload, "module.exports = 1;\n");
+    linkSync(payload, join(root, "node_modules/payload.cjs"));
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, `a hardlink inside the root node_modules was accepted:\n${output}`);
+    assert.match(output, /payload\.cjs/, "the refusal must name it");
+    assert.ok(!output.includes("tree-consistent"), "and must not also claim consistency");
+  });
+
+  it("REFUSES a hardlinked payload inside .git", () => {
+    const root = makeFixtureRepo();
+    mkdirSync(join(root, ".git/objects"), { recursive: true });
+
+    const external = mkdtempSync(join(tmpdir(), "sf-rootgit-"));
+    created.push(external);
+    const payload = join(external, "payload.cjs");
+    writeFileSync(payload, "module.exports = 1;\n");
+    linkSync(payload, join(root, ".git/objects/payload.cjs"));
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, `a hardlink inside .git was accepted:\n${output}`);
+    assert.match(output, /payload\.cjs/, "the refusal must name it");
+  });
+
+  /**
+   * THE EXPLOIT, end to end: the payload is not merely present, it RUNS.
+   *
+   * This is the round-17 reproduction, and its marker assertion is the whole
+   * point — an exit code says the tree was refused, the marker says no external
+   * code executed on the way to that decision.
+   */
+  it("REFUSES a root-node_modules payload that a source test actually executes", () => {
+    const root = makeFixtureRepo();
+    withRealNodeModules(root);
+
+    const external = mkdtempSync(join(tmpdir(), "sf-rootexec-"));
+    created.push(external);
+    const marker = join(external, "EXECUTED");
+    const payload = join(external, "payload.cjs");
+    writeFileSync(
+      payload,
+      `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "yes");\nmodule.exports = 1;\n`,
+    );
+    linkSync(payload, join(root, "node_modules/payload.cjs"));
+
+    writeFileSync(
+      join(root, "src/loader.ts"),
+      [
+        'import { createRequire } from "node:module";',
+        "const req = createRequire(import.meta.url);",
+        'export const loaded = req("../../node_modules/payload.cjs") as number;',
+        "",
+      ].join("\n"),
+    );
+    writeFileSync(
+      join(root, "tests/loads.test.ts"),
+      [
+        'import assert from "node:assert/strict";',
+        'import { describe, it } from "node:test";',
+        'import { loaded } from "../src/loader.js";',
+        'describe("loads", () => { it("loaded", () => { assert.equal(loaded, 1); }); });',
+        "",
+      ].join("\n"),
+    );
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, `the payload reached execution:\n${output}`);
+    assert.ok(
+      !existsSync(marker),
+      "the payload EXECUTED — verification ran code from outside the tree it audited",
+    );
+  });
+
+  /**
+   * THE CONTROL: an ordinary install must still verify.
+   *
+   * A shared `node_modules` reached through a symlink, with no hardlinks in it,
+   * is the layout every fixture here uses and the one this repository has. If
+   * this fails, the scan has been over-applied and every real tree is refused —
+   * which is the outcome that gets a guard deleted rather than fixed.
+   */
+  /**
+   * A REAL install whose packages are SYMLINKS — a shared store, a pnpm farm, a
+   * hoisted monorepo — must verify.
+   *
+   * This exists because the code had an `isSymbolicLink()` branch expressing
+   * exactly this intent and the branch was DEAD: `Dirent` reflects `lstat`, so
+   * the later regular-file check already skipped symlinks, and deleting the
+   * branch failed nothing. Removing it and leaving the intent untested would
+   * have traded an unreachable guard for no guard at all; this is the guard.
+   *
+   * It fails if the walk is ever made to report symlinked entries.
+   */
+  it("still accepts a real node_modules whose packages are symlinks", () => {
+    const root = makeFixtureRepo();
+    withRealNodeModules(root);
+
+    const { status, output } = runHarness(root);
+    assert.equal(status, 0, `an install of symlinked packages was refused:\n${output}`);
+    assert.match(output, /tree-consistent/);
+  });
+
+  it("still accepts an ordinary symlinked node_modules with no hardlinks in it", () => {
+    const root = makeFixtureRepo();
+    const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as {
+      include?: string[];
+    };
+    tsconfig.include = ["**/*.ts"];
+    writeFileSync(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
+
+    const { status, output } = runHarness(root);
+    assert.equal(status, 0, `an ordinary shared install was refused:\n${output}`);
+    assert.match(output, /tree-consistent/);
   });
 });

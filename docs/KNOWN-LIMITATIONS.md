@@ -271,10 +271,14 @@ overstatement that replaced it.
 What `findHardlinkedUnder` walks is every regular file beneath every derived
 root, EXCEPT:
 
-- any directory named `node_modules` or `.git`, at any depth. A nested
-  `node_modules` is a dependency install and a nested `.git` is a submodule's
-  repository wherever they sit, so the name genuinely identifies them.
-- the configured output directory, matched BY PATH.
+- the REPOSITORY-ROOT `node_modules` and `.git`, and everything beneath them.
+  Nested copies elsewhere are scanned — `src/vendor/node_modules` is walked like
+  any other directory. An earlier version of this entry said both names were
+  excluded "at any depth", which round-16 review showed permitted arbitrary code
+  execution and round-17 review caught still being written here after the code
+  had changed.
+- the configured output directory, matched BY RESOLVED PATH, so an equivalent
+  spelling is one answer.
 
 The path match is the round-15 fix. The exclusion was by NAME, so `src/dist/`
 was skipped as though it were build output, and a hardlinked
@@ -509,3 +513,59 @@ external witness L-4 needs.
 **Kept honest by:** `src/adapters/supervision/isolatedExecutor.ts` cites this
 entry by number, and a test asserts every limitation the source cites actually
 exists in this file — the check that would have caught the missing entry.
+
+---
+
+## L-10 — A `node_modules` that is wholly external is not detected
+
+**Status:** OPEN, deliberate. Raised by fixing round-17's CRITICAL and stated
+here rather than left implied by the fix.
+
+Round-17 review demonstrated that an external `.cjs`, hardlinked under the
+repository's own `node_modules` or `.git` and required from a source test, RAN
+while verification exited 0 and reported `tree-consistent`. That is closed:
+`hardlinksInsideRootInstalls` refuses any file with `nlink > 1` inside either.
+
+**What it still does not see.** Only HARDLINKS are reported. A `node_modules`
+that is itself a symlink to an attacker-controlled directory has `nlink == 1`
+on every file inside it, and is accepted. So is a symlinked package inside an
+ordinary install.
+
+**Why it is not closed:** a shared or symlinked `node_modules` is an ordinary
+layout — a shared store, a container volume, a monorepo hoist — and this
+repository's own test harness uses one for every fixture. Refusing it would
+refuse the common case in order to catch the rare one, and a guard that refuses
+ordinary work gets disabled rather than obeyed. Link count cannot tell a
+package manager's store from an attacker's directory; both resolve outside the
+repository, which is what a store IS.
+
+**The honest boundary:** `node_modules` is third-party code that executes by
+design. `npm install` runs lifecycle scripts, and the `typescript` package there
+compiles this tree. Anyone able to plant files in it can replace the compiler,
+which no scan of its contents would catch. It belongs in the trusted computing
+base alongside `node` and `PATH`, which the threat model in `scripts/verify.mjs`
+already excludes. The round-17 fix raises the cost of the specific hardlink
+route; it does not make the directory trustworthy.
+
+**Measured, because the previous version of this reasoning was asserted and
+wrong.** On this repository: 0 hardlinked files in `node_modules` (248 files),
+0 in `.git` (997), full scan 12ms. I had defended excluding both on the ground
+that scanning "would refuse ordinary repositories" — a cost I never measured and
+which is zero here. That claim cost three review rounds and permitted arbitrary
+code execution.
+
+**The cost that IS real:** `git clone --local` hardlinks its objects — 888
+measured in a local clone of this repository — so a `--local` clone is now
+refused. This is the same trade-off L-6 records for `cp -al`, and the same
+instruction applies: if it starts refusing ordinary working copies, revisit the
+trade-off rather than adding a bypass flag, which would delete the guard for
+everyone while appearing to keep it.
+
+**What would close it:** `CLEAN_ROOM_CI` — a fresh checkout and a fresh install
+in an environment the adversary is not in. It is the answer for this class, as
+it is for the TOCTOU gaps the threat model already records.
+
+**Kept honest by:** `tests/verificationHarnessEndToEnd.test.ts` proves the
+hardlink route is refused, including two cases whose assertion is that the
+payload's marker file was never written — the run refused it without executing
+it. Nothing proves the symlink route is refused, because it is not.

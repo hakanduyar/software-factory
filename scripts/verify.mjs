@@ -62,12 +62,26 @@
  * DEFENDS AGAINST (the observed, real problem): gitignored build output that git
  * does not clean on checkout; stale artifacts from another branch; a partial or
  * redirected build; a misconfigured `outDir`; an inherited `noEmit`; symlinks
- * and hardlinks that pull code in from outside the tree, under BOTH source roots
- * (`src/` and `tests/`, not `tests/` alone); an `emitDeclarationOnly` build that
- * exits 0 having emitted no JavaScript; a bind-mounted output directory that a
- * recursive delete would reach through, INCLUDING a same-device bind mount that
- * no device-number comparison can see; and a run that would report success
- * having executed nothing.
+ * and hardlinks that pull code in from outside the tree, under every DERIVED
+ * source root; an `emitDeclarationOnly` build that exits 0 having emitted no
+ * JavaScript; a bind-mounted output directory that a recursive delete would
+ * reach through, INCLUDING a same-device bind mount that no device-number
+ * comparison can see; and a run that would report success having executed
+ * nothing.
+ *
+ * NOTHING IS EXCLUDED BY NAME, and that sentence was bought expensively. Three
+ * consecutive review rounds found the same error in a new place: a directory
+ * NAME treated as evidence about its contents. `src/dist/` skipped as though it
+ * were build output; `src/vendor/node_modules/` skipped as though it were an
+ * install; then the repository's own `node_modules` and `.git` skipped as though
+ * their contents were beyond reach — and the last of those permitted arbitrary
+ * code execution, demonstrated with an external `.cjs` hardlinked in and
+ * required from a source test while the run reported `tree-consistent`.
+ *
+ * What is excluded is IDENTITY: the resolved output directory, and the
+ * repository-root `node_modules` and `.git` — whose CONTENTS are still scanned
+ * for hardlinks. A `node_modules` that is itself symlinked at an
+ * attacker-controlled directory is NOT detected, and that residue is L-10.
  *
  * PLATFORM BOUNDARY, stated so the claim matches the code: the bind-mount
  * guarantee is derived from `/proc/self/mountinfo` and is therefore LINUX-ONLY.
@@ -915,6 +929,96 @@ function linkedCompilerInputs() {
     }
   }
   return found;
+}
+
+/**
+ * HARDLINKS INSIDE THE ROOT `node_modules` AND `.git` (round-17 CRITICAL).
+ *
+ * Excluding those two from the source walk left an execution path open, and the
+ * reviewer demonstrated it twice: an external `.cjs` hardlinked under either
+ * one, required by a source test, RAN — while the run exited 0 and reported
+ * `tree-consistent`.
+ *
+ * I had defended the exemption on the ground that scanning would refuse
+ * ordinary repositories, because npm's cache and pnpm's store hardlink package
+ * files. That was asserted and never measured. Measured on this repository:
+ * ZERO hardlinked files in `node_modules` (248 files) and ZERO in `.git` (997),
+ * with a full link scan of both taking 12ms. The cost I used to justify leaving
+ * a code-execution hole open was, here, nothing at all.
+ *
+ * WHAT THIS DOES NOT CLAIM. Only HARDLINKS are reported, not symlinks: a
+ * `node_modules` symlinked at a shared install is an ordinary layout, and this
+ * fixture harness uses exactly that. The top-level entry is therefore FOLLOWED
+ * rather than reported — its contents are what matter. A `node_modules` pointing
+ * wholly at an attacker-controlled directory still has `nlink == 1` everywhere
+ * and is NOT detected; that residue is L-10.
+ *
+ * THE COST IS REAL WHERE IT LANDS. `git clone --local` hardlinks its objects —
+ * measured at 888 in a local clone of this repository — so a `--local` clone is
+ * now refused. That is the same trade-off L-6 already records for `cp -al`, and
+ * the same instruction applies: if this starts refusing ordinary working copies,
+ * revisit the trade-off rather than adding a bypass flag.
+ */
+function hardlinksInsideRootInstalls() {
+  const found = [];
+  for (const name of ["node_modules", ".git"]) {
+    // realpath, so a shared install reached through a symlink is still walked.
+    const base = realOrUndefined(join(REPO_ROOT, name));
+    if (base === undefined) {
+      continue;
+    }
+    const walk = (current, shown) => {
+      let entries;
+      try {
+        entries = readdirSync(current, { withFileTypes: true });
+      } catch (error) {
+        if (error?.code !== "ENOENT") noteUnreadable(current);
+        return;
+      }
+      for (const entry of entries) {
+        const full = join(current, entry.name);
+        const label = `${shown}/${entry.name}`;
+        if (entry.isDirectory()) {
+          walk(full, label);
+          continue;
+        }
+        /**
+         * Regular files only — which is also how a SYMLINKED package escapes.
+         *
+         * An `isSymbolicLink()` branch stood above this and was DEAD. `Dirent`
+         * reflects `lstat`, so a symlink is neither `isDirectory()` nor
+         * `isFile()` and this line already skipped it. My own mutation found
+         * that: deleting the branch changed no behaviour and failed no test,
+         * which is the definition of a guard nobody can check.
+         *
+         * The INTENT it recorded is real and is kept — a symlinked package is an
+         * ordinary install (a shared store, a pnpm farm, a hoisted monorepo) and
+         * reporting one would refuse the common case. That intent now has a test
+         * of its own rather than an unreachable branch: "still accepts a real
+         * node_modules whose packages are symlinks".
+         */
+        if (!entry.isFile()) {
+          continue;
+        }
+        try {
+          if (lstatSync(full).nlink > 1) found.push(label);
+        } catch {
+          /* unreadable entries are reported by the walk itself */
+        }
+      }
+    };
+    walk(base, name);
+  }
+  return found.sort();
+}
+
+const linkedRootInstalls = hardlinksInsideRootInstalls();
+if (linkedRootInstalls.length > 0) {
+  fail(
+    `verification refused before building: hardlinked entries inside the repository's own ` +
+      `node_modules/.git: ${linkedRootInstalls.join(", ")}; their contents are outside this tree ` +
+      "and a source file can require them, so the run would execute code the audit never saw",
+  );
 }
 
 const linkedSources = [
