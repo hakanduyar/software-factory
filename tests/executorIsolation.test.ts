@@ -1657,11 +1657,26 @@ describe("TASK-011 round 13: a citation must point at something", () => {
     const declared = new Set([...register.matchAll(/^## (L-\d+)/gm)].map((match) => match[1]));
     assert.ok(declared.size > 0, "the register must declare some limitations, or this proves nothing");
 
-    const sources = [
-      "src/adapters/supervision/isolatedExecutor.ts",
-      "src/supervision/supervisorService.ts",
-      "src/supervision/roadmapCatalog.ts",
-    ];
+    /**
+     * EVERY source file, not a hand-listed three (round-14 finding).
+     *
+     * The list omitted `supervisorTypes.ts`, which cites L-3 and L-9, so adding
+     * an invalid `L-999` there left this green. A test that claims "every
+     * citation" and checks a subset is the same subset-for-the-whole
+     * substitution this project keeps finding in its guards — and it is worse in
+     * a test, because the test is what everyone trusts afterwards.
+     */
+    const sources = (function walk(directory: string): string[] {
+      const out: string[] = [];
+      for (const entry of readdirSync(directory, { withFileTypes: true })) {
+        const full = join(directory, entry.name);
+        if (entry.isDirectory()) out.push(...walk(full));
+        else if (entry.name.endsWith(".ts")) out.push(full);
+      }
+      return out;
+    })("src");
+    assert.ok(sources.length > 10, "the walk found almost nothing, so this proves nothing");
+
     for (const file of sources) {
       const text = readFileSync(file, "utf8");
       for (const match of text.matchAll(/\b(L-\d+)\b/g)) {

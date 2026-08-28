@@ -1596,15 +1596,34 @@ export class SupervisorService {
     /**
      * ONE verification, then read it for every ancestor (AC-10).
      *
-     * `undefined` means the chain does not verify, and it is the ONLY signal
-     * this loop acts on for AC-5 — deliberately one mechanism rather than two.
-     * An earlier version had a separate "chain broken" branch above this loop
-     * as well; mutation testing showed the two masking each other, so removing
-     * either left the behaviour intact and neither was load-bearing. Two
-     * guards that cover exactly the same case are not defence in depth, they
-     * are a test that passes for the wrong reason.
+     * `undefined` means the chain does not verify — and by the time this loop
+     * runs, that CANNOT happen.
+     *
+     * Round-14 review measured the pair and found them masking each other:
+     * removing either `brokenChainOutcome` or the per-key `undefined` branch
+     * below left the whole suite green, so neither was load-bearing. That is the
+     * same finding this comment already recorded about an earlier pair, and the
+     * fix drifted back when `brokenChainOutcome` was added in round 4.
+     *
+     * They cover the same case because step 0 uses `verifyAgainstAnchor`, which
+     * is strictly stronger than the structural check behind this `undefined`:
+     * anything that fails the weaker one fails the stronger one first, and the
+     * tick has already refused.
+     *
+     * So there is ONE decision — step 0 — and this is an ASSERTION of the
+     * invariant it establishes, not a second opinion about it. It throws rather
+     * than deciding, because reaching it would mean step 0 is broken, and a
+     * caller must not be able to mistake an internal contradiction for a
+     * considered verdict. Unreachable by construction, recorded as such in
+     * docs/KNOWN-LIMITATIONS.md L-8.
      */
     const chainImplementers = implementersByRoadmapKey(state.provenance);
+    if (chainImplementers === undefined) {
+      throw new SchemaIntegrityError(
+        "internal invariant violated: the reviewer-exclusion walk was reached with a chain that does not " +
+          "verify, which `brokenChainOutcome` refuses before any item is selected",
+      );
+    }
     const unknownImplementers = keysWithUnknownImplementer(state.provenance);
 
     /**
@@ -1633,7 +1652,7 @@ export class SupervisorService {
          * nothing — it is a record of work on something that has since been
          * removed or renamed, and its implementer must still be excluded.
          */
-        for (const resource of chainImplementers?.get(key) ?? []) {
+        for (const resource of chainImplementers.get(key) ?? []) {
           excluded.add(resource);
         }
         if (unknownImplementers.has(key) && !ambiguous.includes(key)) {
@@ -1674,15 +1693,6 @@ export class SupervisorService {
        * Whoever implemented the item under review is exactly who must not
        * review it. That is the entire point of C4.
        */
-      if (chainImplementers === undefined) {
-        // AC-5: the record cannot be vouched for, so the lineage it describes
-        // is not lineage. The review waits for a human rather than proceeding
-        // on history nobody can verify.
-        if (!ambiguous.includes(key)) {
-          ambiguous.push(key);
-        }
-        continue;
-      }
       const fromChain = chainImplementers.get(key) ?? [];
       const fromRow = implementerHistory(entry);
 

@@ -368,6 +368,25 @@ guarantee, each says plainly what it is:
   call exists so a future reordering still meets a tested guard before anything
   is deleted.
 
+Two more joined them in round 14, and both are recorded here rather than deleted
+or dressed up:
+
+- The per-key `chainImplementers === undefined` branch in the reviewer-exclusion
+  walk is GONE, replaced by a single assertion. Independent review measured it
+  against `brokenChainOutcome` and found the two masking each other — removing
+  either left the suite green. They cover the same case because step 0 uses
+  `verifyAgainstAnchor`, which is strictly stronger than the structural check
+  behind the `undefined`. There is one decision now and an assertion of the
+  invariant it establishes, which throws rather than deciding: reaching it would
+  mean step 0 is broken, and an internal contradiction must not be mistakable for
+  a considered verdict.
+- The chain-key traversal's "roadmap no longer contains this key" branch is
+  reachable only through the in-memory repository. `parseSupervisorState` refuses
+  a chain entry naming an unknown roadmap item, so a real database cannot present
+  that state. The branch stays because the two refusals are independent and
+  relaxing one should not silently open the other; its test says in its name that
+  it is in-memory.
+
 **Why they stay:** each is defence in depth against a future reordering, and each
 costs nothing. **Why this entry exists:** "defence in depth" is exactly what an
 untested guard looks like from the outside, and the difference between the two is

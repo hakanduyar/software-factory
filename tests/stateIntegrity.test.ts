@@ -1495,7 +1495,23 @@ describe("TASK-008 round 4: a broken chain on disk is a DECISION, not a crash", 
     db.close();
 
     const reopened = createSqliteSupervisorRepository(dbPath);
-    const supervisor = newSupervisor({ probe: healthyProbe(), repository: reopened });
+    const supervisor = newSupervisor({
+      /**
+       * DECLARED, or the catalog refuses first (round-14 lesson).
+       *
+       * These fixtures persist a single item `A` and used to build the
+       * supervisor on the DEFAULT catalog, so TASK-012 refused the state at
+       * catalog reconciliation and the tick never reached the guard the case is
+       * about. The assertion is `WAITING_FOR_HUMAN` either way, so the case
+       * stayed green while proving nothing — the same false-green the reviewer
+       * found twice elsewhere, in fixtures I wrote.
+       */
+      roadmap: [
+        { key: "A", title: "Implemented", dependsOn: [], status: "PENDING", workClass: "NORMAL_IMPLEMENTATION", order: 1 },
+      ],
+      probe: healthyProbe(),
+      repository: reopened,
+    });
     try {
       const result = await supervisor.service.tick();
       assert.equal(result.kind, "WAITING_FOR_HUMAN", "a tampered chain must produce a decision");
@@ -2059,7 +2075,23 @@ describe("TASK-008 round 8: the wake time cannot overrule the verdict", () => {
     db.close();
 
     const reopened = createSqliteSupervisorRepository(dbPath);
-    const supervisor = newSupervisor({ probe: healthyProbe(), repository: reopened });
+    const supervisor = newSupervisor({
+      /**
+       * DECLARED, or the catalog refuses first (round-14 lesson).
+       *
+       * These fixtures persist a single item `A` and used to build the
+       * supervisor on the DEFAULT catalog, so TASK-012 refused the state at
+       * catalog reconciliation and the tick never reached the guard the case is
+       * about. The assertion is `WAITING_FOR_HUMAN` either way, so the case
+       * stayed green while proving nothing — the same false-green the reviewer
+       * found twice elsewhere, in fixtures I wrote.
+       */
+      roadmap: [
+        { key: "A", title: "Implemented", dependsOn: [], status: "PENDING", workClass: "NORMAL_IMPLEMENTATION", order: 1 },
+      ],
+      probe: healthyProbe(),
+      repository: reopened,
+    });
     try {
       const result = await supervisor.service.tick();
       assert.equal(result.kind, "WAITING_FOR_HUMAN", "the advisory wake write buried the verdict");
@@ -2110,7 +2142,23 @@ describe("TASK-008 round 8: state that will not PARSE is a decision too", () => 
     db.close();
 
     const reopened = createSqliteSupervisorRepository(dbPath);
-    const supervisor = newSupervisor({ probe: healthyProbe(), repository: reopened });
+    const supervisor = newSupervisor({
+      /**
+       * DECLARED, or the catalog refuses first (round-14 lesson).
+       *
+       * These fixtures persist a single item `A` and used to build the
+       * supervisor on the DEFAULT catalog, so TASK-012 refused the state at
+       * catalog reconciliation and the tick never reached the guard the case is
+       * about. The assertion is `WAITING_FOR_HUMAN` either way, so the case
+       * stayed green while proving nothing — the same false-green the reviewer
+       * found twice elsewhere, in fixtures I wrote.
+       */
+      roadmap: [
+        { key: "A", title: "Implemented", dependsOn: [], status: "PENDING", workClass: "NORMAL_IMPLEMENTATION", order: 1 },
+      ],
+      probe: healthyProbe(),
+      repository: reopened,
+    });
     try {
       const result = await supervisor.service.tick();
       assert.equal(result.kind, "WAITING_FOR_HUMAN", "an unparseable record must produce a decision");
@@ -2674,8 +2722,22 @@ describe("TASK-008 round 13: the chain names an item the roadmap no longer has",
    * never contain that key, and only the chain's own list of keys can. The
    * implementer of that work must still be excluded, because the work still
    * happened.
+   *
+   * SERVICE-LEVEL DEFENCE IN DEPTH, and said plainly because round-14 review
+   * measured what this test can and cannot claim. Through the DURABLE path this
+   * state is unreachable: `parseSupervisorState` refuses a chain entry naming a
+   * roadmap item that does not exist, with "provenance entry 0 references
+   * unknown roadmap item". So a real SQLite database can never present it, and
+   * this test drives the in-memory repository to reach the service branch at
+   * all.
+   *
+   * That makes it a guard against a state the DESERIALIZER already refuses —
+   * worth keeping, since the two refusals are independent and a future
+   * relaxation of either should not silently open the other, and worth labelling
+   * honestly rather than presenting as a durable-path regression. Recorded in
+   * docs/KNOWN-LIMITATIONS.md L-8 with the other guards of this kind.
    */
-  it("excludes the implementer of a chain entry whose roadmap item is gone", async () => {
+  it("excludes the implementer of a chain entry whose roadmap item is gone (in-memory; see L-8)", async () => {
     const ONLY = "claude-code:opus";
     const probe = scriptedProbe();
     probe.set("claude-code", "opus", {
