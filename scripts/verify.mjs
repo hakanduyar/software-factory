@@ -606,6 +606,17 @@ const EMIT_LAYOUT = { rootDir: ROOT_DIR, outputDirectory: OUTPUT_DIR };
  * the kind of omission a list prevents and a pair of lines invites.
  */
 for (const root of SOURCE_ROOTS) {
+  /**
+   * The root AND everything above it (round-12 CRITICAL). A root is checked for
+   * being a link; an ANCESTOR of a root is not a root, and was checked by
+   * nothing.
+   */
+  for (const linked of linkedAncestors(root)) {
+    fail(
+      `verification refused before building: ${linked} is a symlink and a derived source root sits inside it; ` +
+        "external code would be compiled and executed as though it belonged to this tree",
+    );
+  }
   if (isSymlink(resolve(REPO_ROOT, root))) {
     fail(
       `verification refused before building: the ${root} directory is a symlink; external code would be ` +
@@ -702,8 +713,12 @@ const allSources = compilerInputs();
  *
  * So the scan is the UNION of two sets, and neither replaces the other:
  *
- *   - every file the compiler says it reads, with no name filtering at all,
- *     because that set is defined by the program rather than by a path; and
+ *   - every file the compiler says it reads that lives in this repository and
+ *     can EMIT — declaration files, `node_modules` and the output directory are
+ *     filtered out, because none of them explains a generated artifact. "Every
+ *     compiler input" would be the wrong claim and is not the one being made;
+ *     the set is defined by the program rather than by a path, which is the
+ *     property that matters; and
  *   - the directory walk, which still skips those names, because it covers
  *     files that are NOT compiler inputs and would otherwise report an ordinary
  *     `node_modules` as foreign source.
@@ -711,15 +726,44 @@ const allSources = compilerInputs();
  * The union is strictly larger than either, which is the only property that
  * matters here.
  *
- * NO ANCESTOR-DIRECTORY CHECK, and the reason is measured rather than assumed.
- * One was written here — walk each input's parent directories looking for a
- * symlink — and a mutation showed it caught nothing the tree did not already
- * catch. `tsc --showConfig` resolves `**` to a `files` list, so a symlinked
- * directory holding compiler inputs becomes a DERIVED ROOT, and the root-symlink
- * refusal above names it directly. Keeping an unreachable second copy would have
- * meant a comment claiming a guard was doing work that a mutation says it is
- * not.
+ * ANCESTORS ARE CHECKED, and this paragraph is the correction of a mistake worth
+ * recording rather than quietly undoing.
+ *
+ * An ancestor walk was written here, a mutation showed it caught nothing the
+ * suite already caught, and it was REMOVED on that evidence. Round-12 review
+ * then produced the case it existed for: `src` a symlink to an external
+ * directory, with `include` naming `src/foo/**` and `src/verification/...`. The
+ * derived roots are then `src/foo`, `src/verification` and `tests` — and `src`
+ * ITSELF is never a root, so the root-symlink refusal never looks at it. The
+ * walk starts below the link and `lstat` on each file follows it. The run exited
+ * 0, reported the tree consistent, and executed external code.
+ *
+ * The measurement was right about the case it measured and wrong as a
+ * generalisation: a symlinked directory that BECOMES a root is caught by the
+ * root check; a symlinked directory ABOVE every root is caught by nothing. "A
+ * mutation shows this is redundant" only ever means redundant for the cases the
+ * suite covers, and the question that should have followed it — what case would
+ * make it necessary? — was not asked.
+ *
+ * So every lexical ancestor of every derived root AND of every compiler input is
+ * inspected, up to the repository root.
  */
+function linkedAncestors(relativePath) {
+  const found = [];
+  const parts = relativePath.split("/").filter((part) => part.length > 0 && part !== ".");
+  // STRICT ancestors. The path itself is judged by its own check, which says
+  // something more specific — "the tests directory is a symlink" reads better
+  // than "a root sits inside a symlink" when the root IS the symlink.
+  for (let depth = 1; depth < parts.length; depth += 1) {
+    const directory = parts.slice(0, depth).join("/");
+    if (isSymlink(resolve(REPO_ROOT, directory))) {
+      found.push(directory);
+      break;
+    }
+  }
+  return found;
+}
+
 function linkedCompilerInputs() {
   const found = [];
   for (const rel of allSources) {
@@ -731,6 +775,7 @@ function linkedCompilerInputs() {
       if (error?.code !== "ENOENT") noteUnreadable(absolute);
       continue;
     }
+    found.push(...linkedAncestors(rel));
     if (stats.isSymbolicLink() || stats.nlink > 1) {
       found.push(rel);
       continue;
@@ -748,7 +793,8 @@ const linkedSources = [
 ].sort();
 if (linkedSources.length > 0) {
   fail(
-    `verification refused before building: symlinked or hardlinked entries under the source roots (src/, tests/): ` +
+    `verification refused before building: symlinked or hardlinked entries under the source roots ` +
+      `(${SOURCE_ROOTS.join(", ")}): ` +
       `${linkedSources.join(", ")}; source must live in this repository`,
   );
 }

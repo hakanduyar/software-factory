@@ -2253,3 +2253,135 @@ describe("TASK-010 round 11: readability, AFTER the build for real", () => {
     }
   });
 });
+
+// =====================================================================
+// ROUND-12 — a symlink ABOVE every root, and a test that proved nothing
+// =====================================================================
+
+describe("TASK-010 round 12: a symlinked ancestor of a derived root", () => {
+  /**
+   * CRITICAL, and the correction of a removal I made on incomplete evidence.
+   *
+   * Round 11 added an ancestor check, a mutation showed it caught nothing the
+   * suite already caught, and I removed it on that evidence. This is the case it
+   * existed for: `src` is a symlink to an external directory, and `include`
+   * names `src/foo/**` and `src/verification/...`, so the DERIVED ROOTS are
+   * `src/foo`, `src/verification` and `tests`. `src` itself is never a root, so
+   * the root-symlink refusal never looks at it; the walk starts below the link;
+   * and `lstat` on each file follows it. Exit 0, "tree-consistent", external code
+   * executed.
+   *
+   * The measurement was right about the case it measured and wrong as a
+   * generalisation. "A mutation shows this is redundant" means redundant for the
+   * cases the suite covers, and the question that should have followed — what
+   * case would make it necessary? — was not asked.
+   */
+  it("REFUSES when a directory ABOVE every derived root is a symlink", () => {
+    const root = makeFixtureRepo();
+    const external = mkdtempSync(join(tmpdir(), "sf-ancestor-"));
+    created.push(external);
+
+    // The external tree holds everything `src` used to.
+    mkdirSync(join(external, "verification"), { recursive: true });
+    mkdirSync(join(external, "foo"), { recursive: true });
+    cpSync(join(root, "src/verification/testArtifacts.ts"), join(external, "verification/testArtifacts.ts"));
+    writeFileSync(join(external, "foo/helper.ts"), "export const helper = 1;\n");
+
+    rmSync(join(root, "src"), { recursive: true, force: true });
+    symlinkSync(external, join(root, "src"), "dir");
+
+    // Roots that sit INSIDE the symlink, so none of them is the link itself.
+    const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as Record<string, unknown>;
+    tsconfig["include"] = ["src/foo/**/*.ts", "src/verification/testArtifacts.ts", "tests/**/*.ts"];
+    writeFileSync(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, "external source arrived through a symlink above every root");
+    assert.ok(output.trim().length > 0, "it exited silently, which is the false pass itself");
+    assert.match(output, /src/);
+    assert.ok(!output.includes("tree-consistent"), "it must not claim consistency");
+  });
+
+  /**
+   * THE CASE THE ROOT-SIDE ANCESTOR CHECK IS THE ONLY ANSWER TO.
+   *
+   * Mutation testing showed the reproduction above is caught by the INPUT scan's
+   * ancestor walk alone — removing the root loop's copy left it green. The
+   * lesson of this very round is not to delete a guard on that evidence without
+   * asking what case would need it, so: a declared root inside a symlink that
+   * holds no compiler inputs YET.
+   *
+   * The input scan never looks, because there is nothing under it to look at.
+   * The root loop does. Refusing is the closed direction — the config has
+   * declared that source will be compiled from inside a symlink, and "it is
+   * empty today" is not a property anyone maintains.
+   */
+  it("REFUSES when the config declares a root inside a symlink that holds no sources yet", () => {
+    const root = makeFixtureRepo();
+    const external = mkdtempSync(join(tmpdir(), "sf-empty-ancestor-"));
+    created.push(external);
+    mkdirSync(join(external, "none"), { recursive: true });
+
+    symlinkSync(external, join(root, "vendor"), "dir");
+    const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as Record<string, unknown>;
+    tsconfig["include"] = ["src/**/*.ts", "tests/**/*.ts", "vendor/none/**/*.ts"];
+    writeFileSync(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, "a declared root inside a symlink was accepted because it happened to be empty");
+    assert.match(output, /vendor/);
+  });
+
+  /**
+   * THE CASE THE INPUT-SIDE ANCESTOR CHECK IS THE ONLY ANSWER TO.
+   *
+   * The root-side walk covers ancestors of DECLARED roots. A file reached by
+   * IMPORT does not have to live under one: `exclude` does not stop an import,
+   * and neither does never having been declared. So `vendor` here is not a root
+   * — nothing in `include` mentions it — and the root-side walk never considers
+   * it. Only the input-side walk, over what the compiler says it actually reads,
+   * sees that the file arrives through a symlink.
+   *
+   * Asked BEFORE deciding whether the check was redundant, because last round I
+   * deleted its sibling on a mutation that only proved redundancy for the cases
+   * the suite happened to cover.
+   */
+  it("REFUSES an imported file that arrives through a symlink outside every declared root", () => {
+    const root = makeFixtureRepo();
+    const external = mkdtempSync(join(tmpdir(), "sf-imported-"));
+    created.push(external);
+    writeFileSync(join(external, "helper.ts"), "export const helper = 1;\n");
+
+    // `vendor` is a symlink and is NOT in `include`; the import is what pulls it
+    // into the program.
+    symlinkSync(external, join(root, "vendor"), "dir");
+    writeFileSync(
+      join(root, "tests/sample.test.ts"),
+      [
+        'import assert from "node:assert/strict";',
+        'import { describe, it } from "node:test";',
+        'import { helper } from "../vendor/helper.js";',
+        'describe("sample", () => { it("passes", () => { assert.equal(helper, 1); }); });',
+        "",
+      ].join("\n"),
+    );
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, "an imported file arrived through a symlink no declared root covers");
+    assert.match(output, /vendor/);
+  });
+
+  /** NEGATIVE CONTROL: nested roots with no symlink above them still pass. */
+  it("still passes when the same roots are ordinary directories", () => {
+    const root = makeFixtureRepo();
+    mkdirSync(join(root, "src/foo"), { recursive: true });
+    writeFileSync(join(root, "src/foo/helper.ts"), "export const helper = 1;\n");
+    const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as Record<string, unknown>;
+    tsconfig["include"] = ["src/foo/**/*.ts", "src/verification/testArtifacts.ts", "tests/**/*.ts"];
+    writeFileSync(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
+
+    const { status, output } = runHarness(root);
+    assert.equal(status, 0, `ordinary nested roots were refused:\n${output}`);
+    assert.match(output, /tree-consistent/);
+  });
+});
