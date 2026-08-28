@@ -3159,3 +3159,211 @@ describe("TASK-010 round 17: hardlinks inside the repository's own node_modules 
     assert.match(output, /tree-consistent/);
   });
 });
+
+// ---------------------------------------------------------------------------
+// ROUND-18 — a worktree is ordinary, a symlinked .git is not, and a mount over
+// any compiler input is invisible to every other check
+// ---------------------------------------------------------------------------
+
+describe("TASK-010 round 18: .git may be a file, must not be a symlink", () => {
+  /**
+   * THE REGRESSION I INTRODUCED, and the one that mattered most in practice.
+   *
+   * In a `git worktree` — and in a submodule — `.git` is a FILE containing
+   * `gitdir: ...`. The round-17 walker called `readdirSync` on it, recorded it
+   * as an unreadable directory, and refused before building.
+   *
+   * THIS REPOSITORY HAS THREE WORKTREES, and the independent reviews of the
+   * supervisor branch ran inside one of them. A guard added to protect
+   * verification would have refused the trees the pipeline actually verifies —
+   * the precise shape of a guard that gets disabled rather than obeyed.
+   */
+  it("ACCEPTS a checkout whose .git is a gitfile, as a worktree's is", () => {
+    const root = makeFixtureRepo();
+    writeFileSync(join(root, ".git"), "gitdir: /somewhere/else/.git/worktrees/wt\n");
+
+    const { status, output } = runHarness(root);
+    assert.equal(status, 0, `a worktree-style gitfile was refused:\n${output}`);
+    assert.match(output, /tree-consistent/);
+  });
+
+  /**
+   * L-10 covers `node_modules` and explicitly does NOT cover this.
+   *
+   * That entry's argument is that `node_modules` holds third-party code which
+   * executes by design and whose store legitimately lives outside the
+   * repository. `.git` has neither property: nothing imports from it, and it has
+   * no reason to be a symlink. The reviewer pointed a `.git` symlink at an
+   * external directory and a source test importing `.git/payload.cjs` executed
+   * it while the run reported `tree-consistent`.
+   */
+  it("REFUSES a symlinked .git", () => {
+    const root = makeFixtureRepo();
+    const external = mkdtempSync(join(tmpdir(), "sf-gitlink-"));
+    created.push(external);
+    writeFileSync(join(external, "payload.cjs"), "module.exports = 1;\n");
+    symlinkSync(external, join(root, ".git"), "dir");
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, `a symlinked .git was accepted:\n${output}`);
+    assert.match(output, /\.git is a symlink/, "the refusal must say what it refused and why");
+  });
+
+  /** The same, proved by execution rather than by exit code. */
+  it("REFUSES a symlinked .git whose payload a source test would execute", () => {
+    const root = makeFixtureRepo();
+    const external = mkdtempSync(join(tmpdir(), "sf-gitexec-"));
+    created.push(external);
+    const marker = join(external, "EXECUTED");
+    writeFileSync(
+      join(external, "payload.cjs"),
+      `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "yes");\nmodule.exports = 1;\n`,
+    );
+    symlinkSync(external, join(root, ".git"), "dir");
+
+    writeFileSync(
+      join(root, "src/loader.ts"),
+      [
+        'import { createRequire } from "node:module";',
+        "const req = createRequire(import.meta.url);",
+        'export const loaded = req("../../.git/payload.cjs") as number;',
+        "",
+      ].join("\n"),
+    );
+    writeFileSync(
+      join(root, "tests/loads.test.ts"),
+      [
+        'import assert from "node:assert/strict";',
+        'import { describe, it } from "node:test";',
+        'import { loaded } from "../src/loader.js";',
+        'describe("loads", () => { it("loaded", () => { assert.equal(loaded, 1); }); });',
+        "",
+      ].join("\n"),
+    );
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, `the .git payload reached execution:\n${output}`);
+    assert.ok(!existsSync(marker), "the payload EXECUTED from a symlinked .git");
+  });
+
+  /** An ordinary `.git` DIRECTORY with nothing planted must still verify. */
+  it("still accepts an ordinary .git directory", () => {
+    const root = makeFixtureRepo();
+    mkdirSync(join(root, ".git/objects"), { recursive: true });
+    writeFileSync(join(root, ".git/HEAD"), "ref: refs/heads/main\n");
+
+    const { status, output } = runHarness(root);
+    assert.equal(status, 0, `an ordinary .git directory was refused:\n${output}`);
+  });
+});
+
+describe("TASK-010 round 18: a mount over any compiler input, not just a root", () => {
+  /**
+   * THE ROUND-8 LESSON, IN THE MOUNT DIMENSION.
+   *
+   * Round 8 found the source SCAN hard-coded to two roots while tsc compiled
+   * from elsewhere, and the roots were derived from the config to fix it. The
+   * MOUNT check kept the narrower list and inherited the same gap: it asked only
+   * about `dist` and the derived roots.
+   *
+   * The reviewer bind-mounted an external directory over an ordinary `helpers/`
+   * directory that no root covers, imported `helpers/helper.ts` from a source
+   * file, and the run COMPILED AND EXECUTED it and exited 0. A bind mount defeats
+   * every other check by construction — it IS the path it is mounted at, so
+   * `isSymlink` says no, link counts say no, and `realpath` resolves inside the
+   * repository.
+   */
+  it("REFUSES a bind mount over an imported directory outside every derived root", (t) => {
+    const namespaces = spawnSync("unshare", ["--user", "--map-root-user", "--mount", "true"], {
+      encoding: "utf8",
+    });
+    if (namespaces.status !== 0) {
+      t.skip("unprivileged user namespaces unavailable; bind-mount wiring not proven here");
+      return;
+    }
+
+    const root = makeFixtureRepo();
+    mkdirSync(join(root, "helpers"), { recursive: true });
+    writeFileSync(join(root, "helpers/helper.ts"), "export const helper = 1;\n");
+    writeFileSync(
+      join(root, "tests/uses.test.ts"),
+      [
+        'import assert from "node:assert/strict";',
+        'import { describe, it } from "node:test";',
+        'import { helper } from "../helpers/helper.js";',
+        'describe("uses", () => { it("works", () => { assert.equal(helper, 1); }); });',
+        "",
+      ].join("\n"),
+    );
+    assert.equal(runHarness(root).status, 0, "the fixture must pass before anything is mounted");
+
+    const external = mkdtempSync(join(tmpdir(), "sf-mounthelpers-"));
+    created.push(external);
+    writeFileSync(join(external, "helper.ts"), "export const helper = 1;\n");
+
+    const script = [
+      "set -e",
+      `mount --bind ${JSON.stringify(external)} ${JSON.stringify(join(root, "helpers"))}`,
+      `grep -qF ${JSON.stringify(join(root, "helpers"))} /proc/self/mountinfo || { echo "BIND-DID-NOT-TAKE"; exit 97; }`,
+      `cd ${JSON.stringify(root)} && node scripts/verify.mjs; echo "HARNESS-EXIT=$?"`,
+    ].join("\n");
+    const result = spawnSync("unshare", ["--user", "--map-root-user", "--mount", "sh", "-c", script], {
+      encoding: "utf8",
+      env: harnessEnv({ PATH: process.env["PATH"] ?? "" }),
+    });
+    const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+
+    assert.ok(!output.includes("BIND-DID-NOT-TAKE"), `the bind mount never took effect:\n${output}`);
+    assert.ok(
+      !output.includes("HARNESS-EXIT=0"),
+      `a bind-mounted compiler-input directory was accepted:\n${output}`,
+    );
+    assert.match(output, /is or contains a mount point/, "the refusal must name the mount");
+  });
+
+  /**
+   * NEGATIVE CONTROL, preserving round 6: bind-mounting the WHOLE repository
+   * onto its own path is an ordinary layout. Everything below moves together and
+   * stays consistent, so an ancestor mount splices nothing in. If this starts
+   * failing, the ancestor exception has been lost and ordinary workspaces are
+   * refused.
+   */
+  it("still ACCEPTS a repository that is itself a bind mount, with inputs below it", (t) => {
+    const namespaces = spawnSync("unshare", ["--user", "--map-root-user", "--mount", "true"], {
+      encoding: "utf8",
+    });
+    if (namespaces.status !== 0) {
+      t.skip("unprivileged user namespaces unavailable; ancestor-mount exception not proven here");
+      return;
+    }
+
+    const root = makeFixtureRepo();
+    mkdirSync(join(root, "helpers"), { recursive: true });
+    writeFileSync(join(root, "helpers/helper.ts"), "export const helper = 1;\n");
+    writeFileSync(
+      join(root, "tests/uses.test.ts"),
+      [
+        'import assert from "node:assert/strict";',
+        'import { describe, it } from "node:test";',
+        'import { helper } from "../helpers/helper.js";',
+        'describe("uses", () => { it("works", () => { assert.equal(helper, 1); }); });',
+        "",
+      ].join("\n"),
+    );
+
+    const script = [
+      "set -e",
+      `mount --bind ${JSON.stringify(root)} ${JSON.stringify(root)}`,
+      `grep -qF ${JSON.stringify(root)} /proc/self/mountinfo || { echo "BIND-DID-NOT-TAKE"; exit 97; }`,
+      `cd ${JSON.stringify(root)} && node scripts/verify.mjs; echo "HARNESS-EXIT=$?"`,
+    ].join("\n");
+    const result = spawnSync("unshare", ["--user", "--map-root-user", "--mount", "sh", "-c", script], {
+      encoding: "utf8",
+      env: harnessEnv({ PATH: process.env["PATH"] ?? "" }),
+    });
+    const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+
+    assert.ok(!output.includes("BIND-DID-NOT-TAKE"), `the bind mount never took effect:\n${output}`);
+    assert.match(output, /HARNESS-EXIT=0/, `an ancestor mount was refused:\n${output}`);
+  });
+});

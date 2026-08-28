@@ -69,19 +69,31 @@
  * comparison can see; and a run that would report success having executed
  * nothing.
  *
- * NOTHING IS EXCLUDED BY NAME, and that sentence was bought expensively. Three
- * consecutive review rounds found the same error in a new place: a directory
- * NAME treated as evidence about its contents. `src/dist/` skipped as though it
- * were build output; `src/vendor/node_modules/` skipped as though it were an
- * install; then the repository's own `node_modules` and `.git` skipped as though
- * their contents were beyond reach — and the last of those permitted arbitrary
- * code execution, demonstrated with an external `.cjs` hardlinked in and
- * required from a source test while the run reported `tree-consistent`.
+ * NO DIRECTORY IS EXCLUDED BY NAME ALONE, and that sentence was bought
+ * expensively. Three consecutive review rounds found the same error in a new
+ * place: a directory NAME treated as evidence about its contents. `src/dist/`
+ * skipped as though it were build output; `src/vendor/node_modules/` skipped as
+ * though it were an install; then the repository's own `node_modules` and `.git`
+ * skipped as though their contents were beyond reach — and the last of those
+ * permitted arbitrary code execution, demonstrated with an external `.cjs`
+ * hardlinked in and required from a source test while the run reported
+ * `tree-consistent`.
+ *
+ * The previous wording here was "NOTHING IS EXCLUDED BY NAME", and round-18
+ * review pointed out that it is literally false: `excludedFromSourceScan` still
+ * compares the first path COMPONENT against `node_modules` and `.git`. The
+ * distinction it was reaching for is real — a name at the repository ROOT
+ * identifies a specific directory, whereas the same name at any depth identifies
+ * nothing — but the sentence as written overstated it, which is the defect this
+ * file keeps being corrected for.
  *
  * What is excluded is IDENTITY: the resolved output directory, and the
- * repository-root `node_modules` and `.git` — whose CONTENTS are still scanned
- * for hardlinks. A `node_modules` that is itself symlinked at an
- * attacker-controlled directory is NOT detected, and that residue is L-10.
+ * repository-ROOT `node_modules` and `.git` — whose CONTENTS are still scanned
+ * for hardlinks. A `node_modules` symlinked at an attacker-controlled directory
+ * is NOT detected, and that residue is L-10. A symlinked `.git` IS refused,
+ * because L-10's reasoning does not extend to it: nothing legitimately imports
+ * from `.git`, so it has no claim to be third-party code that executes by
+ * design.
  *
  * PLATFORM BOUNDARY, stated so the claim matches the code: the bind-mount
  * guarantee is derived from `/proc/self/mountinfo` and is therefore LINUX-ONLY.
@@ -332,14 +344,11 @@ function findHardlinkedSources(directory) {
  * is not a source file, and it was overwritten by the build while the run
  * still reported the tree consistent (round-5 finding).
  */
-/**
- * Directories no source scan should descend into.
- *
- * Relevant once a root can be `.`: tsc excludes `node_modules` by default, the
- * output is build product audited by different rules, and `.git` holds no
- * compilable source.
- */
-const SKIP_IN_SOURCE_SCAN = new Set(["node_modules", ".git", OUTPUT_DIR]);
+// `SKIP_IN_SOURCE_SCAN` stood here and was DEAD once `excludedFromSourceScan`
+// replaced name matching with identity. Round-18 review found it still defined
+// and no longer read. A set of names that no longer decides anything is exactly
+// the thing a later reader reintroduces by wiring it back up, which is how the
+// name-matching defect would return.
 
 /**
  * Whether a source scan should refuse to descend into this entry.
@@ -959,13 +968,82 @@ function linkedCompilerInputs() {
  * the same instruction applies: if this starts refusing ordinary working copies,
  * revisit the trade-off rather than adding a bypass flag.
  */
+/**
+ * A SYMLINKED `.git` IS REFUSED, and a worktree's `.git` FILE is not (round-18).
+ *
+ * Two findings, one place:
+ *
+ *   CRITICAL. The walk followed `.git`'s realpath and only reported hardlinks,
+ *   so a `.git` symlinked at an external directory passed — and a source test
+ *   importing `.git/payload.cjs` executed it. L-10 does NOT cover this: that
+ *   entry's argument is that `node_modules` holds third-party code which
+ *   executes by design and whose store legitimately lives outside the
+ *   repository. `.git` has no such property. Nothing legitimately imports from
+ *   it, and it has no reason to be a symlink.
+ *
+ *   HIGH, and a regression I introduced. In a `git worktree` — and in a
+ *   submodule — `.git` is a FILE containing `gitdir: ...`. `readdirSync` on it
+ *   fails, which this recorded as an unreadable directory and refused. THIS
+ *   REPOSITORY HAS THREE WORKTREES and the earlier independent reviews ran in
+ *   one of them, so the guard I added to protect verification would have
+ *   refused the trees the pipeline actually verifies. A guard that refuses
+ *   ordinary work gets disabled rather than obeyed.
+ *
+ * A gitfile is safe to skip because it is a FILE: `.git/payload.cjs` does not
+ * resolve through it, so there is no directory to smuggle anything into.
+ */
+function rootGitVerdict() {
+  const gitPath = join(REPO_ROOT, ".git");
+  let stats;
+  try {
+    stats = lstatSync(gitPath);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return { walk: false }; // not a git checkout at all; nothing to say
+    }
+    return { refuse: `.git could not be inspected (${error?.code ?? "unknown error"})` };
+  }
+  if (stats.isSymbolicLink()) {
+    return {
+      refuse:
+        ".git is a symlink; nothing legitimately imports from it and a linked .git can " +
+        "carry code from outside this repository into a run that reports on this tree",
+    };
+  }
+  // A worktree or submodule gitfile. A file has no entries to walk, and no path
+  // resolves through it.
+  if (stats.isFile()) {
+    return { walk: false };
+  }
+  return { walk: stats.isDirectory() };
+}
+
 function hardlinksInsideRootInstalls() {
   const found = [];
-  for (const name of ["node_modules", ".git"]) {
-    // realpath, so a shared install reached through a symlink is still walked.
-    const base = realOrUndefined(join(REPO_ROOT, name));
-    if (base === undefined) {
-      continue;
+  const gitVerdict = rootGitVerdict();
+  if (gitVerdict.refuse !== undefined) {
+    fail(`verification refused before building: ${gitVerdict.refuse}`);
+  }
+  const roots = gitVerdict.walk === true ? ["node_modules", ".git"] : ["node_modules"];
+  for (const name of roots) {
+    /**
+     * realpath, so a shared install reached through a symlink is still walked.
+     *
+     * FAILS CLOSED when it cannot be resolved (round-18 note): a broken link or
+     * a symlink cycle used to be skipped silently, which is the quiet
+     * "unreadable subtree treated as empty" this file exists to refuse.
+     */
+    let base;
+    try {
+      base = realpathSync(join(REPO_ROOT, name));
+    } catch (error) {
+      if (error?.code === "ENOENT") {
+        continue; // genuinely absent, which is not a hiding place
+      }
+      fail(
+        `verification refused before building: ${name} could not be resolved ` +
+          `(${error?.code ?? "unknown error"}); an unresolvable install is not an empty one`,
+      );
     }
     const walk = (current, shown) => {
       let entries;
@@ -1083,8 +1161,37 @@ if (process.platform === "linux") {
    * path and not its siblings.
    *
    * The same list the source scan uses, so the two cannot drift apart.
+   *
+   * EVERY COMPILER INPUT AND ITS ANCESTORS TOO (round-18 CRITICAL).
+   *
+   * The derived roots are not the whole compiled program. The reviewer
+   * bind-mounted an external directory over an ordinary `helpers/` directory
+   * that no root covers, a source file imported `helpers/helper.ts`, and the run
+   * COMPILED AND EXECUTED it, wrote an external marker, and exited 0. Every
+   * other check was blind for the reason a bind mount always defeats them: it
+   * IS the path it is mounted at, so `isSymlink` says no, link counts say no,
+   * and `realpath` resolves inside the repository.
+   *
+   * This is the round-8 lesson in the mount dimension. There, the SCAN was
+   * hard-coded to two roots while tsc compiled from elsewhere; the roots were
+   * derived from the config to fix it. The MOUNT check kept the narrower list
+   * and inherited the same gap, so the fix was applied in one place and not the
+   * other.
+   *
+   * Ancestors are included because a mount over any directory ON THE WAY to an
+   * input splices in everything below it. `REPO_ROOT` itself is deliberately
+   * NOT included: an ancestor mount moves the whole tree together and stays
+   * consistent, which is round 6's finding and is preserved here.
    */
-  const managedPaths = [OUTPUT_DIR, ...SOURCE_ROOTS].map((managed) => {
+  const inputPaths = new Set();
+  for (const rel of allSources) {
+    inputPaths.add(rel);
+    const parts = rel.split("/");
+    for (let depth = 1; depth < parts.length; depth += 1) {
+      inputPaths.add(parts.slice(0, depth).join("/"));
+    }
+  }
+  const managedPaths = [...new Set([OUTPUT_DIR, ...SOURCE_ROOTS, ...inputPaths])].map((managed) => {
     const absolute = resolve(REPO_ROOT, managed);
     return { relative: managed, path: (realOrUndefined(absolute) ?? absolute).replace(/\/+$/, "") };
   });
