@@ -350,10 +350,16 @@ function findHardlinkedSources(directory) {
 /**
  * ANY file beneath a directory with a link count above one.
  *
- * `findHardlinkedSources` filters by compilable suffix, which is right for a
- * source root and wrong for build output: a hardlinked `dist/tests/x.test.js`
- * is not a source file, and it was overwritten by the build while the run
- * still reported the tree consistent (round-5 finding).
+ * THE SUFFIX FILTER IS GONE and this comment described it for four rounds after
+ * it was removed (round-21 finding). `findHardlinkedSources` no longer filters
+ * by compilable suffix — it scans every regular file under the derived roots,
+ * which is why a hardlinked `src/dist/data.json` is refused even though a
+ * `.json` is not a compiler input.
+ *
+ * The round-5 finding this paragraph was written for still stands and is why
+ * the OUTPUT scan exists separately: a hardlinked `dist/tests/x.test.js` is not
+ * a source file, and it was overwritten by the build while the run still
+ * reported the tree consistent.
  */
 // `SKIP_IN_SOURCE_SCAN` stood here and was DEAD once `excludedFromSourceScan`
 // replaced name matching with identity. Round-18 review found it still defined
@@ -448,7 +454,13 @@ function findSymlinks(directory, keep = () => true, skipExcluded = false) {
     for (const entry of entries) {
       const full = join(current, entry.name);
       /**
-       * Skipped by NAME before the link test, and only for SOURCE scans.
+       * Skipped by IDENTITY before the link test, and only for SOURCE scans.
+       *
+       * "By NAME" is what this said, and it stopped being true in round 16 when
+       * `excludedFromSourceScan` replaced name matching: the output directory is
+       * matched by RESOLVED PATH, so an aliased spelling is one answer, and only
+       * the repository-ROOT `node_modules` and `.git` are matched by their first
+       * path component. A nested directory sharing either name is scanned.
        *
        * Relevant once a root can be `.`: `node_modules` is commonly a symlink
        * to a shared install, tsc excludes it by default, and reporting it as

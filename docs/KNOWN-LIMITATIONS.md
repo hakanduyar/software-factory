@@ -455,6 +455,21 @@ or dressed up:
   relaxing one should not silently open the other; its test says in its name that
   it is in-memory.
 
+Two more pairs joined them in round 21, and they are PAIRS rather than single
+guards — each member masks the other, so no single removal fails anything:
+
+- the POST-build `linkedCompilerInputs` call. Removing it alone leaves the
+  pre-build case green, because the pre-build call already refused the tree.
+- the pre-build and post-build symlink scans for non-compiler inputs. "REFUSES a
+  symlinked non-source file under a source root" fails only when BOTH are
+  removed.
+
+Measured by the round-21 reviewer, not assumed. They are recorded here rather
+than claimed as pinned in TASK-013's AC-5 inventory, because a criterion
+asserting they are individually proven would be an assertion satisfied by
+something other than what it names — the defect this register exists to catch,
+one level up.
+
 **Why they stay:** each GUARD here is defence in depth against a future
 reordering, and each costs nothing. The AC-1 entry is not a guard and stays for a
 different reason: a test that cannot fail for the reason its name gives should
@@ -639,8 +654,14 @@ who clones this repository is outside its control. A symlinked `.git` is still
 refused — no false positives, no legitimate use.
 
 So the open vector is wider than when this entry was written: a `.git` that is
-mounted, symlinked away from, or hardlinked into can supply code a source test
-imports. All of it is this one class.
+MOUNTED from elsewhere, or HARDLINKED into, can supply code a source test
+imports.
+
+A SYMLINKED `.git` is NOT in that list, and an earlier draft of this sentence
+put it there. `refuseSymlinkedGit` rejects it before building and a test asserts
+the `.git is a symlink` reason, so listing it as open was false — this register
+overstating a danger is the same defect as understating one, and round-21 review
+caught it. What remains open is the mount and the hardlink.
 
 **What would close it, and precisely how much:** `TASK-013` — verification in a
 fresh checkout and a fresh install, where the mount topology and the toolchain
