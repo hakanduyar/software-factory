@@ -831,46 +831,48 @@ describe("TASK-011 round 2: the child cannot re-enter the supervisor", () => {
    */
   it("does not report a timeout until the child has actually exited", async () => {
     /**
-     * The child takes a MEASURABLE time to die: it catches SIGTERM and exits
-     * 600ms later. Settling on actual exit therefore lands near 1800ms;
-     * settling at the timeout instant lands near 1200ms.
+     * MEASURES ORDER, NOT DURATION — rewritten in round 15 after this failed
+     * intermittently under load, which the reviewer saw twice.
      *
-     * The previous fixture ignored SIGTERM entirely and relied on the SIGKILL
-     * escalation two seconds later — which encoded an assumption about HOW the
-     * child dies rather than about waiting for it, and broke when the child
-     * happened to exit sooner. What is under test is that the outcome comes
-     * from the exit event, not from the timer.
+     * The old version asserted `elapsed >= 1_600` against a 1200ms timeout and a
+     * child that takes 600ms to die. Wall-clock thresholds are a bet about the
+     * machine: under a loaded test run it settled at 318ms — impossibly early
+     * for a real timeout — and the case failed for a reason that had nothing to
+     * do with the behaviour.
+     *
+     * A flaky test is worse than a missing one. It will eventually pass for no
+     * reason, and by then nobody trusts it enough to read the failure.
+     *
+     * So the child announces its death ON STDOUT just before exiting, and the
+     * assertion is that the announcement is IN the captured output. That is the
+     * same property — the outcome came from the exit event and not from the
+     * timer — expressed as an ordering fact. If the adapter settled at the
+     * timeout instant, the outcome was built before the child ever wrote it. A
+     * slow machine widens the gap; it cannot close it.
      */
+    const DIED = "CHILD-EXITED-AFTER-SIGTERM";
     const script = childScript(
       `import { readFileSync } from "node:fs";
        JSON.parse(readFileSync(process.argv[2], "utf8"));
-       process.on("SIGTERM", () => { setTimeout(() => process.exit(0), 600); });
+       process.on("SIGTERM", () => {
+         setTimeout(() => {
+           process.stdout.write("${DIED}");
+           process.exit(0);
+         }, 600);
+       });
        setInterval(() => {}, 1000);`,
     );
-    const executor = executorFor(script, 1_200);
-    const started = Date.now();
-    const outcome = await executor.execute(INPUT);
-    const elapsed = Date.now() - started;
+    const outcome = await executorFor(script, 1_200).execute(INPUT);
 
     assert.equal(outcome.kind, "RESOURCE_FAILURE");
     if (outcome.kind === "RESOURCE_FAILURE") {
       assert.equal(outcome.process.terminationReason, "TIMEOUT");
+      assert.ok(
+        outcome.process.stdout.includes(DIED),
+        'the outcome was built before the child exited, so "terminated" was a statement of intent ' +
+          `rather than of fact (stdout: ${JSON.stringify(outcome.process.stdout.slice(0, 200))})`,
+      );
     }
-    /**
-     * The child IGNORES SIGTERM, so it only dies when SIGKILL follows two
-     * seconds later. Settling on actual exit therefore cannot happen before
-     * ~3.2s; settling at the timeout instant would land at ~1.2s.
-     *
-     * The first version asserted `elapsed >= 1_200`, which the timeout instant
-     * also satisfies — mutation testing showed it surviving the exact change it
-     * was written to catch.
-     */
-    assert.ok(
-      elapsed >= 1_600,
-      `settled at ${elapsed}ms — at the timeout instant rather than on the child's exit, ` +
-        'so "terminated" was a statement of intent rather than of fact',
-    );
-    assert.ok(elapsed < 20_000, `did not settle promptly: ${elapsed}ms`);
   });
 });
 

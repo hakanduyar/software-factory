@@ -1210,8 +1210,21 @@ describe("TASK-008 round 3: the chain is read whatever the row now claims", () =
     if (!appended.ok) throw new Error("unreachable");
 
     const { result, supervisor } = await reviewWith({
-      // The row claims A was deterministic work with no implementer.
-      item: { workClass: "DETERMINISTIC", implementedByResourceKeys: [] },
+      /**
+       * DECLARED deterministic, not forged deterministic (round-15 finding).
+       *
+       * `workClass` used to be set through `item`, which lands only on the
+       * persisted row — so TASK-012 saw a row disagreeing with the catalog and
+       * refused before this guard ran. The assertion is `WAITING_FOR_HUMAN`
+       * either way, so the case stayed green while proving nothing.
+       *
+       * The property under test survives the correction and is the interesting
+       * one: recognition must not be GATED on the class. With the catalog
+       * agreeing the item is deterministic, the guard is genuinely reached.
+       */
+      ancestorWorkClass: "DETERMINISTIC",
+      // The row claims A had no implementer at all; the chain says otherwise.
+      item: { implementedByResourceKeys: [] },
       provenance: appended.chain,
     });
 
@@ -1415,7 +1428,18 @@ describe("TASK-008 round 4: an unrecognised identity is not lineage", () => {
     assert.equal(appended.ok, true);
     if (!appended.ok) throw new Error("unreachable");
 
-    const supervisor = newSupervisor({ probe: healthyProbe() });
+    /**
+     * DECLARED, or the catalog refuses first (round-15 finding). Persisting
+     * custom items against the default catalog made TASK-012 refuse for an
+     * unknown roadmap item, before the identity check this case is about.
+     */
+    const supervisor = newSupervisor({
+      probe: healthyProbe(),
+      roadmap: [
+        { key: "B", title: "Review of A", dependsOn: ["A"], status: "PENDING", workClass: "INDEPENDENT_REVIEW", order: 1 },
+        { key: "A", title: "Implemented", dependsOn: [], status: "PENDING", workClass: "DETERMINISTIC", order: 2, declaredActionKinds: ["RUN_TESTS"] },
+      ],
+    });
     const state = await supervisor.service.ensureInitialized();
     await supervisor.repository.compareAndSave(
       {
@@ -1773,11 +1797,20 @@ describe("TASK-008 round 6: the chain's names are recognised too", () => {
     if (!appended.ok) throw new Error("unreachable");
 
     const { result, supervisor } = await reviewWith({
-      // Relabelled, so the row-based recognition branch is skipped entirely.
-      item: {
-        workClass: "DETERMINISTIC",
-        implementedByResourceKeys: ["not-a-catalog-resource"],
-      },
+      /**
+       * DECLARED deterministic, not forged deterministic (round-15 finding).
+       *
+       * `workClass` used to be set through `item`, which lands only on the
+       * persisted row — so TASK-012 saw a row disagreeing with the catalog and
+       * refused before this guard ran. The assertion is `WAITING_FOR_HUMAN`
+       * either way, so the case stayed green while proving nothing.
+       *
+       * The property under test survives the correction and is the interesting
+       * one: recognition must not be GATED on the class. With the catalog
+       * agreeing the item is deterministic, the guard is genuinely reached.
+       */
+      ancestorWorkClass: "DETERMINISTIC",
+      item: { implementedByResourceKeys: ["not-a-catalog-resource"] },
       provenance: appended.chain,
     });
 
@@ -1863,9 +1896,20 @@ describe("TASK-008 round 7: what actually ran is read whatever the row claims", 
     if (!appended.ok) throw new Error("unreachable");
 
     const { result, supervisor } = await reviewWith({
+      /**
+       * DECLARED deterministic, not forged deterministic (round-15 finding).
+       *
+       * `workClass` used to be set through `item`, which lands only on the
+       * persisted row — so TASK-012 saw a row disagreeing with the catalog and
+       * refused before this guard ran. The assertion is `WAITING_FOR_HUMAN`
+       * either way, so the case stayed green while proving nothing.
+       *
+       * The property under test survives the correction and is the interesting
+       * one: recognition must not be GATED on the class. With the catalog
+       * agreeing the item is deterministic, the guard is genuinely reached.
+       */
+      ancestorWorkClass: "DETERMINISTIC",
       item: {
-        // Relabelled, so the old gate would have skipped the cross-check.
-        workClass: "DETERMINISTIC",
         implementedByResourceKeys: ["claude-code:opus"],
         lastRunConfig: {
           requestedProvider: "codex-cli",
@@ -2790,6 +2834,126 @@ describe("TASK-008 round 13: the chain names an item the roadmap no longer has",
     for (const call of supervisor.executor.callsFor("B")) {
       const used = `${call.config?.effectiveProvider ?? ""}:${call.config?.effectiveModel ?? ""}`;
       assert.notEqual(used, ONLY, "the implementer named only by the chain reviewed dependent work");
+    }
+  });
+});
+
+// =====================================================================
+// ROUND-15 — the frozen verification plans, taken literally
+// =====================================================================
+
+/**
+ * A real database holding a two-entry chain for `A`, and a review `B` that
+ * depends on it. Returned open so a caller can tamper with the row directly.
+ */
+async function realDatabaseWithChain(label: string) {
+  const dbPath = tempDbPath(label);
+  const first = chainFor("codex-cli:gpt-5.6-luna");
+  const chain = appendImplementerProvenance(first, "A", "claude-code:opus", 2_000, "completed");
+
+  const repository = createSqliteSupervisorRepository(dbPath);
+  const seeded = await repository.create({
+    version: 1,
+    financialPolicy: { autonomousSpendAllowed: false, autonomousSpendLimit: 0 },
+    resources: [],
+    roadmap: [
+      { key: "A", title: "Implemented", dependsOn: [], status: "DONE", workClass: "NORMAL_IMPLEMENTATION", order: 1, attempts: 1, implementedByResourceKeys: ["codex-cli:gpt-5.6-luna", "claude-code:opus"] } as RoadmapItem,
+      { key: "B", title: "Review of A", dependsOn: ["A"], status: "ELIGIBLE", workClass: "INDEPENDENT_REVIEW", order: 2 },
+    ],
+    checkpoints: [],
+    escalations: [],
+    provenance: chain,
+    provenanceAnchor: anchorFor(chain),
+    updatedAt: 1_000,
+  });
+  repository.close();
+  return { dbPath, seeded };
+}
+
+/** Writes `state` straight into the row, the way anything with file access would. */
+async function writeRowDirectly(dbPath: string, state: unknown): Promise<void> {
+  const { DatabaseSync } = await import("node:sqlite");
+  const db = new DatabaseSync(dbPath);
+  db.prepare("UPDATE supervisor_state SET data = ? WHERE id = ?").run(JSON.stringify(state), "supervisor");
+  db.close();
+}
+
+/** The catalog those fixtures declare, so TASK-012 is not what refuses. */
+const REAL_DB_CATALOG: readonly RoadmapItem[] = [
+  { key: "A", title: "Implemented", dependsOn: [], status: "PENDING", workClass: "NORMAL_IMPLEMENTATION", order: 1 },
+  { key: "B", title: "Review of A", dependsOn: ["A"], status: "PENDING", workClass: "INDEPENDENT_REVIEW", order: 2 },
+];
+
+describe("TASK-008: the four tamper modes, every one through real SQLite", () => {
+  /**
+   * THE FROZEN VERIFICATION PLAN, TAKEN LITERALLY.
+   *
+   * It asks for "chain tampering driven by mutating a real persisted log: edit,
+   * delete, reorder, append-with-wrong-digest — each must be detected and
+   * named", and for "fail-closed behaviour driven end-to-end through the
+   * supervisor, not only at the unit level".
+   *
+   * Round-15 review found that only some of those ran against SQLite; the rest
+   * used the in-memory repository or passed arrays straight to `verifyChain`. A
+   * unit test of the verifier is not the same claim as a database that has been
+   * edited underneath a running supervisor, and the plan asked for the second.
+   */
+  const TAMPERS: readonly (readonly [string, (chain: readonly ProvenanceEntry[]) => readonly unknown[]])[] = [
+    ["edit", (chain) => chain.map((entry, index) => (index === 0 ? { ...entry, detail: "edited on disk" } : entry))],
+    ["delete", (chain) => chain.slice(1)],
+    ["reorder", (chain) => [chain[1], chain[0]]],
+    [
+      "append-with-wrong-digest",
+      (chain) => [
+        ...chain,
+        { ...chain[chain.length - 1], recordedAt: 3_000, detail: "appended without rehashing" },
+      ],
+    ],
+  ];
+
+  for (const [mode, tamper] of TAMPERS) {
+    it(`DETECTS and NAMES a ${mode} of the persisted log, through the supervisor`, async () => {
+      const { dbPath, seeded } = await realDatabaseWithChain(`t8-sqlite-${mode}`);
+      await writeRowDirectly(dbPath, { ...seeded, provenance: tamper(seeded.provenance) });
+
+      const reopened = createSqliteSupervisorRepository(dbPath);
+      const supervisor = newSupervisor({
+        probe: healthyProbe(),
+        repository: reopened,
+        roadmap: REAL_DB_CATALOG,
+      });
+      try {
+        const result = await supervisor.service.tick();
+        assert.equal(result.kind, "WAITING_FOR_HUMAN", `a ${mode} of the durable log was not detected`);
+        if (result.kind === "WAITING_FOR_HUMAN") {
+          // NAMED, not merely refused: the operator has to know what is wrong.
+          assert.match(
+            result.humanActionRequired,
+            /provenance|chain|parses/i,
+            `the refusal for a ${mode} does not say it is about the log`,
+          );
+        }
+        assert.equal(supervisor.executor.calls().length, 0, "work ran on a tampered log");
+      } finally {
+        reopened.close();
+      }
+    });
+  }
+
+  /** NEGATIVE CONTROL: the same real database, untampered, still advances. */
+  it("still advances on an untampered real database", async () => {
+    const { dbPath } = await realDatabaseWithChain("t8-sqlite-clean");
+    const reopened = createSqliteSupervisorRepository(dbPath);
+    const supervisor = newSupervisor({
+      probe: healthyProbe(),
+      repository: reopened,
+      roadmap: REAL_DB_CATALOG,
+    });
+    try {
+      const result = await supervisor.service.tick();
+      assert.notEqual(result.kind, "WAITING_FOR_HUMAN", "an untampered database was refused");
+    } finally {
+      reopened.close();
     }
   });
 });

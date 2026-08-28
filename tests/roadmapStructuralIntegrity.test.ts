@@ -21,7 +21,7 @@
 
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { describe, it } from "node:test";
+import { after, describe, it } from "node:test";
 
 import {
   DEFINITION_FIELDS,
@@ -30,6 +30,8 @@ import {
 } from "../src/supervision/roadmapCatalog.js";
 import { appendProvenance, anchorFor, type ProvenanceEntry } from "../src/supervision/provenanceChain.js";
 import { DEFAULT_ROADMAP, type RoadmapItem } from "../src/supervision/supervisorTypes.js";
+import { createSqliteSupervisorRepository } from "../src/adapters/supervision/sqliteSupervisorRepository.js";
+import { cleanupTempDbs, tempDbPath } from "./support/factoryFixtures.js";
 import {
   declarePersisted,
   newSupervisor,
@@ -468,5 +470,141 @@ describe("TASK-012 AC-9: nothing else changed", () => {
     assert.ok(wiring !== undefined, "EXECUTOR_WIRING must still be in the roadmap");
     assert.ok(wiring.dependsOn.includes("STATE_INTEGRITY"));
     assert.ok(wiring.dependsOn.includes("EXECUTOR_ISOLATION"));
+  });
+});
+
+// =====================================================================
+// THE FROZEN VERIFICATION PLAN — every bypass through real SQLite
+// =====================================================================
+
+after(cleanupTempDbs);
+
+/**
+ * TASK-012's plan asks for each bypass "reproduced against REAL SQLite exactly
+ * as the reviewer drove it: relabelled `workClass`, forged `DONE`, deleted
+ * `dependsOn` edge, unknown key", plus a negative control.
+ *
+ * Round-15 review found this file used only the in-memory repository. The
+ * service logic is the same either way — but the plan asks for the durable path,
+ * and "the same code runs" is an argument, not the evidence that was promised.
+ * A durable reproduction also proves the row survives serialization in the shape
+ * the attack needs, which an in-memory object never demonstrates.
+ */
+const DURABLE_CATALOG: readonly RoadmapItem[] = [
+  { key: "A", title: "Implemented", dependsOn: [], status: "PENDING", workClass: "NORMAL_IMPLEMENTATION", order: 1 },
+  { key: "B", title: "Review of A", dependsOn: ["A"], status: "PENDING", workClass: "INDEPENDENT_REVIEW", order: 2 },
+  { key: "C", title: "Depends on the review", dependsOn: ["B"], status: "PENDING", workClass: "DETERMINISTIC", order: 3, declaredActionKinds: ["RUN_TESTS"] },
+];
+
+async function durableRoadmap(label: string, roadmap: readonly RoadmapItem[]) {
+  const dbPath = tempDbPath(label);
+  const repository = createSqliteSupervisorRepository(dbPath);
+  const seeded = await repository.create({
+    version: 1,
+    financialPolicy: { autonomousSpendAllowed: false, autonomousSpendLimit: 0 },
+    /**
+     * Seeded exactly as `ensureInitialized` would, so the negative control can
+     * actually ADVANCE. With an empty list nothing is probeable and the tick
+     * returns WAITING_FOR_RESOURCE — which would have made this control pass
+     * for a reason that has nothing to do with the roadmap.
+     */
+    resources: TEST_CATALOG.map((entry) => ({
+      provider: entry.provider,
+      model: entry.model,
+      key: `${entry.provider}:${entry.model}`,
+      state: "UNKNOWN_FAILURE" as const,
+      detectedAt: 1_000,
+      lastCheckedAt: 0,
+      backoff: { attempt: 0, delayMs: 0 },
+      diagnostic: "never probed",
+    })),
+    roadmap: DURABLE_CATALOG.map((item) => ({ ...item, dependsOn: [...item.dependsOn] })),
+    checkpoints: [],
+    escalations: [],
+    provenance: [],
+    updatedAt: 1_000,
+  });
+  repository.close();
+
+  const { DatabaseSync } = await import("node:sqlite");
+  const db = new DatabaseSync(dbPath);
+  db.prepare("UPDATE supervisor_state SET data = ? WHERE id = ?").run(
+    JSON.stringify({ ...seeded, roadmap }),
+    "supervisor",
+  );
+  db.close();
+  return dbPath;
+}
+
+async function tickOn(dbPath: string) {
+  const repository = createSqliteSupervisorRepository(dbPath);
+  const supervisor = newSupervisor({ probe: healthyProbe(), repository, roadmap: DURABLE_CATALOG });
+  try {
+    return { result: await supervisor.service.tick(), calls: supervisor.executor.calls().length };
+  } finally {
+    repository.close();
+  }
+}
+
+describe("TASK-012 verification plan: every bypass through real SQLite", () => {
+  it("REFUSES a relabelled workClass written into the database", async () => {
+    const dbPath = await durableRoadmap("t12-sqlite-relabel", [
+      { ...DURABLE_CATALOG[0]!, status: "DONE" },
+      { ...DURABLE_CATALOG[1]!, status: "ELIGIBLE", workClass: "DETERMINISTIC" },
+      DURABLE_CATALOG[2]!,
+    ]);
+    const { result, calls } = await tickOn(dbPath);
+    assert.equal(result.kind, "WAITING_FOR_HUMAN", "a relabelled review item ran as deterministic work");
+    if (result.kind === "WAITING_FOR_HUMAN") assert.match(result.humanActionRequired, /workClass/);
+    assert.equal(calls, 0);
+  });
+
+  it("REFUSES a forged DONE written into the database", async () => {
+    const dbPath = await durableRoadmap("t12-sqlite-forged-done", [
+      { ...DURABLE_CATALOG[0]!, status: "DONE" },
+      { ...DURABLE_CATALOG[1]!, status: "DONE" },
+      { ...DURABLE_CATALOG[2]!, status: "ELIGIBLE" },
+    ]);
+    const { result, calls } = await tickOn(dbPath);
+    assert.equal(result.kind, "WAITING_FOR_HUMAN", "a forged completion satisfied its dependent");
+    if (result.kind === "WAITING_FOR_HUMAN") {
+      assert.match(result.humanActionRequired, /no record of anything having run/);
+    }
+    assert.equal(calls, 0);
+  });
+
+  it("REFUSES a deleted dependsOn edge written into the database", async () => {
+    const dbPath = await durableRoadmap("t12-sqlite-edge", [
+      { ...DURABLE_CATALOG[0]!, status: "DONE" },
+      { ...DURABLE_CATALOG[1]!, status: "ELIGIBLE", dependsOn: [] },
+      DURABLE_CATALOG[2]!,
+    ]);
+    const { result, calls } = await tickOn(dbPath);
+    assert.equal(result.kind, "WAITING_FOR_HUMAN", "a deleted edge decided eligibility");
+    if (result.kind === "WAITING_FOR_HUMAN") assert.match(result.humanActionRequired, /dependsOn/);
+    assert.equal(calls, 0);
+  });
+
+  it("REFUSES an unknown key written into the database", async () => {
+    const dbPath = await durableRoadmap("t12-sqlite-unknown", [
+      ...DURABLE_CATALOG,
+      { key: "SMUGGLED", title: "Not in the catalog", dependsOn: [], status: "ELIGIBLE", workClass: "DETERMINISTIC", order: 0, declaredActionKinds: ["RUN_TESTS"] },
+    ]);
+    const { result, calls } = await tickOn(dbPath);
+    assert.equal(result.kind, "WAITING_FOR_HUMAN", "an item nobody declared was executed");
+    if (result.kind === "WAITING_FOR_HUMAN") {
+      assert.match(result.humanActionRequired, /is not in this installation's catalog/);
+    }
+    assert.equal(calls, 0);
+  });
+
+  /**
+   * THE NEGATIVE CONTROL the plan asks for by name: the guards must not be
+   * satisfiable by refusing everything.
+   */
+  it("still advances a legitimate roadmap from the same real database", async () => {
+    const dbPath = await durableRoadmap("t12-sqlite-clean", DURABLE_CATALOG);
+    const { result } = await tickOn(dbPath);
+    assert.equal(result.kind, "ADVANCED", "a legitimate durable roadmap was refused");
   });
 });
