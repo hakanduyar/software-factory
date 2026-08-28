@@ -575,7 +575,21 @@ ROOT_DIR = (() => {
   }
   return rel === "" ? "." : rel;
 })();
-const EMIT_LAYOUT = { rootDir: ROOT_DIR, outputDirectory: OUTPUT_DIR };
+/**
+ * DERIVED, like everything else about the layout (round-13 HIGH).
+ *
+ * `declaration`, `sourceMap` and `declarationMap` decide which artifact kinds
+ * the build produces. Without them the audit accepted a `.d.ts` as explained by
+ * its source even when nothing would emit one, so a declaration left behind by a
+ * previous configuration survived as "clean".
+ */
+const EMIT_LAYOUT = {
+  rootDir: ROOT_DIR,
+  outputDirectory: OUTPUT_DIR,
+  declaration: effectiveConfig.compilerOptions.declaration === true,
+  sourceMap: effectiveConfig.compilerOptions.sourceMap === true,
+  declarationMap: effectiveConfig.compilerOptions.declarationMap === true,
+};
 /**
  * Refused BEFORE the build, and the wording says so (round-3 finding).
  *
@@ -713,12 +727,15 @@ const allSources = compilerInputs();
  *
  * So the scan is the UNION of two sets, and neither replaces the other:
  *
- *   - every file the compiler says it reads that lives in this repository and
- *     can EMIT — declaration files, `node_modules` and the output directory are
- *     filtered out, because none of them explains a generated artifact. "Every
- *     compiler input" would be the wrong claim and is not the one being made;
- *     the set is defined by the program rather than by a path, which is the
- *     property that matters; and
+ *   - every `.ts`/`.mts`/`.cts` file the compiler says it reads that lives in
+ *     this repository, excluding declaration files, `node_modules` and the
+ *     output directory. Narrower than "every compiler input", and said exactly:
+ *     with `allowJs` or `resolveJsonModule` a `.js` or `.json` input would not
+ *     be scanned here. That direction is CONSERVATIVE — such a file is not
+ *     matched by the walk's exclusions either, so it is still covered by the
+ *     other half of this union — but the claim is narrowed rather than left
+ *     overstated. The property that matters is that the set comes from the
+ *     program rather than from a path; and
  *   - the directory walk, which still skips those names, because it covers
  *     files that are NOT compiler inputs and would otherwise report an ordinary
  *     `node_modules` as foreign source.

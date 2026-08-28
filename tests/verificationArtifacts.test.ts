@@ -33,7 +33,14 @@ import {
 
 const SOURCES = ["tests/alpha.test.ts", "tests/nested/beta.test.ts"];
 const COMPILED = ["dist/tests/alpha.test.js", "dist/tests/nested/beta.test.js"];
-const LAYOUT = { rootDir: ".", outputDirectory: "dist" };
+/** This repository's own emit options, so the fixtures match what it builds. */
+const LAYOUT = {
+  rootDir: ".",
+  outputDirectory: "dist",
+  declaration: true,
+  sourceMap: true,
+  declarationMap: false,
+};
 
 /**
  * The audit needs the WHOLE picture (round-9 HIGH), so every call supplies the
@@ -527,10 +534,51 @@ describe("TASK-010 round 9: generated files no source explains", () => {
       sources: ["src/thing.ts"],
       sourceTests: [],
       compiledTests: [],
-      generated: ["dist/src/thing.js", "dist/src/thing.d.ts", "dist/src/thing.js.map", "dist/src/thing.d.ts.map"],
+      // `declarationMap` is OFF in this layout, so `.d.ts.map` is deliberately
+      // absent — including it here would assert that an unemitted kind is
+      // explained, which is exactly the defect below.
+      generated: ["dist/src/thing.js", "dist/src/thing.d.ts", "dist/src/thing.js.map"],
     });
     assert.deepEqual(audit.staleOutput, []);
     assert.equal(audit.clean, true);
+  });
+
+  /**
+   * HIGH (round-13 review). A `.d.ts` was accepted as explained whenever its
+   * source existed, whatever the configuration said — so a declaration left by a
+   * build whose `declaration` has since been turned off survived as "clean". A
+   * fresh clone has no such file, which is what AC-4 forbids.
+   *
+   * The suffix table says what a source COULD produce; only the options say what
+   * it DOES.
+   */
+  it("treats an artifact kind this configuration does not emit as stale", () => {
+    const noDeclarations = { ...LAYOUT, declaration: false, sourceMap: false };
+    const audit = auditTestArtifacts({
+      sourceTests: [],
+      compiledTests: [],
+      sources: ["src/thing.ts"],
+      generated: ["dist/src/thing.js", "dist/src/thing.d.ts", "dist/src/thing.js.map"],
+      layout: noDeclarations,
+    });
+    assert.deepEqual(
+      audit.staleOutput,
+      ["dist/src/thing.d.ts", "dist/src/thing.js.map"],
+      "a declaration and a source map survived a configuration that emits neither",
+    );
+    assert.equal(audit.clean, false);
+  });
+
+  /** ...and the same kinds are explained when the configuration DOES emit them. */
+  it("accepts those kinds when the configuration emits them", () => {
+    const audit = auditTestArtifacts({
+      sourceTests: [],
+      compiledTests: [],
+      sources: ["src/thing.ts"],
+      generated: ["dist/src/thing.js", "dist/src/thing.d.ts", "dist/src/thing.js.map"],
+      layout: LAYOUT,
+    });
+    assert.deepEqual(audit.staleOutput, []);
   });
 
   /** A file nothing in this configuration could have emitted is stale. */
@@ -555,7 +603,7 @@ describe("TASK-010 round 9: generated files no source explains", () => {
   });
 
   it("maps generated back to source through a non-trivial rootDir", () => {
-    const layout = { rootDir: "src", outputDirectory: "build" };
+    const layout = { rootDir: "src", outputDirectory: "build", declaration: true, sourceMap: true, declarationMap: false };
     assert.equal(compiledPathForSource("src/a/b.ts", layout), "build/a/b.js");
     assert.equal(sourceForGeneratedPath("build/a/b.js", layout), "src/a/b.ts");
     assert.equal(sourceForGeneratedPath("build/a/b.d.ts", layout), "src/a/b.ts");

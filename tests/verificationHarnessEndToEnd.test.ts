@@ -2385,3 +2385,29 @@ describe("TASK-010 round 12: a symlinked ancestor of a derived root", () => {
     assert.match(output, /tree-consistent/);
   });
 });
+
+describe("TASK-010 round 13: an artifact kind the configuration no longer emits", () => {
+  /**
+   * HIGH. `sourceForGeneratedPath` accepted `.d.ts`, `.d.ts.map` and `.js.map`
+   * whenever their source existed, without asking whether this configuration
+   * emits them. The reviewer built a fixture with neither `declaration` nor
+   * `sourceMap`, planted a `.d.ts`, and the run exited 0 reporting
+   * `tree-consistent` with the stale file still in place.
+   *
+   * A fresh clone has no such file. That is precisely what AC-4's "equivalent
+   * final generated state" forbids.
+   */
+  it("removes a declaration left by a configuration that no longer emits one", () => {
+    const root = makeFixtureRepo();
+    assert.equal(runHarness(root).status, 0, "the fixture must pass before anything is planted");
+
+    const stale = join(root, "dist/src/verification/testArtifacts.d.ts");
+    writeFileSync(stale, "export declare const stale: number;\n");
+    assert.ok(existsSync(stale));
+
+    const { status, output } = runHarness(root);
+    assert.match(output, /testArtifacts\.d\.ts/, "the stale declaration was never mentioned");
+    assert.ok(!existsSync(stale), "AC-4: a kind this configuration does not emit survived the run");
+    assert.equal(status, 0, `the repair cycle should converge:\n${output}`);
+  });
+});

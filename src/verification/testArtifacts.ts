@@ -93,6 +93,37 @@ export interface EmitLayout {
   readonly rootDir: string;
   /** `outDir` from the effective tsconfig. */
   readonly outputDirectory: string;
+  /**
+   * Which artifact KINDS this configuration actually emits (round-13 HIGH).
+   *
+   * A `.d.ts` was accepted as explained whenever its source existed, whatever
+   * the config said. So a declaration left by a build whose `declaration` has
+   * since been turned off survived as "clean" — the reviewer planted one, and
+   * the run exited 0 reporting `tree-consistent` with the stale file still
+   * there. A fresh clone has no such file, which is exactly what AC-4 forbids.
+   *
+   * The suffix table says what a source COULD produce; only the options say
+   * what it DOES. Both are needed, and the second was missing.
+   */
+  readonly declaration: boolean;
+  readonly sourceMap: boolean;
+  readonly declarationMap: boolean;
+}
+
+/** Whether `layout` emits the artifact kind ending in `suffix`. */
+function emitsSuffix(suffix: string, layout: EmitLayout): boolean {
+  if (suffix.endsWith(".d.ts.map") || suffix.endsWith(".d.mts.map") || suffix.endsWith(".d.cts.map")) {
+    return layout.declarationMap;
+  }
+  if (suffix.endsWith(".map")) {
+    return layout.sourceMap;
+  }
+  if (suffix.startsWith(".d.")) {
+    return layout.declaration;
+  }
+  // The JavaScript itself is emitted unless the build emits nothing at all,
+  // which is refused before the audit ever runs.
+  return true;
 }
 
 function rootPrefix(rootDir: string): string {
@@ -143,7 +174,7 @@ export function sourceForGeneratedPath(
     return undefined;
   }
   const withinOutput = generated.slice(out.length);
-  const rule = OUTPUT_TO_SOURCE.find(([from]) => withinOutput.endsWith(from));
+  const rule = OUTPUT_TO_SOURCE.find(([from]) => withinOutput.endsWith(from) && emitsSuffix(from, layout));
   if (rule === undefined) {
     return undefined;
   }
@@ -163,7 +194,13 @@ function normalise(path: string): string {
  */
 export function compiledPathForSourceTest(
   sourceRelativePath: string,
-  layout: EmitLayout = { rootDir: ".", outputDirectory: "dist" },
+  layout: EmitLayout = {
+    rootDir: ".",
+    outputDirectory: "dist",
+    declaration: true,
+    sourceMap: true,
+    declarationMap: false,
+  },
 ): string {
   const normalised = normalise(sourceRelativePath);
   if (!SOURCE_TEST_SUFFIXES.some((suffix) => normalised.endsWith(suffix))) {
@@ -389,7 +426,7 @@ export function assessTreeSafety(facts: TreeFacts): TreeSafetyVerdict {
   if (facts.symlinkedSources.length > 0) {
     return {
       safe: false,
-      reason: `symlinked or hardlinked entries under the source roots (src/, tests/): ${facts.symlinkedSources.join(", ")}; source must live in this repository`,
+      reason: `symlinked or hardlinked entries under the source roots: ${facts.symlinkedSources.join(", ")}; source must live in this repository`,
     };
   }
   if (facts.symlinkedArtifacts.length > 0) {

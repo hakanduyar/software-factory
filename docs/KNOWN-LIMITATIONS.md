@@ -315,6 +315,26 @@ guarantee, each says plainly what it is:
   call exists so a future reordering still meets a tested guard before anything
   is deleted.
 
+One more, from round-13 review of the verification harness, and this one is a
+TEST rather than a guard:
+
+- `TASK-010 AC-1`'s end-to-end case cannot distinguish the runner receiving
+  `audit.expected` from it receiving `compiledTests`. Replacing one with the
+  other leaves it green, which the reviewer demonstrated.
+
+  The reason is structural: the audit must be CLEAN before anything runs, and
+  clean means those two lists are equal. On any tree that reaches execution they
+  are the same argv, so no observation of the run can tell them apart — including
+  the injectable-runner approach the reviewer suggested, which would record
+  identical arguments either way.
+
+  What actually enforces AC-1 is the AUDIT, which compares source-derived
+  expectations against what is on disk and refuses when they differ; that
+  comparison is load-bearing and its removal fails several named regressions.
+  The end-to-end case pins that the suite RUNS and reports honestly, not which
+  variable was passed, and it is worth saying so rather than leaving a reader to
+  assume the stronger claim.
+
 **Why they stay:** each is defence in depth against a future reordering, and each
 costs nothing. **Why this entry exists:** "defence in depth" is exactly what an
 untested guard looks like from the outside, and the difference between the two is
