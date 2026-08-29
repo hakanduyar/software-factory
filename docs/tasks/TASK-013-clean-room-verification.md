@@ -119,8 +119,11 @@ both cases of writing it from memory:
      directory"
   7. post-build irregular-entry check — "REFUSES a FIFO the BUILD creates, at
      the after-building stage"
-  8. pre-build `linkedCompilerInputs` call — "refuses a symlinked compiler input
-     BEFORE building, not after"
+  8. pre-build `linkedCompilerInputs` call — SEE THE PAIRS BELOW. Round 23
+     measured that the repository-wide catch-all added in round 22 catches the
+     escaping symlink first, so removing this call alone now leaves its named
+     case passing. It WAS individually pinned when this inventory was written
+     and is not any more.
   9. post-build readability assertion — "reports an unreadable output directory
      created BY the build at the after-building stage"
   10. early mount-table completeness guard — "REFUSES an unparseable mount table,
@@ -140,6 +143,17 @@ a pair whose members mask each other, so no single removal fails anything:
   - the pre-build output hardlink scan (`findHardlinkedUnder(OUTPUT_DIR)`).
     Removing it fails three other cases but NOT the one this inventory named
     for it, so it is covered without being pinned by its own case.
+  - the pre-build `linkedCompilerInputs` call and the pre/post source symlink
+    scans, ALL masked by the round-22 repository-wide catch-all: it refuses the
+    escaping symlink before their named cases can notice their guard is gone.
+
+    THIS IS THE SECOND-ORDER EFFECT WORTH THE MOST ATTENTION HERE. Adding a
+    broad guard did not merely fail to help — it REDUCED the discriminating
+    power of tests that were previously exact. A criterion freezing "these
+    guards are individually pinned" is therefore not stable under later
+    additions, and this entry has been falsified three times: twice by my
+    memory, once by my own new code.
+
   - `assertEverythingWasReadable("before auditing")`. Removing it leaves all
     107 harness tests green. It is kept rather than deleted — the sibling
     `assertEverythingWasRegular("before auditing")` WAS deleted on the same
@@ -158,10 +172,31 @@ EXPLICITLY OUT OF SCOPE: the `.git` hardlink scan, removed in round 19 because
 counts, so it refused ordinary trees for a third party's action. Restoring it is
 not required and would reintroduce that defect.
 
+ORDERING AND ATTRIBUTION, frozen alongside the inventory because five
+regressions on this branch had one shape — a guard correct in isolation and
+wrong in POSITION:
+
+  - Specific guards run BEFORE broader ones. The repository-wide
+    escaping-symlink check runs after the source-root scan, the `.git` checks,
+    the output-link scan and the mount checks, each of which refuses a narrower
+    case with a better message. Placed first it preempted them and six existing
+    cases failed — their trees still refused, but by the wrong guard.
+  - Each specific guard's fixture must be DISTINGUISHABLE from every broader
+    guard that runs later. A fixture any later guard would also refuse cannot
+    show the specific one is load-bearing. When adding a broad guard, re-measure
+    every narrower one: that is how the entries above stopped being true without
+    anyone editing them.
+  - A case asserts the REASON, not merely that verification refused.
+
+Predicates are mutated at BOTH ends. A containment check can be too permissive
+or too strict, and a suite catching only the permissive direction lets it be
+"fixed" by refusing everything — the round-23 `..` / `..hidden` pair.
+
 VERIFICATION METHOD, frozen: for each pinned entry, remove the guard from a
 disposable copy, confirm the mutation LANDED (mutated text present and original
 absent), build, and confirm the named case fails while the others still pass. A
-mutation that does not compile, or does not land, proves nothing.
+mutation that does not compile, or does not land, proves nothing — "did not
+land" is an UNMEASURED result, never a passing one.
 
 **AC-6.** The clean room does not require a network beyond the dependency
 install, does not require sudo, and does not require a paid service.

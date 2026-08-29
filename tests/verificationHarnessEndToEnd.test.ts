@@ -3679,3 +3679,100 @@ describe("TASK-010 round 22: a symlink that escapes the repository", () => {
     assert.equal(status, 0, `the shared install was treated as an escape:\n${output}`);
   });
 });
+
+// ---------------------------------------------------------------------------
+// ROUND-23 CRITICAL — the exact string ".." passed every containment check
+// ---------------------------------------------------------------------------
+
+/**
+ * `relative()` returns exactly `".."` when a path IS the parent directory, and
+ * three of the four containment checks tested `startsWith("../")`, which does
+ * not match it. The reviewer set `include: [".."]`, had a test require
+ * `../payload.cjs` at runtime, and the run exited 0 reporting `tree-consistent`
+ * while the payload executed — the compiler reading from outside the repository
+ * with every guard saying yes.
+ *
+ * The fourth check tested `startsWith("..")`, which catches `".."` and also
+ * refuses an ordinary internal directory named `..hidden`. Both ends of one
+ * off-by-one, in a question asked four times and answered three ways.
+ */
+describe("TASK-010 round 23: the parent directory is outside the repository", () => {
+  /**
+   * `include: ["../"]`, not `include: [".."]`, and the difference is worth
+   * recording because my first version of this case tested the wrong string.
+   *
+   * `deriveSourceRoots` reads the literal prefix of a pattern and treats a final
+   * segment CONTAINING A DOT as a filename, so `".."` collapses to the
+   * repository root and never becomes a parent root at all. That form does not
+   * reach the containment predicate, so a test using it passes whether the
+   * predicate is fixed or broken — it was green against the very bug it was
+   * written to catch.
+   *
+   * `"../"` ends in an empty segment, so the candidate resolves to the parent
+   * and `relative()` returns exactly `".."` — the string `startsWith("../")`
+   * misses.
+   */
+  it("REFUSES a tsconfig whose include resolves to the parent directory", () => {
+    const parent = mkdtempSync(join(tmpdir(), "sf-parent-"));
+    created.push(parent);
+    const marker = join(parent, "EXECUTED");
+    writeFileSync(
+      join(parent, "payload.cjs"),
+      `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "yes");\nmodule.exports = 1;\n`,
+    );
+
+    const root = join(parent, "repo");
+    mkdirSync(root, { recursive: true });
+    cpSync(makeFixtureRepo(), root, { recursive: true, dereference: false });
+
+    const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as {
+      include?: string[];
+    };
+    tsconfig.include = ["../"];
+    writeFileSync(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, `a source root resolving to the parent was accepted:\n${output}`);
+    assert.match(
+      output,
+      /outside this repository|reads from OUTSIDE|sources outside/i,
+      `refused, but not for being outside the repository:\n${output}`,
+    );
+    assert.ok(!existsSync(marker), "the payload EXECUTED from outside the repository");
+  });
+
+  /**
+   * CONTROL for the other end of the same off-by-one: an internal directory
+   * whose name begins with two dots is NOT an escape. `startsWith("..")` alone
+   * refuses it, which would reject an ordinary tree.
+   */
+  it("still accepts an internal directory whose name begins with two dots", () => {
+    const root = makeFixtureRepo();
+    mkdirSync(join(root, "..hidden"), { recursive: true });
+    writeFileSync(join(root, "..hidden/real.json"), '{"ok":true}\n');
+    symlinkSync(join(root, "..hidden/real.json"), join(root, "..hidden/alias.json"));
+
+    const { status, output } = runHarness(root);
+    assert.equal(status, 0, `an internal '..hidden' directory was treated as an escape:\n${output}`);
+    assert.match(output, /tree-consistent/);
+  });
+
+  /** CONTROL: a rootDir of ".." is refused for the same reason. */
+  it("REFUSES a rootDir of exactly '..'", () => {
+    const parent = mkdtempSync(join(tmpdir(), "sf-parentroot-"));
+    created.push(parent);
+    const root = join(parent, "repo");
+    mkdirSync(root, { recursive: true });
+    cpSync(makeFixtureRepo(), root, { recursive: true, dereference: false });
+
+    const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as {
+      compilerOptions: Record<string, unknown>;
+    };
+    tsconfig.compilerOptions["rootDir"] = "..";
+    writeFileSync(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, `a rootDir of ".." was accepted:\n${output}`);
+    assert.match(output, /rootDir .* is outside this repository|outside this repository/);
+  });
+});

@@ -130,10 +130,41 @@
 
 import { execFileSync } from "node:child_process";
 import { lstatSync, readFileSync, readdirSync, realpathSync, rmSync, statSync } from "node:fs";
-import { dirname, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+
+/**
+ * ONE ANSWER TO "IS THIS PATH OUTSIDE THE REPOSITORY?" (round-23 CRITICAL).
+ *
+ * The same question was asked in four places and got three different answers,
+ * two of them wrong:
+ *
+ *   `startsWith("../")` — used by `deriveSourceRoots` and the `rootDir` check.
+ *   It misses the exact string `".."`, which is what `relative()` returns when
+ *   the path IS the parent directory. The reviewer set `include: [".."]`,
+ *   pointed a runtime `require` at `../payload.cjs`, and the run exited 0
+ *   reporting `tree-consistent` while the payload executed. The compiler was
+ *   reading from outside the repository and every containment check said yes.
+ *
+ *   `startsWith("..")` — used by the escaping-symlink walk. It catches `".."`
+ *   but OVER-matches: an ordinary internal directory named `..hidden` has a
+ *   relative path beginning with two dots and was refused as an escape.
+ *
+ * Neither error is exotic. They are the two ends of the same off-by-one, and
+ * having three spellings of one predicate is what let each site be wrong in its
+ * own way. `isAbsolute` is included because `relative()` returns an absolute
+ * path when no relative route exists — a different drive on Windows — and an
+ * absolute answer means "not under this root" just as `..` does.
+ */
+function toRepoRelative(absolutePath) {
+  return relative(REPO_ROOT, absolutePath).split("\\").join("/");
+}
+
+function escapesRepository(relativePath) {
+  return relativePath === ".." || relativePath.startsWith("../") || isAbsolute(relativePath);
+}
 const OUTPUT_DIR = "dist";
 /**
  * Which directories this build compiles FROM — DERIVED, not assumed.
@@ -193,7 +224,7 @@ function deriveSourceRoots(config) {
      */
     const absolute = resolve(REPO_ROOT, candidate.length === 0 ? "." : candidate);
     const rel = relative(REPO_ROOT, absolute).replace(/\\/g, "/");
-    if (rel.startsWith("../")) {
+    if (escapesRepository(rel)) {
       // The compiler reads from OUTSIDE the repository. Nothing here can scan
       // it meaningfully, and a build that compiles foreign source is precisely
       // what these guards exist to refuse.
@@ -740,7 +771,7 @@ ROOT_DIR = (() => {
     fail(`verification refused: rootDir is ${JSON.stringify(declared)}, which is not a string`);
   }
   const rel = relative(REPO_ROOT, resolve(REPO_ROOT, declared)).replace(/\\/g, "/");
-  if (rel.startsWith("../")) {
+  if (escapesRepository(rel)) {
     fail(`verification refused: rootDir (${declared}) is outside this repository`);
   }
   return rel === "" ? "." : rel;
@@ -853,7 +884,7 @@ function compilerInputs() {
     const path = line.trim();
     if (path.length === 0) continue;
     const rel = relative(REPO_ROOT, resolve(REPO_ROOT, path)).replace(/\\/g, "/");
-    if (rel.startsWith("../") || rel.length === 0) continue;
+    if (escapesRepository(rel) || rel.length === 0) continue;
     if (rel.startsWith("node_modules/") || rel.startsWith(`${OUTPUT_DIR}/`)) continue;
     // Declaration files are inputs but emit nothing, so they explain no artifact.
     if (/\.d\.(ts|mts|cts)$/.test(rel)) continue;
@@ -1217,7 +1248,7 @@ function escapingSymlinks() {
           found.push(`${rel} (unresolvable)`);
           continue;
         }
-        if (relative(REPO_ROOT, target).startsWith("..")) {
+        if (escapesRepository(toRepoRelative(target))) {
           found.push(rel);
         }
         continue;
@@ -1583,20 +1614,22 @@ const sourceTests = allSources.filter((path) => checker.isSourceTest(path));
 const generatedFiles = listFiles(OUTPUT_DIR);
 const compiledTests = generatedFiles.filter((path) => checker.isTestArtifact(path));
 assertEverythingWasReadable("before auditing");
-// NO `assertEverythingWasRegular` HERE, and the omission is deliberate.
-//
-// It was here, and measurement said it never fires. `irregular` accumulates and
-// is never cleared, so the pre-build call catches everything present before the
-// build, and the call inside `assertTreeIsSafe` catches everything the build
-// creates — including on the repair path, which re-enters it after the rebuild.
-// Nothing can appear in the window between that call and this line.
-//
-// Removing each of the three call sites in turn left the whole suite green,
-// because all three masked each other: the tests proved the PROPERTY and no call
-// site at all. The other two now have a case that names the stage they refuse
-// at, so each fails alone. This one had nothing that could fail for it, which is
-// the definition of a guard nobody can check — so it is deleted rather than kept
-// and described as defence in depth.
+/**
+ * RESTORED (round-23), because the reviewer answered the question I put to them.
+ *
+ * Round 19 deleted this call: measurement showed the three
+ * `assertEverythingWasRegular` sites masked each other, so no single removal
+ * failed anything. Round 22 then found the SAME thing true of
+ * `assertEverythingWasReadable("before auditing")` — removing it left 107/107
+ * green — and I kept that one, which left two identical situations treated
+ * oppositely. I flagged the inconsistency rather than resolving it alone.
+ *
+ * The answer: keep both. Under a frozen AC-5, restoring the deleted guard is
+ * the correct way to make them consistent, not deleting a second one. Neither
+ * is individually pinned and both are recorded as masked in L-8; that is what
+ * the register is for.
+ */
+assertEverythingWasRegular("before auditing");
 let audit = checker.auditTestArtifacts({
   sourceTests,
   compiledTests,
