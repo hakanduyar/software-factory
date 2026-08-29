@@ -8,6 +8,8 @@
  */
 
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, it } from "node:test";
 
 import {
@@ -254,5 +256,162 @@ describe("TASK-014: the checkpoint carries state rather than inventing it", () =
       assert.deepEqual(outcome.checkpoint.pendingVerification, ["npm run lint"]);
       assert.deepEqual(outcome.checkpoint.findings, ["a finding from before"]);
     }
+  });
+});
+
+describe("TASK-014 AC-1: the SHIPPED CLI construction path", () => {
+  const SUPERVISE = readFileSync(join(process.cwd(), "src/cli/supervise.ts"), "utf8");
+
+  /**
+   * Asserted against the SOURCE the CLI actually ships, not against a test
+   * double. `buildService` is not exported — deliberately, it is CLI wiring —
+   * so the check is that the shipped file constructs the real executor and no
+   * longer defines the stub.
+   *
+   * The repository already uses this shape where behaviour is a property of
+   * wiring rather than of a callable unit: a test that asserted a double was
+   * constructed would prove nothing about what `sf supervise` runs.
+   */
+  it("constructs the plan-backed executor", () => {
+    assert.match(SUPERVISE, /createPlanBackedExecutor\(/, "the CLI does not construct the real executor");
+    assert.match(SUPERVISE, /executor: createSupervisorExecutor\(/, "the service is not given it");
+  });
+
+  it("no longer DEFINES the unimplemented stub", () => {
+    assert.doesNotMatch(
+      SUPERVISE,
+      /function createUnimplementedExecutor/,
+      "the stub is still defined, so the CLI can still be wired to it",
+    );
+  });
+
+  /**
+   * The stub is allowed to be MENTIONED — the comment explaining what changed
+   * is worth keeping. This pins the distinction so a future reader does not
+   * "tidy" the prose away and think they have restored something.
+   */
+  it("still explains what it replaced", () => {
+    assert.match(SUPERVISE, /createUnimplementedExecutor` used to live here/);
+  });
+});
+
+describe("TASK-014 AC-4: the executor cannot start a duplicate loop", () => {
+  /**
+   * STRUCTURAL, which is stronger than counting.
+   *
+   * AC-4 asks that an existing loop be adopted rather than started again. This
+   * executor cannot start a loop AT ALL: `PlanAdvancer` exposes exactly one
+   * method, `resume`. Adoption-versus-start is `PlanningService`'s decision,
+   * made through `LoopDispatcher.find`, and that is accepted work with its own
+   * tests.
+   *
+   * So the proof here is that repeated execution produces repeated RESUME and
+   * nothing else — a duplicate start is not something this seam can express.
+   */
+  it("resumes on every execution and has no way to start", async () => {
+    const planning = advancer(planWith("EXECUTING"));
+    const executor = createPlanBackedExecutor({
+      plans: lookup(planWith("APPROVED")),
+      planning,
+      clock: CLOCK,
+    });
+
+    await executor.execute(input());
+    await executor.execute(input());
+
+    assert.deepEqual(planning.resumed, ["plan-1", "plan-1"]);
+    assert.deepEqual(
+      Object.keys(planning).filter((key) => key !== "resumed"),
+      ["resume"],
+      "the planning port exposes more than resume, so a duplicate start became expressible",
+    );
+  });
+});
+
+describe("TASK-014 AC-6: no AI launch through the isolated child", () => {
+  const EXECUTOR_SRC = readFileSync(
+    join(process.cwd(), "src/supervision/planBackedExecutor.ts"),
+    "utf8",
+  );
+
+  /**
+   * Only the lines that actually create a dependency.
+   *
+   * The IMPORT boundary, not any mention of the name. The first version of
+   * this asserted the string was absent entirely and failed on the module's own
+   * comment explaining that the isolated executor already applies the no-throw
+   * rule. A guard that cannot tell a dependency from a documentation reference
+   * would force the documentation to be deleted to satisfy it -- the same
+   * distinction the commit-attribution rule makes between a trailer line and a
+   * mention of one.
+   */
+  const IMPORT_LINE = new RegExp("^\\s*import\\b");
+
+  function importLines(source: string): readonly string[] {
+    return source.split(String.fromCharCode(10)).filter((line) => IMPORT_LINE.test(line));
+  }
+
+  /**
+   * The isolated child is denied credentials on purpose (L-3), so it performs
+   * DETERMINISTIC work only. Routing an AI launch through it would either fail
+   * or require restoring the capability TASK-011 exists to remove.
+   */
+  it("does not import the isolated executor", () => {
+    assert.deepEqual(
+      importLines(EXECUTOR_SRC).filter((line) => line.includes("isolatedExecutor")),
+      [],
+      "the plan-backed executor can reach the isolated child",
+    );
+  });
+
+  it("does not import or spawn a child process", () => {
+    assert.deepEqual(
+      importLines(EXECUTOR_SRC).filter((line) => line.includes("child_process")),
+      [],
+      "the plan-backed executor can spawn a process",
+    );
+    assert.ok(
+      !EXECUTOR_SRC.includes("spawnSync(") && !EXECUTOR_SRC.includes("execFileSync("),
+      "a launch call site exists in the plan-backed executor",
+    );
+  });
+});
+
+describe("TASK-014: an unconfigured supervisor is honest rather than stubbed", () => {
+  /**
+   * The behaviour the removed stub used to hard-code now comes out of the real
+   * executor. That is the whole point of AC-1: the same code runs in both
+   * deployments, and the difference is configuration rather than which class
+   * was wired.
+   */
+  it("reports that a human must author a plan when no plan is found", async () => {
+    const executor = createPlanBackedExecutor({
+      plans: lookup(undefined),
+      clock: CLOCK,
+    });
+
+    const outcome = await executor.execute(input());
+    assert.equal(outcome.kind, "HUMAN_REQUIRED");
+    assert.equal(outcome.kind === "HUMAN_REQUIRED" ? outcome.action.kind : "", "AUTHOR_PLAN");
+  });
+
+  /**
+   * And an APPROVED plan with no planning wired says exactly that, rather than
+   * claiming the work is done or that approval is missing. An unconfigured
+   * deployment must not be able to look like a completed one.
+   */
+  it("refuses to claim progress on an approved plan it cannot drive", async () => {
+    const executor = createPlanBackedExecutor({
+      plans: lookup(planWith("APPROVED")),
+      clock: CLOCK,
+    });
+
+    const outcome = await executor.execute(input());
+    assert.equal(outcome.kind, "HUMAN_REQUIRED");
+    assert.match(
+      outcome.kind === "HUMAN_REQUIRED" ? outcome.detail : "",
+      /no planning configuration/,
+    );
+    assert.notEqual(outcome.kind, "COMPLETED");
   });
 });

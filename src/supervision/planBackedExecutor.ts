@@ -63,7 +63,20 @@ export interface PlanAdvancer {
 
 export interface PlanBackedExecutorDeps {
   readonly plans: RoadmapPlanLookup;
-  readonly planning: PlanAdvancer;
+  /**
+   * OPTIONAL, and the absence is a real deployment rather than a gap.
+   *
+   * Driving a plan needs the whole TASK-005 construction — planner worker, loop
+   * dispatcher, workspace, verification commands — which the supervisor CLI only
+   * has when an operator supplies a planning configuration. Without one, an
+   * approved plan is reported as needing a human instead of being driven.
+   *
+   * This is why the CLI can stop wiring `createUnimplementedExecutor` (AC-1)
+   * without pretending to capabilities it lacks: the SAME executor runs in both
+   * deployments, and the honest answer for an unconfigured supervisor comes out
+   * of the real path rather than a stub that hard-codes it.
+   */
+  readonly planning?: PlanAdvancer;
   readonly clock: Clock;
   readonly log?: (line: string) => void;
 }
@@ -202,6 +215,14 @@ export function createPlanBackedExecutor(deps: PlanBackedExecutorDeps): WorkExec
 
         if (!DRIVABLE.includes(plan.phase)) {
           return outcomeForPhase(input.item, plan, input, deps.clock);
+        }
+
+        if (deps.planning === undefined) {
+          return humanRequired(
+            input.item,
+            "CONFIGURE_PLANNING",
+            `plan ${plan.id} is ${plan.phase} but this supervisor has no planning configuration, so it cannot drive the engineering loop`,
+          );
         }
 
         // Approved: hand it to planning, which owns every transition from here.

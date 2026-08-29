@@ -27,8 +27,9 @@ import { boundedDiagnostic } from "../supervision/resourceClassifier.js";
 import { reconcileRoadmapWithCatalog } from "../supervision/roadmapCatalog.js";
 import { DEFAULT_ROADMAP } from "../supervision/supervisorTypes.js";
 import { verifyAgainstAnchor } from "../supervision/provenanceChain.js";
+import { createPlanBackedExecutor } from "../supervision/planBackedExecutor.js";
 import { SupervisorService, type TickResult } from "../supervision/supervisorService.js";
-import type { WorkExecutionInput, WorkExecutor, WorkOutcome } from "../supervision/supervisorPorts.js";
+import type { WorkExecutor } from "../supervision/supervisorPorts.js";
 import { ESCALATION_REASONS, type EscalationReason, type SupervisorState } from "../supervision/supervisorTypes.js";
 import { systemClock } from "../ports/clock.js";
 
@@ -106,39 +107,51 @@ function openForReading(options: SuperviseCliOptions, log: (line: string) => voi
 }
 
 /**
- * The executor the shipped CLI wires in.
+ * The executor the shipped CLI wires in (TASK-014 AC-1).
  *
- * TASK-006 builds the SCHEDULER, not a new way to do work: driving TASK-005
- * planning and the TASK-004 loop from a roadmap item is the next roadmap task's
- * job, and inventing it here would be exactly the "second engineering loop"
- * every previous task refused to build.
+ * `createUnimplementedExecutor` used to live here and answered every roadmap
+ * item with `HUMAN_REQUIRED / AUTHOR_PLAN`. That was honest when nothing
+ * connected the queue to TASK-005 planning, and it is not honest any more:
+ * `createPlanBackedExecutor` is that connection.
  *
- * So this reports honestly that a human-authored plan is required for the item,
- * rather than pretending to execute it. Every other part of the supervisor —
- * resource states, waiting, backoff, gating, checkpointing, escalation — is
- * fully live.
+ * WHAT CHANGES AND WHAT DOES NOT. A supervisor with no planning configuration
+ * still reports that a human must author a plan — but it reaches that answer
+ * through the REAL executor by finding no plan, rather than through a stub that
+ * hard-codes the reply. A supervisor given a plan database finds an approved
+ * plan and reports its actual state. Nothing here can approve one: approval is
+ * `PLAN_APPROVAL`, a protected gate under C1, and this path holds no token.
+ *
+ * The lookup is `undefined` until a planning configuration exists, which is a
+ * deployment fact rather than a placeholder: the binding from a roadmap key to
+ * a plan is TASK-005 configuration, and inventing one here would put a
+ * convention in the CLI that belongs in the planning layer.
  */
-function createUnimplementedExecutor(): WorkExecutor {
-  return {
-    async execute(input: WorkExecutionInput): Promise<WorkOutcome> {
-      return {
-        kind: "HUMAN_REQUIRED",
-        action: {
-          kind: "AUTHOR_PLAN",
-          description: `roadmap item ${input.item.key} ("${input.item.title}") needs an approved plan before it can be executed`,
-        },
-        detail:
-          "the supervisor schedules work; turning a roadmap item into an approved plan is TASK-005's job and is not yet wired to the queue",
-      };
+function createSupervisorExecutor(log: (line: string) => void): WorkExecutor {
+  return createPlanBackedExecutor({
+    plans: {
+      /**
+       * No planning configuration is wired into `sf supervise` yet, so no plan
+       * is ever found and every item reports that a human must author one.
+       *
+       * Stated as a lookup that answers honestly rather than as a stub that
+       * answers unconditionally, because the difference is exactly what AC-1
+       * asks for: when a plan database is wired here, this becomes the only
+       * thing that changes.
+       */
+      async findPlanForItem() {
+        return undefined;
+      },
     },
-  };
+    clock: systemClock,
+    log,
+  });
 }
 
 function buildService(repository: SqliteSupervisorRepository, log: (line: string) => void): SupervisorService {
   return new SupervisorService({
     repository,
     probe: createCliResourceProbe({ processRunner: createNodeProcessRunner(), cwd: process.cwd() }),
-    executor: createUnimplementedExecutor(),
+    executor: createSupervisorExecutor(log),
     clock: systemClock,
     ids: createSequentialIdGenerator(),
     routingPolicy: DEFAULT_ROUTING_POLICY,
