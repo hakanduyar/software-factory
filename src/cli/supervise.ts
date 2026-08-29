@@ -11,7 +11,7 @@
  * they never probe a provider, never launch a worker and never write.
  */
 
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
 import { createCliResourceProbe } from "../adapters/supervision/cliResourceProbe.js";
@@ -27,7 +27,13 @@ import { boundedDiagnostic } from "../supervision/resourceClassifier.js";
 import { reconcileRoadmapWithCatalog } from "../supervision/roadmapCatalog.js";
 import { DEFAULT_ROADMAP } from "../supervision/supervisorTypes.js";
 import { verifyAgainstAnchor } from "../supervision/provenanceChain.js";
-import { createPlanBackedExecutor } from "../supervision/planBackedExecutor.js";
+import { createSqlitePlanRepository } from "../adapters/planning/sqlitePlanRepository.js";
+import { DEFAULT_PLANS_DB_PATH, openPlanningForSupervisor } from "./plan.js";
+import {
+  createPlanBackedExecutor,
+  type PlanAdvancer,
+  type RoadmapPlanLookup,
+} from "../supervision/planBackedExecutor.js";
 import { SupervisorService, type TickResult } from "../supervision/supervisorService.js";
 import type { WorkExecutor } from "../supervision/supervisorPorts.js";
 import { ESCALATION_REASONS, type EscalationReason, type SupervisorState } from "../supervision/supervisorTypes.js";
@@ -38,6 +44,26 @@ const DEFAULT_SUPERVISOR_DB_PATH = ".factory/supervisor.db";
 export interface SuperviseCliOptions {
   readonly supervisorDbPath?: string;
   readonly log?: (line: string) => void;
+  /**
+   * The same `--config` file `sf plan` takes. Supplying it is what makes this
+   * supervisor able to DRIVE an approved plan rather than only report that one
+   * is needed.
+   */
+  readonly planConfigPath?: string;
+  /**
+   * Which approved plan serves which roadmap item, declared by a human.
+   *
+   * NOT a convention derived from the plan's intent text. A plan's `requestKey`
+   * comes from the human's goal and carries no roadmap linkage, so any
+   * automatic binding would be a guess this layer invented. Binding an approved
+   * plan to a roadmap item is a decision that belongs beside the approval
+   * itself, which C1 already reserves to a person.
+   *
+   * Shape: `{ "EXECUTOR_WIRING": "plan-abc123" }`.
+   */
+  readonly roadmapPlansPath?: string;
+  /** Where the plans database lives; defaults as `sf plan` does. */
+  readonly plansDbPath?: string;
 }
 
 /**
@@ -111,47 +137,113 @@ function openForReading(options: SuperviseCliOptions, log: (line: string) => voi
  *
  * `createUnimplementedExecutor` used to live here and answered every roadmap
  * item with `HUMAN_REQUIRED / AUTHOR_PLAN`. That was honest when nothing
- * connected the queue to TASK-005 planning, and it is not honest any more:
- * `createPlanBackedExecutor` is that connection.
+ * connected the queue to TASK-005 planning, and it is not honest any more.
  *
- * WHAT CHANGES AND WHAT DOES NOT. A supervisor with no planning configuration
- * still reports that a human must author a plan — but it reaches that answer
- * through the REAL executor by finding no plan, rather than through a stub that
- * hard-codes the reply. A supervisor given a plan database finds an approved
- * plan and reports its actual state. Nothing here can approve one: approval is
- * `PLAN_APPROVAL`, a protected gate under C1, and this path holds no token.
+ * WITH a plan configuration and a roadmap-to-plan binding, this supervisor
+ * finds the approved plan for an item and drives it through the real
+ * `PlanningService`, which dispatches into the TASK-004 loop. WITHOUT them it
+ * finds no plan and reports that a human must author one -- the same words the
+ * old stub produced, but reached by the real code path rather than hard-coded,
+ * and the difference becomes visible the moment a configuration exists.
  *
- * The lookup is `undefined` until a planning configuration exists, which is a
- * deployment fact rather than a placeholder: the binding from a roadmap key to
- * a plan is TASK-005 configuration, and inventing one here would put a
- * convention in the CLI that belongs in the planning layer.
+ * Nothing here can approve a plan. Approval is `PLAN_APPROVAL`, a protected
+ * gate under C1, and this path holds no `TrustedHumanToken`.
  */
-function createSupervisorExecutor(log: (line: string) => void): WorkExecutor {
-  return createPlanBackedExecutor({
-    plans: {
-      /**
-       * No planning configuration is wired into `sf supervise` yet, so no plan
-       * is ever found and every item reports that a human must author one.
-       *
-       * Stated as a lookup that answers honestly rather than as a stub that
-       * answers unconditionally, because the difference is exactly what AC-1
-       * asks for: when a plan database is wired here, this becomes the only
-       * thing that changes.
-       */
-      async findPlanForItem() {
-        return undefined;
-      },
-    },
-    clock: systemClock,
-    log,
-  });
+function readRoadmapPlanBindings(path: string): Readonly<Record<string, string>> {
+  const raw = JSON.parse(readFileSync(resolve(path), "utf8")) as unknown;
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error(`--roadmap-plans "${path}" must be a JSON object of roadmapKey -> planId`);
+  }
+  const bindings: Record<string, string> = {};
+  for (const [key, value] of Object.entries(raw)) {
+    if (typeof value !== "string" || value.length === 0) {
+      throw new Error(`--roadmap-plans entry "${key}" must be a non-empty plan id`);
+    }
+    bindings[key] = value;
+  }
+  return bindings;
 }
 
-function buildService(repository: SqliteSupervisorRepository, log: (line: string) => void): SupervisorService {
+interface SupervisorExecutorWiring {
+  readonly executor: WorkExecutor;
+  close(): void;
+}
+
+/**
+ * FINDING A PLAN AND DRIVING ONE ARE SEPARATE CAPABILITIES, and separating them
+ * was forced by evidence rather than taste.
+ *
+ * They were one option, so a supervisor could not look up a plan without the
+ * entire planning stack -- planner worker, loop dispatcher, workspace. That
+ * made the unconfigured and stub behaviours observationally IDENTICAL, and
+ * round-1 review proved the consequence: a mutation that constructed the real
+ * executor, discarded it, and returned the old stub passed every test. Nothing
+ * could distinguish them because nothing could reach a configuration where they
+ * differ.
+ *
+ * Now `--roadmap-plans` (with the plans database) is enough to FIND a plan and
+ * report its real state, and `--plan-config` is additionally required to DRIVE
+ * one. A supervisor that can see a blocked plan and say so is already doing
+ * something no stub can.
+ */
+function createSupervisorExecutor(
+  options: SuperviseCliOptions,
+  log: (line: string) => void,
+): SupervisorExecutorWiring {
+  const closers: (() => void)[] = [];
+
+  let lookup: RoadmapPlanLookup = {
+    async findPlanForItem() {
+      return undefined;
+    },
+  };
+  if (options.roadmapPlansPath !== undefined) {
+    const bindings = readRoadmapPlanBindings(options.roadmapPlansPath);
+    const plansDbPath = resolve(
+      options.plansDbPath ?? process.env["FACTORY_PLANS_DB_PATH"] ?? DEFAULT_PLANS_DB_PATH,
+    );
+    mkdirSync(dirname(plansDbPath), { recursive: true });
+    const plans = createSqlitePlanRepository(plansDbPath);
+    closers.push(() => plans.close());
+    lookup = {
+      async findPlanForItem(item) {
+        const planId = bindings[item.key];
+        return planId === undefined ? undefined : plans.findById(planId);
+      },
+    };
+  }
+
+  let planning: PlanAdvancer | undefined;
+  if (options.planConfigPath !== undefined) {
+    const opened = openPlanningForSupervisor(options.planConfigPath, { log });
+    closers.push(() => opened.close());
+    planning = opened.service;
+  }
+
+  return {
+    executor: createPlanBackedExecutor({
+      plans: lookup,
+      ...(planning === undefined ? {} : { planning }),
+      clock: systemClock,
+      log,
+    }),
+    close(): void {
+      for (const close of closers.reverse()) {
+        close();
+      }
+    },
+  };
+}
+
+function buildService(
+  repository: SqliteSupervisorRepository,
+  log: (line: string) => void,
+  executor: WorkExecutor,
+): SupervisorService {
   return new SupervisorService({
     repository,
     probe: createCliResourceProbe({ processRunner: createNodeProcessRunner(), cwd: process.cwd() }),
-    executor: createSupervisorExecutor(log),
+    executor,
     clock: systemClock,
     ids: createSequentialIdGenerator(),
     routingPolicy: DEFAULT_ROUTING_POLICY,
@@ -243,8 +335,14 @@ export async function runSuperviseBlock(options: SuperviseBlockOptions): Promise
   }
 
   const repository = openRepository(options);
+  /**
+   * Recording a blocker never executes work, so the wiring is opened and closed
+   * around it rather than special-cased: one construction path means the
+   * blocker command cannot drift into a different executor from the tick.
+   */
+  const wiring = createSupervisorExecutor(options, log);
   try {
-    const service = buildService(repository, log);
+    const service = buildService(repository, log, wiring.executor);
     const result = await service.recordBlocker({
       roadmapKey: options.roadmapKey,
       reason: options.reason as EscalationReason,
@@ -260,6 +358,7 @@ export async function runSuperviseBlock(options: SuperviseBlockOptions): Promise
     log(`detail     : ${safe(options.detail)}`);
     return 0;
   } finally {
+    wiring.close();
     repository.close();
   }
 }
@@ -267,11 +366,13 @@ export async function runSuperviseBlock(options: SuperviseBlockOptions): Promise
 export async function runSuperviseTick(options: SuperviseCliOptions = {}): Promise<TickResult> {
   const log = options.log ?? ((line: string): void => console.log(line));
   const repository = openRepository(options);
+  const wiring = createSupervisorExecutor(options, log);
   try {
-    const result = await buildService(repository, log).tick();
+    const result = await buildService(repository, log, wiring.executor).tick();
     describeTick(result, log);
     return result;
   } finally {
+    wiring.close();
     repository.close();
   }
 }

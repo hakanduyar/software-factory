@@ -143,10 +143,21 @@ function outcomeForPhase(
     };
   }
   if (TERMINAL_UNSUCCESSFUL.includes(plan.phase)) {
+    /**
+     * THE LOOP'S REASON, not just the phase (round-1 finding 2).
+     *
+     * `PlanningService` records WHY a plan blocked -- "verifier failed for
+     * command test", the loop phase that ended it, the work item -- in
+     * `failureReason`. Reporting only `BLOCKED` throws that away at exactly the
+     * moment a human is being asked to decide something, and the supervisor's
+     * escalation record is the last place that detail could still be useful.
+     */
     return humanRequired(
       item,
       "REVIEW_PLAN",
-      `plan ${plan.id} is ${plan.phase} and cannot proceed without a human decision`,
+      plan.failureReason === undefined
+        ? `plan ${plan.id} is ${plan.phase} and cannot proceed without a human decision`
+        : `plan ${plan.id} is ${plan.phase} and cannot proceed without a human decision: ${plan.failureReason}`,
     );
   }
   if (AWAITING_HUMAN.includes(plan.phase)) {

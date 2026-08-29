@@ -55,7 +55,7 @@ import { systemClock } from "../ports/clock.js";
 
 const DEFAULT_FACTORY_DB_PATH = ".factory-data/factory.db";
 const DEFAULT_LOOPS_DB_PATH = ".factory-data/loops.db";
-const DEFAULT_PLANS_DB_PATH = ".factory-data/plans.db";
+export const DEFAULT_PLANS_DB_PATH = ".factory-data/plans.db";
 /** Fixture-scale credential, same posture as `sf loop`'s: never a real secret (C6). */
 const CLI_CREDENTIAL = "sf-plan-local-operator-secret";
 
@@ -464,6 +464,40 @@ function openStores(
   });
   return { store, loops, plans, factory, service };
   }
+}
+
+/**
+ * Planning, opened for the SUPERVISOR (TASK-014).
+ *
+ * `sf supervise` needs the same construction `sf plan` performs -- planner
+ * worker, loop dispatcher, workspace, verification commands -- because driving
+ * an approved plan means driving the real TASK-004 loop. Exported here rather
+ * than rebuilt there so the two CLIs cannot drift into two different planning
+ * stacks, which is the "second engineering loop" failure one layer up.
+ *
+ * The caller owns the handles and must `close()` them.
+ */
+export interface SupervisorPlanning {
+  readonly plans: SqlitePlanRepository;
+  readonly service: PlanningService;
+  close(): void;
+}
+
+export function openPlanningForSupervisor(
+  configPath: string,
+  options: PlanCliOptions = {},
+): SupervisorPlanning {
+  const config = loadPlanConfig(configPath);
+  const stores = openWithConfig(options, config);
+  return {
+    plans: stores.plans,
+    service: stores.service,
+    close(): void {
+      stores.plans.close();
+      stores.loops.close();
+      stores.store.close();
+    },
+  };
 }
 
 /** `sf plan start`: the configuration comes from the `--config` file the operator supplied. */

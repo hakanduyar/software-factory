@@ -8,20 +8,32 @@
  */
 
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, it } from "node:test";
+import { after, describe, it } from "node:test";
 
 import {
   createPlanBackedExecutor,
   type PlanAdvancer,
   type RoadmapPlanLookup,
 } from "../src/supervision/planBackedExecutor.js";
-import type { Plan, PlanPhase } from "../src/planning/planTypes.js";
+import { createSqlitePlanRepository } from "../src/adapters/planning/sqlitePlanRepository.js";
+import { computePlanContentDigest } from "../src/planning/planDigest.js";
+import type { Plan, PlanPhase, PlannedWorkItem } from "../src/planning/planTypes.js";
 import type { WorkExecutionInput } from "../src/supervision/supervisorPorts.js";
 import type { RoadmapItem } from "../src/supervision/supervisorTypes.js";
 
+import { runSuperviseTick } from "../src/cli/supervise.js";
+import { approvedPlan, newPlanning } from "./support/planFixtures.js";
 import type { Timestamp } from "../src/domain/time.js";
+
+const created: string[] = [];
+after(() => {
+  for (const path of created) {
+    rmSync(path, { recursive: true, force: true });
+  }
+});
 
 const CLOCK = { now: (): Timestamp => 1756449600000 as Timestamp };
 
@@ -55,6 +67,78 @@ function advancer(result: Plan): PlanAdvancer & { resumed: string[] } {
       resumed.push(planId);
       return result;
     },
+  };
+}
+
+
+/**
+ * A genuinely valid BLOCKED plan, with the loop's real failure reason on it.
+ *
+ * Shaped after tests/planHardening.test.ts's `validPlan` so the digests are
+ * really computed rather than stubbed -- the SQLite repository refuses a plan
+ * whose content digest does not match, so a hand-waved fixture would fail to
+ * persist and the test would pass for the wrong reason.
+ */
+function blockedPlanFixture(): Plan {
+  const item: PlannedWorkItem = {
+    key: "WI-A",
+    title: "Do the thing",
+    type: "FEATURE",
+    priority: "P2",
+    spec: "Implement the thing.",
+    acceptanceCriteria: [{ text: "It works", verificationHint: "npm test" }],
+    dependsOn: [],
+  };
+  const contentDigest = computePlanContentDigest({
+    revision: 1,
+    summary: "Deliver it.",
+    assumptions: [],
+    constraints: [],
+    risks: [],
+    items: [item],
+  });
+  return {
+    id: "plan-blocked-1",
+    projectId: "prj-0001",
+    requestKey: "req-blocked-1",
+    version: 1,
+    phase: "BLOCKED",
+    failureReason: "verifier failed for command test",
+    intent: "Build the thing.",
+    declaredConstraints: [],
+    budget: { maxPlannerAttempts: 2, maxClarificationCycles: 2, maxTotalPlannerRuns: 6 },
+    planner: { tool: "scripted", model: "test" },
+    execution: {
+      implementer: { tool: "scripted", model: "impl" },
+      reviewer: { tool: "scripted", model: "rev" },
+      verificationCommands: [{ id: "check", executable: "node", argv: ["-e", "0"] }],
+      workspaceRoot: "/tmp/ws",
+    },
+    revisions: [
+      {
+        revision: 1,
+        summary: "Deliver it.",
+        assumptions: [],
+        constraints: [],
+        risks: [],
+        items: [item],
+        contentDigest,
+        plannerRunRef: "plan-blocked-1:r1:planner:a1",
+        generatedAt: 0,
+      },
+    ],
+    openQuestions: [],
+    answers: [],
+    attemptsForCurrentRevision: 0,
+    clarificationCycles: 0,
+    totalPlannerRuns: 1,
+    materialized: [],
+    dispatches: [],
+    cancelRequested: false,
+    events: [{ seq: 1, kind: "REQUEST_CREATED", detail: "created", at: 0 }],
+    startedBy: { id: "user:test", kind: "HUMAN", displayName: "Test Human" },
+    startedAt: 0,
+    lastTransitionAt: 0,
   };
 }
 
@@ -260,55 +344,118 @@ describe("TASK-014: the checkpoint carries state rather than inventing it", () =
 });
 
 describe("TASK-014 AC-1: the SHIPPED CLI construction path", () => {
-  const SUPERVISE = readFileSync(join(process.cwd(), "src/cli/supervise.ts"), "utf8");
-
   /**
-   * Asserted against the SOURCE the CLI actually ships, not against a test
-   * double. `buildService` is not exported — deliberately, it is CLI wiring —
-   * so the check is that the shipped file constructs the real executor and no
-   * longer defines the stub.
+   * BEHAVIOURAL, AND AT A CONFIGURATION WHERE A STUB CANNOT FOLLOW.
    *
-   * The repository already uses this shape where behaviour is a property of
-   * wiring rather than of a callable unit: a test that asserted a double was
-   * constructed would prove nothing about what `sf supervise` runs.
+   * Round-1 review compiled a mutation that constructed
+   * `createPlanBackedExecutor`, DISCARDED it, and returned the old stub -- and
+   * every test passed. The first repair made the test behavioural and it STILL
+   * passed, because with no planning configured the real executor and the stub
+   * produce the same answer: HUMAN_REQUIRED / AUTHOR_PLAN. No black-box test at
+   * that configuration can tell them apart, so the test was not the problem.
+   *
+   * What was wrong was the wiring: finding a plan required the whole planning
+   * stack. Now `--roadmap-plans` alone is enough to FIND a plan and report its
+   * real state, so this drives `runSuperviseTick` against a plans database
+   * holding a BLOCKED plan bound to a roadmap item. The real executor reports
+   * that plan and its failure reason. A stub that answers AUTHOR_PLAN for
+   * everything cannot.
    */
-  it("constructs the plan-backed executor", () => {
-    assert.match(SUPERVISE, /createPlanBackedExecutor\(/, "the CLI does not construct the real executor");
-    assert.match(SUPERVISE, /executor: createSupervisorExecutor\(/, "the service is not given it");
-  });
+  it("reports a bound plan's real state, which a stub cannot", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "sf-supervise-ac1-"));
+    created.push(dir);
 
-  it("no longer DEFINES the unimplemented stub", () => {
-    assert.doesNotMatch(
-      SUPERVISE,
-      /function createUnimplementedExecutor/,
-      "the stub is still defined, so the CLI can still be wired to it",
+    const plansDbPath = join(dir, "plans.db");
+    const plans = createSqlitePlanRepository(plansDbPath);
+    try {
+      await plans.create(blockedPlanFixture());
+    } finally {
+      plans.close();
+    }
+
+    const bindingsPath = join(dir, "roadmap-plans.json");
+    writeFileSync(bindingsPath, JSON.stringify({ LOCAL_24_7_RUNTIME: "plan-blocked-1" }));
+
+    const lines: string[] = [];
+    await runSuperviseTick({
+      supervisorDbPath: join(dir, "supervisor.db"),
+      plansDbPath,
+      roadmapPlansPath: bindingsPath,
+      log: (line) => lines.push(line),
+    });
+
+    const output = lines.join(String.fromCharCode(10));
+    assert.match(
+      output,
+      /plan-blocked-1/,
+      `the supervisor never reached the bound plan, so a stub would behave identically:${String.fromCharCode(10)}${output}`,
+    );
+  });
+});
+
+describe("TASK-014 AC-4: dispatch is idempotent through the REAL planning seam", () => {
+  /**
+   * THE INTEGRATION PROOF, replacing a structural argument.
+   *
+   * Round-1 review was right that counting `resume()` on a fake advancer proves
+   * nothing about duplicate loops: it never touches `LoopDispatcher`, which is
+   * where adoption-versus-start is actually decided. The structural claim -- the
+   * executor cannot start a loop because `PlanAdvancer` has one method -- is
+   * true and is still worth stating, but it is an argument about the seam rather
+   * than evidence about the system.
+   *
+   * So this drives the REAL `PlanningService` against the scripted dispatcher,
+   * which enforces the same one-loop-per-work-item rule TASK-004's database
+   * enforces with a constraint, and counts `start()` across two executions of
+   * the same roadmap item.
+   */
+  it("executes the same item twice and starts exactly one loop", async () => {
+    const context = await newPlanning();
+    const plan = await approvedPlan(context);
+
+    const executor = createPlanBackedExecutor({
+      plans: { async findPlanForItem() { return context.plans.findById(plan.id); } },
+      planning: context.service,
+      clock: CLOCK,
+    });
+
+    const startsAfterApproval = context.dispatcher.startCount();
+    const first = await executor.execute(input());
+    const second = await executor.execute(input());
+
+    /**
+     * THE EXECUTOR MUST ACTUALLY HAVE DRIVEN SOMETHING.
+     *
+     * Without this the case is vacuous: `approvedPlan` already dispatches, so
+     * "the count did not change" is equally true of an executor that did
+     * nothing at all. Asserting it reached the plan is what makes the count
+     * meaningful -- the fourth shape, caught in this test before review had to.
+     */
+    for (const [label, outcome] of [["first", first], ["second", second]] as const) {
+      assert.notEqual(
+        outcome.kind,
+        "HUMAN_REQUIRED",
+        `the ${label} execution never drove the approved plan, so the start count proves nothing`,
+      );
+    }
+
+    assert.equal(
+      context.dispatcher.startCount(),
+      startsAfterApproval,
+      "executing the same roadmap item twice started another loop",
+    );
+    assert.ok(
+      context.dispatcher.startCount() <= 1,
+      "more than one loop exists for a single work item",
     );
   });
 
   /**
-   * The stub is allowed to be MENTIONED — the comment explaining what changed
-   * is worth keeping. This pins the distinction so a future reader does not
-   * "tidy" the prose away and think they have restored something.
+   * And the seam still cannot express a start at all: `PlanAdvancer` has one
+   * method. Kept alongside the integration proof rather than instead of it --
+   * the structural fact explains WHY the count stays put.
    */
-  it("still explains what it replaced", () => {
-    assert.match(SUPERVISE, /createUnimplementedExecutor` used to live here/);
-  });
-});
-
-describe("TASK-014 AC-4: the executor cannot start a duplicate loop", () => {
-  /**
-   * STRUCTURAL, which is stronger than counting.
-   *
-   * AC-4 asks that an existing loop be adopted rather than started again. This
-   * executor cannot start a loop AT ALL: `PlanAdvancer` exposes exactly one
-   * method, `resume`. Adoption-versus-start is `PlanningService`'s decision,
-   * made through `LoopDispatcher.find`, and that is accepted work with its own
-   * tests.
-   *
-   * So the proof here is that repeated execution produces repeated RESUME and
-   * nothing else — a duplicate start is not something this seam can express.
-   */
-  it("resumes on every execution and has no way to start", async () => {
+  it("exposes no way to start a loop", async () => {
     const planning = advancer(planWith("EXECUTING"));
     const executor = createPlanBackedExecutor({
       plans: lookup(planWith("APPROVED")),
@@ -345,10 +492,18 @@ describe("TASK-014 AC-6: no AI launch through the isolated child", () => {
    * distinction the commit-attribution rule makes between a trailer line and a
    * mention of one.
    */
-  const IMPORT_LINE = new RegExp("^\\s*import\\b");
 
-  function importLines(source: string): readonly string[] {
-    return source.split(String.fromCharCode(10)).filter((line) => IMPORT_LINE.test(line));
+  /**
+   * The whole import SECTION, not line-by-line.
+   *
+   * Round-1 review hid `createIsolatedExecutor` in a MULTILINE import and the
+   * line-based scanner missed it: only the first line of an import statement
+   * starts with `import`, so a continuation line was invisible. Everything
+   * before the first non-import top-level statement is examined instead.
+   */
+  function importSection(source: string): string {
+    const marker = source.search(new RegExp("^(?:export|const|function|interface|type|class)", "m"));
+    return marker === -1 ? source : source.slice(0, marker);
   }
 
   /**
@@ -358,7 +513,7 @@ describe("TASK-014 AC-6: no AI launch through the isolated child", () => {
    */
   it("does not import the isolated executor", () => {
     assert.deepEqual(
-      importLines(EXECUTOR_SRC).filter((line) => line.includes("isolatedExecutor")),
+      [importSection(EXECUTOR_SRC)].filter((section) => section.includes("isolatedExecutor")),
       [],
       "the plan-backed executor can reach the isolated child",
     );
@@ -366,7 +521,7 @@ describe("TASK-014 AC-6: no AI launch through the isolated child", () => {
 
   it("does not import or spawn a child process", () => {
     assert.deepEqual(
-      importLines(EXECUTOR_SRC).filter((line) => line.includes("child_process")),
+      [importSection(EXECUTOR_SRC)].filter((section) => section.includes("child_process")),
       [],
       "the plan-backed executor can spawn a process",
     );
