@@ -21,6 +21,7 @@ import {
   cpSync,
   existsSync,
   linkSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -2949,6 +2950,20 @@ describe("TASK-010 round 16: an aliased outDir is the same directory", () => {
 
     const { status, output } = runHarness(root);
     assert.notEqual(status, 0, `an outDir resolving outside the repository was accepted:\n${output}`);
+    /**
+     * THE REASON (round-22 HIGH). This asserted only a nonzero status, and the
+     * reviewer satisfied it with an unrelated unconditional `fail()`. A case
+     * that accepts any refusal proves only that the harness can refuse.
+     *
+     * The refusal comes from the CONFIG check comparing the effective `outDir`
+     * against the managed directory — not from a scan — which is the same point
+     * this case's own comment makes about what it does and does not pin.
+     */
+    assert.match(
+      output,
+      /builds into .* but verification manages|is a symlink|outside this repository/,
+      `refused, but not for the reason this case names:\n${output}`,
+    );
   });
 
   /**
@@ -3081,7 +3096,23 @@ describe("TASK-010 round 17: hardlinks inside the repository's own node_modules 
     created.push(external);
     const payload = join(external, "payload.cjs");
     writeFileSync(payload, "module.exports = 1;\n");
-    linkSync(payload, join(root, ".git/objects/payload.cjs"));
+    const planted = join(root, ".git/objects/payload.cjs");
+    linkSync(payload, planted);
+
+    /**
+     * THE CONDITION MUST ACTUALLY EXIST (round-22 note).
+     *
+     * The reviewer deleted the `linkSync` line and this case still passed — it
+     * then asserted only that an ordinary `.git` directory verifies, which is a
+     * different and much weaker claim. An acceptance case is as capable of being
+     * vacuous as a refusal case, and easier to overlook because nothing about a
+     * passing run looks wrong.
+     */
+    assert.equal(
+      lstatSync(planted).nlink,
+      2,
+      "the fixture did not create a hardlink, so this proves nothing about hardlinks",
+    );
 
     const { status, output } = runHarness(root);
     assert.equal(
@@ -3538,5 +3569,113 @@ describe("TASK-010 round 19: an unparseable mount table refuses BEFORE building"
       `the control ran against the real /proc, so it tested nothing:\n${output}`,
     );
     assert.match(output, /HARNESS-EXIT=0/, `a well-formed mount table was refused:\n${output}`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ROUND-22 CRITICAL — a symlink outside every root, required at runtime
+// ---------------------------------------------------------------------------
+
+/**
+ * The reviewer's reproduction: `helpers/payload.cjs` is a symlink to `/tmp`
+ * code, a source test `require`s it at RUNTIME, and the run reported
+ * `tree-consistent` with `STATUS=0 MARKER=yes`. The payload executed.
+ *
+ * Nothing saw it. `findSymlinks` walks only the derived roots;
+ * `linkedCompilerInputs` covers what tsc compiles and a runtime `require` is not
+ * a compiler input; the path is not under `node_modules` (L-10) and is not a
+ * `.git` mount or hardlink (L-11), so it was in no register either.
+ *
+ * Fixed here rather than deferred to TASK-013 because a symlink is OBSERVABLE:
+ * `lstat` reports it and `realpath` resolves it. L-11's boundary is about what
+ * the verifier cannot see from inside — a bind mount, where `lstat` and
+ * `realpath` both agree with the attacker. Deferring an observable defect to a
+ * future clean room would be using the boundary as an excuse.
+ */
+describe("TASK-010 round 22: a symlink that escapes the repository", () => {
+  it("REFUSES a runtime-required symlink outside every derived root", () => {
+    const root = makeFixtureRepo();
+    assert.equal(runHarness(root).status, 0, "the fixture must pass before the link is planted");
+
+    const external = mkdtempSync(join(tmpdir(), "sf-escape-"));
+    created.push(external);
+    const marker = join(external, "EXECUTED");
+    const payload = join(external, "payload.cjs");
+    writeFileSync(
+      payload,
+      `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "yes");\nmodule.exports = 1;\n`,
+    );
+
+    // Outside src/ and tests/, so no derived root covers it; loaded by a runtime
+    // require, so tsc never lists it as an input.
+    mkdirSync(join(root, "helpers"), { recursive: true });
+    symlinkSync(payload, join(root, "helpers/payload.cjs"));
+    writeFileSync(
+      join(root, "tests/loads.test.ts"),
+      [
+        'import assert from "node:assert/strict";',
+        'import { createRequire } from "node:module";',
+        'import { describe, it } from "node:test";',
+        "const req = createRequire(import.meta.url);",
+        'describe("loads", () => {',
+        '  it("loads", () => { assert.equal(req("../../helpers/payload.cjs"), 1); });',
+        "});",
+        "",
+      ].join("\n"),
+    );
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, `an escaping symlink was accepted:\n${output}`);
+    assert.match(
+      output,
+      /symlinks whose target is outside this repository/,
+      `refused, but not by the escaping-symlink guard:\n${output}`,
+    );
+    assert.match(output, /helpers\/payload\.cjs/, "the refusal must name the link");
+    assert.ok(!existsSync(marker), "the payload EXECUTED before the tree was judged");
+  });
+
+  /** The same escape hidden inside an ordinary `.git` DIRECTORY. */
+  it("REFUSES an escaping symlink inside an ordinary .git directory", () => {
+    const root = makeFixtureRepo();
+    mkdirSync(join(root, ".git/objects"), { recursive: true });
+    writeFileSync(join(root, ".git/HEAD"), "ref: refs/heads/main\n");
+
+    const external = mkdtempSync(join(tmpdir(), "sf-gitescape-"));
+    created.push(external);
+    writeFileSync(join(external, "payload.cjs"), "module.exports = 1;\n");
+    symlinkSync(join(external, "payload.cjs"), join(root, ".git/objects/payload.cjs"));
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, `an escaping symlink inside .git was accepted:\n${output}`);
+    assert.match(output, /symlinks whose target is outside this repository/);
+  });
+
+  /**
+   * CONTROL: a symlink resolving INSIDE the repository is not an escape and
+   * must still verify. Without this the guard could become "no symlinks at all",
+   * which refuses ordinary trees — the failure mode that gets a guard disabled.
+   */
+  it("still accepts a symlink whose target is inside the repository", () => {
+    const root = makeFixtureRepo();
+    mkdirSync(join(root, "helpers"), { recursive: true });
+    writeFileSync(join(root, "helpers/real.json"), '{"ok":true}\n');
+    symlinkSync(join(root, "helpers/real.json"), join(root, "helpers/alias.json"));
+
+    const { status, output } = runHarness(root);
+    assert.equal(status, 0, `an internal symlink was refused:\n${output}`);
+    assert.match(output, /tree-consistent/);
+  });
+
+  /**
+   * CONTROL: the shared `node_modules` symlink every fixture uses points OUTSIDE
+   * the repository by construction, and must not be refused. That exclusion is
+   * L-10's documented residue, not an oversight — if this fails, the guard has
+   * been applied to the package store and every real tree is refused.
+   */
+  it("still accepts the shared node_modules symlink, which escapes by design", () => {
+    const root = makeFixtureRepo();
+    const { status, output } = runHarness(root);
+    assert.equal(status, 0, `the shared install was treated as an escape:\n${output}`);
   });
 });

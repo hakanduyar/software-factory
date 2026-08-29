@@ -97,13 +97,18 @@ because the stricter `findHardlinkedSources` scan caught the hardlink anyway.
 The table below is the reviewer's measurement, not the author's recollection.
 
 INDIVIDUALLY PINNED — removing the guard alone must fail the named case, with
-the other cases still passing:
+the other cases still passing. Every entry below was verified by running the
+mutation, not by recalling it; the two rounds where this list was wrong were
+both cases of writing it from memory:
 
   1. root-`node_modules` hardlink scan — "REFUSES a hardlinked payload inside
      the root node_modules"
   2. symlinked-`.git` refusal — "REFUSES a symlinked .git"
-  3. `findHardlinkedSources` scanning every regular file under the derived roots
-     — "REFUSES a hardlinked file under src/dist, which is not the build output"
+  3. `findHardlinkedSources` — SEE THE PAIRS BELOW. This entry claimed the
+     `src/dist` case pins it individually and that is false: the pre-build and
+     post-build calls mask each other, and removing either alone leaves the
+     whole harness green. Measured in round 22, after the round-21 correction to
+     this same entry was itself incomplete.
   4. `excludedFromSourceScan` identity exclusion — "passes with a symlinked
      node_modules when the root is the repository". Removing it does NOT fail the
      `src/dist` case; it makes ORDINARY trees refuse, so the control is what
@@ -129,6 +134,20 @@ a pair whose members mask each other, so no single removal fails anything:
   - the pre-build and post-build symlink scans for non-compiler inputs.
     "REFUSES a symlinked non-source file under a source root" fails only when
     BOTH are removed.
+  - the pre-build and post-build `findHardlinkedSources` calls. Removing EITHER
+    leaves the entire harness green; only removing both fails the `src/dist`
+    case.
+  - the pre-build output hardlink scan (`findHardlinkedUnder(OUTPUT_DIR)`).
+    Removing it fails three other cases but NOT the one this inventory named
+    for it, so it is covered without being pinned by its own case.
+  - `assertEverythingWasReadable("before auditing")`. Removing it leaves all
+    107 harness tests green. It is kept rather than deleted — the sibling
+    `assertEverythingWasRegular("before auditing")` WAS deleted on the same
+    evidence in round 19, and treating the two differently is an inconsistency
+    stated here rather than hidden. Deleting a guard on my own judgement has
+    gone wrong before (round 12 found the case for an ancestor check I had
+    removed on a mutation result), so the conservative option is taken and the
+    question is put to review.
 
 Those are recorded in docs/KNOWN-LIMITATIONS.md L-8, which exists for exactly
 this. A criterion claiming to pin them would be the same defect one level up —

@@ -464,8 +464,22 @@ guards — each member masks the other, so no single removal fails anything:
   symlinked non-source file under a source root" fails only when BOTH are
   removed.
 
-Measured by the round-21 reviewer, not assumed. They are recorded here rather
-than claimed as pinned in TASK-013's AC-5 inventory, because a criterion
+Round 22 found three more, measured by me after the reviewer named them: the
+pre-build and post-build `findHardlinkedSources` calls mask each other (removing
+either leaves the whole harness green); the pre-build output hardlink scan is
+covered by other cases but not by the one named for it; and
+`assertEverythingWasReadable("before auditing")` can be removed with all 107
+harness tests still passing.
+
+That last one is kept rather than deleted, and the inconsistency is deliberate
+and stated: its sibling `assertEverythingWasRegular("before auditing")` was
+deleted on identical evidence in round 19. Deleting a guard on a mutation result
+has gone wrong here before — round 12 produced the case for an ancestor check
+removed exactly that way — so the conservative option is taken and the choice is
+put to review rather than settled unilaterally.
+
+Measured rather than assumed. They are recorded here rather than claimed as
+pinned in TASK-013's AC-5 inventory, because a criterion
 asserting they are individually proven would be an assertion satisfied by
 something other than what it names — the defect this register exists to catch,
 one level up.

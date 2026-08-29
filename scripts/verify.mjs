@@ -370,7 +370,15 @@ function findHardlinkedSources(directory) {
 /**
  * Whether a source scan should refuse to descend into this entry.
  *
- * NOTHING HERE IS MATCHED BY NAME. That rule was wrong three times.
+ * NO DIRECTORY IS EXCLUDED BY NAME ALONE — and note "alone", because the
+ * sentence here has been too absolute twice. `excludedFromSourceScan` DOES
+ * compare the first path component against `node_modules` and `.git`; what it
+ * no longer does is match those names at any DEPTH. A name at the repository
+ * root identifies one specific directory; the same name three levels down
+ * identifies nothing. Round-22 review caught the previous wording still
+ * claiming more than the code does.
+ *
+ * The rule that was wrong three times is the one about depth.
  *
  *   Round 11: a compiler input inside a directory skipped by name.
  *   Round 15: `src/dist/data.json`, hardlinked, never scanned, run reported
@@ -1152,6 +1160,77 @@ function hardlinksInsideRootInstalls() {
   return found.sort();
 }
 
+/**
+ * SYMLINKS ANYWHERE IN THE REPOSITORY WHOSE TARGET ESCAPES IT (round-22
+ * CRITICAL).
+ *
+ * The reviewer put `helpers/payload.cjs` — a symlink to `/tmp` code — outside
+ * every derived root, had a source test `require` it at RUNTIME, and the run
+ * reported `verification complete: 1 test files, tree-consistent` with
+ * `STATUS=0 MARKER=yes`. The payload executed.
+ *
+ * Nothing saw it. `findSymlinks` walks only the derived roots.
+ * `linkedCompilerInputs` covers what tsc compiles, and a `.cjs` pulled in by a
+ * runtime `require` is not a compiler input. The path was not under
+ * `node_modules` (L-10) and not a `.git` mount or hardlink (L-11), so it was in
+ * no register either.
+ *
+ * WHY THIS IS FIXED HERE RATHER THAN DEFERRED TO THE CLEAN ROOM. The
+ * architectural boundary in L-11 is about things the verifier CANNOT SEE from
+ * inside: a bind mount IS the path it is mounted at, so `lstat` and `realpath`
+ * both agree with the attacker and only the mount table disagrees. A symlink is
+ * not like that. `lstat` reports it and `realpath` resolves it, so the verifier
+ * can answer the question directly and cheaply. Deferring an observable defect
+ * to a future clean room would be using the boundary as an excuse.
+ *
+ * ONLY ESCAPING links are reported, which is narrower than the source-root scan
+ * (that one refuses every symlink, including internal ones, because a source
+ * root is small and the stricter rule is affordable there). A link resolving
+ * INSIDE the repository moves nothing across the boundary.
+ *
+ * `node_modules` is excluded, and that is L-10 rather than an oversight: a
+ * package store legitimately lives outside the repository, so every symlink in
+ * a pnpm-style install escapes by design. Excluding it is the same trade-off
+ * already recorded there, not a new hole.
+ */
+function escapingSymlinks() {
+  const found = [];
+  const walk = (absolute) => {
+    let entries;
+    try {
+      entries = readdirSync(absolute, { withFileTypes: true });
+    } catch (error) {
+      if (error?.code !== "ENOENT") noteUnreadable(absolute);
+      return;
+    }
+    for (const entry of entries) {
+      const full = join(absolute, entry.name);
+      const rel = relative(REPO_ROOT, full).replace(/\\/g, "/");
+      if (rel === "node_modules" || rel.startsWith("node_modules/")) {
+        continue;
+      }
+      if (entry.isSymbolicLink()) {
+        const target = realOrUndefined(full);
+        if (target === undefined) {
+          // Unresolvable is not harmless: it is a link this process cannot
+          // judge, and an unjudgeable entry is refused rather than assumed safe.
+          found.push(`${rel} (unresolvable)`);
+          continue;
+        }
+        if (relative(REPO_ROOT, target).startsWith("..")) {
+          found.push(rel);
+        }
+        continue;
+      }
+      if (entry.isDirectory()) {
+        walk(full);
+      }
+    }
+  };
+  walk(REPO_ROOT);
+  return found.sort();
+}
+
 const linkedRootInstalls = hardlinksInsideRootInstalls();
 if (linkedRootInstalls.length > 0) {
   fail(
@@ -1175,6 +1254,7 @@ if (linkedSources.length > 0) {
       `${linkedSources.join(", ")}; source must live in this repository`,
   );
 }
+
 const rootDevice = deviceOf(REPO_ROOT);
 const outputDevice = deviceOf(join(REPO_ROOT, OUTPUT_DIR));
 if (outputDevice !== undefined && rootDevice !== undefined && outputDevice !== rootDevice) {
@@ -1347,6 +1427,38 @@ if (outputLinksBeforeBuild.length > 0) {
   fail(
     `verification refused before building: linked entries under ${OUTPUT_DIR}: ` +
       `${outputLinksBeforeBuild.join(", ")}; the build would write through them into files outside this tree`,
+  );
+}
+
+/**
+ * THE CATCH-ALL RUNS LAST, and the ordering was a regression before it was a
+ * decision.
+ *
+ * This repository-wide escape check was placed first and it PREEMPTED the
+ * specific guards: five source-root cases and then the output-link case began
+ * failing — not because their trees were accepted, but because a DIFFERENT
+ * guard refused them, and those assertions name the refusal they exist to
+ * prove. Relaxing them to accept either message would have been fitting the
+ * tests to the implementation, and would have destroyed exactly the specificity
+ * rounds 19 and 21 forced me to add.
+ *
+ * So every SPECIFIC pre-build link rule answers first — the source-root scan,
+ * which refuses even an internal link because a root is small and the stricter
+ * rule is affordable there, and the output-directory scan, which refuses links
+ * the build would write through. This runs afterwards for everything else in
+ * the repository, where only an ESCAPING link matters.
+ *
+ * The general lesson, recorded because it is the shape of five regressions on
+ * this branch: a guard correct in isolation can still be wrong in position. The
+ * AC-5 inventory pins guards individually and says nothing about their order,
+ * which is where these mistakes actually live.
+ */
+const escaping = escapingSymlinks();
+if (escaping.length > 0) {
+  fail(
+    `verification refused before building: symlinks whose target is outside this repository: ` +
+      `${escaping.join(", ")}; a source file can require one at runtime, so the run would ` +
+      "execute code the audit never saw",
   );
 }
 
