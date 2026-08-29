@@ -1,0 +1,13 @@
+#!/bin/sh
+# Reject AI attribution trailers in new commits.
+#
+# Enforcement lives in tests/commitPolicy.test.ts, which runs under `npm test`
+# and cannot be skipped by forgetting to install a hook. This is the early
+# warning, not the guarantee.
+#
+# Install:  git config core.hooksPath scripts/hooks
+if grep -qiE '^[[:space:]]*co[-[:space:]]?authored[-[:space:]]?by[[:space:]]*:.*(claude|anthropic|codex|openai|copilot|chatgpt)' "$1"; then
+  echo "commit-msg: AI attribution trailers are not permitted in new commits." >&2
+  echo "The canonical author of this repository is Hakan Duyar <iamhakanduyar@gmail.com>." >&2
+  exit 1
+fi
