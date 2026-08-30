@@ -39,7 +39,12 @@ import {
   type BillingObservation,
   type SupervisedAction,
 } from "./financialSafety.js";
-import { reconcileReportedIdentity, SUPPORTED_MODELS, type AiRunConfigRecord } from "./modelEnforcement.js";
+import {
+  reconcileReportedIdentity,
+  SUPPORTED_CODEX_EFFORTS,
+  SUPPORTED_MODELS,
+  type AiRunConfigRecord,
+} from "./modelEnforcement.js";
 import { requiresAi, selectResource, type RoutingPolicy } from "./modelRouting.js";
 import {
   anchorFor,
@@ -1022,7 +1027,28 @@ export class SupervisorService {
 
     let declaredResources: readonly RequiredResource[] = [];
     try {
-      declaredResources = (await this.deps.executor.declareResources?.(deepFreeze(structuredClone({ ...item })))) ?? [];
+      /**
+       * READ ONCE, INTO INERT DATA (round-3 finding 3).
+       *
+       * The declaration is data returned by the executor, and it was validated
+       * and then read again — so a property GETTER could answer `opus` to the
+       * validator and `ghost-model` to the authoriser. The reviewer did exactly
+       * that and the action advanced on the ghost model.
+       *
+       * Every field is copied into a plain frozen object here, so validation and
+       * use read the same bytes. This is the same discipline `snapshotIdentity`
+       * already applies to what a worker CLAIMS: a value that can change between
+       * two reads is not evidence.
+       */
+      const raw = (await this.deps.executor.declareResources?.(deepFreeze(structuredClone({ ...item })))) ?? [];
+      declaredResources = deepFreeze(
+        [...raw].map((resource) => ({
+          role: String(resource.role) as RequiredResource["role"],
+          provider: String(resource.provider),
+          model: String(resource.model),
+          ...(resource.effort === undefined ? {} : { effort: String(resource.effort) }),
+        })),
+      );
     } catch (error) {
       // A declaration that cannot be produced is not permission to launch with
       // an empty one: the executor was asked what it needs and could not say.
@@ -1325,24 +1351,57 @@ export class SupervisorService {
               entry.effort === reported.effort,
           );
     /**
-     * THE ROUTED RECORD IS NEVER REWRITTEN.
+     * WHAT RAN IS THE IMPLEMENTER, AND `lastRunConfig` MUST SAY SO (round-3
+     * finding 4).
      *
-     * Substituting a basis is only meaningful for a NON-ROUTED member. When the
-     * report names the routed resource, `runConfig` is already the record for
-     * it — with its real `argvEvidence` — and rebuilding it would replace
-     * genuine launch evidence with an empty list. Caught by the existing
-     * "records the configuration on the item after a completed run" regression,
-     * which is precisely its job.
+     * `excludedReviewerResources` reads BOTH the implementer history and
+     * `lastRunConfig`, and stops when they disagree — correctly, because a row
+     * naming Claude while the run configuration names Codex is exactly the
+     * tampering that guard exists to catch.
+     *
+     * Round-1 fixed the history to name the implementer and left `lastRunConfig`
+     * naming the ROUTED resource, so the two now disagreed BY DESIGN. The
+     * reviewer drove the consequence out: the next dependent independent review
+     * reported "unknown implementer" and refused to launch at all. A C4 gate
+     * that blocks every review is no better than one that permits the wrong
+     * reviewer.
+     *
+     * So when a declaration names an implementer, THAT is the record of what
+     * ran. An action that declares nothing keeps the routed record untouched,
+     * with its real `argvEvidence` — the round-4 regression pins that.
      */
-    const reportsRouted =
-      member !== undefined &&
-      runConfig !== undefined &&
-      member.provider === runConfig.effectiveProvider &&
-      member.model === runConfig.effectiveModel &&
-      member.effort === runConfig.effectiveEffort;
-    const basis =
-      runConfig === undefined || member === undefined || reportsRouted
+    const implementerMember = authorized.find((entry) => entry.role === "implementer");
+    const asRecord = (entry: AuthorizedResource, why: string): AiRunConfigRecord | undefined =>
+      runConfig === undefined
+        ? undefined
+        : {
+            ...runConfig,
+            requestedProvider: entry.provider,
+            requestedModel: entry.model,
+            ...(entry.effort === undefined ? {} : { requestedEffort: entry.effort }),
+            effectiveProvider: entry.provider,
+            effectiveModel: entry.model,
+            ...(entry.effort === undefined ? {} : { effectiveEffort: entry.effort }),
+            // Never the routed argv: it describes a different launch, and
+            // attaching it here would be evidence about a run that did not happen.
+            argvEvidence: [],
+            note: `${runConfig.note}; ${why}`,
+          };
+
+    const implementerBasis =
+      implementerMember === undefined
         ? runConfig
+        : asRecord(implementerMember, "recorded against the declared implementer");
+
+    const sameAsBasis = (entry: AuthorizedResource, record: AiRunConfigRecord | undefined): boolean =>
+      record !== undefined &&
+      entry.provider === record.effectiveProvider &&
+      entry.model === record.effectiveModel &&
+      entry.effort === record.effectiveEffort;
+
+    const basis =
+      runConfig === undefined || member === undefined || sameAsBasis(member, implementerBasis)
+        ? implementerBasis
         : {
             ...runConfig,
             requestedProvider: member.provider,
@@ -2801,14 +2860,35 @@ const ROUTED_ROLE = "routed";
 function describeDeclarationProblem(declared: readonly RequiredResource[]): string | undefined {
   for (const resource of declared) {
     if (!(REQUIRED_RESOURCE_ROLES as readonly string[]).includes(resource.role)) {
-      return `role ${JSON.stringify(boundedDiagnostic(resource.role))} is not one of ${REQUIRED_RESOURCE_ROLES.join(", ")}`;
+      return `role ${JSON.stringify(boundedDiagnostic(String(resource.role)))} is not one of ${REQUIRED_RESOURCE_ROLES.join(", ")}`;
     }
-    const models = SUPPORTED_MODELS[resource.provider as keyof typeof SUPPORTED_MODELS];
-    if (models === undefined) {
+    /**
+     * `Object.hasOwn` RATHER THAN INDEXING (round-3 finding 3).
+     *
+     * A declared provider of `__proto__` resolved to `Object.prototype` through
+     * the index, and the next line then threw
+     * `models.includes is not a function` — an uncontrolled TypeError out of a
+     * validator whose entire job is to produce controlled refusals. Only OWN
+     * properties of the table are providers.
+     */
+    if (!Object.hasOwn(SUPPORTED_MODELS, resource.provider)) {
       return `provider ${JSON.stringify(boundedDiagnostic(resource.provider))} is not a provider this build can launch`;
     }
-    if (!models.includes(resource.model)) {
+    const models = SUPPORTED_MODELS[resource.provider as keyof typeof SUPPORTED_MODELS];
+    if (!Array.isArray(models) || !models.includes(resource.model)) {
       return `model ${JSON.stringify(boundedDiagnostic(resource.model))} is not a supported model for ${resource.provider}`;
+    }
+    /**
+     * EFFORT IS VALIDATED TOO. `not-a-real-effort` was accepted and reached a
+     * launch. `modelEnforcement` refuses an effort it cannot vouch for when it
+     * builds a run configuration, and the set path skipped that entirely — so a
+     * capability this task added was weaker than the path it widened.
+     */
+    if (
+      resource.effort !== undefined &&
+      !(SUPPORTED_CODEX_EFFORTS as readonly string[]).includes(resource.effort)
+    ) {
+      return `effort ${JSON.stringify(boundedDiagnostic(resource.effort))} is not one of ${SUPPORTED_CODEX_EFFORTS.join(", ")}`;
     }
   }
 

@@ -710,7 +710,7 @@ export class PlanningService {
         return finalized;
       }
 
-      const result = await this.stepFor(plan);
+      const result = await this.stepFor(plan, expectApprovedDigest);
       if (result.kind === "conflict") {
         continue;
       }
@@ -721,7 +721,7 @@ export class PlanningService {
     throw new ValidationError(`plan ${planId} did not settle within ${MAX_DRIVE_STEPS} steps; refusing to loop further`);
   }
 
-  private async stepFor(plan: Plan): Promise<StepResult> {
+  private async stepFor(plan: Plan, expectApprovedDigest?: string): Promise<StepResult> {
     switch (plan.phase) {
       case "DRAFT":
       case "PLANNING":
@@ -736,7 +736,7 @@ export class PlanningService {
       case "EXECUTING":
       case "WAITING_FOR_HUMAN":
       case "BLOCKED":
-        return this.stepExecute(plan);
+        return this.stepExecute(plan, expectApprovedDigest);
       default:
         return { kind: "halt", plan };
     }
@@ -1619,7 +1619,7 @@ export class PlanningService {
     return authority.ok;
   }
 
-  private async stepExecute(plan: Plan): Promise<StepResult> {
+  private async stepExecute(plan: Plan, expectApprovedDigest?: string): Promise<StepResult> {
     const problem = await this.authorityProblem(plan, "act");
     if (problem !== undefined) {
       return this.failClosed(plan, `refusing to dispatch: ${problem}`);
@@ -1695,7 +1695,15 @@ export class PlanningService {
       if (!ready) {
         continue;
       }
-      return this.claimAndDispatch(plan, key, mapping.workItemId, item.spec, item.title, item.acceptanceCriteria);
+      return this.claimAndDispatch(
+        plan,
+        key,
+        mapping.workItemId,
+        item.spec,
+        item.title,
+        item.acceptanceCriteria,
+        expectApprovedDigest,
+      );
     }
 
     // Nothing new to dispatch — derive where the plan stands from authoritative
@@ -1746,6 +1754,7 @@ export class PlanningService {
     spec: string,
     title: string,
     acceptanceCriteria: readonly { readonly text: string; readonly verificationHint: string }[],
+    expectApprovedDigest?: string,
   ): Promise<StepResult> {
     // Adopt before starting: combined with TASK-004's database-level
     // one-active-loop-per-work-item constraint, a duplicate loop cannot exist
@@ -1771,6 +1780,33 @@ export class PlanningService {
     const claimed = await this.commit(plan, { ...plan, dispatchClaim: { planItemKey, workItemId, claimedAt: this.clock.now() } }, []);
     if (claimed === undefined) {
       return { kind: "conflict" };
+    }
+
+    /**
+     * THE LAST CHECK BEFORE A WORKER STARTS (TASK-015 round-3 finding 1).
+     *
+     * `drive()` checks the pin at the top of each step, and this method then
+     * commits a claim and starts a worker -- so an approval replaced between
+     * those two moments was launched anyway, and only the NEXT loop read
+     * noticed. The reviewer measured it: two workers started, then the
+     * mismatch threw.
+     *
+     * This is the THIRD place this window has appeared in this task: before
+     * the child, then before `drive()`, now before `start()`. The lesson is
+     * that every re-read is a new opportunity, so the check belongs at the
+     * point of the side effect rather than anywhere upstream of it.
+     *
+     * Re-read from the repository rather than trusting `plan`, because
+     * `plan` is exactly the copy that may have gone stale.
+     */
+    if (expectApprovedDigest !== undefined) {
+      const atStart = await this.plans.findById(plan.id);
+      if (atStart?.approvedDigest !== expectApprovedDigest) {
+        throw new ValidationError(
+          `plan ${plan.id} is no longer the approval that was authorized: expected digest ` +
+            `${expectApprovedDigest}, found ${atStart?.approvedDigest ?? "none"}. Refusing to start a worker.`,
+        );
+      }
     }
 
     const instructions = buildTaskInstructions(title, spec, acceptanceCriteria);

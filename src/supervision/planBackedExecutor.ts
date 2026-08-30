@@ -441,7 +441,23 @@ export function createPlanBackedExecutor(deps: PlanBackedExecutorDeps): WorkExec
          * plan used to say while the child runs what it says now, which is the
          * same defect as authorising X and running Y, arrived at by waiting.
          */
-        const atLaunch = (await deps.plans.findPlanForItem(input.item)) ?? plan;
+        /**
+         * A MISSING RE-READ IS A REFUSAL, NOT A FALLBACK (round-3 finding 2).
+         *
+         * This was `?? plan`, which authorised the STALE copy whenever the fresh
+         * read came back empty — a deleted plan, an unavailable database, a
+         * lookup that failed. The entire point of re-reading is that the earlier
+         * copy is not evidence any more, so falling back to it when the check
+         * cannot be performed is the one thing this line must not do.
+         */
+        const atLaunch = await deps.plans.findPlanForItem(input.item);
+        if (atLaunch === undefined) {
+          return humanRequired(
+            input.item,
+            "RECONCILE_PLAN_BINDING",
+            `plan ${plan.id} could not be re-read immediately before launch, so what would run cannot be checked against what was authorised`,
+          );
+        }
         const rebound = checkPlanBinding(input.item.key, atLaunch);
         if (!rebound.ok) {
           return humanRequired(input.item, "RECONCILE_PLAN_BINDING", rebound.reason);

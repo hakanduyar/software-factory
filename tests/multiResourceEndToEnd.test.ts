@@ -15,29 +15,19 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { after, describe, it } from "node:test";
 
 import { cleanupTempDbs } from "./support/factoryFixtures.js";
 import { newSupervisor, scriptedProbe, seedRoadmap } from "./support/supervisorFixtures.js";
-import { createSqlitePlanRepository } from "../src/adapters/planning/sqlitePlanRepository.js";
-import { approvalDigestOfPlan, computePlanContentDigest } from "../src/planning/planDigest.js";
+import { approvedPlan, newPlanning } from "./support/planFixtures.js";
 import { createPlanBackedExecutor, type PlanAdvancer } from "../src/supervision/planBackedExecutor.js";
-import type { Plan, PlannedWorkItem, PlannerConfig } from "../src/planning/planTypes.js";
+import type { Plan, PlannerConfig } from "../src/planning/planTypes.js";
 import type { RequiredResource, WorkExecutionInput, WorkOutcome } from "../src/supervision/supervisorPorts.js";
 import type { ScriptedExecutor } from "./support/supervisorFixtures.js";
 import type { RoadmapItem } from "../src/supervision/supervisorTypes.js";
 import { systemClock } from "../src/ports/clock.js";
 
-const created: string[] = [];
-after(() => {
-  for (const path of created) {
-    rmSync(path, { recursive: true, force: true });
-  }
-  cleanupTempDbs();
-});
+after(cleanupTempDbs);
 
 const CATALOG = [
   { provider: "claude-code", model: "opus", billingMode: "INCLUDED_SUBSCRIPTION" as const },
@@ -66,109 +56,58 @@ function healthyProbe() {
   return probe;
 }
 
-/** A persistable plan whose three roles are three distinct models — the C4 shape. */
-function c4Plan(overrides: { readonly reviewer?: PlannerConfig } = {}): Plan {
-  const reviewer = overrides.reviewer ?? { tool: "codex-cli", model: "gpt-5.6-luna" };
-  const item: PlannedWorkItem = {
-    key: "WI-A",
-    title: "Do the thing",
-    type: "FEATURE",
-    priority: "P2",
-    spec: "Implement the thing.",
-    acceptanceCriteria: [{ text: "It works", verificationHint: "npm test" }],
-    dependsOn: [],
-  };
-  const contentDigest = computePlanContentDigest({
-    revision: 1,
-    summary: "Deliver it.",
-    assumptions: [],
-    constraints: [],
-    risks: [],
-    items: [item],
-  });
-  const base = {
-    id: "plan-c4-1",
-    projectId: "prj-0001",
-    requestKey: "req-c4-1",
-    version: 1,
-    /**
-     * A REAL approval, because the repository refuses anything less: an
-     * APPROVED phase presupposes a recorded approval, and a fixture that
-     * skipped it would fail to persist and the test would pass for the wrong
-     * reason. Round-3 of TASK-014 taught the same lesson about the phase itself.
-     */
-    phase: "APPROVED",
-    approvalId: "apr-c4-1",
-    approvedRevision: 1,
-    approvedAt: 0,
-    intent: "Build the thing.",
-    declaredConstraints: [`roadmap-key: ${ITEM.key}`],
-    budget: { maxPlannerAttempts: 2, maxClarificationCycles: 2, maxTotalPlannerRuns: 6 },
+/**
+ * A REAL approved plan, through the REAL approval gate (round-3 finding 5).
+ *
+ * The first version of this helper hand-built an approval-shaped row and paired
+ * it with a `verifiedPhase` that answered "APPROVED" unconditionally — so it
+ * exercised the set path but not Factory approval authority, which the reviewer
+ * correctly called out as a weaker claim than the test's name implied.
+ *
+ * Everything here comes from the real planning fixtures instead: the approval is
+ * minted by the gate that mints approvals, the digest is the one that gate
+ * computed, and the executor's authority reader is the real
+ * `PlanningService.status`, which runs `projectFailClosed` against the Factory's
+ * own records.
+ */
+async function realExecutor(reviewer: PlannerConfig) {
+  const context = await newPlanning();
+  const plan = await approvedPlan(context, "Build the thing.", {
+    constraints: [`roadmap-key: ${ITEM.key}`],
     planner: { tool: "claude-code", model: "sonnet" },
     execution: {
       implementer: { tool: "claude-code", model: "opus" },
       reviewer,
-      verificationCommands: [{ id: "check", executable: "node", argv: ["-e", "0"] }],
-      workspaceRoot: "/tmp/ws",
+      verificationCommands: [{ id: "check", executable: "node", argv: ["-e", "process.exit(0)"] }],
+      workspaceRoot: "/tmp/sf-plan-test",
+      loopBudget: { maxIterations: 2 },
     },
-    revisions: [
-      {
-        revision: 1,
-        summary: "Deliver it.",
-        assumptions: [],
-        constraints: [],
-        risks: [],
-        items: [item],
-        contentDigest,
-        plannerRunRef: "plan-c4-1:r1:planner:a1",
-        generatedAt: 0,
-      },
-    ],
-    openQuestions: [],
-    answers: [],
-    attemptsForCurrentRevision: 0,
-    clarificationCycles: 0,
-    totalPlannerRuns: 1,
-    materialized: [],
-    dispatches: [],
-    cancelRequested: false,
-    events: [{ seq: 1, kind: "REQUEST_CREATED", detail: "created", at: 0 }],
-    startedBy: { id: "user:test", kind: "HUMAN", displayName: "Test Human" },
-    startedAt: 0,
-    lastTransitionAt: 0,
-  } as Plan;
-
-  // The approval digest is computed FROM the finished plan, exactly as the real
-  // approval path computes it, so the persisted record is internally consistent
-  // rather than merely well-shaped.
-  const revision = base.revisions[0];
-  if (revision === undefined) throw new Error("the fixture lost its revision");
-  return { ...base, approvedDigest: approvalDigestOfPlan(base, revision) } as Plan;
-}
-
-/** The REAL plan-backed executor over a REAL plans database. */
-async function realExecutor(plan: Plan) {
-  const dir = mkdtempSync(join(tmpdir(), "sf-e2e-set-"));
-  created.push(dir);
-  const plans = createSqlitePlanRepository(join(dir, "plans.db"));
-  await plans.create(plan);
+  });
 
   const resumed: string[] = [];
   const advancer: PlanAdvancer = {
     async resume(planId: string): Promise<Plan> {
       resumed.push(planId);
-      return { ...plan, phase: "EXECUTING" } as Plan;
+      const current = await context.plans.findById(planId);
+      if (current === undefined) throw new Error("the fixture plan vanished");
+      return current;
     },
   };
 
   const executor = createPlanBackedExecutor({
-    plans: { async findPlanForItem() { return plans.findById(plan.id); } },
+    plans: { async findPlanForItem() { return context.plans.findById(plan.id); } },
     planning: advancer,
-    state: { async verifiedPhase() { return "APPROVED"; } },
+    // REAL authority: this is the projection that demotes a plan whose approval
+    // can no longer be re-derived, not a constant.
+    state: {
+      async verifiedPhase(planId: string) {
+        return (await context.service.status(planId)).phase;
+      },
+    },
     clock: systemClock,
   });
 
-  return { executor, resumed, close: () => plans.close() };
+  return { executor, resumed, close: () => {} };
 }
 
 describe("TASK-015 AC-6 end to end: a real supervisor set meets the real plan check", () => {
@@ -182,7 +121,7 @@ describe("TASK-015 AC-6 end to end: a real supervisor set meets the real plan ch
    * fallback compares the plan's roles against the single ROUTED record.
    */
   it("authorises a C4 plan's three models and lets the plan launch", async () => {
-    const real = await realExecutor(c4Plan());
+    const real = await realExecutor({ tool: "codex-cli", model: "gpt-5.6-luna" });
     try {
       const supervisor = newSupervisor({
         probe: healthyProbe(),
@@ -193,9 +132,9 @@ describe("TASK-015 AC-6 end to end: a real supervisor set meets the real plan ch
 
       const result = await supervisor.service.tick();
 
-      assert.deepEqual(
-        real.resumed,
-        ["plan-c4-1"],
+      assert.equal(
+        real.resumed.length,
+        1,
         `the C4 plan was not launched through the real chain: ${JSON.stringify(result)}`,
       );
     } finally {
@@ -209,7 +148,7 @@ describe("TASK-015 AC-6 end to end: a real supervisor set meets the real plan ch
    * and refused BEFORE anything runs.
    */
   it("refuses a plan naming a model this build does not support", async () => {
-    const real = await realExecutor(c4Plan({ reviewer: { tool: "claude-code", model: "ghost-model" } }));
+    const real = await realExecutor({ tool: "claude-code", model: "ghost-model" });
     try {
       const supervisor = newSupervisor({
         probe: healthyProbe(),
