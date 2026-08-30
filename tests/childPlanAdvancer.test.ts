@@ -162,6 +162,54 @@ describe("TASK-014: the plan is advanced by a child process", () => {
   });
 
   /**
+   * TASK-015 round-1 finding 3 (CRITICAL): re-reading before launch NARROWED the
+   * window and did not close it. The child is handed a plan id and reads the row
+   * itself, so a revision approved in between replaces the configuration that was
+   * just checked. A plan id carries no statement of WHICH content was authorised.
+   */
+  it("hands the child the approval digest the supervisor authorised", async () => {
+    const runner = recordingRunner();
+    const advancer = createChildPlanAdvancer({
+      processRunner: runner,
+      plans: reader(planFixture()),
+      cwd: "/repo",
+      plansDbPath: "/data/plans.db",
+      cliEntry: "/build/main.js",
+    });
+
+    await advancer.resume("plan-child-1", "plan-abc123");
+
+    assert.deepEqual(runner.requests[0]?.argv, [
+      "/build/main.js",
+      "plan",
+      "resume",
+      "plan-child-1",
+      "--expect-approved-digest",
+      "plan-abc123",
+    ]);
+  });
+
+  /**
+   * And an INTERACTIVE caller passes none, so the flag never appears. Without
+   * this the argv assertion above could be satisfied by always sending a digest,
+   * including an empty one.
+   */
+  it("sends no digest when the caller pinned nothing", async () => {
+    const runner = recordingRunner();
+    const advancer = createChildPlanAdvancer({
+      processRunner: runner,
+      plans: reader(planFixture()),
+      cwd: "/repo",
+      plansDbPath: "/data/plans.db",
+      cliEntry: "/build/main.js",
+    });
+
+    await advancer.resume("plan-child-1");
+
+    assert.deepEqual(runner.requests[0]?.argv, ["/build/main.js", "plan", "resume", "plan-child-1"]);
+  });
+
+  /**
    * The parent and the child MUST read the same database.
    *
    * Round-2 finding 1's second half: the lookup resolved a plans database and
@@ -364,6 +412,55 @@ describe("TASK-014: the plan is advanced by a child process", () => {
         advanced.phase,
         "PLAN_REVIEW",
         "the child moved a plan that was waiting for a human decision",
+      );
+    } finally {
+      plans.close();
+    }
+  });
+
+  /**
+   * AND THE CHILD ENFORCES THE PIN (TASK-015 finding 3).
+   *
+   * The argv assertions above prove the digest is SENT. This proves the command
+   * on the other end refuses when it does not match — otherwise the handoff is
+   * decoration, and the window the reviewer found stays open.
+   */
+  it("really refuses, in a real child, when the approval digest does not match", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "sf-child-digest-"));
+    created.push(dir);
+
+    const plansDbPath = join(dir, "plans.db");
+    const plans = createSqlitePlanRepository(plansDbPath);
+    try {
+      await plans.create(
+        planFixture({
+          execution: {
+            implementer: { tool: "claude-code", model: "opus" },
+            reviewer: { tool: "claude-code", model: "opus" },
+            verificationCommands: [{ id: "check", executable: "node", argv: ["-e", "0"] }],
+            workspaceRoot: createTempWorkspace("sf-child-digest-ws-"),
+          },
+        }),
+      );
+
+      const advancer = createChildPlanAdvancer({
+        processRunner: createNodeProcessRunner(),
+        plans,
+        cwd: process.cwd(),
+        plansDbPath,
+        cliEntry: join(process.cwd(), "dist/src/cli/main.js"),
+        environmentSource: {
+          ...process.env,
+          FACTORY_DB_PATH: join(dir, "factory.db"),
+          FACTORY_LOOPS_DB_PATH: join(dir, "loops.db"),
+        },
+        timeoutMs: 60_000,
+      });
+
+      // The fixture carries no approval, so ANY pinned digest is a mismatch.
+      await assert.rejects(
+        () => advancer.resume("plan-child-1", "plan-a-different-approval"),
+        /no longer the approval that was authorised|failed in its child process/,
       );
     } finally {
       plans.close();

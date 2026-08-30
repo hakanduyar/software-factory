@@ -77,7 +77,20 @@ export interface RoadmapPlanLookup {
  * instead of the whole loop service.
  */
 export interface PlanAdvancer {
-  resume(planId: string): Promise<Plan>;
+  /**
+   * `expectApprovedDigest` closes the last of the time-of-check window
+   * (TASK-015 round-1 finding 3, CRITICAL).
+   *
+   * Re-reading the plan immediately before launching NARROWED the window and did
+   * not close it: the child is handed a plan ID and reads the row itself, so a
+   * revision approved in between replaces the very configuration that was just
+   * checked. Nothing in a plan id carries which content was authorised.
+   *
+   * So the check travels WITH the request. The digest is the one a human
+   * approval is bound to, and the child refuses to act on a plan whose approval
+   * digest is no longer the one the supervisor authorised.
+   */
+  resume(planId: string, expectApprovedDigest?: string): Promise<Plan>;
 }
 
 /**
@@ -443,7 +456,13 @@ export function createPlanBackedExecutor(deps: PlanBackedExecutorDeps): WorkExec
         // a SEPARATE OS PROCESS (`createChildPlanAdvancer`); this file holds the
         // narrow port so that fact is a property of the wiring rather than of
         // this decision.
-        const advanced = await deps.planning.resume(plan.id);
+        /**
+         * The digest of the plan THIS CHECK PASSED, handed to the child so it
+         * cannot act on a different one. `undefined` for a plan carrying no
+         * approval digest is not a bypass: such a plan cannot be APPROVED, so it
+         * never reaches this line.
+         */
+        const advanced = await deps.planning.resume(plan.id, atLaunch.approvedDigest);
         /**
          * VERIFIED ON THE WAY OUT TOO, so the invariant is uniform.
          *

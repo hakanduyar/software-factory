@@ -171,7 +171,7 @@ export function createChildPlanAdvancer(deps: ChildPlanAdvancerDeps): PlanAdvanc
   const nodeExecutable = deps.nodeExecutable ?? process.execPath;
 
   return {
-    async resume(planId: string): Promise<Plan> {
+    async resume(planId: string, expectApprovedDigest?: string): Promise<Plan> {
       const before = await deps.plans.findById(planId);
       const timeoutMs = timeoutFor(before, deps.timeoutMs);
 
@@ -181,7 +181,15 @@ export function createChildPlanAdvancer(deps: ChildPlanAdvancerDeps): PlanAdvanc
         // No shell, no concatenation, and the plan id is an ARGUMENT rather than
         // part of a command string — `ProcessRequest` has no `shell` option for
         // exactly this reason.
-        argv: [cliEntry, "plan", "resume", planId],
+        // The digest travels WITH the request, so the child cannot act on a plan
+        // whose approval changed after the supervisor cleared it (finding 3).
+        argv: [
+          cliEntry,
+          "plan",
+          "resume",
+          planId,
+          ...(expectApprovedDigest === undefined ? [] : ["--expect-approved-digest", expectApprovedDigest]),
+        ],
         cwd: deps.cwd,
         env: buildWorkerEnvironment(
           {

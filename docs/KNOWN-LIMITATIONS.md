@@ -747,11 +747,33 @@ each role independently — planner, implementer and reviewer each get a case th
 leaves the other two matching — and one case asserts this limitation directly. If
 that case ever goes green, L-12 is closed and this entry is what has to change.
 
-## L-13 — A plan's roadmap identity is not bound to its approval
+## L-13 — A plan's roadmap identity (CLOSED — and this entry was WRONG when written)
 
-**Status:** OPEN, ACCEPTED SCOPE BOUNDARY. Found by independent review of
-TASK-014 (round 3, finding 3, HIGH). The dangerous half is closed; this entry is
-the half that is not.
+**Status:** CLOSED. Kept rather than deleted, because its first version claimed a
+limitation that does not exist. A register that overstates a danger is the same
+defect as one that understates it, and round-21 review already made that point
+about a different entry — this is the same mistake, made by me, one task later.
+
+**The claim that was wrong.** The entry said `declaredConstraints` "is not part
+of the content digest an approval signs", so anyone with write access to the
+plans database could re-point a plan at a different roadmap item. That conflated
+two digests. `computePlanContentDigest` covers a REVISION's content and does not
+include it — but what an APPROVAL is bound to is `computePlanApprovalDigest`,
+which covers `declaredConstraints` explicitly, and `verifyApprovalAuthority`
+recomputes it on every authority check and refuses when it no longer matches
+`plan.approvedDigest`.
+
+So editing a plan's declared roadmap key after approval INVALIDATES the approval.
+The plan is then demoted to `RECOVERY_REQUIRED` by the same re-derivation that
+closed round-3 finding 1, and the supervisor refuses to act on it.
+
+**Therefore the binding is semantic, durable AND approval-bound**, which is
+strictly more than the entry claimed to deliver. Caught by TASK-015's independent
+review, which read the digest code instead of believing the entry. I had reasoned
+from a function name without checking which digest an approval actually signs.
+
+The historical description of the defect and its fix follows, because the
+reproduction is still worth having.
 
 `--roadmap-plans` maps a roadmap key to a plan id. Round-3 review bound a
 perfectly valid approved plan — whose own work item is `WI-A` — under the
@@ -766,24 +788,11 @@ different key, no key, or more than one, and it runs BEFORE any outcome is
 derived — so an unrelated plan's `BLOCKED` cannot be reported as this item's
 blocker either.
 
-**What is OPEN.** `declaredConstraints` is not part of the content digest an
-approval signs. It is operator input, and `planTypes.ts` states the rule it lives
-under — never rewritten by any model — which is why it was chosen over revision
-constraints, which ARE digest-covered but are planner OUTPUT. An identity a model
-can edit during a re-plan is not an identity.
-
-So the binding is semantic and durable, and it is not cryptographically bound to
-the approval. A party with write access to the plans database can edit the
-declared key. That same party can edit the phase — which is why the phase is
-re-derived from Factory authority (L-12's neighbour, round-3 finding 1) — but no
-independent record of a plan's roadmap key exists to re-derive from.
-
-**Why it is not closed here.** Closing it means either adding a roadmap key to
-the signed plan content, which is a schema change to `Plan` and to the digest
-every existing approval was computed over, or recording the binding in the
-supervisor's own provenance chain at approval time, which needs a human action
-the supervisor cannot take. Both are larger than the task that found it, and
-neither may be done by quietly widening what an approval covers.
+**Why `declaredConstraints` and not revision constraints.** It is operator input,
+and `planTypes.ts` states the rule it lives under — never rewritten by any model.
+Revision constraints are planner OUTPUT, and an identity a model can edit during
+a re-plan is not an identity. It turns out to be the digest-covered choice as
+well, which the entry originally got backwards.
 
 **Kept honest by:** `tests/planBinding.test.ts` asserts the refusal for a
 different key, a missing key and two keys, and — the control that matters —

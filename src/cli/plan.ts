@@ -39,7 +39,7 @@ import { resolveWorkspace } from "../adapters/workers/workspace.js";
 import { createSqliteStore, type SqliteFactoryStore } from "../adapters/sqlite/sqliteStore.js";
 import { FactoryService } from "../app/factoryService.js";
 import { agent, human } from "../domain/actor.js";
-import { NotFoundError } from "../domain/errors.js";
+import { NotFoundError, ValidationError } from "../domain/errors.js";
 import { createRandomIdGenerator } from "../domain/ids.js";
 import { EngineeringLoopService } from "../orchestration/engineeringLoopService.js";
 import type { LoopWorkerConfig, VerificationCommandConfig } from "../orchestration/loopTypes.js";
@@ -670,10 +670,38 @@ export async function runPlanReject(planId: string, note: string | undefined, op
   }
 }
 
-export async function runPlanResume(planId: string, options: PlanCliOptions = {}): Promise<PlanStatusView> {
+export async function runPlanResume(
+  planId: string,
+  options: PlanCliOptions & { readonly expectApprovedDigest?: string } = {},
+): Promise<PlanStatusView> {
   const log = options.log ?? ((): void => {});
   const { store, loops, plans, service } = await openForStoredPlan(planId, options);
   try {
+    /**
+     * THE CALLER MAY PIN WHICH APPROVAL IT AUTHORISED (TASK-015 finding 3).
+     *
+     * An unattended supervisor checks a plan's resources and then launches this
+     * command, and between those two moments a new revision can be approved —
+     * replacing the configuration that was checked with one that was not. A plan
+     * ID does not carry which content was authorised, so the caller states it.
+     *
+     * Refused BEFORE `resume` does anything, and refused rather than
+     * re-authorised: acting on a different approval than the one the caller
+     * cleared is exactly the substitution this whole task exists to prevent. An
+     * interactive human passes nothing and is unaffected.
+     */
+    if (options.expectApprovedDigest !== undefined) {
+      const current = await plans.findById(planId);
+      if (current === undefined) {
+        throw new NotFoundError("Plan", planId);
+      }
+      if (current.approvedDigest !== options.expectApprovedDigest) {
+        throw new ValidationError(
+          `plan ${planId} is no longer the approval that was authorised: expected digest ` +
+            `${options.expectApprovedDigest}, found ${current.approvedDigest ?? "none"}. Refusing to resume.`,
+        );
+      }
+    }
     // Resuming grants nothing new: it re-derives approval authority from the
     // Factory's own records before it materializes or dispatches anything, and
     // durably demotes a checkpoint that can no longer be proven. No token here.

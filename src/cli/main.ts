@@ -351,7 +351,15 @@ async function main(argv: readonly string[]): Promise<number> {
               : sub === "reject"
                 ? await runPlanReject(planId, flag("--note"), { log })
                 : sub === "resume"
-                  ? await runPlanResume(planId, { log })
+                  ? await runPlanResume(planId, {
+                      log,
+                      // Lets an unattended caller pin WHICH approval it cleared,
+                      // so a revision approved in between cannot be resumed in
+                      // its place (TASK-015 finding 3). Humans pass nothing.
+                      ...(flag("--expect-approved-digest") === undefined
+                        ? {}
+                        : { expectApprovedDigest: flag("--expect-approved-digest") as string }),
+                    })
                   : await runPlanCancel(planId, { log });
         return view.phase === "BLOCKED" || view.phase === "RECOVERY_REQUIRED" ? 1 : 0;
       }

@@ -611,7 +611,30 @@ export class SupervisorService {
     | { readonly ok: false; readonly state: SupervisorState; readonly result: TickResult }
   > {
     const chosen = resourceKey(provider, model);
-    const confirmation = await this.deps.probe.probe(provider, model);
+    /**
+     * A PROBE THAT THROWS IS A REFUSAL, NOT AN ESCAPED EXCEPTION (TASK-015
+     * round-1 finding 4).
+     *
+     * `createCliResourceProbe` throws `ValidationError` for a provider it has no
+     * zero-token probe for — correctly, since an unknown provider must not be
+     * optimistically assumed usable. Nothing caught it here, and `tick()`
+     * rethrows anything that is not a persistence error, so a plan declaring
+     * `rogue-provider/m` killed the tick instead of producing the named,
+     * controlled, whole-action refusal AC-3 requires.
+     *
+     * Caught around the probe ALONE rather than around the whole method, so a
+     * bug in the classification or commit below still surfaces as itself.
+     */
+    let confirmation: Classification;
+    try {
+      confirmation = await this.deps.probe.probe(provider, model);
+    } catch (error) {
+      const detail = boundedDiagnostic(error instanceof Error ? error.message : String(error));
+      const reason = `${chosen} could not be probed before launch: ${detail}`;
+      const escalated = await this.escalate(state, item.key, "RECOVERY_REQUIRED", `Investigate ${item.key}: ${reason}`, reason);
+      void escalated;
+      return { ok: false, state, result: { kind: "RECOVERY_REQUIRED", reason } };
+    }
     const now = this.deps.clock.now();
     let next = await this.commit(state, {
       ...state,
@@ -1187,6 +1210,7 @@ export class SupervisorService {
       outcome,
       config?.ok === true ? resourceKey(config.option.provider, config.option.model) : undefined,
       config?.ok === true ? config.config : undefined,
+      authorized,
     );
   }
 
@@ -1201,6 +1225,7 @@ export class SupervisorService {
     outcome: WorkOutcome,
     usedResourceKey: string | undefined,
     runConfig: AiRunConfigRecord | undefined,
+    authorized: readonly AuthorizedResource[] = [],
   ): Promise<TickResult> {
     const now = this.deps.clock.now();
     const { activeClaim: _dropped, ...withoutClaim } = state;
@@ -1221,12 +1246,65 @@ export class SupervisorService {
     const reported = snapshotIdentity(
       outcome.kind === "COMPLETED" || outcome.kind === "CHECKPOINT" ? outcome.reportedIdentity : undefined,
     );
+    /**
+     * RECONCILED AGAINST THE SET, NOT THE SINGLETON (TASK-015 round-1 finding 2).
+     *
+     * `reconcileReportedIdentity` compares a report to ONE record. With a set,
+     * an executor that ran an authorised NON-ROUTED member — a plan's reviewer,
+     * say — reported the exact truth and was refused as a mismatch, which is the
+     * old single-resource behaviour surviving into a multi-resource world.
+     *
+     * The fix is to pick the BASIS the report names, then let the existing
+     * reconciliation do its unchanged job: partial evidence is still not proof,
+     * a contradicted effort is still a MISMATCH, and a report naming NOTHING in
+     * the set still falls through to the routed record and is refused. Only the
+     * question "which record is this report about?" changed.
+     *
+     * `argvEvidence` is deliberately EMPTIED for a non-routed member rather than
+     * carried over: the routed argv describes a different launch, and attaching
+     * it to another resource would be evidence about a run that did not happen.
+     */
+    const member =
+      reported === undefined
+        ? undefined
+        : authorized.find(
+            (entry) => entry.provider === reported.provider && entry.model === reported.model,
+          );
+    /**
+     * THE ROUTED RECORD IS NEVER REWRITTEN.
+     *
+     * Substituting a basis is only meaningful for a NON-ROUTED member. When the
+     * report names the routed resource, `runConfig` is already the record for
+     * it — with its real `argvEvidence` — and rebuilding it would replace
+     * genuine launch evidence with an empty list. Caught by the existing
+     * "records the configuration on the item after a completed run" regression,
+     * which is precisely its job.
+     */
+    const reportsRouted =
+      member !== undefined &&
+      runConfig !== undefined &&
+      member.provider === runConfig.effectiveProvider &&
+      member.model === runConfig.effectiveModel;
+    const basis =
+      runConfig === undefined || member === undefined || reportsRouted
+        ? runConfig
+        : {
+            ...runConfig,
+            requestedProvider: member.provider,
+            requestedModel: member.model,
+            ...(member.effort === undefined ? {} : { requestedEffort: member.effort }),
+            effectiveProvider: member.provider,
+            effectiveModel: member.model,
+            ...(member.effort === undefined ? {} : { effectiveEffort: member.effort }),
+            argvEvidence: [],
+            note: `${runConfig.note}; reconciled against the authorised ${member.role} resource`,
+          };
     const reconciled =
-      runConfig === undefined
+      basis === undefined
         ? undefined
         : reported === undefined || Object.keys(reported).length === 0
-          ? runConfig
-          : reconcileReportedIdentity(runConfig, reported);
+          ? basis
+          : reconcileReportedIdentity(basis, reported);
     /**
      * LINEAGE IS RECORDED ONCE, HERE (round-9 HIGH).
      *
@@ -1247,16 +1325,61 @@ export class SupervisorService {
      * Both helpers are no-ops when no resource was used, so DETERMINISTIC work
      * is unaffected.
      */
+    /**
+     * LINEAGE MUST NAME THE RESOURCE THAT IMPLEMENTED (TASK-015 round-1
+     * finding 1, CRITICAL).
+     *
+     * This recorded the ROUTED resource, which for a plan-backed action is
+     * whatever the router happened to pick — not the model that did the work.
+     * Independent review authorised planner `claude-code/sonnet`, implementer
+     * `claude-code/opus` and reviewer `codex-cli/gpt-5.6-luna`, and the durable
+     * record said `IMPLEMENTED_BY claude-code:sonnet`.
+     *
+     * That is not merely incomplete evidence. `excludedReviewerResources` reads
+     * this chain to keep an implementer from reviewing its own work, so a wrong
+     * name excludes an innocent resource AND LEAVES THE REAL IMPLEMENTER FREE TO
+     * REVIEW ITSELF. C4 is a gate, and this turned it into a coin toss.
+     *
+     * The implementer ROLE is the answer when the work declared one; the routed
+     * resource remains correct when it did not, which is every action that
+     * declares nothing.
+     */
+    const implementerResourceKey =
+      authorized.find((entry) => entry.role === "implementer") === undefined
+        ? usedResourceKey
+        : resourceKey(
+            authorized.find((entry) => entry.role === "implementer")!.provider,
+            authorized.find((entry) => entry.role === "implementer")!.model,
+          );
+
+    /**
+     * AC-5: the WHOLE authorised set is recorded, and it is recorded in the
+     * entry's DETAIL rather than as additional `IMPLEMENTED_BY` entries.
+     *
+     * One entry per resource would be a tidier shape and a worse record: this
+     * chain means "X implemented Y", and adding the reviewer's resource to it
+     * would later exclude that reviewer from reviewing anything — inventing the
+     * very C4 failure the finding above describes, from the opposite direction.
+     */
+    const authorizedDetail =
+      authorized.length === 0
+        ? ""
+        : `; authorised ${authorized
+            .map((entry) => `${entry.role}=${entry.provider}/${entry.model}${entry.effort === undefined ? "" : `:${entry.effort}`}`)
+            .join(", ")}`;
+
     const lineageProvenance = appendImplementerProvenance(
       state.provenance,
       item.key,
-      usedResourceKey,
+      implementerResourceKey,
       now,
-      LINEAGE_DETAIL[outcome.kind],
+      `${LINEAGE_DETAIL[outcome.kind]}${authorizedDetail}`,
     );
     const withLineage: SupervisorState = {
       ...withoutClaim,
-      roadmap: setRunConfig(setImplementer(state.roadmap, item.key, usedResourceKey), item.key, reconciled),
+      // The same correction applies to the item's own implementer history,
+      // which `excludedReviewerResources` reads alongside the chain.
+      roadmap: setRunConfig(setImplementer(state.roadmap, item.key, implementerResourceKey), item.key, reconciled),
       provenance: lineageProvenance,
       // An anchor is written with EVERY chain, so that its absence is a
       // detectable deletion rather than a permitted state (round-9 CRITICAL).
