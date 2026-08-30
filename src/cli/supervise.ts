@@ -28,11 +28,15 @@ import { reconcileRoadmapWithCatalog } from "../supervision/roadmapCatalog.js";
 import { DEFAULT_ROADMAP } from "../supervision/supervisorTypes.js";
 import { verifyAgainstAnchor } from "../supervision/provenanceChain.js";
 import { createSqlitePlanRepository } from "../adapters/planning/sqlitePlanRepository.js";
-import { createChildPlanAdvancer } from "../adapters/supervision/childPlanAdvancer.js";
+import {
+  createChildPlanAdvancer,
+  createChildPlanStateReader,
+} from "../adapters/supervision/childPlanAdvancer.js";
 import { DEFAULT_PLANS_DB_PATH } from "./plan.js";
 import {
   createPlanBackedExecutor,
   type PlanAdvancer,
+  type PlanStateReader,
   type RoadmapPlanLookup,
 } from "../supervision/planBackedExecutor.js";
 import { SupervisorService, type TickResult } from "../supervision/supervisorService.js";
@@ -259,6 +263,7 @@ function createSupervisorExecutor(
     },
   };
   let planning: PlanAdvancer | undefined;
+  let state: PlanStateReader | undefined;
 
   if (options.roadmapPlansPath !== undefined) {
     const bindings = readRoadmapPlanBindings(options.roadmapPlansPath);
@@ -283,6 +288,23 @@ function createSupervisorExecutor(
         return planId === undefined ? undefined : plans.findById(planId);
       },
     };
+
+    /**
+     * THE AUTHORITY-CHECKED READ IS ALWAYS WIRED (round-3 finding 1).
+     *
+     * It runs `sf plan status`, which launches no worker and spends nothing, so
+     * there is no reason to gate it behind `--drive-plans` — and every reason
+     * not to. A supervisor that can only READ must still be unable to certify a
+     * completion it cannot verify, which is exactly the configuration the
+     * fabricated-row reproduction ran in.
+     */
+    state = createChildPlanStateReader({
+      processRunner: createNodeProcessRunner(),
+      plans,
+      cwd: process.cwd(),
+      plansDbPath,
+      log,
+    });
 
     if (options.drivePlans === true) {
       planning = createChildPlanAdvancer({
@@ -309,6 +331,7 @@ function createSupervisorExecutor(
     executor: createPlanBackedExecutor({
       plans: lookup,
       ...(planning === undefined ? {} : { planning }),
+      ...(state === undefined ? {} : { state }),
       clock: systemClock,
       log,
     }),

@@ -45,6 +45,7 @@
  */
 
 import { checkPlanAuthorization } from "./planAuthorization.js";
+import { checkPlanBinding } from "./planBinding.js";
 import type { Clock } from "../ports/clock.js";
 import type { Plan, PlanPhase } from "../planning/planTypes.js";
 import type { WorkExecutionInput, WorkExecutor, WorkOutcome } from "./supervisorPorts.js";
@@ -74,6 +75,21 @@ export interface PlanAdvancer {
   resume(planId: string): Promise<Plan>;
 }
 
+/**
+ * The plan's phase, RE-DERIVED FROM AUTHORITY rather than read from a row.
+ *
+ * Round-3 finding 1: a persisted phase is a claim, not a fact. A row saying
+ * `COMPLETED` with a fabricated `approvalId` is indistinguishable, to a reader
+ * of the plans database alone, from work a human really approved and the loop
+ * really finished. `PlanningService.status()` knows the difference because it
+ * can re-derive the approval from the Factory's own records; this port is how
+ * the supervisor asks it that question without holding it in-process.
+ */
+export interface PlanStateReader {
+  /** Throws if the answer cannot be obtained. Never guesses. */
+  verifiedPhase(planId: string): Promise<PlanPhase>;
+}
+
 export interface PlanBackedExecutorDeps {
   readonly plans: RoadmapPlanLookup;
   /**
@@ -91,9 +107,34 @@ export interface PlanBackedExecutorDeps {
    * the real path rather than a stub that hard-codes it.
    */
   readonly planning?: PlanAdvancer;
+  /**
+   * REQUIRED IN PRODUCTION, optional only so a test can drive the phases that
+   * assert nothing. Its absence does not weaken anything: without it, a plan in
+   * any authority-asserting phase is reported as unverifiable rather than
+   * believed.
+   */
+  readonly state?: PlanStateReader;
   readonly clock: Clock;
   readonly log?: (line: string) => void;
 }
+
+/**
+ * Phases that are a CLAIM ABOUT A HUMAN APPROVAL, mirroring
+ * `PHASES_ASSERTING_APPROVAL` in `planningService.ts`.
+ *
+ * Round-3 review found `COMPLETED` being believed from a fabricated row. The
+ * defect is the class, not that one branch: every phase here asserts that a
+ * human approved this exact content, and a plans database is not evidence of
+ * that. `WAITING_FOR_HUMAN` claims approved work FINISHED; `APPROVED` and its
+ * successors claim there is authority to run. None may be taken from the row.
+ */
+const ASSERTS_APPROVAL: readonly PlanPhase[] = [
+  "APPROVED",
+  "MATERIALIZING",
+  "EXECUTING",
+  "WAITING_FOR_HUMAN",
+  "COMPLETED",
+];
 
 /** Phases in which a human, and only a human, can move the plan forward. */
 const AWAITING_HUMAN: readonly PlanPhase[] = [
@@ -217,6 +258,29 @@ function outcomeForPhase(
   };
 }
 
+/**
+ * The authority-checked phase, or a refusal to proceed on an unverified one.
+ *
+ * A supervisor with no `PlanStateReader` cannot verify these phases, so it must
+ * not act on them. Throwing here is deliberate: `execute` turns it into a
+ * definite outcome, and the alternative — silently falling back to the row —
+ * is precisely the defect this exists to close.
+ */
+async function verifiedPhaseOf(plan: Plan, deps: PlanBackedExecutorDeps): Promise<PlanPhase> {
+  if (deps.state === undefined) {
+    throw new Error(
+      `plan ${plan.id} is recorded ${plan.phase}, which asserts a human approval, and this supervisor has no way to verify that against Factory authority`,
+    );
+  }
+  const verified = await deps.state.verifiedPhase(plan.id);
+  if (verified !== plan.phase) {
+    (deps.log ?? ((): void => {}))(
+      `plan ${plan.id}: persisted ${plan.phase} but authority re-derives it as ${verified}`,
+    );
+  }
+  return verified;
+}
+
 export function createPlanBackedExecutor(deps: PlanBackedExecutorDeps): WorkExecutor {
   const log = deps.log ?? ((): void => {});
   return {
@@ -230,13 +294,46 @@ export function createPlanBackedExecutor(deps: PlanBackedExecutorDeps): WorkExec
        * rule; the seam to planning is no different.
        */
       try {
-        const plan = await deps.plans.findPlanForItem(input.item);
-        if (plan === undefined) {
+        const found = await deps.plans.findPlanForItem(input.item);
+        if (found === undefined) {
           return authorPlan(
             input.item,
             "no plan exists for this roadmap item; creating and approving one is a human decision",
           );
         }
+
+        /**
+         * IS THIS PLAN EVEN FOR THIS ITEM? (round-3 finding 3, HIGH)
+         *
+         * Checked before ANY outcome is derived from the plan, because a plan
+         * belonging to another roadmap item is the wrong answer to every
+         * question that follows — not only to "may it launch?" but to "what is
+         * this item's state?". Reporting an unrelated plan's BLOCKED as this
+         * item's blocker would be a false record even though nothing ran.
+         */
+        const binding = checkPlanBinding(input.item.key, found);
+        if (!binding.ok) {
+          return humanRequired(input.item, "RECONCILE_PLAN_BINDING", binding.reason);
+        }
+
+        /**
+         * THE PHASE IS RE-DERIVED BEFORE IT IS USED (round-3 finding 1, HIGH).
+         *
+         * Everything below decides on `plan.phase`, and the row's phase is a
+         * claim. For the five phases that assert a human approval, the real
+         * phase comes from `PlanStateReader`, which asks `sf plan status` — the
+         * command that re-derives approval authority from the Factory's records
+         * and demotes to RECOVERY_REQUIRED when it cannot.
+         *
+         * The rest of this function then works on a phase that has been
+         * verified, so no later branch has to remember to check. The
+         * CONFIGURATION on the row (execution config, failureReason) is still
+         * used as-is: it is not a claim of authority, and the authorization gate
+         * below treats it as the untrusted input it is.
+         */
+        const plan = ASSERTS_APPROVAL.includes(found.phase)
+          ? { ...found, phase: await verifiedPhaseOf(found, deps) }
+          : found;
 
         if (!DRIVABLE.includes(plan.phase)) {
           return outcomeForPhase(input.item, plan, input, deps.clock);
@@ -277,8 +374,23 @@ export function createPlanBackedExecutor(deps: PlanBackedExecutorDeps): WorkExec
         // narrow port so that fact is a property of the wiring rather than of
         // this decision.
         const advanced = await deps.planning.resume(plan.id);
-        log(`plan ${plan.id} for ${input.item.key}: ${plan.phase} -> ${advanced.phase}`);
-        return outcomeForPhase(input.item, advanced, input, deps.clock);
+        /**
+         * VERIFIED ON THE WAY OUT TOO, so the invariant is uniform.
+         *
+         * `resume` returns the plan's ROW after the child exited, and a row is a
+         * claim wherever it is read — the same reason the phase was re-derived
+         * on the way in. Without this, the one path that can report COMPLETED
+         * after real work would be the one path that did not check.
+         *
+         * The extra child is a status read of a couple of seconds, taken only
+         * when the result asserts an approval, immediately after a child that
+         * may have run for half an hour.
+         */
+        const settled = ASSERTS_APPROVAL.includes(advanced.phase)
+          ? { ...advanced, phase: await verifiedPhaseOf(advanced, deps) }
+          : advanced;
+        log(`plan ${plan.id} for ${input.item.key}: ${plan.phase} -> ${settled.phase}`);
+        return outcomeForPhase(input.item, settled, input, deps.clock);
       } catch (error) {
         return {
           kind: "RESOURCE_FAILURE",

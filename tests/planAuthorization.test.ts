@@ -60,6 +60,7 @@ function approvedPlanWith(roles: Roles = {}): Plan {
   return {
     id: "plan-1",
     phase: "APPROVED",
+    declaredConstraints: [`roadmap-key: ${ITEM.key}`],
     planner: roles.planner ?? AUTHORIZED_WORKER,
     execution: {
       implementer: roles.implementer ?? AUTHORIZED_WORKER,
@@ -87,6 +88,20 @@ async function execute(plan: Plan, config: AiRunConfigRecord | undefined) {
   const executor = createPlanBackedExecutor({
     plans: { async findPlanForItem() { return plan; } },
     planning,
+    /**
+     * Authority CONFIRMS the approval in every case here.
+     *
+     * Since round-3 finding 1 the executor re-derives any phase that asserts an
+     * approval, so without this these cases would all stop at the authority
+     * check and never reach the authorization gate they exist to test — green
+     * for the wrong reason, or red for one. The forged-row cases live in
+     * planBackedExecutor.test.ts.
+     */
+    state: {
+      async verifiedPhase() {
+        return plan.phase;
+      },
+    },
     clock: CLOCK,
   });
   const outcome = await executor.execute({

@@ -17,6 +17,7 @@ import { after, describe, it } from "node:test";
 import {
   createPlanBackedExecutor,
   type PlanAdvancer,
+  type PlanStateReader,
   type RoadmapPlanLookup,
 } from "../src/supervision/planBackedExecutor.js";
 import { createSqlitePlanRepository } from "../src/adapters/planning/sqlitePlanRepository.js";
@@ -77,6 +78,9 @@ function planWith(phase: PlanPhase): Plan {
   return {
     id: "plan-1",
     phase,
+    // The plan names the roadmap item it serves (round-3 finding 3). Without
+    // this the binding is one-sided and any plan can be pointed at any item.
+    declaredConstraints: [`roadmap-key: ${ITEM.key}`],
     planner: AUTHORIZED_WORKER,
     execution: {
       implementer: AUTHORIZED_WORKER,
@@ -103,6 +107,33 @@ function advancer(result: Plan): PlanAdvancer & { resumed: string[] } {
     async resume(planId: string) {
       resumed.push(planId);
       return result;
+    },
+  };
+}
+
+/**
+ * What AUTHORITY says the phase is, in call order; the last value repeats.
+ *
+ * Explicit rather than echoing the row, because since round-3 finding 1 the
+ * whole point is that the two can DISAGREE: the row is a claim and this is the
+ * answer. A test that wants them to agree says so, and a test about a forged row
+ * says that instead.
+ *
+ * The executor asks once on the way in and, after a resume, once more on the way
+ * out — so a driving test supplies both.
+ */
+function authoritySays(...phases: readonly PlanPhase[]): PlanStateReader & { asked: string[] } {
+  const queue = [...phases];
+  const asked: string[] = [];
+  return {
+    asked,
+    async verifiedPhase(planId: string): Promise<PlanPhase> {
+      asked.push(planId);
+      const next = queue.length > 1 ? queue.shift() : queue[0];
+      if (next === undefined) {
+        throw new Error("the test did not say what authority reports");
+      }
+      return next;
     },
   };
 }
@@ -142,7 +173,7 @@ function blockedPlanFixture(): Plan {
     phase: "BLOCKED",
     failureReason: "verifier failed for command test",
     intent: "Build the thing.",
-    declaredConstraints: [],
+    declaredConstraints: ["roadmap-key: LOCAL_24_7_RUNTIME"],
     budget: { maxPlannerAttempts: 2, maxClarificationCycles: 2, maxTotalPlannerRuns: 6 },
     planner: { tool: "scripted", model: "test" },
     execution: {
@@ -228,6 +259,7 @@ describe("TASK-014 AC-3: an approved plan is driven through the planning seam", 
     const executor = createPlanBackedExecutor({
       plans: lookup(planWith("APPROVED")),
       planning,
+      state: authoritySays("APPROVED", "EXECUTING"),
       clock: CLOCK,
     });
 
@@ -241,11 +273,121 @@ describe("TASK-014 AC-3: an approved plan is driven through the planning seam", 
     const executor = createPlanBackedExecutor({
       plans: lookup(planWith("APPROVED")),
       planning: advancer(planWith("COMPLETED")),
+      state: authoritySays("APPROVED", "COMPLETED"),
       clock: CLOCK,
     });
 
     const outcome = await executor.execute(input());
     assert.equal(outcome.kind, "COMPLETED");
+  });
+});
+
+/**
+ * ROUND-3 FINDING 1 (HIGH): a persisted phase is a claim, not authority.
+ *
+ * The reviewer persisted a structurally valid plan with a fabricated
+ * `approvalId`, no matching Factory approval, and `phase: COMPLETED`. The
+ * executor reported the roadmap item COMPLETED without consulting approval
+ * authority at all — the repository's own rule, broken in the one branch that
+ * reports success.
+ *
+ * The fix is the CLASS, not that branch: five phases assert a human approval,
+ * and none of them may be taken from the row.
+ */
+describe("TASK-014: a persisted phase is never authority", () => {
+  it("does not report COMPLETED when authority cannot re-derive the approval", async () => {
+    const authority = authoritySays("RECOVERY_REQUIRED");
+    const executor = createPlanBackedExecutor({
+      // The forged row: it SAYS the approved work finished.
+      plans: lookup(planWith("COMPLETED")),
+      planning: advancer(planWith("COMPLETED")),
+      state: authority,
+      clock: CLOCK,
+    });
+
+    const outcome = await executor.execute(input());
+
+    assert.notEqual(outcome.kind, "COMPLETED", "a fabricated COMPLETED row was reported as success");
+    assert.equal(outcome.kind, "HUMAN_REQUIRED");
+    assert.deepEqual(authority.asked, ["plan-1"], "authority was never consulted");
+  });
+
+  /**
+   * EVERY asserting phase, not just the one the reviewer happened to forge.
+   * Each is a claim that a human approved this exact content.
+   */
+  it("re-derives every phase that asserts a human approval", async () => {
+    for (const phase of ["APPROVED", "MATERIALIZING", "EXECUTING", "WAITING_FOR_HUMAN", "COMPLETED"] as const) {
+      const authority = authoritySays("RECOVERY_REQUIRED");
+      const planning = advancer(planWith("EXECUTING"));
+      const executor = createPlanBackedExecutor({
+        plans: lookup(planWith(phase)),
+        planning,
+        state: authority,
+        clock: CLOCK,
+      });
+
+      const outcome = await executor.execute(input());
+
+      assert.deepEqual(authority.asked, ["plan-1"], `${phase} was taken from the row unverified`);
+      assert.equal(outcome.kind, "HUMAN_REQUIRED", `${phase} was acted on after a failed re-derivation`);
+      assert.deepEqual(planning.resumed, [], `${phase} reached a launch despite unverifiable authority`);
+    }
+  });
+
+  /**
+   * A supervisor that CANNOT verify must not fall back to the row. Falling back
+   * is the defect; refusing is the fix, and it has to be true of the shipped
+   * shape where the reader is simply absent.
+   */
+  it("refuses an asserting phase when it has no way to verify at all", async () => {
+    const executor = createPlanBackedExecutor({
+      plans: lookup(planWith("COMPLETED")),
+      clock: CLOCK,
+    });
+
+    const outcome = await executor.execute(input());
+
+    assert.notEqual(outcome.kind, "COMPLETED");
+    assert.match(
+      outcome.kind === "RESOURCE_FAILURE" ? outcome.process.stderr : "",
+      /no way to verify that against Factory authority/,
+    );
+  });
+
+  /**
+   * And the check is not one-way: when authority CONFIRMS the completion, it is
+   * reported. Without this the guard could be satisfied by never completing
+   * anything, which is a refusal rather than a verification.
+   */
+  it("reports COMPLETED when authority confirms it", async () => {
+    const executor = createPlanBackedExecutor({
+      plans: lookup(planWith("COMPLETED")),
+      state: authoritySays("COMPLETED"),
+      clock: CLOCK,
+    });
+
+    const outcome = await executor.execute(input());
+    assert.equal(outcome.kind, "COMPLETED");
+  });
+
+  /**
+   * The phase reported AFTER a resume is a row read too, and was the one path
+   * that could reach COMPLETED after real work without a check.
+   */
+  it("re-derives the phase the loop left behind, not just the one it started from", async () => {
+    const authority = authoritySays("APPROVED", "RECOVERY_REQUIRED");
+    const executor = createPlanBackedExecutor({
+      plans: lookup(planWith("APPROVED")),
+      planning: advancer(planWith("COMPLETED")),
+      state: authority,
+      clock: CLOCK,
+    });
+
+    const outcome = await executor.execute(input());
+
+    assert.equal(authority.asked.length, 2, "the post-resume phase was taken from the row");
+    assert.notEqual(outcome.kind, "COMPLETED", "an unverifiable post-resume COMPLETED was reported as success");
   });
 });
 
@@ -289,6 +431,7 @@ describe("TASK-014 AC-5: a terminal failure is never success", () => {
     const executor = createPlanBackedExecutor({
       plans: lookup(planWith("APPROVED")),
       planning: advancer(planWith("WAITING_FOR_HUMAN")),
+      state: authoritySays("APPROVED", "WAITING_FOR_HUMAN"),
       clock: CLOCK,
     });
 
@@ -327,6 +470,7 @@ describe("TASK-014 AC-9: a failure is a definite outcome, never a throw", () => 
           throw new Error("dispatcher exploded");
         },
       },
+      state: authoritySays("APPROVED"),
       clock: CLOCK,
     });
 
@@ -344,6 +488,7 @@ describe("TASK-014: the checkpoint carries state rather than inventing it", () =
     const executor = createPlanBackedExecutor({
       plans: lookup(planWith("EXECUTING")),
       planning: advancer(planWith("EXECUTING")),
+      state: authoritySays("EXECUTING"),
       clock: CLOCK,
     });
 
@@ -368,6 +513,7 @@ describe("TASK-014: the checkpoint carries state rather than inventing it", () =
     const executor = createPlanBackedExecutor({
       plans: lookup(planWith("EXECUTING")),
       planning: advancer(planWith("EXECUTING")),
+      state: authoritySays("EXECUTING"),
       clock: CLOCK,
     });
 
@@ -632,6 +778,7 @@ describe("TASK-014 AC-4: dispatch is idempotent through the REAL planning seam",
      * question behind an unrelated stop.
      */
     const plan = await approvedPlan(context, "Build the thing.", {
+      constraints: [`roadmap-key: ${ITEM.key}`],
       planner: AUTHORIZED_WORKER,
       execution: {
         implementer: AUTHORIZED_WORKER,
@@ -645,6 +792,18 @@ describe("TASK-014 AC-4: dispatch is idempotent through the REAL planning seam",
     const executor = createPlanBackedExecutor({
       plans: { async findPlanForItem() { return context.plans.findById(plan.id); } },
       planning: context.service,
+      /**
+       * Authority is REAL here: this plan was approved through the real Factory,
+       * so re-deriving its phase legitimately echoes the row. This case is about
+       * idempotence; the forged-row cases below are what test the check itself.
+       */
+      state: {
+        async verifiedPhase(planId: string) {
+          const current = await context.plans.findById(planId);
+          if (current === undefined) throw new Error("the fixture plan vanished");
+          return current.phase;
+        },
+      },
       clock: CLOCK,
     });
 
@@ -704,6 +863,7 @@ describe("TASK-014 AC-4: dispatch is idempotent through the REAL planning seam",
     const executor = createPlanBackedExecutor({
       plans: lookup(planWith("APPROVED")),
       planning,
+      state: authoritySays("APPROVED", "EXECUTING"),
       clock: CLOCK,
     });
 
@@ -802,6 +962,7 @@ describe("TASK-014: an unconfigured supervisor is honest rather than stubbed", (
   it("refuses to claim progress on an approved plan it cannot drive", async () => {
     const executor = createPlanBackedExecutor({
       plans: lookup(planWith("APPROVED")),
+      state: authoritySays("APPROVED"),
       clock: CLOCK,
     });
 

@@ -74,8 +74,8 @@ import {
   DEFAULT_WORKER_ENV_ALLOWLIST,
 } from "../workers/environmentPolicy.js";
 import { boundedDiagnostic } from "../../supervision/resourceClassifier.js";
-import type { Plan } from "../../planning/planTypes.js";
-import type { PlanAdvancer } from "../../supervision/planBackedExecutor.js";
+import { PLAN_PHASES, type Plan, type PlanPhase } from "../../planning/planTypes.js";
+import type { PlanAdvancer, PlanStateReader } from "../../supervision/planBackedExecutor.js";
 import type { ProcessRunner } from "../../ports/processRunner.js";
 
 /**
@@ -216,6 +216,98 @@ export function createChildPlanAdvancer(deps: ChildPlanAdvancerDeps): PlanAdvanc
         );
       }
       return advanced;
+    },
+  };
+}
+
+/** How long an authority-checked read may take. It launches no worker. */
+export const DEFAULT_PLAN_STATUS_TIMEOUT_MS = 120_000;
+
+/**
+ * The one line of `sf plan status` this reader believes, parsed strictly.
+ *
+ * The child's output is UNTRUSTED DATA (TASK-011 AC-4): exactly one `phase`
+ * line must be present and its value must be a declared `PlanPhase`. Zero
+ * lines, two lines, or an unrecognised word all FAIL rather than degrade — a
+ * reader that guesses when the format changes is a reader that will one day
+ * report a phase nobody produced.
+ */
+export function parseStatusPhase(stdout: string): PlanPhase | undefined {
+  const matches = [...stdout.matchAll(/^phase\s*:\s*(\S+)\s*$/gm)].map((m) => m[1]);
+  if (matches.length !== 1) {
+    return undefined;
+  }
+  const [phase] = matches;
+  return (PLAN_PHASES as readonly string[]).includes(phase ?? "") ? (phase as PlanPhase) : undefined;
+}
+
+/**
+ * THE PERSISTED PHASE IS NOT AUTHORITY (round-3 finding 1, HIGH).
+ *
+ * The executor read `plan.phase` straight from the plans database and acted on
+ * it. Independent review persisted a structurally valid row with a fabricated
+ * `approvalId`, no matching Factory approval, and `phase: COMPLETED` — and the
+ * supervisor reported the roadmap item COMPLETED without consulting approval
+ * authority at all. That is the repository's own rule, broken in the one branch
+ * that reports success.
+ *
+ * FIVE phases assert approval, not one: APPROVED, MATERIALIZING, EXECUTING,
+ * WAITING_FOR_HUMAN and COMPLETED. `PlanningService.status()` already answers
+ * this correctly — it runs `projectFailClosed`, which demotes any of them to
+ * RECOVERY_REQUIRED when the approval cannot be re-derived from the Factory's
+ * own records. The supervisor cannot call it in-process (TASK-011 AC-1), so it
+ * asks the same question the same way it drives a plan: out of process.
+ *
+ * `sf plan status` LAUNCHES NO WORKER and spends nothing. It opens databases and
+ * projects. So this read is wired unconditionally — a supervisor without
+ * `--drive-plans` must still never certify a completion it cannot verify.
+ */
+export function createChildPlanStateReader(deps: ChildPlanAdvancerDeps): PlanStateReader {
+  const source = deps.environmentSource ?? process.env;
+  const cliEntry = deps.cliEntry ?? defaultCliEntry();
+  const nodeExecutable = deps.nodeExecutable ?? process.execPath;
+
+  return {
+    async verifiedPhase(planId: string): Promise<PlanPhase> {
+      const result = await deps.processRunner.run({
+        executable: nodeExecutable,
+        argv: [cliEntry, "plan", "status", planId],
+        cwd: deps.cwd,
+        env: buildWorkerEnvironment(
+          {
+            allowedVars: DEFAULT_WORKER_ENV_ALLOWLIST,
+            extraVars: factoryPaths(deps.plansDbPath, source),
+          },
+          source,
+        ),
+        timeoutMs: deps.timeoutMs ?? DEFAULT_PLAN_STATUS_TIMEOUT_MS,
+        maxOutputBytes: MAX_CHILD_OUTPUT_BYTES,
+      });
+
+      /**
+       * THE EXIT CODE IS NOT THE SIGNAL HERE, and that is a property of the
+       * command rather than a concession. `sf plan status` exits 1 to say the
+       * phase is BLOCKED or RECOVERY_REQUIRED — which is exactly the answer this
+       * reader exists to obtain. Treating that as a failure would convert the
+       * demotion into a resource error and hide it.
+       *
+       * What is NOT tolerated is a child that never produced a phase: a crash, a
+       * timeout, a spawn failure or unparseable output all throw.
+       */
+      if (result.terminationReason !== "EXITED") {
+        const detail = redactSecrets(boundedDiagnostic(result.stderr));
+        throw new Error(`sf plan status ${planId} did not complete (${result.terminationReason}): ${detail}`);
+      }
+      const phase = parseStatusPhase(result.stdout);
+      if (phase === undefined) {
+        const detail = redactSecrets(boundedDiagnostic(result.stderr.length > 0 ? result.stderr : result.stdout));
+        throw new Error(
+          `sf plan status ${planId} produced no readable phase (exit ${
+            result.exitCode === null ? "none" : result.exitCode
+          }): ${detail}`,
+        );
+      }
+      return phase;
     },
   };
 }

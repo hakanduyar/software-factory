@@ -156,6 +156,12 @@ export function authorizePlanHuman(factory: FactoryService, actor = PLAN_HUMAN) 
 export interface PlanFixtureOverrides {
   readonly planner?: PlannerConfig;
   readonly execution?: PlanExecutionConfig;
+  /**
+   * The operator's own constraints, which since TASK-014 round-3 finding 3 are
+   * where a plan declares WHICH ROADMAP ITEM it serves. A supervisor refuses to
+   * act on a plan that does not name the item it was bound to.
+   */
+  readonly constraints?: readonly string[];
 }
 
 /** Starts a plan and returns it at PLAN_REVIEW. */
@@ -170,6 +176,7 @@ export async function planAtReview(
     intent,
     planner: overrides.planner ?? TEST_PLANNER_CONFIG,
     execution: overrides.execution ?? testExecutionConfig(),
+    ...(overrides.constraints === undefined ? {} : { constraints: [...overrides.constraints] }),
   });
 }
 
