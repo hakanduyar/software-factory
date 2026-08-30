@@ -42,8 +42,25 @@ export interface ResourceProbe {
  * role travels with the identity so provenance can say which role used which
  * resource, rather than recording a set and losing who was who.
  */
+/**
+ * The roles a declaration may name (round-2 finding 3, CRITICAL).
+ *
+ * `role` was an unrestricted string, and settlement picked the first entry
+ * spelled exactly `"implementer"` or fell back to the routed resource. So a
+ * declaration with `"implementor"`, or none at all, recorded the WRONG resource
+ * as the implementer — and the reviewer drove the consequence out: the next
+ * independent review then selected the resource that had really implemented and
+ * advanced. C4 broken by a typo.
+ *
+ * A closed set makes the misspelling a compile error where the caller is typed,
+ * and `validateDeclaredRoles` makes it a refusal where it is data.
+ */
+export const REQUIRED_RESOURCE_ROLES = ["planner", "implementer", "reviewer"] as const;
+
+export type RequiredResourceRole = (typeof REQUIRED_RESOURCE_ROLES)[number];
+
 export interface RequiredResource {
-  readonly role: string;
+  readonly role: RequiredResourceRole;
   readonly provider: string;
   readonly model: string;
   readonly effort?: string;
@@ -57,7 +74,9 @@ export interface RequiredResource {
  * list went through the same probe, the same billing observation and the same
  * financial gate as a single routed resource does.
  */
-export interface AuthorizedResource extends RequiredResource {
+export interface AuthorizedResource extends Omit<RequiredResource, "role"> {
+  /** A declared role, or `routed` for the resource the router itself chose. */
+  readonly role: RequiredResourceRole | "routed";
   /** Observed in-process immediately before the gate, never read from a row. */
   readonly billingMode: BillingMode;
 }

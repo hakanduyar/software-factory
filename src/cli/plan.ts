@@ -705,7 +705,10 @@ export async function runPlanResume(
     // Resuming grants nothing new: it re-derives approval authority from the
     // Factory's own records before it materializes or dispatches anything, and
     // durably demotes a checkpoint that can no longer be proven. No token here.
-    const view = toPlanStatusView(await service.resume(planId));
+    // The pin travels INTO the service, which re-checks it against every read
+    // its drive loop makes. The check above is a fast, clear refusal; this is
+    // the one that actually protects the launch (round-2 finding 1).
+    const view = toPlanStatusView(await service.resume(planId, options.expectApprovedDigest));
     printStatus(view, log);
     return view;
   } finally {

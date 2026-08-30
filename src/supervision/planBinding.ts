@@ -25,17 +25,23 @@
  * a plan could acquire or lose its roadmap identity through a re-plan. An
  * identity a model can edit is not an identity.
  *
- * WHAT THIS DOES NOT ACHIEVE, stated plainly because the reviewer named three
- * things and this closes one and a half of them:
+ * WHAT THIS ACHIEVES — and the third point below was WRONG in the first version
+ * of this comment, which is why it is spelled out rather than summarised:
  *
- *   - The binding is now SEMANTIC: an unrelated plan is refused.
+ *   - The binding is SEMANTIC: an unrelated plan is refused.
  *   - It is DURABLE in the plan record, which is append-only and versioned.
- *   - It is NOT bound to the approval itself. `declaredConstraints` is not part
- *     of the content digest an approval signs, so a party who can write the
- *     plans database can still edit it. That party can already edit the phase,
- *     which is why the phase is re-derived from Factory authority — but no such
- *     independent record exists for a roadmap key, and inventing one is a
- *     schema change beyond this task. Recorded as L-13.
+ *   - It IS bound to the approval. `computePlanApprovalDigest` covers
+ *     `declaredConstraints`, and `verifyApprovalAuthority` recomputes that
+ *     digest on every authority check and refuses when it no longer matches
+ *     `plan.approvedDigest`. So editing a plan's declared roadmap key after
+ *     approval INVALIDATES the approval, and the plan is then demoted to
+ *     RECOVERY_REQUIRED rather than acted on.
+ *
+ * The first version claimed the opposite, reasoning from
+ * `computePlanContentDigest` — the REVISION digest, which indeed omits this
+ * field — without checking which digest an APPROVAL is bound to. TASK-015's
+ * independent review read the digest code and reported the disagreement.
+ * docs/KNOWN-LIMITATIONS.md L-13 records the correction and is marked CLOSED.
  */
 
 import type { Plan } from "../planning/planTypes.js";

@@ -49,6 +49,7 @@ function planRunning(worker: { tool: string; model: string; effort?: string }): 
     id: "plan-1",
     phase: "APPROVED",
     declaredConstraints: [`roadmap-key: ${ITEM.key}`],
+    approvedDigest: "plan-approval-digest-1",
     planner: worker,
     execution: {
       implementer: worker,
@@ -59,12 +60,18 @@ function planRunning(worker: { tool: string; model: string; effort?: string }): 
   } as unknown as Plan;
 }
 
-function advancer(): PlanAdvancer & { readonly resumed: string[] } {
+function advancer(): PlanAdvancer & {
+  readonly resumed: string[];
+  readonly pinned: (string | undefined)[];
+} {
   const resumed: string[] = [];
+  const pinned: (string | undefined)[] = [];
   return {
     resumed,
-    async resume(planId: string): Promise<Plan> {
+    pinned,
+    async resume(planId: string, expectApprovedDigest?: string): Promise<Plan> {
       resumed.push(planId);
+      pinned.push(expectApprovedDigest);
       return { ...planRunning({ tool: "claude-code", model: "opus" }), phase: "EXECUTING" } as Plan;
     },
   };
@@ -76,7 +83,9 @@ function advancer(): PlanAdvancer & { readonly resumed: string[] } {
  * `reads` are returned in order and the last repeats, which is what lets a case
  * model a plan edited after its resources were declared and authorised.
  */
-async function execute(reads: readonly Plan[]): Promise<{ outcome: WorkOutcome; resumed: string[] }> {
+async function execute(
+  reads: readonly Plan[],
+): Promise<{ outcome: WorkOutcome; resumed: string[]; pinned: (string | undefined)[] }> {
   const queue = [...reads];
   const planning = advancer();
   const executor = createPlanBackedExecutor({
@@ -97,7 +106,7 @@ async function execute(reads: readonly Plan[]): Promise<{ outcome: WorkOutcome; 
     actionId: "action-1",
     authorizedResources: AUTHORIZED,
   });
-  return { outcome, resumed: planning.resumed };
+  return { outcome, resumed: planning.resumed, pinned: planning.pinned };
 }
 
 describe("TASK-015: membership in the authorised set is exact", () => {
@@ -106,6 +115,23 @@ describe("TASK-015: membership in the authorised set is exact", () => {
 
     assert.deepEqual(resumed, ["plan-1"], "an authorised resource was refused");
     assert.notEqual(outcome.kind, "HUMAN_REQUIRED");
+  });
+
+  /**
+   * THE PIN IS HANDED DOWN (round-2 finding 1).
+   *
+   * Re-reading the plan before launch is worth nothing if the launcher is
+   * then told only a plan id: the thing that actually runs must be told
+   * WHICH approval was cleared, or it will happily read a newer one.
+   */
+  it("hands the launcher the approval digest it just checked", async () => {
+    const { pinned } = await execute([planRunning({ tool: "claude-code", model: "opus" })]);
+
+    assert.deepEqual(
+      pinned,
+      ["plan-approval-digest-1"],
+      "the launch was started without naming the approval the check cleared",
+    );
   });
 
   /**

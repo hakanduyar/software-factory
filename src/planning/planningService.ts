@@ -365,8 +365,20 @@ export class PlanningService {
     return this.drive(plan.id);
   }
 
-  async resume(planId: string): Promise<Plan> {
-    return this.drive(planId);
+  /**
+   * `expectApprovedDigest` pins WHICH APPROVAL the caller cleared.
+   *
+   * An unattended caller checks a plan's configuration and then asks for it to
+   * be resumed, and a revision approved in between replaces what was checked.
+   * Verifying once before calling `drive()` is NOT enough — TASK-015 round 2
+   * found exactly that: `drive()` re-reads the plan on every step, so a check
+   * outside it protected the call and not the launch.
+   *
+   * The pin is therefore enforced inside the loop, against every read. An
+   * interactive human passes nothing and is unaffected.
+   */
+  async resume(planId: string, expectApprovedDigest?: string): Promise<Plan> {
+    return this.drive(planId, expectApprovedDigest);
   }
 
   /**
@@ -660,9 +672,25 @@ export class PlanningService {
   // Drive loop
   // =====================================================================
 
-  private async drive(planId: string): Promise<Plan> {
+  private async drive(planId: string, expectApprovedDigest?: string): Promise<Plan> {
     for (let step = 0; step < MAX_DRIVE_STEPS; step += 1) {
       const plan = await this.requirePlan(planId);
+
+      /**
+       * THE PIN IS CHECKED AGAINST EVERY READ (TASK-015 round-2 finding 1).
+       *
+       * This loop re-reads the plan on each step, so a revision approved
+       * between two steps would be driven by the later ones even though the
+       * caller only ever cleared the earlier content. Checking once outside the
+       * loop protected the CALL, not the LAUNCH — which is the same
+       * check-then-use shape one level down from where it was first found.
+       */
+      if (expectApprovedDigest !== undefined && plan.approvedDigest !== expectApprovedDigest) {
+        throw new ValidationError(
+          `plan ${planId} is no longer the approval that was authorized: expected digest ` +
+            `${expectApprovedDigest}, found ${plan.approvedDigest ?? "none"}. Refusing to drive it.`,
+        );
+      }
 
       if (isTerminalPlanPhase(plan.phase)) {
         // Same conclusion as `status()`, by construction (round 2): a terminal

@@ -190,6 +190,37 @@ describe("TASK-015 finding 2: identity is reconciled against the set", () => {
   });
 
   /**
+   * EFFORT IS PART OF MEMBERSHIP (round-2 finding 2).
+   *
+   * With `routed claude-code/sonnet` and `implementer claude-code/sonnet:high`
+   * both authorised, a worker reporting `sonnet:high` matched the ROUTED entry —
+   * which requested no effort — and was refused with "reported effort high but
+   * none was requested". An authorised member, refused, because the lookup
+   * compared only provider and model.
+   */
+  it("accepts a member that differs from the routed resource only by effort", async () => {
+    const executor = executorReporting(
+      [
+        { role: "implementer", provider: "claude-code", model: "sonnet", effort: "high" },
+        { role: "reviewer", provider: "codex-cli", model: "gpt-5.6-luna" },
+      ],
+      {
+        kind: "COMPLETED",
+        detail: "done",
+        reportedIdentity: { provider: "claude-code", model: "sonnet", effort: "high" },
+      },
+    );
+
+    const { result } = await runOnce(executor);
+
+    assert.notEqual(
+      result.kind,
+      "RECOVERY_REQUIRED",
+      `an authorised member was refused over effort: ${JSON.stringify(result)}`,
+    );
+  });
+
+  /**
    * THE CONTROL. A report naming something OUTSIDE the set must still be
    * refused, or the fix is a bypass rather than a widening.
    */

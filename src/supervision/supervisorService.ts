@@ -39,7 +39,7 @@ import {
   type BillingObservation,
   type SupervisedAction,
 } from "./financialSafety.js";
-import { reconcileReportedIdentity, type AiRunConfigRecord } from "./modelEnforcement.js";
+import { reconcileReportedIdentity, SUPPORTED_MODELS, type AiRunConfigRecord } from "./modelEnforcement.js";
 import { requiresAi, selectResource, type RoutingPolicy } from "./modelRouting.js";
 import {
   anchorFor,
@@ -60,6 +60,7 @@ import {
   type ResourceRecord,
   type ResourceState,
 } from "./resourceTypes.js";
+import { REQUIRED_RESOURCE_ROLES } from "./supervisorPorts.js";
 import type {
   AuthorizedResource,
   ReportedRunIdentity,
@@ -1037,6 +1038,41 @@ export class SupervisorService {
       return { kind: "RECOVERY_REQUIRED", reason: `resource declaration failed for ${item.key}: ${detail}` };
     }
 
+    /**
+     * A DECLARATION MUST BE UNAMBIGUOUS BEFORE IT IS AUTHORISED (round-2
+     * findings 3 and 4).
+     *
+     * Two ways a well-formed-looking declaration used to produce a broken run:
+     *
+     *   - ROLES. Settlement picks the entry whose role is `implementer`. A typo,
+     *     a missing implementer, or TWO of them meant lineage silently named the
+     *     routed resource or the first of two — and the reviewer showed the
+     *     consequence: the resource that really implemented was then chosen to
+     *     review its own work. C4 broken by a spelling mistake.
+     *   - MODELS. The single-resource path validates against `SUPPORTED_MODELS`
+     *     when it builds a run configuration. The set path never did, and the
+     *     probe is provider-level, so `claude-code/ghost-model` could be
+     *     declared, probed, gated and launched. That is strictly weaker than
+     *     what existed before this task, which is not an acceptable trade for a
+     *     capability.
+     *
+     * Both refuse the WHOLE action. An ambiguous declaration cannot be repaired
+     * by choosing an interpretation, and choosing one is how the C4 hole
+     * happened.
+     */
+    const declarationProblem = declaredResources.length === 0 ? undefined : describeDeclarationProblem(declaredResources);
+    if (declarationProblem !== undefined) {
+      const escalated = await this.escalate(
+        state,
+        item.key,
+        "RECOVERY_REQUIRED",
+        `Correct the resources ${item.key} declares: ${declarationProblem}`,
+        declarationProblem,
+      );
+      void escalated;
+      return { kind: "RECOVERY_REQUIRED", reason: `${item.key} declared unusable resources: ${declarationProblem}` };
+    }
+
     for (const required of declaredResources) {
       const identity = resourceIdentity(required);
       const already = authorized.find((entry) => resourceIdentity(entry) === identity);
@@ -1264,11 +1300,29 @@ export class SupervisorService {
      * carried over: the routed argv describes a different launch, and attaching
      * it to another resource would be evidence about a run that did not happen.
      */
+    /**
+     * EFFORT IS PART OF MEMBERSHIP HERE TOO (round-2 finding 2).
+     *
+     * Authorisation membership is provider/model/EFFORT, and this lookup
+     * compared only provider and model — so with `routed claude-code/sonnet` and
+     * `implementer claude-code/sonnet:high` both authorised, a worker reporting
+     * `sonnet:high` matched the ROUTED entry, was reconciled against a record
+     * that requested no effort, and was refused with "reported effort high but
+     * none was requested". An authorised member, refused.
+     *
+     * An EXACT match wins. A report that states no effort may still match an
+     * entry that names none; a report that states one only matches an entry that
+     * names the same one. Anything else finds no member and falls through to the
+     * routed record, which refuses — the fail-closed direction.
+     */
     const member =
       reported === undefined
         ? undefined
         : authorized.find(
-            (entry) => entry.provider === reported.provider && entry.model === reported.model,
+            (entry) =>
+              entry.provider === reported.provider &&
+              entry.model === reported.model &&
+              entry.effort === reported.effort,
           );
     /**
      * THE ROUTED RECORD IS NEVER REWRITTEN.
@@ -1284,7 +1338,8 @@ export class SupervisorService {
       member !== undefined &&
       runConfig !== undefined &&
       member.provider === runConfig.effectiveProvider &&
-      member.model === runConfig.effectiveModel;
+      member.model === runConfig.effectiveModel &&
+      member.effort === runConfig.effectiveEffort;
     const basis =
       runConfig === undefined || member === undefined || reportsRouted
         ? runConfig
@@ -2735,6 +2790,40 @@ export function chainIsLegacySilence(state: {
  */
 /** The role name for the resource the ROUTER chose, as opposed to a plan's. */
 const ROUTED_ROLE = "routed";
+
+/**
+ * What is wrong with a declaration, or `undefined` when nothing is.
+ *
+ * Returns the FIRST problem rather than all of them: an operator fixes one and
+ * re-runs, and a list invites fixing the easy one and re-reading the rest as
+ * advisory. Every branch here refuses the whole action.
+ */
+function describeDeclarationProblem(declared: readonly RequiredResource[]): string | undefined {
+  for (const resource of declared) {
+    if (!(REQUIRED_RESOURCE_ROLES as readonly string[]).includes(resource.role)) {
+      return `role ${JSON.stringify(boundedDiagnostic(resource.role))} is not one of ${REQUIRED_RESOURCE_ROLES.join(", ")}`;
+    }
+    const models = SUPPORTED_MODELS[resource.provider as keyof typeof SUPPORTED_MODELS];
+    if (models === undefined) {
+      return `provider ${JSON.stringify(boundedDiagnostic(resource.provider))} is not a provider this build can launch`;
+    }
+    if (!models.includes(resource.model)) {
+      return `model ${JSON.stringify(boundedDiagnostic(resource.model))} is not a supported model for ${resource.provider}`;
+    }
+  }
+
+  /**
+   * EXACTLY ONE IMPLEMENTER. Zero means lineage would fall back to the routed
+   * resource and record a resource that did not implement; two means it would
+   * silently take the first. Both are the C4 defect, and neither is repairable
+   * by picking.
+   */
+  const implementers = declared.filter((resource) => resource.role === "implementer");
+  if (implementers.length !== 1) {
+    return `a declaration must name exactly one implementer, found ${implementers.length}`;
+  }
+  return undefined;
+}
 
 /** Identity for deduplication: same provider, model and effort is one resource. */
 function resourceIdentity(resource: { readonly provider: string; readonly model: string; readonly effort?: string }): string {
