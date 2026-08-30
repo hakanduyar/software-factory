@@ -8,6 +8,7 @@
  */
 
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -20,11 +21,13 @@ import {
 } from "../src/supervision/planBackedExecutor.js";
 import { createSqlitePlanRepository } from "../src/adapters/planning/sqlitePlanRepository.js";
 import { computePlanContentDigest } from "../src/planning/planDigest.js";
+import type { AiRunConfigRecord } from "../src/supervision/modelEnforcement.js";
 import type { Plan, PlanPhase, PlannedWorkItem } from "../src/planning/planTypes.js";
 import type { WorkExecutionInput } from "../src/supervision/supervisorPorts.js";
 import type { RoadmapItem } from "../src/supervision/supervisorTypes.js";
 
 import { runSuperviseTick } from "../src/cli/supervise.js";
+import { parseSuperviseTickArgs } from "../src/cli/main.js";
 import { approvedPlan, newPlanning } from "./support/planFixtures.js";
 import type { Timestamp } from "../src/domain/time.js";
 
@@ -46,12 +49,46 @@ const ITEM: RoadmapItem = {
   order: 6,
 };
 
+/**
+ * ONE RESOURCE, DECLARED ON BOTH SIDES.
+ *
+ * Round-2 finding 2: the supervisor authorizes a single provider/model/effort
+ * and the plan carries its own, and nothing compared them. Every fixture here
+ * now states both, so a case about something else is not silently a case about
+ * an unauthorized launch — and so the cases about the gate itself can vary one
+ * side and watch the launch stop.
+ */
+export const AUTHORIZED_WORKER = { tool: "claude-code", model: "opus" } as const;
+
+const AUTHORIZED: AiRunConfigRecord = {
+  requestedProvider: "claude-code",
+  requestedModel: "opus",
+  effectiveProvider: "claude-code",
+  effectiveModel: "opus",
+  // What the supervisor really records at LAUNCH time: `VERIFIED_EFFECTIVE`
+  // exists only after a worker reports back, so a fixture claiming it here
+  // would be testing a state the gate never sees.
+  verification: "UNVERIFIED",
+  argvEvidence: ["claude", "--model", "opus"],
+  note: "scripted for tests",
+};
+
 function planWith(phase: PlanPhase): Plan {
-  return { id: "plan-1", phase } as unknown as Plan;
+  return {
+    id: "plan-1",
+    phase,
+    planner: AUTHORIZED_WORKER,
+    execution: {
+      implementer: AUTHORIZED_WORKER,
+      reviewer: AUTHORIZED_WORKER,
+      verificationCommands: [],
+      workspaceRoot: "/tmp/ws",
+    },
+  } as unknown as Plan;
 }
 
 function input(overrides: Partial<WorkExecutionInput> = {}): WorkExecutionInput {
-  return { item: ITEM, actionId: "action-1", ...overrides } as WorkExecutionInput;
+  return { item: ITEM, actionId: "action-1", config: AUTHORIZED, ...overrides } as WorkExecutionInput;
 }
 
 function lookup(plan: Plan | undefined): RoadmapPlanLookup {
@@ -215,9 +252,13 @@ describe("TASK-014 AC-3: an approved plan is driven through the planning seam", 
 describe("TASK-014 AC-5: a terminal failure is never success", () => {
   it("reports every unsuccessful terminal phase as needing a human, naming it", async () => {
     for (const phase of ["REJECTED", "BLOCKED", "CANCELLED", "RECOVERY_REQUIRED"] as const) {
+      const withReason = {
+        ...planWith(phase),
+        failureReason: "verifier failed for command test",
+      } as Plan;
       const executor = createPlanBackedExecutor({
-        plans: lookup(planWith(phase)),
-        planning: advancer(planWith(phase)),
+        plans: lookup(withReason),
+        planning: advancer(withReason),
         clock: CLOCK,
       });
 
@@ -228,6 +269,18 @@ describe("TASK-014 AC-5: a terminal failure is never success", () => {
         outcome.kind === "HUMAN_REQUIRED" ? outcome.detail : "",
         new RegExp(phase),
         `${phase} was not named in the escalation`,
+      );
+      /**
+       * AND THE LOOP'S REASON (round-2 survivor). Deleting `failureReason` from
+       * the escalation left the whole focused file green, because this case
+       * only ever checked the phase name. The reason is the part a human
+       * actually needs -- "verifier failed for command test" -- and it is the
+       * part that was being dropped.
+       */
+      assert.match(
+        outcome.kind === "HUMAN_REQUIRED" ? outcome.detail : "",
+        /verifier failed for command test/,
+        `${phase} did not carry the loop's failure reason`,
       );
     }
   });
@@ -391,6 +444,165 @@ describe("TASK-014 AC-1: the SHIPPED CLI construction path", () => {
       `the supervisor never reached the bound plan, so a stub would behave identically:${String.fromCharCode(10)}${output}`,
     );
   });
+
+  /**
+   * THE COMMAND AN OPERATOR TYPES (round-2 finding 1).
+   *
+   * The case above calls `runSuperviseTick` directly, and round-2 review pointed
+   * out what that leaves unproven: `src/cli/main.ts` never parsed
+   * `--roadmap-plans`, `--plans-db` or `--drive-plans`, so the shipped command
+   * ignored all three and exited 0 — including with a bindings path that does
+   * not exist. Every option was reachable from a test and from nowhere else.
+   *
+   * These drive the REAL BUILT CLI as a child process. `npm test` builds before
+   * it runs tests, so `dist/` is this tree's own output rather than a leftover.
+   */
+  function runCli(args: readonly string[], env: Record<string, string>) {
+    return spawnSync(process.execPath, ["dist/src/cli/main.js", ...args], {
+      cwd: process.cwd(),
+      env: { ...process.env, ...env },
+      encoding: "utf8",
+    });
+  }
+
+  it("fails when the shipped command is given a bindings file that does not exist", () => {
+    const dir = mkdtempSync(join(tmpdir(), "sf-supervise-cli-"));
+    created.push(dir);
+
+    const result = runCli(
+      ["supervise", "tick", "--roadmap-plans", join(dir, "does-not-exist.json")],
+      { FACTORY_SUPERVISOR_DB_PATH: join(dir, "supervisor.db") },
+    );
+
+    assert.notEqual(
+      result.status,
+      0,
+      `the CLI ignored --roadmap-plans and reported success:${String.fromCharCode(10)}${result.stdout}`,
+    );
+    assert.match(
+      `${result.stdout}${result.stderr}`,
+      /does-not-exist\.json|ENOENT/,
+      "the CLI failed for some reason other than the bindings file it was given",
+    );
+  });
+
+  /**
+   * And the POSITIVE half, which is the one that cannot be satisfied by any
+   * amount of failing early: the shipped command reaches a real bound plan and
+   * prints its real state. A `main.ts` that drops the flags cannot.
+   */
+  it("reaches a bound plan through the shipped command", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "sf-supervise-cli-ok-"));
+    created.push(dir);
+
+    const plansDbPath = join(dir, "plans.db");
+    const plans = createSqlitePlanRepository(plansDbPath);
+    try {
+      await plans.create(blockedPlanFixture());
+    } finally {
+      plans.close();
+    }
+    const bindingsPath = join(dir, "roadmap-plans.json");
+    writeFileSync(bindingsPath, JSON.stringify({ LOCAL_24_7_RUNTIME: "plan-blocked-1" }));
+
+    const result = runCli(
+      ["supervise", "tick", "--roadmap-plans", bindingsPath, "--plans-db", plansDbPath],
+      { FACTORY_SUPERVISOR_DB_PATH: join(dir, "supervisor.db") },
+    );
+
+    assert.match(
+      `${result.stdout}${result.stderr}`,
+      /plan-blocked-1/,
+      `the shipped command never reached the bound plan:${String.fromCharCode(10)}${result.stdout}${result.stderr}`,
+    );
+  });
+
+  it("refuses an unknown option rather than ignoring it", () => {
+    assert.equal(parseSuperviseTickArgs(["--plan-config", "x"]).ok, false);
+    assert.equal(parseSuperviseTickArgs(["extra"]).ok, false);
+    assert.equal(parseSuperviseTickArgs(["--roadmap-plans"]).ok, false);
+    // Driving with nothing to drive is a mistake worth naming, not a silent no-op.
+    assert.equal(parseSuperviseTickArgs(["--drive-plans"]).ok, false);
+  });
+
+  it("maps every documented flag onto the option the supervisor reads", () => {
+    const parsed = parseSuperviseTickArgs([
+      "--roadmap-plans",
+      "/tmp/bindings.json",
+      "--plans-db",
+      "/tmp/plans.db",
+      "--drive-plans",
+    ]);
+
+    assert.equal(parsed.ok, true);
+    assert.deepEqual(parsed.ok ? parsed.value : {}, {
+      roadmapPlansPath: "/tmp/bindings.json",
+      plansDbPath: "/tmp/plans.db",
+      drivePlans: true,
+    });
+  });
+});
+
+/**
+ * The operator's bindings file is INPUT, and round-2 review's binding
+ * assessment listed what was not validated: unknown keys, whitespace ids and
+ * resource limits. Each is refused by NAME, because the failure mode is an
+ * operator who believes a plan is wired when it is not.
+ */
+describe("TASK-014: the roadmap-to-plan bindings file is validated", () => {
+  function bindings(contents: string): string {
+    const dir = mkdtempSync(join(tmpdir(), "sf-bindings-"));
+    created.push(dir);
+    const path = join(dir, "roadmap-plans.json");
+    writeFileSync(path, contents);
+    return path;
+  }
+
+  async function tickWith(path: string): Promise<void> {
+    const dir = mkdtempSync(join(tmpdir(), "sf-bindings-db-"));
+    created.push(dir);
+    await runSuperviseTick({
+      supervisorDbPath: join(dir, "supervisor.db"),
+      roadmapPlansPath: path,
+      log: () => {},
+    });
+  }
+
+  it("refuses a roadmap key this installation does not declare", async () => {
+    await assert.rejects(
+      () => tickWith(bindings(JSON.stringify({ NOT_A_REAL_ITEM: "plan-1" }))),
+      /not a roadmap key/,
+      "a typo'd key bound nothing and said nothing",
+    );
+  });
+
+  it("refuses a plan id that is only whitespace", async () => {
+    await assert.rejects(
+      () => tickWith(bindings(JSON.stringify({ LOCAL_24_7_RUNTIME: "   " }))),
+      /non-empty plan id/,
+    );
+  });
+
+  it("refuses a plan id with surrounding whitespace rather than trimming it", async () => {
+    await assert.rejects(
+      () => tickWith(bindings(JSON.stringify({ LOCAL_24_7_RUNTIME: " plan-1 " }))),
+      /surrounding whitespace/,
+      "the id was silently trimmed, so the file no longer says what the supervisor did",
+    );
+  });
+
+  it("refuses more bindings than it will consider", async () => {
+    const many: Record<string, string> = {};
+    for (let i = 0; i < 101; i += 1) {
+      many[`KEY_${i}`] = "plan-1";
+    }
+    await assert.rejects(() => tickWith(bindings(JSON.stringify(many))), /the limit is 100/);
+  });
+
+  it("refuses a file too large to parse safely", async () => {
+    const huge = JSON.stringify({ LOCAL_24_7_RUNTIME: "x".repeat(70 * 1024) });
+    await assert.rejects(() => tickWith(bindings(huge)), /the limit is 65536/);
+  });
 });
 
 describe("TASK-014 AC-4: dispatch is idempotent through the REAL planning seam", () => {
@@ -411,7 +623,24 @@ describe("TASK-014 AC-4: dispatch is idempotent through the REAL planning seam",
    */
   it("executes the same item twice and starts exactly one loop", async () => {
     const context = await newPlanning();
-    const plan = await approvedPlan(context);
+    /**
+     * Started with ONE worker configuration throughout, because the
+     * authorization gate refuses to launch a plan that would run anything the
+     * supervisor did not authorize — and the default fixture names three
+     * different models. That refusal is tested on its own in
+     * planAuthorization.test.ts; here it would only hide the idempotence
+     * question behind an unrelated stop.
+     */
+    const plan = await approvedPlan(context, "Build the thing.", {
+      planner: AUTHORIZED_WORKER,
+      execution: {
+        implementer: AUTHORIZED_WORKER,
+        reviewer: AUTHORIZED_WORKER,
+        verificationCommands: [{ id: "check", executable: "node", argv: ["-e", "process.exit(0)"] }],
+        workspaceRoot: "/tmp/sf-plan-test",
+        loopBudget: { maxIterations: 2 },
+      },
+    });
 
     const executor = createPlanBackedExecutor({
       plans: { async findPlanForItem() { return context.plans.findById(plan.id); } },
@@ -431,6 +660,21 @@ describe("TASK-014 AC-4: dispatch is idempotent through the REAL planning seam",
      * nothing at all. Asserting it reached the plan is what makes the count
      * meaningful -- the fourth shape, caught in this test before review had to.
      */
+    /**
+     * THE EXECUTOR MUST HAVE ACTUALLY RESUMED (round-2 survivor).
+     *
+     * Replacing `planning.resume(plan.id)` with `const advanced = plan` compiled
+     * and this case still passed, because "not HUMAN_REQUIRED" is equally true
+     * of a no-op that reports the plan's existing phase. The plan is APPROVED
+     * before the first execution and the scripted dispatcher moves it on, so a
+     * genuine resume CHANGES what comes back; a no-op cannot.
+     */
+    const drove = await context.plans.findById(plan.id);
+    assert.notEqual(
+      drove?.phase,
+      "APPROVED",
+      "the plan is still APPROVED, so resume() did nothing and the start count proves nothing",
+    );
     for (const [label, outcome] of [["first", first], ["second", second]] as const) {
       assert.notEqual(
         outcome.kind,
@@ -565,7 +809,7 @@ describe("TASK-014: an unconfigured supervisor is honest rather than stubbed", (
     assert.equal(outcome.kind, "HUMAN_REQUIRED");
     assert.match(
       outcome.kind === "HUMAN_REQUIRED" ? outcome.detail : "",
-      /no planning configuration/,
+      /not permitted to drive plans/,
     );
     assert.notEqual(outcome.kind, "COMPLETED");
   });

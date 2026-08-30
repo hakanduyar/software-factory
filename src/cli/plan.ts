@@ -467,38 +467,27 @@ function openStores(
 }
 
 /**
- * Planning, opened for the SUPERVISOR (TASK-014).
+ * THERE IS DELIBERATELY NO `openPlanningForSupervisor` HERE ANY MORE.
  *
- * `sf supervise` needs the same construction `sf plan` performs -- planner
- * worker, loop dispatcher, workspace, verification commands -- because driving
- * an approved plan means driving the real TASK-004 loop. Exported here rather
- * than rebuilt there so the two CLIs cannot drift into two different planning
- * stacks, which is the "second engineering loop" failure one layer up.
+ * TASK-014's first attempt exported one, so `sf supervise` could build this
+ * whole stack — planner worker, loop dispatcher, workspace — inside the
+ * SUPERVISOR'S OWN PROCESS and call `PlanningService.resume()` as a function.
+ * Round-2 review named the consequence: that put the engineering loop and every
+ * AI worker back in-process, which is precisely what TASK-011 AC-1 and AC-11
+ * exist to prevent, and the isolation test did not catch it because it asserted
+ * only that the ISOLATED child was absent.
  *
- * The caller owns the handles and must `close()` them.
+ * It was also a second, quieter defect. That function built the stack from an
+ * operator-supplied `--config` FILE, while every command below builds it from
+ * the plan's PERSISTED configuration — so the supervisor could have driven an
+ * approved plan with a workspace, verification commands and worker models the
+ * approval never covered.
+ *
+ * The supervisor now runs `sf plan resume <plan-id>` as a CHILD PROCESS
+ * (`createChildPlanAdvancer`), which reaches `runPlanResume` below and therefore
+ * uses the plan's own stored configuration, exactly as a human's invocation
+ * does. Re-adding an in-process entry point would reopen both holes at once.
  */
-export interface SupervisorPlanning {
-  readonly plans: SqlitePlanRepository;
-  readonly service: PlanningService;
-  close(): void;
-}
-
-export function openPlanningForSupervisor(
-  configPath: string,
-  options: PlanCliOptions = {},
-): SupervisorPlanning {
-  const config = loadPlanConfig(configPath);
-  const stores = openWithConfig(options, config);
-  return {
-    plans: stores.plans,
-    service: stores.service,
-    close(): void {
-      stores.plans.close();
-      stores.loops.close();
-      stores.store.close();
-    },
-  };
-}
 
 /** `sf plan start`: the configuration comes from the `--config` file the operator supplied. */
 function openWithConfig(options: PlanCliOptions, config: PlanCliConfig): OpenStores {

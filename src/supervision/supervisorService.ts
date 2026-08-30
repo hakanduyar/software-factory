@@ -741,21 +741,22 @@ export class SupervisorService {
      *
      * WHAT THIS DOES NOT DO, and where that line has moved.
      *
-     * The executor this service calls TODAY is in-process, and an in-process
-     * function cannot stop code that can already call `fetch`. What this closes
-     * is the version of the hole the supervisor CAN close: work that never
-     * declared anything and was therefore never asked.
+     * The `WorkExecutor` this service CALLS is still an in-process function, and
+     * an in-process function cannot stop code that can already call `fetch`.
+     * What this closes is the version of the hole the supervisor CAN close: work
+     * that never declared anything and was therefore never asked.
      *
-     * Real enforcement — a separate process with restricted credentials — is no
-     * longer "a later roadmap item": `createIsolatedExecutor` implements it
-     * (TASK-011, on this branch). It is not yet WIRED, because `EXECUTOR_WIRING`
-     * depends on both `EXECUTOR_ISOLATION` and `STATE_INTEGRITY` being accepted
-     * and integrated first, so production still uses the explicitly named
-     * `createUnimplementedExecutor`.
+     * Real enforcement — a separate process — is no longer "a later roadmap
+     * item". `createIsolatedExecutor` implements the credential-denied form
+     * (TASK-011), and since `EXECUTOR_WIRING` production wires
+     * `createPlanBackedExecutor`, which runs an approved plan by launching
+     * `sf plan resume` as a CHILD PROCESS rather than by calling the engineering
+     * loop here. `createUnimplementedExecutor` is gone.
      *
-     * That distinction is the whole of the honesty here: the mechanism exists,
-     * this path does not use it yet, and this note will be wrong the day the
-     * wiring lands if nobody updates it again.
+     * That distinction is the whole of the honesty here, and it has narrowed
+     * rather than disappeared: the function called in this process can now only
+     * read a plan's state and start a child, so the WORK is outside — but what
+     * that child does once started, this gate still cannot police.
      */
     if (!requiresAi(item.workClass) && (item.declaredActionKinds ?? []).length === 0) {
       const humanAction = `Declare the action kinds ${item.key} will perform (declaredActionKinds) before it can run; deterministic work that declares nothing cannot be gated.`;

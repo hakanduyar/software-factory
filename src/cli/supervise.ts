@@ -11,7 +11,7 @@
  * they never probe a provider, never launch a worker and never write.
  */
 
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
 import { createCliResourceProbe } from "../adapters/supervision/cliResourceProbe.js";
@@ -28,7 +28,8 @@ import { reconcileRoadmapWithCatalog } from "../supervision/roadmapCatalog.js";
 import { DEFAULT_ROADMAP } from "../supervision/supervisorTypes.js";
 import { verifyAgainstAnchor } from "../supervision/provenanceChain.js";
 import { createSqlitePlanRepository } from "../adapters/planning/sqlitePlanRepository.js";
-import { DEFAULT_PLANS_DB_PATH, openPlanningForSupervisor } from "./plan.js";
+import { createChildPlanAdvancer } from "../adapters/supervision/childPlanAdvancer.js";
+import { DEFAULT_PLANS_DB_PATH } from "./plan.js";
 import {
   createPlanBackedExecutor,
   type PlanAdvancer,
@@ -45,11 +46,21 @@ export interface SuperviseCliOptions {
   readonly supervisorDbPath?: string;
   readonly log?: (line: string) => void;
   /**
-   * The same `--config` file `sf plan` takes. Supplying it is what makes this
-   * supervisor able to DRIVE an approved plan rather than only report that one
-   * is needed.
+   * Permission to LAUNCH — `--drive-plans` (round-2 finding 2).
+   *
+   * This replaced `--plan-config`, and the replacement is the fix rather than a
+   * rename. That flag named a configuration FILE, from which the supervisor
+   * built its own planning stack in its own process: an AI execution path inside
+   * the supervisor (TASK-011 AC-1/AC-11), and one that could drive a plan with
+   * verification commands and worker models its approval never covered, because
+   * every other `sf plan` command builds from the plan's PERSISTED config.
+   *
+   * There is now nothing to configure. Driving means running `sf plan resume` as
+   * a child process, and that child reads the plan's own stored configuration.
+   * What remains is a decision — may this supervisor spend? — so what remains is
+   * a boolean, and its default is no.
    */
-  readonly planConfigPath?: string;
+  readonly drivePlans?: boolean;
   /**
    * Which approved plan serves which roadmap item, declared by a human.
    *
@@ -133,31 +144,75 @@ function openForReading(options: SuperviseCliOptions, log: (line: string) => voi
 }
 
 /**
- * The executor the shipped CLI wires in (TASK-014 AC-1).
+ * Which approved plan serves which roadmap item, read from the file a human
+ * declared it in.
  *
- * `createUnimplementedExecutor` used to live here and answered every roadmap
- * item with `HUMAN_REQUIRED / AUTHOR_PLAN`. That was honest when nothing
- * connected the queue to TASK-005 planning, and it is not honest any more.
- *
- * WITH a plan configuration and a roadmap-to-plan binding, this supervisor
- * finds the approved plan for an item and drives it through the real
- * `PlanningService`, which dispatches into the TASK-004 loop. WITHOUT them it
- * finds no plan and reports that a human must author one -- the same words the
- * old stub produced, but reached by the real code path rather than hard-coded,
- * and the difference becomes visible the moment a configuration exists.
- *
- * Nothing here can approve a plan. Approval is `PLAN_APPROVAL`, a protected
- * gate under C1, and this path holds no `TrustedHumanToken`.
+ * Nothing here can approve a plan. Approval is `PLAN_APPROVAL`, a protected gate
+ * under C1, and this path holds no `TrustedHumanToken`.
  */
+/** Bounds on the operator's bindings file. Generous, and finite. */
+const MAX_BINDINGS_BYTES = 64 * 1024;
+const MAX_BINDINGS_ENTRIES = 100;
+const MAX_PLAN_ID_LENGTH = 200;
+
 function readRoadmapPlanBindings(path: string): Readonly<Record<string, string>> {
-  const raw = JSON.parse(readFileSync(resolve(path), "utf8")) as unknown;
+  const resolved = resolve(path);
+  /**
+   * BOUNDED BEFORE IT IS PARSED (round-2 binding assessment).
+   *
+   * `JSON.parse` on an arbitrarily large file is an arbitrarily large
+   * allocation, and this file is operator input read at the start of every
+   * tick. Checking the size first costs one `stat`.
+   */
+  const size = statSync(resolved).size;
+  if (size > MAX_BINDINGS_BYTES) {
+    throw new Error(
+      `--roadmap-plans "${path}" is ${size} bytes; the limit is ${MAX_BINDINGS_BYTES}`,
+    );
+  }
+
+  const raw = JSON.parse(readFileSync(resolved, "utf8")) as unknown;
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
     throw new Error(`--roadmap-plans "${path}" must be a JSON object of roadmapKey -> planId`);
   }
+
+  const entries = Object.entries(raw);
+  if (entries.length > MAX_BINDINGS_ENTRIES) {
+    throw new Error(
+      `--roadmap-plans "${path}" declares ${entries.length} bindings; the limit is ${MAX_BINDINGS_ENTRIES}`,
+    );
+  }
+
+  const declared = new Set(DEFAULT_ROADMAP.map((item) => item.key));
   const bindings: Record<string, string> = {};
-  for (const [key, value] of Object.entries(raw)) {
-    if (typeof value !== "string" || value.length === 0) {
+  for (const [key, value] of entries) {
+    /**
+     * AN UNKNOWN ROADMAP KEY IS A MISTAKE, NOT A NO-OP.
+     *
+     * Round-2 review pointed out that this accepted any key. A typo bound
+     * nothing and said nothing: the operator saw a successful tick and
+     * concluded their plan was wired, when in fact the item they meant was
+     * still reporting that it needs a plan. Refusing names the typo.
+     */
+    if (!declared.has(key)) {
+      throw new Error(
+        `--roadmap-plans entry ${JSON.stringify(safe(key))} is not a roadmap key this installation declares`,
+      );
+    }
+    if (typeof value !== "string" || value.trim().length === 0) {
       throw new Error(`--roadmap-plans entry "${key}" must be a non-empty plan id`);
+    }
+    /**
+     * Surrounding whitespace is refused rather than trimmed. A trimmed id would
+     * silently mean something different from what the file says, and the whole
+     * point of this file is that a human declared exactly which plan serves
+     * which item.
+     */
+    if (value !== value.trim()) {
+      throw new Error(`--roadmap-plans entry "${key}" has surrounding whitespace in its plan id`);
+    }
+    if (value.length > MAX_PLAN_ID_LENGTH) {
+      throw new Error(`--roadmap-plans entry "${key}" has a plan id longer than ${MAX_PLAN_ID_LENGTH} characters`);
     }
     bindings[key] = value;
   }
@@ -170,21 +225,27 @@ interface SupervisorExecutorWiring {
 }
 
 /**
- * FINDING A PLAN AND DRIVING ONE ARE SEPARATE CAPABILITIES, and separating them
- * was forced by evidence rather than taste.
+ * THE EXECUTOR THE SHIPPED CLI WIRES IN (TASK-014 AC-1).
  *
- * They were one option, so a supervisor could not look up a plan without the
- * entire planning stack -- planner worker, loop dispatcher, workspace. That
+ * `createUnimplementedExecutor` used to live here and answered every roadmap
+ * item with `HUMAN_REQUIRED / AUTHOR_PLAN`. That was honest when nothing
+ * connected the queue to TASK-005 planning, and it is not honest any more.
+ *
+ * FINDING A PLAN AND DRIVING ONE ARE SEPARATE CAPABILITIES, and separating them
+ * was forced by evidence rather than taste. They were one option, so a
+ * supervisor could not look up a plan without the entire planning stack. That
  * made the unconfigured and stub behaviours observationally IDENTICAL, and
  * round-1 review proved the consequence: a mutation that constructed the real
  * executor, discarded it, and returned the old stub passed every test. Nothing
  * could distinguish them because nothing could reach a configuration where they
  * differ.
  *
- * Now `--roadmap-plans` (with the plans database) is enough to FIND a plan and
- * report its real state, and `--plan-config` is additionally required to DRIVE
- * one. A supervisor that can see a blocked plan and say so is already doing
- * something no stub can.
+ * So `--roadmap-plans` (with the plans database) is enough to FIND a plan and
+ * report its real state — blocked, awaiting approval, running — which is already
+ * something no stub can do. `--drive-plans` is additionally required to LAUNCH
+ * one, and launching happens in a CHILD PROCESS running `sf plan resume`
+ * (TASK-011 AC-1). The supervisor's own process never contains the engineering
+ * loop or an AI worker.
  */
 function createSupervisorExecutor(
   options: SuperviseCliOptions,
@@ -197,8 +258,19 @@ function createSupervisorExecutor(
       return undefined;
     },
   };
+  let planning: PlanAdvancer | undefined;
+
   if (options.roadmapPlansPath !== undefined) {
     const bindings = readRoadmapPlanBindings(options.roadmapPlansPath);
+    /**
+     * RESOLVED ONCE, and shared by everything that touches plans.
+     *
+     * Round-2 finding 1 named the drift: the lookup resolved a plans database
+     * here while the planning stack resolved its own, so a supervisor could read
+     * a plan from one database and advance a plan in another. The same resolved
+     * string now feeds the lookup AND is handed to the child process in its
+     * environment, so there is one path and no way for the two to disagree.
+     */
     const plansDbPath = resolve(
       options.plansDbPath ?? process.env["FACTORY_PLANS_DB_PATH"] ?? DEFAULT_PLANS_DB_PATH,
     );
@@ -211,13 +283,26 @@ function createSupervisorExecutor(
         return planId === undefined ? undefined : plans.findById(planId);
       },
     };
-  }
 
-  let planning: PlanAdvancer | undefined;
-  if (options.planConfigPath !== undefined) {
-    const opened = openPlanningForSupervisor(options.planConfigPath, { log });
-    closers.push(() => opened.close());
-    planning = opened.service;
+    if (options.drivePlans === true) {
+      planning = createChildPlanAdvancer({
+        processRunner: createNodeProcessRunner(),
+        plans,
+        cwd: process.cwd(),
+        plansDbPath,
+        log,
+      });
+    }
+  } else if (options.drivePlans === true) {
+    /**
+     * REFUSED LOUDLY rather than silently doing nothing.
+     *
+     * Driving needs a plan to drive, and only `--roadmap-plans` says which plan
+     * serves which roadmap item. An operator who asked for driving and got a
+     * supervisor that quietly never drives anything would reasonably conclude
+     * the feature works and nothing was ready.
+     */
+    throw new Error("--drive-plans also needs --roadmap-plans: there is no plan to drive without a binding");
   }
 
   return {
@@ -334,15 +419,25 @@ export async function runSuperviseBlock(options: SuperviseBlockOptions): Promise
     return 1;
   }
 
-  const repository = openRepository(options);
   /**
-   * Recording a blocker never executes work, so the wiring is opened and closed
-   * around it rather than special-cased: one construction path means the
-   * blocker command cannot drift into a different executor from the tick.
+   * Recording a blocker NEVER executes work, so it opens no planning wiring at
+   * all (round-2 finding 4). The previous version opened the plans database and
+   * possibly the whole planning stack to record a note, which is both wasteful
+   * and a second way to fail before the `try`.
+   *
+   * `buildService` still needs an executor, so it gets one that refuses: if the
+   * blocker path ever did reach execution, it must fail loudly rather than run
+   * work through a command that is not supposed to.
    */
-  const wiring = createSupervisorExecutor(options, log);
+  const refuseToExecute: WorkExecutor = {
+    async execute() {
+      throw new Error("sf supervise block does not execute work");
+    },
+  };
+  let repository: SqliteSupervisorRepository | undefined;
   try {
-    const service = buildService(repository, log, wiring.executor);
+    repository = openRepository(options);
+    const service = buildService(repository, log, refuseToExecute);
     const result = await service.recordBlocker({
       roadmapKey: options.roadmapKey,
       reason: options.reason as EscalationReason,
@@ -358,22 +453,32 @@ export async function runSuperviseBlock(options: SuperviseBlockOptions): Promise
     log(`detail     : ${safe(options.detail)}`);
     return 0;
   } finally {
-    wiring.close();
-    repository.close();
+    repository?.close();
   }
 }
 
 export async function runSuperviseTick(options: SuperviseCliOptions = {}): Promise<TickResult> {
   const log = options.log ?? ((line: string): void => console.log(line));
-  const repository = openRepository(options);
-  const wiring = createSupervisorExecutor(options, log);
+  /**
+   * EVERY handle is opened inside the `try` (round-2 finding 4).
+   *
+   * Both were constructed BEFORE it, so a throw from the second -- a missing
+   * bindings file, a malformed plan config -- left the first open. The reviewer
+   * reproduced exactly that: `rejected ENOENT` with supervisor.db, its WAL and
+   * its SHM still in `open_fds`. A CLI that leaks a database handle on a
+   * configuration typo is a CLI that eventually cannot reopen its own state.
+   */
+  let repository: SqliteSupervisorRepository | undefined;
+  let wiring: SupervisorExecutorWiring | undefined;
   try {
+    repository = openRepository(options);
+    wiring = createSupervisorExecutor(options, log);
     const result = await buildService(repository, log, wiring.executor).tick();
     describeTick(result, log);
     return result;
   } finally {
-    wiring.close();
-    repository.close();
+    wiring?.close();
+    repository?.close();
   }
 }
 

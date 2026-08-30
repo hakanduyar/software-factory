@@ -40,9 +40,17 @@ Usage:
                       Reject the current plan revision (trusted human)
   sf plan resume <plan-id>   Resume planning/materialization/dispatch after a restart
   sf plan cancel <plan-id>   Durably cancel a plan (trusted human)
-  sf supervise tick   Run ONE bounded autonomous-completion pass and exit (TASK-006).
+  sf supervise tick [--roadmap-plans <path>] [--plans-db <path>] [--drive-plans]
+                      Run ONE bounded autonomous-completion pass and exit (TASK-006).
                       Designed for a systemd timer/cron: between ticks no process
                       runs, so waiting for a provider costs nothing.
+                      --roadmap-plans  JSON map of roadmapKey -> approved plan id,
+                                       declared by a human. Lets the tick FIND the
+                                       plan serving an item and report its state.
+                      --plans-db       Where the plans database lives.
+                      --drive-plans    Also LAUNCH an approved plan, by running
+                                       sf plan resume in a child process. Off by
+                                       default: launching spends.
   sf supervise status     Show supervisor state, spending policy and open escalations
   sf supervise resources  Show per-resource availability, retry times and backoff
   sf supervise roadmap    Show the durable roadmap queue and what it is waiting on
@@ -161,6 +169,66 @@ export function parseBlockArgs(
     return { ok: false, error: `no default human action for reason ${JSON.stringify(reason)}; pass --action` };
   }
   return { ok: true, value: { roadmapKey, reason, humanActionRequired, detail } };
+}
+
+/**
+ * What `sf supervise tick` accepts (TASK-014 round-2 finding 1).
+ *
+ * The options existed on `SuperviseCliOptions` and the shipped CLI never parsed
+ * them, so `sf supervise tick --roadmap-plans <path>` ran a supervisor that
+ * could find no plan and exited 0 — including with a path that does not exist.
+ * The AC-1 test called `runSuperviseTick` directly and so proved nothing about
+ * the command an operator actually types.
+ *
+ * Exported, and parsed by a function rather than by `argv.indexOf` at the call
+ * site, so the mapping from flags to options is something a test can hold.
+ */
+export interface SuperviseTickArgs {
+  readonly roadmapPlansPath?: string;
+  readonly plansDbPath?: string;
+  readonly drivePlans?: boolean;
+}
+
+export function parseSuperviseTickArgs(
+  args: readonly string[],
+): { readonly ok: true; readonly value: SuperviseTickArgs } | { readonly ok: false; readonly error: string } {
+  const valued = new Map<string, string>();
+  let drivePlans = false;
+
+  for (let i = 0; i < args.length; i += 1) {
+    const token = args[i];
+    if (token === undefined) continue;
+    if (token === "--drive-plans") {
+      drivePlans = true;
+      continue;
+    }
+    if (token !== "--roadmap-plans" && token !== "--plans-db") {
+      // Unknown flags and stray positionals both REFUSED. A tick that silently
+      // ignores an argument is how the defect above stayed invisible: the
+      // operator sees a successful run and concludes the option took effect.
+      return { ok: false, error: `unexpected argument ${JSON.stringify(token)}` };
+    }
+    const value = args[i + 1];
+    if (value === undefined || value.startsWith("--")) {
+      return { ok: false, error: `option ${JSON.stringify(token)} requires a value` };
+    }
+    valued.set(token, value);
+    i += 1;
+  }
+
+  const roadmapPlansPath = valued.get("--roadmap-plans");
+  const plansDbPath = valued.get("--plans-db");
+  if (drivePlans && roadmapPlansPath === undefined) {
+    return { ok: false, error: "--drive-plans also needs --roadmap-plans: there is no plan to drive without a binding" };
+  }
+  return {
+    ok: true,
+    value: {
+      ...(roadmapPlansPath === undefined ? {} : { roadmapPlansPath }),
+      ...(plansDbPath === undefined ? {} : { plansDbPath }),
+      ...(drivePlans ? { drivePlans: true } : {}),
+    },
+  };
 }
 
 async function main(argv: readonly string[]): Promise<number> {
@@ -302,7 +370,15 @@ async function main(argv: readonly string[]): Promise<number> {
       const log = (line: string): void => console.log(line);
 
       if (sub === "tick") {
-        const result = await runSuperviseTick({ log });
+        const parsed = parseSuperviseTickArgs(argv.slice(2));
+        if (!parsed.ok) {
+          console.error(parsed.error);
+          console.error(
+            `Usage: sf supervise tick [--roadmap-plans <path>] [--plans-db <path>] [--drive-plans]`,
+          );
+          return 1;
+        }
+        const result = await runSuperviseTick({ log, ...parsed.value });
         // A resource shortage or a human-only boundary is an expected outcome,
         // not a failure; only unrecoverable state is a non-zero exit.
         return result.kind === "RECOVERY_REQUIRED" ? 1 : 0;

@@ -30,8 +30,21 @@
  *   - It never turns a terminal failure into success. A plan that is BLOCKED,
  *     REJECTED, CANCELLED or in RECOVERY_REQUIRED is reported as needing a
  *     human, naming the phase.
+ *   - It never launches a plan whose configuration disagrees with what the
+ *     supervisor authorised. `checkPlanAuthorization` runs immediately before
+ *     the launch and refuses; it does not substitute a provider or rewrite
+ *     either side into agreement.
+ *
+ * IT DOES NOT PERFORM THE WORK ITSELF, and that is a process boundary rather
+ * than a convention. `PlanAdvancer` is one method wide, and the shipped wiring
+ * satisfies it with `createChildPlanAdvancer`, which runs `sf plan resume` in a
+ * SEPARATE OS PROCESS (TASK-011 AC-1). Round-2 review found the first version
+ * calling `PlanningService.resume()` in this process, which put the whole
+ * engineering loop and every AI worker inside the supervisor — the exact
+ * arrangement TASK-011 exists to remove.
  */
 
+import { checkPlanAuthorization } from "./planAuthorization.js";
 import type { Clock } from "../ports/clock.js";
 import type { Plan, PlanPhase } from "../planning/planTypes.js";
 import type { WorkExecutionInput, WorkExecutor, WorkOutcome } from "./supervisorPorts.js";
@@ -66,15 +79,16 @@ export interface PlanBackedExecutorDeps {
   /**
    * OPTIONAL, and the absence is a real deployment rather than a gap.
    *
-   * Driving a plan needs the whole TASK-005 construction — planner worker, loop
-   * dispatcher, workspace, verification commands — which the supervisor CLI only
-   * has when an operator supplies a planning configuration. Without one, an
-   * approved plan is reported as needing a human instead of being driven.
+   * Driving a plan launches AI workers and therefore spends, so the shipped CLI
+   * wires this only when an operator asks for it with `--drive-plans`. Without
+   * it a supervisor still FINDS the plan and reports its true state — blocked,
+   * awaiting approval, running — and says a human must enable driving before it
+   * will launch anything.
    *
    * This is why the CLI can stop wiring `createUnimplementedExecutor` (AC-1)
    * without pretending to capabilities it lacks: the SAME executor runs in both
-   * deployments, and the honest answer for an unconfigured supervisor comes out
-   * of the real path rather than a stub that hard-codes it.
+   * deployments, and the honest answer for a read-only supervisor comes out of
+   * the real path rather than a stub that hard-codes it.
    */
   readonly planning?: PlanAdvancer;
   readonly clock: Clock;
@@ -232,11 +246,36 @@ export function createPlanBackedExecutor(deps: PlanBackedExecutorDeps): WorkExec
           return humanRequired(
             input.item,
             "CONFIGURE_PLANNING",
-            `plan ${plan.id} is ${plan.phase} but this supervisor has no planning configuration, so it cannot drive the engineering loop`,
+            `plan ${plan.id} is ${plan.phase} but this supervisor is not permitted to drive plans, so it cannot launch the engineering loop (start it with --drive-plans to allow that)`,
           );
         }
 
-        // Approved: hand it to planning, which owns every transition from here.
+        /**
+         * THE LAST CHECK BEFORE THE LAUNCH (round-2 finding 2, CRITICAL).
+         *
+         * The supervisor authorised ONE provider/model/effort for this action:
+         * it routed it, probed its billing mode in-process, put that exact
+         * resource through the financial gate and will record it as provenance.
+         * The plan carries its OWN persisted configuration, and the engineering
+         * loop launches THAT. Nothing reconciled the two, so the gate could
+         * authorise `claude-code/opus`, the loop could run `codex-cli`, and the
+         * evidence would name the resource that did not run.
+         *
+         * Refused rather than repaired. Substituting a provider, or re-routing
+         * to whatever the plan declares, would be this layer granting authority
+         * it does not have. It sits HERE, immediately before the launch, rather
+         * than earlier where another path could reach the launch around it.
+         */
+        const authorization = checkPlanAuthorization(plan, input.config);
+        if (!authorization.ok) {
+          return humanRequired(input.item, "RECONCILE_PLAN_AUTHORIZATION", authorization.reason);
+        }
+
+        // Approved AND authorised: hand it to planning, which owns every
+        // transition from here. In the shipped wiring `resume` runs the plan in
+        // a SEPARATE OS PROCESS (`createChildPlanAdvancer`); this file holds the
+        // narrow port so that fact is a property of the wiring rather than of
+        // this decision.
         const advanced = await deps.planning.resume(plan.id);
         log(`plan ${plan.id} for ${input.item.key}: ${plan.phase} -> ${advanced.phase}`);
         return outcomeForPhase(input.item, advanced, input, deps.clock);

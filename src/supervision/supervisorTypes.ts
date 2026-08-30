@@ -347,13 +347,20 @@ export const DEFAULT_ROADMAP: readonly RoadmapItem[] = [
    * paragraph of reassurance, and it sits before anything is wired to actually
    * execute autonomous work.
    *
-   * IMPLEMENTED on this branch: `createIsolatedExecutor` runs the executor in a
-   * separate process with a filtered environment, a filesystem permission model,
-   * no inherited credentials and a closed inspector. Not yet WIRED — production
-   * still uses the explicitly named `createUnimplementedExecutor` until
-   * `EXECUTOR_WIRING`, which is why the item's status below is still PENDING and
-   * why the financial gate is still the only thing in front of the in-process
-   * path.
+   * IMPLEMENTED: `createIsolatedExecutor` runs an executor in a separate
+   * process with a filtered environment, a filesystem permission model, no
+   * inherited credentials and a closed inspector.
+   *
+   * WHAT PRODUCTION WIRES since `EXECUTOR_WIRING` is `createPlanBackedExecutor`,
+   * which performs no work in this process either: it reads the state of the
+   * plan serving an item and, when an operator passed `--drive-plans`, launches
+   * `sf plan resume` in a CHILD PROCESS. `createUnimplementedExecutor` is gone.
+   *
+   * `createIsolatedExecutor` ITSELF REMAINS UNWIRED, and saying so is the point
+   * of this note rather than an omission from it. The work the supervisor now
+   * performs is an AI launch, and the isolated child is deliberately denied
+   * exactly the credential access such a launch needs (L-3). It stands ready for
+   * deterministic work, which does not yet route through it.
    *
    * Network egress is NOT blocked in the isolated child, and same-UID signalling
    * is not constrained; both are recorded in docs/KNOWN-LIMITATIONS.md as L-3

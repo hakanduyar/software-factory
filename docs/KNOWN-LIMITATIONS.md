@@ -696,3 +696,53 @@ boundary.
 and this entry names the reproduction so nobody has to rediscover it. If a
 future change claims to close this class inside `verify.mjs`, that claim needs
 the reviewer's probe run against it, not an argument.
+
+## L-12 — The supervisor authorises one AI resource; a plan declares three
+
+**Status:** OPEN, ACCEPTED SCOPE BOUNDARY. Found by independent review of
+TASK-014 (round 2, CRITICAL, second half). The gate that closes the dangerous
+half is implemented; what remains open is how much legitimate work it can
+therefore drive.
+
+`SupervisorService` routes a roadmap item to exactly ONE provider/model/effort.
+It probes that resource in-process, puts it through the financial gate, and
+records it as provenance. A PLAN carries its own persisted execution
+configuration — a planner, an implementer and a reviewer, each with its own tool
+and model — and the engineering loop launches those.
+
+Nothing reconciled the two, so a supervisor could authorise `claude-code/opus`,
+drive a plan whose implementer is `codex-cli/gpt-5.6-luna`, and record
+`claude-code/opus` as what ran. A gate that authorises X while Y executes is
+worse than no gate, because it produces evidence that the wrong thing was
+checked.
+
+**What is closed.** `checkPlanAuthorization` runs immediately before the launch
+and REFUSES any plan whose planner, implementer or reviewer is not exactly the
+authorised resource, including its effort. It does not repair the mismatch:
+substituting a provider, or re-routing to whatever the plan declares, would be
+that layer granting authority it does not have. The refusal is
+`HUMAN_REQUIRED / RECONCILE_PLAN_AUTHORIZATION` and it names both sides.
+
+**What is therefore OPEN.** A plan whose reviewer is a different model from its
+implementer cannot be driven by this supervisor at all. That is the ordinary
+shape, and for critical work it is the shape C4 REQUIRES — the implementer must
+not be the sole semantic reviewer. So the supervisor can currently drive only a
+plan whose entire AI surface is one resource, which is the least interesting
+kind of plan.
+
+**Why it is not closed here.** Closing it means the supervisor authorising a SET
+of resources: routing a set, probing each, gating each, recording each in
+provenance, and reconciling each reported identity. That is `SupervisorService`'s
+design, frozen and accepted under TASK-006, and TASK-014 may not quietly widen it
+to make its own work pass — C2 exists for exactly this temptation. The
+conservative direction was to refuse and record.
+
+**What is NOT weakened.** The refusal is not softened for the common case, and
+the check is not moved earlier where another path could reach the launch around
+it. It sits immediately before the launch, which is the only position a
+fail-closed gate can hold.
+
+**Kept honest by:** `tests/planAuthorization.test.ts` asserts the refusal for
+each role independently — planner, implementer and reviewer each get a case that
+leaves the other two matching — and one case asserts this limitation directly. If
+that case ever goes green, L-12 is closed and this entry is what has to change.

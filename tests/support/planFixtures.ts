@@ -144,20 +144,42 @@ export function authorizePlanHuman(factory: FactoryService, actor = PLAN_HUMAN) 
   return factory.authorizeHuman(actor, PLAN_CREDENTIAL);
 }
 
+/**
+ * The worker configuration a plan is started with, when a test needs a
+ * particular one.
+ *
+ * Added for TASK-014's authorization gate, which compares what a plan will RUN
+ * against the single resource the supervisor authorized. The defaults name three
+ * different models, which is the realistic shape and is exactly what that gate
+ * refuses — so a test about the permitted case has to be able to say so.
+ */
+export interface PlanFixtureOverrides {
+  readonly planner?: PlannerConfig;
+  readonly execution?: PlanExecutionConfig;
+}
+
 /** Starts a plan and returns it at PLAN_REVIEW. */
-export async function planAtReview(context: TestPlanning, intent = "Build the thing."): Promise<Plan> {
+export async function planAtReview(
+  context: TestPlanning,
+  intent = "Build the thing.",
+  overrides: PlanFixtureOverrides = {},
+): Promise<Plan> {
   return context.service.start({
     projectId: context.projectId,
     actor: PLAN_HUMAN,
     intent,
-    planner: TEST_PLANNER_CONFIG,
-    execution: testExecutionConfig(),
+    planner: overrides.planner ?? TEST_PLANNER_CONFIG,
+    execution: overrides.execution ?? testExecutionConfig(),
   });
 }
 
 /** Starts and approves a plan, returning it after the drive that follows approval. */
-export async function approvedPlan(context: TestPlanning, intent = "Build the thing."): Promise<Plan> {
-  const plan = await planAtReview(context, intent);
+export async function approvedPlan(
+  context: TestPlanning,
+  intent = "Build the thing.",
+  overrides: PlanFixtureOverrides = {},
+): Promise<Plan> {
+  const plan = await planAtReview(context, intent, overrides);
   return context.service.approve(plan.id, PLAN_HUMAN, authorizePlanHuman(context.factory));
 }
 

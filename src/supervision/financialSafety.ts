@@ -587,13 +587,19 @@ export function zeroCostCommandArgv(id: string): readonly string[] | undefined {
  * permission model, no inherited credentials and a closed inspector, so for
  * work that goes through it the enforcement is no longer aspirational.
  *
+ * What has changed AGAIN, with `EXECUTOR_WIRING`: the production CLI no longer
+ * wires `createUnimplementedExecutor`. It wires `createPlanBackedExecutor`,
+ * which performs no work in this process — it reads the state of the plan
+ * serving an item and, only when an operator passed `--drive-plans`, launches
+ * `sf plan resume` in a CHILD process. So the AI launch this gate authorises now
+ * happens outside the supervisor.
+ *
  * What is STILL true, and is the reason this paragraph is not simply deleted:
- * the isolated executor is not yet WIRED. `EXECUTOR_WIRING` depends on both
- * `EXECUTOR_ISOLATION` and `STATE_INTEGRITY`, and until it lands the production
- * CLI still uses the explicitly named `createUnimplementedExecutor`. So the gate
- * is the only thing standing in front of the in-process path that exists today,
- * exactly as this note has always said — and it will stop being the only thing
- * when the wiring lands, not before.
+ * that child is NOT the isolated one. Launching an AI worker needs exactly the
+ * credential access `createIsolatedExecutor` removes, so the plan-resume child
+ * runs with the ordinary worker environment and CAN bill. The gate remains the
+ * thing that decides whether it starts, and `checkPlanAuthorization` is what
+ * makes the resource it authorised the resource that can actually run.
  *
  * Network egress is NOT blocked even in the isolated child, and is recorded in
  * docs/KNOWN-LIMITATIONS.md rather than assumed away.
