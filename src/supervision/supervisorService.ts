@@ -61,7 +61,9 @@ import {
   type ResourceState,
 } from "./resourceTypes.js";
 import type {
+  AuthorizedResource,
   ReportedRunIdentity,
+  RequiredResource,
   ResourceProbe,
   SupervisorRepository,
   WorkExecutor,
@@ -583,6 +585,151 @@ export class SupervisorService {
   // Running one roadmap item
   // =====================================================================
 
+  /**
+   * Probe ONE resource in this process and observe how it is paid for.
+   *
+   * EXTRACTED, NOT REWRITTEN (TASK-015 AC-1). The single routed resource and
+   * every additional resource a plan declares go through this one function, so
+   * "each member gets the same treatment" is a property of there being one
+   * implementation rather than a promise about two. Every guard that was inline
+   * here is still here: the in-process probe (F4-3), the durable classification,
+   * the not-available wait, and the observation bound to its own resource
+   * (R10-FIN-1).
+   */
+  private async probeAndObserve(
+    state: SupervisorState,
+    item: RoadmapItem,
+    provider: string,
+    model: string,
+  ): Promise<
+    | {
+        readonly ok: true;
+        readonly state: SupervisorState;
+        readonly billingMode: BillingMode;
+        readonly observation: BillingObservation;
+      }
+    | { readonly ok: false; readonly state: SupervisorState; readonly result: TickResult }
+  > {
+    const chosen = resourceKey(provider, model);
+    const confirmation = await this.deps.probe.probe(provider, model);
+    const now = this.deps.clock.now();
+    let next = await this.commit(state, {
+      ...state,
+      resources: state.resources.map((record) =>
+        record.key === chosen ? this.applyClassification(record, confirmation, now) : record,
+      ),
+    });
+    if (confirmation.state !== "AVAILABLE") {
+      // It was usable when the schedule was computed and is not usable now.
+      // That is ordinary, and it is a wait rather than a failure.
+      // F5-SEC-2: `confirmation.reason` is provider text. It is NOT bounded
+      // here on purpose — `setStatus` bounds what becomes durable state and
+      // `sanitizeTickResult` bounds what the CLI prints, and bounding a third
+      // time in the middle made both of those chokepoints untestable: a
+      // delete-the-fix run showed the regression still passing with
+      // `sanitizeTickResult` removed. A control that cannot be observed to
+      // fail is not known to work.
+      const reason = `${chosen} was not confirmed available immediately before launch: ${confirmation.reason}`;
+      const waiting = await this.commit(next, {
+        ...next,
+        roadmap: setStatus(next.roadmap, item.key, "WAITING_FOR_RESOURCE", reason),
+      });
+      const wake = this.computeNextWake(waiting);
+      next = await this.commit(waiting, withWake(waiting, wake));
+      return {
+        ok: false,
+        state: next,
+        result: {
+          kind: "WAITING_FOR_RESOURCE",
+          roadmapKey: item.key,
+          reason,
+          ...(wake === undefined ? {} : { nextWakeAt: wake }),
+        },
+      };
+    }
+    const billingMode = this.billingModeFor(confirmation.billingMode, provider, model);
+    return {
+      ok: true,
+      state: next,
+      billingMode,
+      observation: observeBilling({ provider, model, billingMode }),
+    };
+  }
+
+  /**
+   * Mint the launch action for ONE resource, bind the verdict to it, and gate it.
+   *
+   * The routed resource and every declared one go through this. That is what
+   * makes "the same gate" a fact rather than a claim: there is one place where
+   * an AI launch is cleared, so a resource cannot be cleared by a weaker path
+   * that someone added later for the additional ones.
+   */
+  private async gateAiResource(
+    state: SupervisorState,
+    item: RoadmapItem,
+    provider: string,
+    model: string,
+    observation: BillingObservation | undefined,
+    policy: ReturnType<typeof parseFinancialPolicy>,
+    reviewer: boolean,
+  ): Promise<
+    | { readonly ok: true; readonly action: SupervisedAction }
+    | { readonly ok: false; readonly result: TickResult }
+  > {
+    const launching = resourceKey(provider, model);
+    const action = launchAiWorkerAction({
+      resourceKey: launching,
+      // Observed in this process, moments ago (F4-3), and carried as an
+      // observation bound to the resource rather than as a bare string that
+      // any caller could have written (R10-FIN-1).
+      ...(observation === undefined ? {} : { observation }),
+      description: `roadmap item ${item.key}: ${item.title}`,
+      ...(reviewer ? { reviewer: true } : {}),
+    });
+
+    /**
+     * F6-FIN-1: the verdict is ABOUT a specific resource, so the thing about to
+     * be launched must be that resource. A cleared "included subscription"
+     * verdict for one resource is not authorization to run a different one, and
+     * before this check nothing compared the two.
+     */
+    const cleared = mintedResourceKey(action);
+    if (!resourceBindingHolds(cleared, launching)) {
+      const humanAction = `Investigate ${item.key}: the financial verdict was issued for ${cleared ?? "no resource"} but the launch targets ${launching}.`;
+      const escalated = await this.escalate(
+        state,
+        item.key,
+        "RECOVERY_REQUIRED",
+        humanAction,
+        "the cleared resource and the launched resource disagree",
+      );
+      void escalated;
+      return { ok: false, result: { kind: "RECOVERY_REQUIRED", reason: `resource binding mismatch on ${item.key}` } };
+    }
+
+    const verdict = evaluateFinancialSafety(action, policy);
+    if (!verdict.allowed) {
+      const escalated = await this.escalate(
+        state,
+        item.key,
+        reasonForClass(verdict.actionClass),
+        verdict.humanActionRequired,
+        verdict.reason,
+      );
+      void escalated;
+      return {
+        ok: false,
+        result: {
+          kind: "WAITING_FOR_HUMAN",
+          roadmapKey: item.key,
+          reason: reasonForClass(verdict.actionClass),
+          humanActionRequired: verdict.humanActionRequired,
+        },
+      };
+    }
+    return { ok: true, action };
+  }
+
   private async runItem(state: SupervisorState, item: RoadmapItem): Promise<TickResult> {
     const resources = new Map(state.resources.map((record) => [record.key, record]));
 
@@ -682,49 +829,13 @@ export class SupervisorService {
       }
 
       // F4-3: confirm the chosen resource NOW, in this process, before the gate.
-      const chosen = resourceKey(config.option.provider, config.option.model);
-      const confirmation = await this.deps.probe.probe(config.option.provider, config.option.model);
-      const now = this.deps.clock.now();
-      state = await this.commit(state, {
-        ...state,
-        resources: state.resources.map((record) =>
-          record.key === chosen ? this.applyClassification(record, confirmation, now) : record,
-        ),
-      });
-      if (confirmation.state !== "AVAILABLE") {
-        // It was usable when the schedule was computed and is not usable now.
-        // That is ordinary, and it is a wait rather than a failure.
-        // F5-SEC-2: `confirmation.reason` is provider text. It is NOT bounded
-        // here on purpose — `setStatus` bounds what becomes durable state and
-        // `sanitizeTickResult` bounds what the CLI prints, and bounding a third
-        // time in the middle made both of those chokepoints untestable: a
-        // delete-the-fix run showed the regression still passing with
-        // `sanitizeTickResult` removed. A control that cannot be observed to
-        // fail is not known to work.
-        const reason = `${chosen} was not confirmed available immediately before launch: ${confirmation.reason}`;
-        const waiting = await this.commit(state, {
-          ...state,
-          roadmap: setStatus(state.roadmap, item.key, "WAITING_FOR_RESOURCE", reason),
-        });
-        const wake = this.computeNextWake(waiting);
-        state = await this.commit(waiting, withWake(waiting, wake));
-        return {
-          kind: "WAITING_FOR_RESOURCE",
-          roadmapKey: item.key,
-          reason,
-          ...(wake === undefined ? {} : { nextWakeAt: wake }),
-        };
+      const observed = await this.probeAndObserve(state, item, config.option.provider, config.option.model);
+      state = observed.state;
+      if (!observed.ok) {
+        return observed.result;
       }
-      confirmedBillingMode = this.billingModeFor(
-        confirmation.billingMode,
-        config.option.provider,
-        config.option.model,
-      );
-      billingObservation = observeBilling({
-        provider: config.option.provider,
-        model: config.option.model,
-        billingMode: confirmedBillingMode,
-      });
+      confirmedBillingMode = observed.billingMode;
+      billingObservation = observed.observation;
     }
 
     /**
@@ -790,21 +901,13 @@ export class SupervisorService {
     // malicious one does — but it does mean the supervisor never LAUNCHES an
     // executor whose declared work it would have refused.
     const policy = parseFinancialPolicy(state.financialPolicy);
-    const action: SupervisedAction = requiresAi(item.workClass)
-      ? launchAiWorkerAction({
-          resourceKey: config?.ok === true ? resourceKey(config.option.provider, config.option.model) : "unknown",
-          // Observed in this process, moments ago (F4-3), and carried as an
-          // observation bound to the resource rather than as a bare string that
-          // any caller could have written (R10-FIN-1).
-          ...(billingObservation === undefined ? {} : { observation: billingObservation }),
-          description: `roadmap item ${item.key}: ${item.title}`,
-          ...(item.workClass === "INDEPENDENT_REVIEW" ? { reviewer: true } : {}),
-        })
-      : // F4-4: this authorises invoking the trusted local executor, and says
-        // nothing about any command line. A concrete command must be minted by
-        // `verificationCommandAction` against the executable allowlist.
-        { kind: "RUN_DETERMINISTIC_WORK", description: `roadmap item ${item.key}: ${item.title}` };
 
+    /**
+     * The DECLARED-KINDS gate runs first, exactly where it ran before the
+     * resource gate was extracted. Minting an action has no side effect, so
+     * moving the mint below this loop changes nothing an observer can see —
+     * and keeping this loop first preserves which refusal wins when both would.
+     */
     for (const declared of item.declaredActionKinds ?? []) {
       const declaredVerdict = evaluateFinancialSafety(
         { kind: declared, description: `roadmap item ${item.key} declares action ${declared}` },
@@ -828,45 +931,121 @@ export class SupervisorService {
       }
     }
 
-    /**
-     * F6-FIN-1: the verdict is ABOUT a specific resource, so the thing about to
-     * be launched must be that resource. A cleared "included subscription"
-     * verdict for one resource is not authorization to run a different one, and
-     * before this check nothing compared the two.
-     */
-    if (requiresAi(item.workClass)) {
-      const launching = config?.ok === true ? resourceKey(config.option.provider, config.option.model) : undefined;
-      const cleared = mintedResourceKey(action);
-      if (!resourceBindingHolds(cleared, launching)) {
-        const humanAction = `Investigate ${item.key}: the financial verdict was issued for ${cleared ?? "no resource"} but the launch targets ${launching ?? "no resource"}.`;
+    let action: SupervisedAction;
+    if (requiresAi(item.workClass) && config?.ok === true) {
+      const gated = await this.gateAiResource(
+        state,
+        item,
+        config.option.provider,
+        config.option.model,
+        billingObservation,
+        policy,
+        item.workClass === "INDEPENDENT_REVIEW",
+      );
+      if (!gated.ok) {
+        return gated.result;
+      }
+      action = gated.action;
+    } else {
+      // F4-4: this authorises invoking the trusted local executor, and says
+      // nothing about any command line. A concrete command must be minted by
+      // `verificationCommandAction` against the executable allowlist.
+      action = { kind: "RUN_DETERMINISTIC_WORK", description: `roadmap item ${item.key}: ${item.title}` };
+      const verdict = evaluateFinancialSafety(action, policy);
+      if (!verdict.allowed) {
         const escalated = await this.escalate(
           state,
           item.key,
-          "RECOVERY_REQUIRED",
-          humanAction,
-          "the cleared resource and the launched resource disagree",
+          reasonForClass(verdict.actionClass),
+          verdict.humanActionRequired,
+          verdict.reason,
         );
         void escalated;
-        return { kind: "RECOVERY_REQUIRED", reason: `resource binding mismatch on ${item.key}` };
+        return {
+          kind: "WAITING_FOR_HUMAN",
+          roadmapKey: item.key,
+          reason: reasonForClass(verdict.actionClass),
+          humanActionRequired: verdict.humanActionRequired,
+        };
       }
     }
 
-    const verdict = evaluateFinancialSafety(action, policy);
-    if (!verdict.allowed) {
+    /**
+     * EVERY OTHER RESOURCE THIS WORK WILL LAUNCH (TASK-015).
+     *
+     * The routed resource above is one of possibly several. A plan declares a
+     * planner, an implementer and a reviewer, and for critical work C4 REQUIRES
+     * the reviewer to differ from the implementer — so authorising one resource
+     * and launching three was the gap round-3 review found in `EXECUTOR_WIRING`.
+     *
+     * The executor states what the work needs; the supervisor decides. Each
+     * DISTINCT identity is probed and gated by the same two functions the routed
+     * resource just used — no shortcut for a sibling that shares a provider, and
+     * no member inheriting a verdict from another. Any refusal stops the whole
+     * action here, before anything is claimed or launched: there is no partial
+     * authorisation and no "run the ones that passed".
+     */
+    const authorized: AuthorizedResource[] = [];
+    if (requiresAi(item.workClass) && config?.ok === true) {
+      authorized.push({
+        role: ROUTED_ROLE,
+        provider: config.option.provider,
+        model: config.option.model,
+        ...(config.option.effort === undefined ? {} : { effort: config.option.effort }),
+        billingMode: confirmedBillingMode,
+      });
+    }
+
+    let declaredResources: readonly RequiredResource[] = [];
+    try {
+      declaredResources = (await this.deps.executor.declareResources?.(deepFreeze(structuredClone({ ...item })))) ?? [];
+    } catch (error) {
+      // A declaration that cannot be produced is not permission to launch with
+      // an empty one: the executor was asked what it needs and could not say.
+      const detail = boundedDiagnostic(error instanceof Error ? error.message : String(error));
       const escalated = await this.escalate(
         state,
         item.key,
-        reasonForClass(verdict.actionClass),
-        verdict.humanActionRequired,
-        verdict.reason,
+        "RECOVERY_REQUIRED",
+        `Investigate ${item.key}: the executor could not state which resources its work would launch.`,
+        detail,
       );
       void escalated;
-      return {
-        kind: "WAITING_FOR_HUMAN",
-        roadmapKey: item.key,
-        reason: reasonForClass(verdict.actionClass),
-        humanActionRequired: verdict.humanActionRequired,
-      };
+      return { kind: "RECOVERY_REQUIRED", reason: `resource declaration failed for ${item.key}: ${detail}` };
+    }
+
+    for (const required of declaredResources) {
+      const identity = resourceIdentity(required);
+      const already = authorized.find((entry) => resourceIdentity(entry) === identity);
+      if (already !== undefined) {
+        /**
+         * DEDUPLICATED FOR PROBING, NOT FOR PROVENANCE. Two roles on the same
+         * model are one resource to gate and two facts to record, so the second
+         * role reuses the first's verdict and observation but keeps its own
+         * name. Collapsing them would lose which role ran what.
+         */
+        authorized.push({ ...required, billingMode: already.billingMode });
+        continue;
+      }
+
+      const observed = await this.probeAndObserve(state, item, required.provider, required.model);
+      state = observed.state;
+      if (!observed.ok) {
+        return observed.result;
+      }
+      const gated = await this.gateAiResource(
+        state,
+        item,
+        required.provider,
+        required.model,
+        observed.observation,
+        policy,
+        required.role === "reviewer",
+      );
+      if (!gated.ok) {
+        return gated.result;
+      }
+      authorized.push({ ...required, billingMode: observed.billingMode });
     }
 
     // CLAIM before the side effect. The attempt counter lives on the ITEM, so
@@ -981,6 +1160,9 @@ export class SupervisorService {
           item: structuredClone({ ...item }),
           actionId,
           ...(config?.ok === true ? { config: config.config } : {}),
+          // TASK-015: the exact set, so the executor can refuse to launch
+          // anything outside it at the last point before it launches.
+          ...(authorized.length === 0 ? {} : { authorizedResources: authorized }),
           ...(checkpoint === undefined ? {} : { checkpoint }),
         }),
       );
@@ -2428,6 +2610,14 @@ export function chainIsLegacySilence(state: {
  * that a new `WorkOutcome` variant fails to COMPILE until someone says what it
  * means for lineage.
  */
+/** The role name for the resource the ROUTER chose, as opposed to a plan's. */
+const ROUTED_ROLE = "routed";
+
+/** Identity for deduplication: same provider, model and effort is one resource. */
+function resourceIdentity(resource: { readonly provider: string; readonly model: string; readonly effort?: string }): string {
+  return `${resource.provider} ${resource.model} ${resource.effort ?? ""}`;
+}
+
 const LINEAGE_DETAIL: Record<WorkOutcome["kind"], string> = {
   COMPLETED: "completed",
   CHANGES_REQUIRED: "changes required",

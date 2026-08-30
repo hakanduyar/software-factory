@@ -44,11 +44,16 @@
  * arrangement TASK-011 exists to remove.
  */
 
-import { checkPlanAuthorization } from "./planAuthorization.js";
+import { checkPlanAuthorization, declaredPlanResources } from "./planAuthorization.js";
 import { checkPlanBinding } from "./planBinding.js";
 import type { Clock } from "../ports/clock.js";
 import type { Plan, PlanPhase } from "../planning/planTypes.js";
-import type { WorkExecutionInput, WorkExecutor, WorkOutcome } from "./supervisorPorts.js";
+import type {
+  RequiredResource,
+  WorkExecutionInput,
+  WorkExecutor,
+  WorkOutcome,
+} from "./supervisorPorts.js";
 import type { RoadmapItem } from "./supervisorTypes.js";
 
 /**
@@ -284,6 +289,52 @@ async function verifiedPhaseOf(plan: Plan, deps: PlanBackedExecutorDeps): Promis
 export function createPlanBackedExecutor(deps: PlanBackedExecutorDeps): WorkExecutor {
   const log = deps.log ?? ((): void => {});
   return {
+    /**
+     * WHAT THIS WORK WILL LAUNCH (TASK-015 AC-2).
+     *
+     * The supervisor cannot know a plan's worker configuration, so it asks
+     * before it authorises anything. Declaring is not permission: the set that
+     * comes back is authorised member by member, and `execute` then refuses to
+     * launch anything outside it — so under-declaring here buys nothing.
+     *
+     * An unreadable plan means the declaration cannot be made, and the throw is
+     * deliberate: the supervisor treats a failed declaration as a refusal rather
+     * than as "nothing to authorise", which is the fail-closed direction.
+     */
+    async declareResources(item): Promise<readonly RequiredResource[]> {
+      const plan = await deps.plans.findPlanForItem(item);
+      if (plan === undefined) {
+        return [];
+      }
+      // A plan bound to the wrong item is not this item's resource list.
+      if (!checkPlanBinding(item.key, plan).ok) {
+        return [];
+      }
+      /**
+       * NOTHING TO AUTHORISE FOR A PLAN THAT WILL NOT RUN.
+       *
+       * A blocked, rejected or unapproved plan launches no worker, so asking the
+       * supervisor to probe and gate its three configured models would make
+       * every tick pay for resources nothing is going to use — and would turn a
+       * plan whose provider is simply unreachable into WAITING_FOR_RESOURCE
+       * instead of the honest "this plan is BLOCKED, a human is needed".
+       *
+       * The row's phase is untrusted, and it is safe to use HERE precisely
+       * because it only decides whether to ASK for authorisation. Wrong in the
+       * permissive direction authorises more than needed; wrong in the
+       * restrictive direction leaves the set empty and `execute` refuses at the
+       * authorization check. Both directions fail closed.
+       */
+      if (!DRIVABLE.includes(plan.phase)) {
+        return [];
+      }
+      return declaredPlanResources(plan).map((resource) => ({
+        role: resource.role,
+        provider: resource.tool,
+        model: resource.model,
+        ...(resource.effort === undefined ? {} : { effort: resource.effort }),
+      }));
+    },
     async execute(input: WorkExecutionInput): Promise<WorkOutcome> {
       /**
        * EVERY failure becomes a definite outcome (AC-9).
@@ -363,7 +414,26 @@ export function createPlanBackedExecutor(deps: PlanBackedExecutorDeps): WorkExec
          * it does not have. It sits HERE, immediately before the launch, rather
          * than earlier where another path could reach the launch around it.
          */
-        const authorization = checkPlanAuthorization(plan, input.config);
+        /**
+         * RE-READ AT THE LAST SAFE POINT (TASK-015 §4, time-of-check/time-of-use).
+         *
+         * The plan authorised above was read at the top of this function, and
+         * the supervisor's set was decided before that, from a `declareResources`
+         * call that read the plan earlier still. Between then and now the
+         * persisted execution configuration can have changed — a re-plan, an
+         * operator edit, or anything with write access to the plans database.
+         *
+         * So the resources are checked against a FRESH read, immediately before
+         * the launch. Checking the stale in-memory copy would authorise what the
+         * plan used to say while the child runs what it says now, which is the
+         * same defect as authorising X and running Y, arrived at by waiting.
+         */
+        const atLaunch = (await deps.plans.findPlanForItem(input.item)) ?? plan;
+        const rebound = checkPlanBinding(input.item.key, atLaunch);
+        if (!rebound.ok) {
+          return humanRequired(input.item, "RECONCILE_PLAN_BINDING", rebound.reason);
+        }
+        const authorization = checkPlanAuthorization(atLaunch, input.config, input.authorizedResources);
         if (!authorization.ok) {
           return humanRequired(input.item, "RECONCILE_PLAN_AUTHORIZATION", authorization.reason);
         }

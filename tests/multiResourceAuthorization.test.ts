@@ -1,0 +1,254 @@
+/**
+ * TASK-015 — MULTI_RESOURCE_AUTHORIZATION.
+ *
+ * The supervisor authorised one resource per action while a plan declares
+ * three, so a plan whose reviewer differs from its implementer — the shape C4
+ * REQUIRES for critical work — could never run. Widening authorisation to a SET
+ * must not become a way to run something ungated, so every case here checks both
+ * directions: the C4 shape now runs, and anything outside the set still does not.
+ *
+ * Offline: no provider, no model, no money.
+ */
+
+import assert from "node:assert/strict";
+import { after, describe, it } from "node:test";
+
+import { cleanupTempDbs } from "./support/factoryFixtures.js";
+import { newSupervisor, scriptedProbe, seedRoadmap } from "./support/supervisorFixtures.js";
+import type {
+  AuthorizedResource,
+  RequiredResource,
+  WorkExecutionInput,
+  WorkOutcome,
+} from "../src/supervision/supervisorPorts.js";
+import type { ScriptedExecutor } from "./support/supervisorFixtures.js";
+import type { RoadmapItem } from "../src/supervision/supervisorTypes.js";
+
+after(cleanupTempDbs);
+
+const IMPLEMENTER = { role: "implementer", provider: "claude-code", model: "opus" } as const;
+const REVIEWER = { role: "reviewer", provider: "codex-cli", model: "gpt-5.6-luna" } as const;
+const PLANNER = { role: "planner", provider: "claude-code", model: "sonnet" } as const;
+
+/** The routed resource the supervisor picks for NORMAL_IMPLEMENTATION. */
+const CATALOG = [
+  { provider: "claude-code", model: "opus", billingMode: "INCLUDED_SUBSCRIPTION" as const },
+  { provider: "claude-code", model: "sonnet", billingMode: "INCLUDED_SUBSCRIPTION" as const },
+  { provider: "codex-cli", model: "gpt-5.6-luna", billingMode: "INCLUDED_SUBSCRIPTION" as const },
+];
+
+const ITEM: RoadmapItem = {
+  key: "GITHUB_ORCHESTRATION",
+  title: "GitHub orchestration",
+  dependsOn: [],
+  status: "PENDING",
+  workClass: "NORMAL_IMPLEMENTATION",
+  order: 1,
+};
+
+/**
+ * Records exactly what it was authorised to launch.
+ *
+ * `declare` is a function rather than a list so a case can make the declaration
+ * itself fail — an executor that cannot say what it needs must not thereby be
+ * allowed to launch with nothing authorised.
+ */
+function recordingExecutor(
+  declare: () => Promise<readonly RequiredResource[]>,
+): ScriptedExecutor & { authorized(): readonly AuthorizedResource[]; ran(): boolean } {
+  const inputs: WorkExecutionInput[] = [];
+  return {
+    calls: () => inputs,
+    callsFor: (roadmapKey: string) => inputs.filter((entry) => entry.item.key === roadmapKey),
+    authorized: () => inputs[0]?.authorizedResources ?? [],
+    ran: () => inputs.length > 0,
+    declareResources: declare,
+    async execute(input: WorkExecutionInput): Promise<WorkOutcome> {
+      inputs.push(input);
+      return { kind: "CHANGES_REQUIRED", findings: ["scripted"] };
+    },
+  };
+}
+
+/** The ordinary case: a fixed declaration that succeeds. */
+function declaring(...declared: readonly RequiredResource[]) {
+  return recordingExecutor(async () => declared);
+}
+
+function probeWith(overrides: Record<string, { state: "AVAILABLE" | "USAGE_LIMIT_REACHED"; billingMode?: "INCLUDED_SUBSCRIPTION" | "USAGE_BILLED" | "UNKNOWN" }> = {}) {
+  const probe = scriptedProbe();
+  for (const entry of CATALOG) {
+    const key = `${entry.provider}:${entry.model}`;
+    const override = overrides[key];
+    probe.set(entry.provider, entry.model, {
+      state: override?.state ?? "AVAILABLE",
+      reason: "scripted",
+      billingMode: override?.billingMode ?? "INCLUDED_SUBSCRIPTION",
+    });
+  }
+  return probe;
+}
+
+async function tickWith(
+  executor: ScriptedExecutor,
+  probeOverrides: Parameters<typeof probeWith>[0] = {},
+) {
+  const supervisor = newSupervisor({
+    probe: probeWith(probeOverrides),
+    executor,
+    resourceCatalog: CATALOG,
+  });
+  await seedRoadmap(supervisor, [ITEM]);
+  return supervisor.service.tick();
+}
+
+describe("TASK-015 AC-1/AC-2: the supervisor authorises the set the work declares", () => {
+  /**
+   * CASE A — one resource for every role. It is probed and gated once, and the
+   * plan runs.
+   */
+  it("authorises a single shared resource once and runs", async () => {
+    const executor = declaring(
+      { ...IMPLEMENTER },
+      { role: "reviewer", provider: "claude-code", model: "opus" },
+      { role: "planner", provider: "claude-code", model: "opus" },
+    );
+
+    const result = await tickWith(executor);
+
+    assert.equal(result.kind, "ADVANCED", `expected the item to run, got ${result.kind}`);
+    assert.equal(executor.ran(), true);
+    /**
+     * The DECLARED roles share one identity. The router's own choice is a
+     * legitimate additional member of the set — it was probed and gated like
+     * every other — so the assertion is about what the work declared, not about
+     * the set being a single element.
+     */
+    const declaredIdentities = new Set(
+      executor
+        .authorized()
+        .filter((entry) => entry.role !== "routed")
+        .map((entry) => `${entry.provider}/${entry.model}`),
+    );
+    assert.deepEqual([...declaredIdentities], ["claude-code/opus"], "the shared resource was split");
+  });
+
+  /**
+   * CASE B and H — THE POINT OF THIS TASK. Three distinct resources, reviewer
+   * independent of implementer, all authorised, work runs.
+   */
+  it("runs a C4-shaped plan whose reviewer is a different model from its implementer", async () => {
+    const executor = declaring(PLANNER, IMPLEMENTER, REVIEWER);
+
+    const result = await tickWith(executor);
+
+    assert.equal(result.kind, "ADVANCED", `the C4 shape was refused: ${JSON.stringify(result)}`);
+    const authorized = executor.authorized();
+    for (const role of ["planner", "implementer", "reviewer"]) {
+      assert.ok(
+        authorized.some((entry) => entry.role === role),
+        `${role} is missing from the authorised set`,
+      );
+    }
+    // Reviewer independence survives: the two are still different resources.
+    const implementer = authorized.find((entry) => entry.role === "implementer");
+    const reviewer = authorized.find((entry) => entry.role === "reviewer");
+    assert.notEqual(
+      `${implementer?.provider}/${implementer?.model}`,
+      `${reviewer?.provider}/${reviewer?.model}`,
+      "the reviewer was collapsed onto the implementer's resource",
+    );
+  });
+
+  /**
+   * CASE G — duplicates are one resource to gate and two facts to record.
+   */
+  it("deduplicates identical identities for probing but keeps both roles", async () => {
+    const executor = declaring(
+      { role: "implementer", provider: "claude-code", model: "opus" },
+      { role: "reviewer", provider: "claude-code", model: "opus" },
+    );
+
+    await tickWith(executor);
+
+    const authorized = executor.authorized();
+    const roles = authorized.filter((entry) => entry.role !== "routed").map((entry) => entry.role);
+    assert.deepEqual(roles.sort(), ["implementer", "reviewer"], "a role was lost to deduplication");
+  });
+
+  /**
+   * CASE D — one member unavailable stops everything. No partial authorisation.
+   */
+  it("stops the whole action when one declared resource is unavailable", async () => {
+    const executor = declaring(IMPLEMENTER, REVIEWER);
+
+    const result = await tickWith(executor, { "codex-cli:gpt-5.6-luna": { state: "USAGE_LIMIT_REACHED" } });
+
+    assert.equal(result.kind, "WAITING_FOR_RESOURCE");
+    assert.equal(executor.ran(), false, "work ran despite an unavailable member");
+  });
+
+  /**
+   * CASE C and AC-4 — one member that would BILL stops everything, even though
+   * every other member is free. This is `AUTONOMOUS_SPEND_LIMIT = 0` surviving
+   * the widening.
+   */
+  it("stops the whole action when one declared resource would bill", async () => {
+    const executor = declaring(IMPLEMENTER, REVIEWER);
+
+    const result = await tickWith(executor, {
+      "codex-cli:gpt-5.6-luna": { state: "AVAILABLE", billingMode: "USAGE_BILLED" },
+    });
+
+    assert.equal(result.kind, "WAITING_FOR_HUMAN", `a billable member was allowed: ${JSON.stringify(result)}`);
+    assert.equal(executor.ran(), false, "work ran with a billable resource in the set");
+  });
+
+  it("stops when a declared resource's billing mode is simply unknown", async () => {
+    const executor = declaring(IMPLEMENTER, REVIEWER);
+
+    const result = await tickWith(executor, {
+      "codex-cli:gpt-5.6-luna": { state: "AVAILABLE", billingMode: "UNKNOWN" },
+    });
+
+    assert.equal(result.kind, "WAITING_FOR_HUMAN");
+    assert.equal(executor.ran(), false, "an unknown billing mode was treated as free");
+  });
+
+  /**
+   * An executor that cannot say what it needs does not thereby get to launch
+   * with nothing authorised.
+   */
+  it("refuses when the executor cannot state what it will launch", async () => {
+    const executor = recordingExecutor(async () => {
+      throw new Error("the plans database is unreadable");
+    });
+
+    const result = await tickWith(executor);
+
+    assert.equal(result.kind, "RECOVERY_REQUIRED");
+    assert.equal(executor.ran(), false, "work ran after the declaration failed");
+  });
+
+  /**
+   * AC-2's other half: an executor that declares NOTHING gets exactly today's
+   * behaviour. The widening must not change the single-resource path.
+   */
+  it("leaves an executor that declares nothing exactly as it was", async () => {
+    const inputs: WorkExecutionInput[] = [];
+    const executor: ScriptedExecutor = {
+      calls: () => inputs,
+      callsFor: (roadmapKey: string) => inputs.filter((entry) => entry.item.key === roadmapKey),
+      async execute(input: WorkExecutionInput): Promise<WorkOutcome> {
+        inputs.push(input);
+        return { kind: "CHANGES_REQUIRED", findings: ["scripted"] };
+      },
+    };
+
+    const result = await tickWith(executor);
+
+    assert.equal(result.kind, "ADVANCED");
+    const roles = (inputs[0]?.authorizedResources ?? []).map((entry) => entry.role);
+    assert.deepEqual(roles, ["routed"], "an executor that declared nothing got more than the routed resource");
+  });
+});

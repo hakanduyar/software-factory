@@ -34,6 +34,7 @@
 
 import type { Plan, PlannerConfig } from "../planning/planTypes.js";
 import type { AiRunConfigRecord } from "./modelEnforcement.js";
+import type { AuthorizedResource } from "./supervisorPorts.js";
 
 /** One AI resource a plan can launch, named by the role that launches it. */
 export interface DeclaredPlanResource {
@@ -122,11 +123,55 @@ function difference(resource: DeclaredPlanResource, config: AiRunConfigRecord): 
  * supervisor's billing-mode probe immediately before its financial gate instead
  * of at the top of the tick.
  */
+/**
+ * Does the AUTHORISED SET cover this resource? (TASK-015 AC-6)
+ *
+ * Membership is exact: same provider, same model, same effort. There is no
+ * "same provider, therefore allowed" — a provider is not a resource, and a gate
+ * that cleared `claude-code/opus` says nothing about `claude-code/sonnet`.
+ */
+function coveredBy(resource: DeclaredPlanResource, authorized: readonly AuthorizedResource[]): boolean {
+  return authorized.some(
+    (entry) =>
+      entry.provider === resource.tool && entry.model === resource.model && entry.effort === resource.effort,
+  );
+}
+
 export function checkPlanAuthorization(
   plan: Plan,
   config: AiRunConfigRecord | undefined,
+  authorized?: readonly AuthorizedResource[],
 ): PlanAuthorizationVerdict {
   const resources = declaredPlanResources(plan);
+
+  /**
+   * THE SET IS THE AUTHORITY WHEN THERE IS ONE (TASK-015).
+   *
+   * Round-2 built this gate against a SINGLE authorised record. That was
+   * correct, and round-3 review then showed it unusable: a supervisor
+   * authorising one resource can never drive a plan whose reviewer differs from
+   * its implementer, which is the shape C4 REQUIRES for critical work.
+   *
+   * With a set, every declared role must be a MEMBER. Nothing is looser — a
+   * resource absent from the set is refused exactly as it was when the set had
+   * one element — and the set exists only because each member went through the
+   * supervisor's probe and financial gate individually.
+   */
+  if (authorized !== undefined && authorized.length > 0) {
+    for (const resource of resources) {
+      if (!coveredBy(resource, authorized)) {
+        return {
+          ok: false,
+          reason:
+            `plan ${plan.id} would run its ${resource.role} on ${format(resource)}, which is not in the set this ` +
+            `action authorized (${authorized.map((entry) => `${entry.provider}/${entry.model}`).join(", ")}). ` +
+            `Refusing to launch: every resource that can actually execute must have been probed and gated, and ` +
+            `this one was not`,
+        };
+      }
+    }
+    return { ok: true, resources };
+  }
 
   if (config === undefined) {
     /**

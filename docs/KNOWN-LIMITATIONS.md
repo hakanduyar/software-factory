@@ -746,3 +746,46 @@ fail-closed gate can hold.
 each role independently — planner, implementer and reviewer each get a case that
 leaves the other two matching — and one case asserts this limitation directly. If
 that case ever goes green, L-12 is closed and this entry is what has to change.
+
+## L-13 — A plan's roadmap identity is not bound to its approval
+
+**Status:** OPEN, ACCEPTED SCOPE BOUNDARY. Found by independent review of
+TASK-014 (round 3, finding 3, HIGH). The dangerous half is closed; this entry is
+the half that is not.
+
+`--roadmap-plans` maps a roadmap key to a plan id. Round-3 review bound a
+perfectly valid approved plan — whose own work item is `WI-A` — under the
+unrelated key `LOCAL_24_7_RUNTIME`, and the supervisor resumed it. One mistaken
+line in a JSON file executed unrelated approved work, because the plan carried no
+roadmap identity at all and so nothing could disagree with the file.
+
+**What is closed.** The declaration is now TWO-SIDED: the operator's file says
+which plan serves an item, and the plan must name the item it serves, in
+`declaredConstraints`. `checkPlanBinding` refuses a plan that declares a
+different key, no key, or more than one, and it runs BEFORE any outcome is
+derived — so an unrelated plan's `BLOCKED` cannot be reported as this item's
+blocker either.
+
+**What is OPEN.** `declaredConstraints` is not part of the content digest an
+approval signs. It is operator input, and `planTypes.ts` states the rule it lives
+under — never rewritten by any model — which is why it was chosen over revision
+constraints, which ARE digest-covered but are planner OUTPUT. An identity a model
+can edit during a re-plan is not an identity.
+
+So the binding is semantic and durable, and it is not cryptographically bound to
+the approval. A party with write access to the plans database can edit the
+declared key. That same party can edit the phase — which is why the phase is
+re-derived from Factory authority (L-12's neighbour, round-3 finding 1) — but no
+independent record of a plan's roadmap key exists to re-derive from.
+
+**Why it is not closed here.** Closing it means either adding a roadmap key to
+the signed plan content, which is a schema change to `Plan` and to the digest
+every existing approval was computed over, or recording the binding in the
+supervisor's own provenance chain at approval time, which needs a human action
+the supervisor cannot take. Both are larger than the task that found it, and
+neither may be done by quietly widening what an approval covers.
+
+**Kept honest by:** `tests/planBinding.test.ts` asserts the refusal for a
+different key, a missing key and two keys, and — the control that matters —
+asserts a correctly declared plan is still ACCEPTED, so the guard is not
+satisfied by refusing everything.
