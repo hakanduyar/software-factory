@@ -10,8 +10,13 @@
  * not "the latest push". Those are labels a remote can move at any time and
  * without any commit changing, so a decision resting on one is a decision about
  * nothing in particular. Every field this module compares is a SHA, and the two
- * label-shaped fields it does read (`baseRef`, `headRef`) are checked for
- * agreement but are never permitted to stand IN PLACE of a SHA.
+ * label-shaped fields it does read are used narrowly and never permitted to
+ * stand IN PLACE of a SHA: `baseRef` is compared for agreement, and `headRef`
+ * is used only to refuse a candidate whose head IS its base or the remote's
+ * default branch, and to name things in refusals. Corrected after the round-10
+ * review observed that the earlier wording claimed `headRef` was checked for
+ * agreement, which it is not — the head is bound by SHA, which is the stronger
+ * check and the reason no label comparison is needed there.
  *
  * The refusals here are deliberately boring restatements of that rule. That is
  * the point: a stale acceptance is not an exotic attack, it is what happens by

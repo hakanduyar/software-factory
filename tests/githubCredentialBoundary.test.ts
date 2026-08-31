@@ -447,11 +447,73 @@ describe("TASK-016 AC-6: a token in captured process output reaches nothing dura
   });
 
   /**
-   * And the durable chain, which is the one that matters most: an entry is
-   * hash-linked and append-only, so a token recorded there is a token published
-   * permanently in a public repository.
+   * THE DURABLE DESTINATION, REACHED THE WAY THE SYSTEM REACHES IT (round-10
+   * review).
+   *
+   * The case below this one injects the token directly and proves the CHAIN
+   * redacts. That is a real property and it is not this one. This case starts
+   * where a token actually starts — in what a child process printed — carries
+   * the adapter's own derived text into the record, and asserts three things
+   * that only mean something together:
+   *
+   *   1. a `gh` process really ran, so a token really entered;
+   *   2. the recorded text really DERIVES from what that process printed, so
+   *      the record is not merely some unrelated string that never had a token
+   *      in it to begin with;
+   *   3. the token is absent from the serialised state.
+   *
+   * Without (1) and (2), (3) is also what a pipeline that never ran would
+   * report — which is exactly how the previous version passed.
    */
-  it("does not carry the token into the provenance chain", () => {
+  it("does not carry a token from captured child output into the provenance chain", async () => {
+    const d = deps();
+
+    let derived = "";
+    try {
+      await d.github.repository();
+    } catch (error) {
+      derived = error instanceof Error ? error.message : String(error);
+    }
+
+    assertReachedGitHub(d.processRunner.seen());
+    // (2): the text is genuinely downstream of the child's output. `gh` and the
+    // non-zero exit both come from the scripted failure, not from this test.
+    assert.match(
+      derived,
+      /exit 1/,
+      `the recorded text does not derive from the child's output: ${derived}`,
+    );
+
+    const recorded = withPublicationRecorded(emptyState(), {
+      roadmapKey: `GITHUB_ORCHESTRATION ${derived}`,
+      pullRequest: {
+        number: 7,
+        state: "OPEN",
+        headRef: CANDIDATE.headRef,
+        headSha: HEAD,
+        baseRef: "main",
+        baseSha: BASE,
+      },
+      checks: { sha: HEAD, conclusion: "NO_CHECKS_CONFIGURED", total: 0 },
+      recordedAt: 2_000,
+    });
+
+    assert.equal(recorded.ok, true, `the control failed to record: ${JSON.stringify(recorded)}`);
+    if (!recorded.ok) return;
+    assert.ok(
+      !JSON.stringify(recorded.state).includes(LEAK),
+      "a GitHub token captured from a child process was hashed into the provenance chain",
+    );
+  });
+
+  /**
+   * AND THE CHAIN REDACTS ON ITS OWN. Defence in depth, stated as its own case
+   * rather than left to stand in for the end-to-end property above — which is
+   * the mistake the round-10 review found. `appendProvenance` redacts before
+   * hashing, so what is verified is what is stored, and neither carries the
+   * secret even when a caller injects one directly.
+   */
+  it("redacts a token injected straight into the record, with no process involved", () => {
     const recorded = withPublicationRecorded(emptyState(), {
       roadmapKey: `GITHUB_ORCHESTRATION ${LEAK}`,
       pullRequest: {
