@@ -918,4 +918,3 @@ first needs an observation to be evidence rather than custody.
 **Kept honest by:** nothing yet - which is the point of recording it. The
 existing `tests/pushAuthorization.test.ts` cases prove the binding and the
 provenance, and deliberately claim nothing about truthfulness.
-
