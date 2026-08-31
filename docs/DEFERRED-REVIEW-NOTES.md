@@ -137,3 +137,19 @@ restores, and a hard abort on any mismatch. What remains open:
 The fix is a `scripts/mutation/` harness with a self-test, reviewed under its
 own criteria. Deferred rather than folded into TASK-015, whose frozen scope is
 multi-resource authorization, not evidence tooling.
+
+## Fresh-read second-lookup coverage (TASK-014 round 4, non-blocking)
+
+The combined-tree acceptance review (the round that closed TASK-014) confirmed
+the executor REFUSES when the pre-launch fresh read finds no plan — a direct
+two-read probe showed the candidate refusing and not resuming while the
+mutation resumed — but the CHECKED-IN fresh-read tests only cover a second
+lookup returning a DIFFERENT plan, not one returning `undefined`. The
+missing-fresh-read mutation therefore survived the focused suite even though
+the behavior is correct.
+
+The fix is one test: a plan lookup whose second read returns `undefined`,
+asserting refusal and zero resumes. Recorded rather than patched immediately
+because the accepting verdict binds to the reviewed tree byte-for-byte
+(ADR-0002 condition 9); the test belongs to the next work on this seam, where
+it will be reviewed under that work's criteria.
