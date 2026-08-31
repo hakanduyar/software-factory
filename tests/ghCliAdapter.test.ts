@@ -14,7 +14,12 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { createGhCliClient, createGitPusher, githubTargetFromUrl } from "../src/adapters/github/ghCliClient.js";
+import {
+  createGhCliClient,
+  createGitPusher,
+  createGitRepositoryReader,
+  githubTargetFromUrl,
+} from "../src/adapters/github/ghCliClient.js";
 import type { ProcessRequest, ProcessResult, ProcessRunner } from "../src/ports/processRunner.js";
 import type { Timestamp } from "../src/domain/time.js";
 
@@ -244,6 +249,91 @@ describe("TASK-016 HIGH 4: malformed remote responses fail closed", () => {
       "a contradictory response was recorded as 'there are no checks'",
     );
     assert.equal(status.conclusion, "FAILURE");
+  });
+});
+
+describe("TASK-016 round-3 HIGH 2: LFS is detected by tracking, not by a diff", () => {
+  function reader(responses: Record<string, string>, failing?: string) {
+    const seen = runner(responses);
+    const wrapped: ProcessRunner & { seen(): readonly string[] } = {
+      seen: () => seen.seen(),
+      async run(request: ProcessRequest): Promise<ProcessResult> {
+        const key = request.argv.join(" ");
+        if (failing !== undefined && key.includes(failing)) {
+          // `git grep` exits 1 for "no matches", which is an answer.
+          return result("", 1);
+        }
+        return seen.run(request);
+      },
+    };
+    return {
+      reader: createGitRepositoryReader({
+        processRunner: wrapped,
+        cwd: "/tmp",
+        repository: REPO,
+        ghPath: "/usr/bin/true",
+        gitPath: "/usr/bin/true",
+      }),
+      runner: wrapped,
+    };
+  }
+
+  /**
+   * THE REPRODUCTION. The base already tracks `*.bin` through LFS and the
+   * candidate adds `new.bin` without touching `.gitattributes` — a diff-based
+   * detector reported "adds no LFS" while the push would upload metered
+   * objects. Asking whether the candidate TRACKS anything through LFS cannot
+   * miss a file an unchanged rule already covers.
+   */
+  it("reports LFS in use when the candidate tracks it, even with no rule change", async () => {
+    const { reader: git } = reader({ grep: `${A}:.gitattributes\n` });
+
+    assert.equal(await git.usesLfs(A), true, "existing LFS tracking was reported as absent");
+  });
+
+  it("asks about the candidate's own tree rather than a range", async () => {
+    const { reader: git, runner: seen } = reader({ grep: "" });
+
+    await git.usesLfs(A);
+
+    const grepArgv = seen.seen().find((entry) => entry.startsWith("grep "));
+    assert.ok(grepArgv !== undefined, "no grep was issued");
+    assert.match(grepArgv, /filter=lfs/);
+    assert.match(grepArgv, new RegExp(A));
+    assert.ok(!grepArgv.includes(".."), `the detector still compares a range: ${grepArgv}`);
+  });
+
+  /** No matches is an ANSWER (git grep exits 1), not an unknown. */
+  it("reports false when the candidate tracks nothing through LFS", async () => {
+    const { reader: git } = reader({}, "grep");
+
+    assert.equal(await git.usesLfs(A), false);
+  });
+
+  /**
+   * BUT AN UNREADABLE PROBE IS UNKNOWN, NOT "NO LFS" — my own mutation harness
+   * found this untested, which is the fail-open direction on a metered
+   * channel. `git grep` exits 1 for "no matches" and something else entirely
+   * for a bad object or an unreadable repository, and only the first is an
+   * answer.
+   */
+  it("reports unknown when the LFS probe fails for any other reason", async () => {
+    const failing: ProcessRunner = {
+      async run(request: ProcessRequest): Promise<ProcessResult> {
+        return request.argv[0] === "grep"
+          ? { ...result("fatal: bad object", 128), stderr: "fatal: bad object" }
+          : result("");
+      },
+    };
+    const git = createGitRepositoryReader({
+      processRunner: failing,
+      cwd: "/tmp",
+      repository: REPO,
+      ghPath: "/usr/bin/true",
+      gitPath: "/usr/bin/true",
+    });
+
+    assert.equal(await git.usesLfs(A), undefined, "an unreadable LFS probe was reported as 'no LFS'");
   });
 });
 

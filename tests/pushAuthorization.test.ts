@@ -44,7 +44,7 @@ function publicUnmetered(
     repositoryWebhooks: 0,
     configuredWorkflows: 0,
     candidateAddsWorkflows: false,
-    candidateAddsLfs: false,
+    candidateUsesLfs: false,
     ...overrides,
   });
 }
@@ -170,7 +170,7 @@ describe("TASK-016 AC-1/AC-2: a push cannot currently be demonstrated free", () 
         repositoryWebhooks: 0,
         configuredWorkflows: 0,
         candidateAddsWorkflows: false,
-        candidateAddsLfs: false,
+        candidateUsesLfs: false,
       },
     ],
     ["no observation at all", undefined],
@@ -236,8 +236,8 @@ describe("TASK-016 AC-2: zero liability must be observed, not assumed", () => {
     ["a workflow count that could not be read", { configuredWorkflows: undefined }, "existing-workflows"],
     ["a candidate that introduces a workflow", { candidateAddsWorkflows: true }, "introduced-workflows"],
     ["an unknown answer about introduced workflows", { candidateAddsWorkflows: undefined }, "introduced-workflows"],
-    ["a candidate that introduces Git LFS, whose transfer is metered", { candidateAddsLfs: true }, "introduced-lfs"],
-    ["an unknown answer about introduced LFS", { candidateAddsLfs: undefined }, "introduced-lfs"],
+    ["a candidate that introduces Git LFS, whose transfer is metered", { candidateUsesLfs: true }, "introduced-lfs"],
+    ["an unknown answer about introduced LFS", { candidateUsesLfs: undefined }, "introduced-lfs"],
   ] as const;
 
   for (const [label, override, channel] of mechanisms) {

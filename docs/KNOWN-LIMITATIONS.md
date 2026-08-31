@@ -816,12 +816,18 @@ channels still open: a GitHub App can subscribe to push events independently
 of both webhook scopes, and a candidate can introduce Git LFS, whose storage
 and bandwidth are metered.
 
-**What is observed now.** Six channels, each failing closed when it cannot be
-read: Actions metering (visibility PUBLIC), organisation webhooks (owner is a
-USER, which cannot have them), repository webhooks (count 0), existing
-workflows (count 0, so no run can start and runner size cannot bill one),
-introduced workflows (the candidate adds none), and introduced LFS (the
-candidate adds no `.gitattributes` changes).
+**What is observed now.** The report enumerates SEVEN channels - the six
+observable ones here plus the unobservable one below. Each of these six fails
+closed when it cannot be read: Actions metering (visibility PUBLIC),
+organisation webhooks (owner is a USER, which cannot have them), repository
+webhooks (count 0), existing workflows (count 0, so no run can start and runner
+size cannot bill one), introduced workflows (the candidate adds none), and Git
+LFS (the candidate TRACKS nothing through it).
+
+That last one is deliberately about tracking rather than about a change to the
+rules: a rule the base already carries still uploads metered objects for files
+the candidate adds under it, so comparing `.gitattributes` between base and
+head missed the ordinary case entirely.
 
 **The channel that stays open.** A GitHub App installation is not observable
 with the Factory's credentials: `/repos/:owner/:repo/installation` answers 401

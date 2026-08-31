@@ -10,7 +10,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { publishCandidate, type PublishDeps } from "../src/github/publishCandidate.js";
+import { ensurePullRequest, publishCandidate, type PublishDeps } from "../src/github/publishCandidate.js";
 import { githubTargetFromUrl } from "../src/adapters/github/ghCliClient.js";
 import type {
   RemoteCheckStatus,
@@ -59,7 +59,9 @@ function scripted(options: {
     pushUrls?: readonly string[];
     ancestor?: boolean | undefined;
     addsWorkflows?: boolean | undefined;
-    addsLfs?: boolean | undefined;
+    usesLfs?: boolean | undefined;
+    /** What `url.*.insteadOf` would rewrite the push URL to; `null` = unresolvable. */
+    effectiveUrl?: string | null;
   };
   /** Makes `createPullRequest` throw, as GitHub does for a duplicate. */
   readonly createFails?: boolean;
@@ -154,9 +156,13 @@ function scripted(options: {
         gitCalls.push("addsWorkflows");
         return options.local?.addsWorkflows ?? false;
       },
-      async addsLfs(): Promise<boolean | undefined> {
-        gitCalls.push("addsLfs");
-        return options.local?.addsLfs ?? false;
+      async usesLfs(): Promise<boolean | undefined> {
+        gitCalls.push("usesLfs");
+        return options.local?.usesLfs ?? false;
+      },
+      async effectiveUrl(url: string): Promise<string | undefined> {
+        gitCalls.push("effectiveUrl");
+        return options.local?.effectiveUrl === undefined ? url : (options.local.effectiveUrl ?? undefined);
       },
     },
     creates: () => createCount,
@@ -314,6 +320,87 @@ describe("TASK-016 AC-5: publication is idempotent", () => {
     assert.equal(outcome.kind, "HUMAN_REQUIRED", `a stale remote head was written: ${JSON.stringify(outcome)}`);
     assert.equal(s.creates(), 0, "a duplicate pull request was created");
     assert.deepEqual(s.pushes(), [], "the gate refused but a push happened anyway");
+  });
+});
+
+describe("TASK-016 round-3 HIGH 4: each observed fact reaches the report", () => {
+  /**
+   * THE VACUITY THE REVIEWER FOUND. Every push refuses, so a test asserting
+   * `HUMAN_REQUIRED` passes no matter what the orchestration observed —
+   * replacing `visibility: repository.visibility` with a hard-coded `"PUBLIC"`
+   * left all 27 cases green. What must be pinned is the WIRING: each fact the
+   * client reports has to arrive in the report the human reads.
+   *
+   * Asserted on the refusal's own text, which carries the action detail, so a
+   * hard-coded value shows up as the wrong word.
+   */
+  const wiring = [
+    ["visibility", { repository: { visibility: "PRIVATE" as const } }, /visibility PRIVATE/],
+    ["owner type", { repository: { ownerType: "ORGANIZATION" as const } }, /owner ORGANIZATION/],
+    ["webhook count", { repository: { repositoryWebhooks: 3 } }, /webhooks 3/],
+    ["workflow count", { repository: { configuredWorkflows: 2 } }, /workflows 2/],
+    ["introduced workflows", { local: { addsWorkflows: true } }, /candidate adds workflows true/],
+    ["LFS tracking", { local: { usesLfs: true } }, /candidate uses LFS true/],
+  ] as const;
+
+  for (const [label, options, pattern] of wiring) {
+    it(`carries the observed ${label} into the refusal a human reads`, async () => {
+      const s = scripted(options);
+
+      const outcome = await publishCandidate(deps(s), CANDIDATE);
+
+      assert.equal(outcome.kind, "HUMAN_REQUIRED", `expected a gated refusal: ${JSON.stringify(outcome)}`);
+      assert.match(
+        outcome.kind === "HUMAN_REQUIRED" ? outcome.reason : "",
+        pattern,
+        `the observed ${label} did not reach the report`,
+      );
+    });
+  }
+
+  /** And the target itself, so the human knows which repository is meant. */
+  it("names the derived target in the refusal", async () => {
+    const s = scripted();
+
+    const outcome = await publishCandidate(deps(s), CANDIDATE);
+
+    assert.match(outcome.kind === "HUMAN_REQUIRED" ? outcome.reason : "", new RegExp(REPO));
+  });
+});
+
+describe("TASK-016 round-3 HIGH 1: a rewritten push URL is refused", () => {
+  /**
+   * `url.*.insteadOf` rewrites a URL at the moment of use, so naming one
+   * explicitly was not enough — the reviewer demonstrated an observed
+   * `safe/actual` being contacted as `other/actual`. A rewrite in play means
+   * the destination observed is not the destination written, so it refuses.
+   */
+  it("refuses when git rewrites the push URL to somewhere else", async () => {
+    const s = scripted({ local: { effectiveUrl: "https://github.com/other/actual.git" } });
+
+    const outcome = await publishCandidate(deps(s), CANDIDATE);
+
+    assert.equal(outcome.kind, "REFUSED", `a rewritten destination was accepted: ${JSON.stringify(outcome)}`);
+    assert.match(outcome.kind === "REFUSED" ? outcome.reason : "", /rewrites the push URL/);
+    assert.deepEqual(s.pushes(), [], "a push reached a rewritten destination");
+  });
+
+  it("refuses when the effective push URL cannot be resolved", async () => {
+    const s = scripted({ local: { effectiveUrl: null } });
+
+    const outcome = await publishCandidate(deps(s), CANDIDATE);
+
+    assert.equal(outcome.kind, "REFUSED");
+    assert.match(outcome.kind === "REFUSED" ? outcome.reason : "", /could not be resolved/);
+  });
+
+  /** The control: an unrewritten URL still publishes. */
+  it("permits a push URL that git does not rewrite", async () => {
+    const s = scripted({ pullRequest: EXISTING_PR, local: { effectiveUrl: URL } });
+
+    const outcome = await publishCandidate(deps(s), CANDIDATE);
+
+    assert.equal(outcome.kind, "PUBLISHED", `an unrewritten URL was refused: ${JSON.stringify(outcome)}`);
   });
 });
 
@@ -518,6 +605,95 @@ describe("TASK-016 round-1 CRITICAL 1: the verdict binds to where the push will 
     assert.equal(outcome.kind, "REFUSED");
     assert.match(outcome.kind === "REFUSED" ? outcome.reason : "", /not a GitHub repository URL/);
     assert.deepEqual(s.pushes(), []);
+  });
+});
+
+describe("TASK-016 AC-5 (round-3 HIGH 3): the create/adopt behaviour, demonstrated directly", () => {
+  /**
+   * The frozen AC-5 describes create-or-adopt behaviour that `publishCandidate`
+   * can no longer reach, because the gate refuses every remote write first. The
+   * reviewer's instruction was to keep the behaviour and prove it through a
+   * separately testable seam rather than delete it — so these cases drive
+   * `ensurePullRequest` directly. Nothing about the production gate is
+   * weakened: publication still refuses before reaching this code.
+   */
+  it("creates a pull request when none exists", async () => {
+    const s = scripted();
+
+    const result = await ensurePullRequest(s.client, CANDIDATE);
+
+    assert.equal(result.ok, true, `creation failed: ${JSON.stringify(result)}`);
+    if (!result.ok) return;
+    assert.equal(result.created, true, "an existing pull request was reported");
+    assert.equal(s.creates(), 1, "the pull request was not created exactly once");
+  });
+
+  it("adopts an existing pull request instead of creating a second", async () => {
+    const s = scripted({ pullRequest: EXISTING_PR });
+
+    const result = await ensurePullRequest(s.client, CANDIDATE);
+
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    assert.equal(result.created, false, "an existing pull request was duplicated");
+    assert.equal(result.pullRequest.number, EXISTING_PR.number);
+    assert.equal(s.creates(), 0);
+  });
+
+  /**
+   * TWO RUNS, ONE PULL REQUEST. The second call finds what the first created,
+   * which is the resume-after-interruption case: a previous attempt may have
+   * created the pull request and died before recording it.
+   */
+  it("creates once across two runs", async () => {
+    const s = scripted();
+
+    const first = await ensurePullRequest(s.client, CANDIDATE);
+    const second = await ensurePullRequest(s.client, CANDIDATE);
+
+    assert.equal(first.ok && first.created, true, "the first run did not create");
+    assert.equal(second.ok && second.created, false, "the second run created a duplicate");
+    assert.equal(s.creates(), 1, "more than one pull request was created for one candidate");
+  });
+
+  /**
+   * THE LOST RACE. GitHub refuses a second open pull request for the same head
+   * and base, so the losing run must ADOPT the winner's rather than failing.
+   */
+  it("adopts the pull request that won a creation race", async () => {
+    const s = scripted({ createFails: true });
+    let attempted = false;
+    const racing: GitHubClient = {
+      ...s.client,
+      async findPullRequest(headRef: string): Promise<RemotePullRequest | undefined> {
+        // The winner's pull request becomes visible only after this run's
+        // creation attempt has failed.
+        return attempted
+          ? { number: 9, state: "OPEN", headRef, headSha: A, baseRef: "main", baseSha: BASE }
+          : undefined;
+      },
+      async createPullRequest(input) {
+        attempted = true;
+        return s.client.createPullRequest(input);
+      },
+    };
+
+    const result = await ensurePullRequest(racing, CANDIDATE);
+
+    assert.equal(result.ok, true, `the losing run failed instead of adopting: ${JSON.stringify(result)}`);
+    if (!result.ok) return;
+    assert.equal(result.pullRequest.number, 9, "the winner's pull request was not adopted");
+    assert.equal(result.created, false, "the losing run reported creating a pull request");
+  });
+
+  /** Adoption must not swallow a genuine failure. */
+  it("fails when creation fails and no pull request appears", async () => {
+    const s = scripted({ createFails: true });
+
+    const result = await ensurePullRequest(s.client, CANDIDATE);
+
+    assert.equal(result.ok, false, "a failed creation was reported as success");
+    assert.match(result.ok === false ? result.reason : "", /creating the pull request failed/);
   });
 });
 

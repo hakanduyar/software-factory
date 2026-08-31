@@ -153,3 +153,21 @@ asserting refusal and zero resumes. Recorded rather than patched immediately
 because the accepting verdict binds to the reviewed tree byte-for-byte
 (ADR-0002 condition 9); the test belongs to the next work on this seam, where
 it will be reviewed under that work's criteria.
+
+## Approval actor-kind guard is not load-bearing (TASK-016 rounds 2-3, non-blocking)
+
+Both the round-2 and round-3 TASK-016 reviews mutated the approval gate's
+actor-kind check and found it SURVIVES: 163 approval/state tests stayed green,
+because downstream `TrustedHumanToken` verification independently rejects the
+forged actor. The behaviour is correct; the guard is simply not proven to be
+doing anything.
+
+That is a real defence-in-depth gap — a check nothing can distinguish from its
+absence is not known to work — but it lives in TASK-011/TASK-001 territory,
+in a tree that is accepted and integrated. Editing it inside TASK-016 would
+mean changing an accepted tree for a defect this task did not introduce, and
+the reviewer explicitly agreed it belongs elsewhere.
+
+The fix is one test that isolates the actor-kind check from token verification
+— a forged actor whose token WOULD verify, so only the kind check can refuse.
+It wants its own task with its own frozen criteria.

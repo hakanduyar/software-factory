@@ -31,8 +31,19 @@ export interface GitRepositoryReader {
   isAncestor(ancestor: string, descendant: string): Promise<boolean>;
   /** Whether this push would ADD workflow files; `undefined` when unknown. */
   addsWorkflows(baseSha: string, headSha: string): Promise<boolean | undefined>;
-  /** Whether this push would introduce Git LFS tracking; `undefined` when unknown. */
-  addsLfs(baseSha: string, headSha: string): Promise<boolean | undefined>;
+  /**
+   * Whether the candidate tracks ANYTHING through Git LFS; `undefined` when
+   * unknown.
+   *
+   * Deliberately not "adds LFS": a rule the base already carries still uploads
+   * metered objects for files the candidate adds under it (round-3 HIGH 2).
+   */
+  usesLfs(headSha: string): Promise<boolean | undefined>;
+  /**
+   * The URL git will really contact after `url.*.insteadOf` rewrites, or
+   * `undefined` when it cannot be resolved (round-3 HIGH 1).
+   */
+  effectiveUrl(url: string): Promise<string | undefined>;
 }
 
 /** The one WRITE this task performs against a remote. */

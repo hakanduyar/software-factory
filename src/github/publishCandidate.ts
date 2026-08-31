@@ -121,10 +121,96 @@ export async function readLocalState(
           : `origin has ${pushUrls.length} push URLs, so a push writes to more than one destination and no single target can be observed`,
     };
   }
+  /**
+   * AND THE CONFIGURED URL MUST BE THE URL GIT WILL REALLY CONTACT (round-3
+   * HIGH 1).
+   *
+   * `url.*.insteadOf` rewrites a URL at the moment of use, so naming one
+   * explicitly was still not enough: the reviewer demonstrated an observed
+   * `safe/actual` being contacted as `other/actual`. Resolving the rewrite and
+   * refusing any difference means the destination this process observed is the
+   * destination git contacts — and a repository configured with such a rewrite
+   * for its own remote is refused rather than guessed about.
+   */
+  const configured = pushUrls[0]!;
+  const effective = await git.effectiveUrl(configured).catch(() => undefined);
+  if (effective === undefined) {
+    return { ok: false, reason: `the effective push URL for ${configured} could not be resolved` };
+  }
+  if (effective !== configured) {
+    return {
+      ok: false,
+      reason: `git rewrites the push URL ${configured} to ${effective}, so the destination observed would not be the destination written`,
+    };
+  }
   const baseIsAncestorOfHead = await git
     .isAncestor(baseSha, headSha)
     .catch(() => undefined);
-  return { ok: true, state: { pushUrl: pushUrls[0]!, headSha, baseSha, clean, baseIsAncestorOfHead } };
+  return { ok: true, state: { pushUrl: configured, headSha, baseSha, clean, baseIsAncestorOfHead } };
+}
+
+/**
+ * Find-or-create-or-adopt for one candidate's pull request (AC-5).
+ *
+ * EXTRACTED AS ITS OWN SEAM (round-3 HIGH 3). With every remote write refused,
+ * this logic was never executed by any test — `publishCandidate` stops at the
+ * gate first, so the create/adopt behaviour the frozen AC-5 describes had no
+ * positive demonstration at all, only a proof that the race cannot begin.
+ *
+ * Extracting it changes nothing about the production gate: `publishCandidate`
+ * still refuses before reaching here. What it buys is that the BEHAVIOUR can be
+ * exercised directly, so "creates when none exists", "adopts an existing one"
+ * and "adopts the winner of a creation race" are demonstrated rather than
+ * asserted in a comment.
+ *
+ * FIND BEFORE CREATE, and let the remote arbitrate: GitHub refuses a second
+ * open pull request for the same head and base, so a failed creation is
+ * followed by a re-find and an existing pull request is adopted. A failure with
+ * no pull request afterwards stays a failure — adoption must not swallow real
+ * errors.
+ */
+export async function ensurePullRequest(
+  github: GitHubClient,
+  candidate: ReviewedCandidate,
+  known?: RemotePullRequest,
+): Promise<
+  | { readonly ok: true; readonly pullRequest: RemotePullRequest; readonly created: boolean }
+  | { readonly ok: false; readonly reason: string }
+> {
+  const found = known ?? (await github.findPullRequest(candidate.headRef));
+  if (found !== undefined) {
+    return { ok: true, pullRequest: found, created: false };
+  }
+  try {
+    const pullRequest = await github.createPullRequest({
+      headRef: candidate.headRef,
+      baseRef: candidate.baseRef,
+      title: `${candidate.roadmapKey}: ${candidate.headSha.slice(0, 12)}`,
+      /**
+       * The body carries IDENTITY, not conclusions. It states which commit is
+       * proposed and against which base; it does not claim the work is
+       * accepted, because a pull-request body is not an acceptance and this
+       * module is not the thing that decides one.
+       */
+      body: [
+        `Roadmap item: ${candidate.roadmapKey}`,
+        `Candidate commit: ${candidate.headSha}`,
+        `Reviewed against base: ${candidate.baseSha} (${candidate.baseRef})`,
+        "",
+        "Acceptance is recorded by the Factory's independent review process, not by this pull request.",
+      ].join("\n"),
+    });
+    return { ok: true, pullRequest, created: true };
+  } catch (error) {
+    const adopted = await github.findPullRequest(candidate.headRef);
+    if (adopted === undefined) {
+      return {
+        ok: false,
+        reason: `creating the pull request failed and none exists: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+    return { ok: true, pullRequest: adopted, created: false };
+  }
 }
 
 export async function publishCandidate(
@@ -221,9 +307,12 @@ export async function publishCandidate(
    * metered transfer, so the target's current state is not sufficient alone.
    */
   if (needsPush || needsCreate) {
-    const [addsWorkflows, addsLfs] = await Promise.all([
+    const [addsWorkflows, usesLfs] = await Promise.all([
       deps.git.addsWorkflows(candidate.baseSha, candidate.headSha).catch(() => undefined),
-      deps.git.addsLfs(candidate.baseSha, candidate.headSha).catch(() => undefined),
+      // Whether the candidate TRACKS anything through LFS, not whether it
+      // changed the rules — an unchanged rule still uploads metered objects
+      // for files the candidate adds under it (round-3 HIGH 2).
+      deps.git.usesLfs(candidate.headSha).catch(() => undefined),
     ]);
     const observation = observePushLiability({
       target,
@@ -232,7 +321,7 @@ export async function publishCandidate(
       repositoryWebhooks: repository.repositoryWebhooks,
       configuredWorkflows: repository.configuredWorkflows,
       candidateAddsWorkflows: addsWorkflows,
-      candidateAddsLfs: addsLfs,
+      candidateUsesLfs: usesLfs,
     });
     const action = gitPushAction({
       target,
@@ -262,58 +351,21 @@ export async function publishCandidate(
   }
 
   /**
-   * FIND BEFORE CREATE (AC-5), AND LET THE REMOTE BE THE ARBITER.
+   * FIND BEFORE CREATE (AC-5), through the extracted seam.
    *
    * Re-reading after the push is what makes an interrupted run safe: a
-   * previous attempt may have created the PR and died before recording it.
-   *
-   * ROUND-1 REVIEW, HIGH 5. Find-then-create is not atomic, so two concurrent
-   * runs could both find nothing and both create. The serialization point that
-   * actually exists is GITHUB: it refuses a second open pull request for the
-   * same head and base. So a failed creation is not assumed fatal — it is
-   * followed by a re-find, and an existing PR is ADOPTED. The race therefore
-   * ends with one pull request and one of the two runs reporting `created`.
-   * (The push itself is idempotent: two pushes of the same sha to the same ref
-   * leave the ref at that sha.)
+   * previous attempt may have created the pull request and died before
+   * recording it. The find/create/adopt behaviour itself lives in
+   * `ensurePullRequest`, where it can be exercised directly -- round-3 HIGH 3
+   * observed that the gate stops publication before this point, so the
+   * behaviour had no positive demonstration while it was inline here.
    */
-  const found = existing ?? (await deps.github.findPullRequest(candidate.headRef));
-  let pullRequest: RemotePullRequest;
-  let created = false;
-  if (found === undefined) {
-
-    try {
-      pullRequest = await deps.github.createPullRequest({
-        headRef: candidate.headRef,
-        baseRef: candidate.baseRef,
-        title: `${candidate.roadmapKey}: ${candidate.headSha.slice(0, 12)}`,
-        /**
-         * The body carries IDENTITY, not conclusions. It states which commit
-         * is proposed and against which base; it does not claim the work is
-         * accepted, because a PR body is not an acceptance and this module is
-         * not the thing that decides one.
-         */
-        body: [
-          `Roadmap item: ${candidate.roadmapKey}`,
-          `Candidate commit: ${candidate.headSha}`,
-          `Reviewed against base: ${candidate.baseSha} (${candidate.baseRef})`,
-          "",
-          "Acceptance is recorded by the Factory's independent review process, not by this pull request.",
-        ].join("\n"),
-      });
-      created = true;
-    } catch (error) {
-      const adopted = await deps.github.findPullRequest(candidate.headRef);
-      if (adopted === undefined) {
-        return {
-          kind: "REFUSED",
-          reason: `creating the pull request failed and none exists: ${error instanceof Error ? error.message : String(error)}`,
-        };
-      }
-      pullRequest = adopted;
-    }
-  } else {
-    pullRequest = found;
+  const ensured = await ensurePullRequest(deps.github, candidate, existing);
+  if (!ensured.ok) {
+    return { kind: "REFUSED", reason: ensured.reason };
   }
+  const pullRequest = ensured.pullRequest;
+  const created = ensured.created;
 
   /**
    * RE-BIND AFTER ACTING. Everything above could have been true while the

@@ -501,17 +501,57 @@ export function createGitRepositoryReader(deps: GhCliDeps): GitRepositoryReader 
      * Any change to a `.gitattributes` counts: deciding which rules are
      * "really" LFS from a diff is the kind of cleverness that fails open.
      */
-    async addsLfs(baseSha: string, headSha: string): Promise<boolean | undefined> {
+    async usesLfs(headSha: string): Promise<boolean | undefined> {
       try {
-        const changed = await run(deps, git, [
-          "diff",
-          "--name-only",
-          `${baseSha}..${headSha}`,
+        /**
+         * ANY LFS TRACKING AT THE CANDIDATE, not a CHANGE to it (round-3
+         * HIGH 2).
+         *
+         * The first version compared `.gitattributes` between base and head,
+         * which missed the ordinary case the reviewer built: the base already
+         * tracks `*.bin` through LFS, the candidate adds `new.bin`, and
+         * `.gitattributes` is untouched — so LFS objects upload on push while
+         * the detector reported "adds no LFS".
+         *
+         * Asking whether the candidate tracks anything through LFS at all is
+         * both simpler and stricter: it cannot miss a file that an unchanged
+         * rule already covers. `git grep` against a commit reads the tree, so
+         * no checkout is involved.
+         */
+        const matches = await run(deps, git, [
+          "grep",
+          "-I",
+          "-l",
+          "filter=lfs",
+          headSha,
           "--",
-          "*.gitattributes",
           ".gitattributes",
+          "*.gitattributes",
         ]);
-        return changed.trim().length > 0;
+        return matches.trim().length > 0;
+      } catch (error) {
+        /**
+         * `git grep` exits 1 for "no matches", which is an ANSWER, and
+         * anything else is genuinely unknown. Distinguished by the message the
+         * runner builds, because a bare catch here would report "no LFS" for a
+         * repository it could not read — failing open on the metered channel.
+         */
+        return /exit 1\b/.test(error instanceof Error ? error.message : "") ? false : undefined;
+      }
+    },
+    /**
+     * The URL git will REALLY contact, after `url.*.insteadOf` rewrites
+     * (round-3 HIGH 1).
+     *
+     * Naming a URL explicitly was not enough: git rewrites it from config at
+     * the moment of use, so the destination observed could still differ from
+     * the destination written. `ls-remote --get-url` applies exactly those
+     * rewrites and prints the result without contacting anything.
+     */
+    async effectiveUrl(url: string): Promise<string | undefined> {
+      try {
+        const resolved = (await run(deps, git, ["ls-remote", "--get-url", url])).trim();
+        return resolved.length > 0 ? resolved : undefined;
       } catch {
         return undefined;
       }

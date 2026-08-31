@@ -594,7 +594,7 @@ export interface PushLiabilityObservation {
    * repositories, so a candidate adding `.gitattributes` filters can turn a
    * push into billed transfer. `undefined` is unknown, which is financial.
    */
-  readonly candidateAddsLfs: boolean | undefined;
+  readonly candidateUsesLfs: boolean | undefined;
 }
 
 /** One metered channel a push to GitHub can open, and whether it was closed. */
@@ -646,8 +646,8 @@ export function describePushLiability(
     ),
     channel(
       "introduced-lfs",
-      o?.candidateAddsLfs === false,
-      `candidate adds LFS ${o?.candidateAddsLfs ?? "unknown"}`,
+      o?.candidateUsesLfs === false,
+      `candidate uses LFS ${o?.candidateUsesLfs ?? "unknown"}`,
     ),
     /**
      * NEVER CLOSED, and that is the honest answer rather than a gap.
@@ -679,7 +679,7 @@ export function observePushLiability(input: {
   readonly repositoryWebhooks: number | undefined;
   readonly configuredWorkflows: number | undefined;
   readonly candidateAddsWorkflows: boolean | undefined;
-  readonly candidateAddsLfs: boolean | undefined;
+  readonly candidateUsesLfs: boolean | undefined;
 }): PushLiabilityObservation {
   const observation = Object.freeze({
     target: input.target,
@@ -689,7 +689,7 @@ export function observePushLiability(input: {
     repositoryWebhooks: input.repositoryWebhooks,
     configuredWorkflows: input.configuredWorkflows,
     candidateAddsWorkflows: input.candidateAddsWorkflows,
-    candidateAddsLfs: input.candidateAddsLfs,
+    candidateUsesLfs: input.candidateUsesLfs,
   });
   PUSH_OBSERVATIONS.add(observation);
   return observation;
