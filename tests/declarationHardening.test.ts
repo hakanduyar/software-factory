@@ -159,6 +159,51 @@ describe("TASK-015 round-3 finding 3: a declaration is validated as inert data",
   });
 });
 
+describe("TASK-015 round-5 finding 4: declarations enter through the catalog", () => {
+  /**
+   * `claude-code/sonnet` is a model this BUILD supports, and it is not in this
+   * installation's catalog. It was probed, gated, authorised and launched
+   * anyway, with no resource record for it in durable state — so it had no
+   * availability history, no backoff ladder and no observed billing, and "the
+   * same path the routed resource takes" was never true of it.
+   *
+   * TASK-015's frozen OUT OF SCOPE says resources enter through the existing
+   * catalog. A declaration was quietly a second door.
+   */
+  it("refuses a declared resource this installation does not carry", async () => {
+    const executor = declaringRaw([
+      { role: "implementer", provider: "claude-code", model: "opus" },
+      { role: "reviewer", provider: "claude-code", model: "sonnet" },
+    ]);
+
+    const result = await tickWith(executor);
+
+    assert.equal(result.kind, "RECOVERY_REQUIRED");
+    assert.match(
+      result.kind === "RECOVERY_REQUIRED" ? result.reason : "",
+      /resource catalog/,
+      "refused for some reason other than the missing catalog entry",
+    );
+    assert.equal(executor.calls().length, 0, "an uncatalogued resource was launched");
+  });
+
+  /**
+   * THE CONTROL: a declaration entirely inside the catalog still runs, so the
+   * guard is not satisfied by refusing everything.
+   */
+  it("permits a declaration whose resources are all catalogued", async () => {
+    const executor = declaringRaw([
+      { role: "implementer", provider: "claude-code", model: "opus" },
+      { role: "reviewer", provider: "codex-cli", model: "gpt-5.6-luna" },
+    ]);
+
+    const result = await tickWith(executor);
+
+    assert.equal(result.kind, "ADVANCED", `a catalogued declaration was refused: ${JSON.stringify(result)}`);
+    assert.equal(executor.calls().length, 1);
+  });
+});
+
 describe("TASK-015 round-3 finding 2: a missing re-read is a refusal", () => {
   /**
    * `?? plan` authorised the STALE copy whenever the fresh read came back

@@ -85,6 +85,7 @@ async function realExecutor(reviewer: PlannerConfig) {
   });
 
   const resumed: string[] = [];
+  const seen: WorkExecutionInput[] = [];
   const advancer: PlanAdvancer = {
     async resume(planId: string): Promise<Plan> {
       resumed.push(planId);
@@ -94,7 +95,7 @@ async function realExecutor(reviewer: PlannerConfig) {
     },
   };
 
-  const executor = createPlanBackedExecutor({
+  const inner = createPlanBackedExecutor({
     plans: { async findPlanForItem() { return context.plans.findById(plan.id); } },
     planning: advancer,
     // REAL authority: this is the projection that demotes a plan whose approval
@@ -107,7 +108,20 @@ async function realExecutor(reviewer: PlannerConfig) {
     clock: systemClock,
   });
 
-  return { executor, resumed, close: () => {} };
+  const executor = {
+    declareResources: inner.declareResources?.bind(inner),
+    async execute(input: WorkExecutionInput) {
+      seen.push(input);
+      return inner.execute(input);
+    },
+  };
+
+  return {
+    executor,
+    resumed,
+    authorized: () => seen[0]?.authorizedResources ?? [],
+    close: () => {},
+  };
 }
 
 describe("TASK-015 AC-6 end to end: a real supervisor set meets the real plan check", () => {
@@ -136,6 +150,25 @@ describe("TASK-015 AC-6 end to end: a real supervisor set meets the real plan ch
         real.resumed.length,
         1,
         `the C4 plan was not launched through the real chain: ${JSON.stringify(result)}`,
+      );
+
+      /**
+       * EXACTLY THE DECLARATION, NOTHING ELSE (round-5 finding 2).
+       *
+       * The routed resource used to be added to every set, so a plan declaring
+       * three was authorised for four — and no test said otherwise, because the
+       * assertions filtered `routed` out before looking. Restoring the extra
+       * insertion left 30 focused tests green.
+       *
+       * AC-2 says the supervisor authorises exactly the declared set, and an
+       * authorised resource that nothing can launch is a permission granted for
+       * no reason.
+       */
+      const authorized = real.authorized();
+      assert.deepEqual(
+        [...authorized.map((entry) => entry.role)].sort(),
+        ["implementer", "planner", "reviewer"],
+        `the authorised set is not exactly the declaration: ${JSON.stringify(authorized)}`,
       );
     } finally {
       real.close();

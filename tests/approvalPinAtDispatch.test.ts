@@ -19,7 +19,14 @@ import assert from "node:assert/strict";
 import { after, describe, it } from "node:test";
 
 import { cleanupTempDbs } from "./support/factoryFixtures.js";
-import { approvedPlan, newPlanning, TEST_PLANNER_CONFIG, testExecutionConfig } from "./support/planFixtures.js";
+import {
+  approvedPlan,
+  dependentPlanResponse,
+  finishWorkItem,
+  newPlanning,
+  TEST_PLANNER_CONFIG,
+  testExecutionConfig,
+} from "./support/planFixtures.js";
 
 after(cleanupTempDbs);
 
@@ -67,6 +74,88 @@ describe("TASK-015: the approval pin holds at the moment a worker starts", () =>
       context.dispatcher.startCount(),
       before,
       "a worker was started for an approval nobody cleared",
+    );
+  });
+
+  /**
+   * THE RACE AT THE REAL DISPATCH (round-5 finding 1, CRITICAL).
+   *
+   * The previous version of this file never reached `claimAndDispatch()`'s
+   * read/CAS pair at all: `approvedPlan()` has already dispatched the single
+   * work item, so a later resume adopts the existing loop instead of claiming a
+   * new one. The reviewer proved the gap by replacing the CAS version with a
+   * separate re-read — the production guard's defining property — and all three
+   * tests still passed.
+   *
+   * A TWO-ITEM plan is what makes the second dispatch happen: WI-B depends on
+   * WI-A, so it is claimed only after A finishes. The approval is then replaced
+   * during that claim, which is the window the CAS exists to close.
+   */
+  it("does not claim a dispatch when the approval changes at the claim itself", async () => {
+    const context = await newPlanning({ plannerOutputs: [dependentPlanResponse()] });
+    const plan = await approvedPlan(context, "Build two things.", {
+      constraints: CONSTRAINTS,
+      planner: TEST_PLANNER_CONFIG,
+      execution: testExecutionConfig(),
+    });
+    const pinned = (await context.plans.findById(plan.id))?.approvedDigest;
+    assert.ok(pinned !== undefined);
+
+    /**
+     * WI-A must be finished AS A WORK ITEM, not merely reported finished by the
+     * scripted loop. The first version of this test only set the loop phase, and
+     * the readiness check for WI-B looks at the Factory record — so no second
+     * dispatch happened, `claimAndDispatch` was never reached, and the test was
+     * inert. The reviewer proved that by breaking the CAS and watching it pass.
+     */
+    const first = plan.materialized[0];
+    assert.ok(first !== undefined, "the two-item fixture materialized nothing");
+    context.dispatcher.setPhase(first.workItemId, { phase: "COMPLETED", outcome: "COMPLETED" });
+    await finishWorkItem(context.factory, first.workItemId, "a");
+
+    const startsBefore = context.dispatcher.startCount();
+
+    /**
+     * Replace the approval on the read `claimAndDispatch` is about to write
+     * against. If the claim were written against any other read, this is the
+     * moment a worker would start for an approval nobody cleared.
+     */
+    let armed = true;
+    const realFindById = context.plans.findById.bind(context.plans);
+    Object.assign(context.plans, {
+      findById: async (id: string) => {
+        const found = await realFindById(id);
+        /**
+         * FIRED ON THE READ INSIDE `claimAndDispatch`, AND ONLY THAT ONE.
+         *
+         * An earlier version fired on the first EXECUTING read of the resume,
+         * which is the drive loop's — so the digest changed long before the
+         * claim, the loop's own check caught it, and the outcome was identical
+         * whether or not the claim used the right version. The mutation that
+         * breaks atomicity survived it.
+         *
+         * The stack is the only thing that distinguishes the two reads, and the
+         * distinction is the entire point: the guard's property is that the CAS
+         * is written against THE READ THE DIGEST WAS CHECKED ON.
+         */
+        const insideClaim = new Error().stack?.includes("claimAndDispatch") === true;
+        if (found !== undefined && armed && insideClaim) {
+          armed = false;
+          await context.plans.compareAndSave(
+            { ...found, version: found.version + 1, approvedDigest: "replaced-at-the-claim" },
+            found.version,
+          );
+        }
+        return found;
+      },
+    });
+
+    await context.service.resume(plan.id, pinned).catch(() => undefined);
+
+    assert.equal(
+      context.dispatcher.startCount(),
+      startsBefore,
+      "a second worker was claimed and started under an approval that had already been replaced",
     );
   });
 

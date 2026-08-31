@@ -1077,7 +1077,37 @@ export class SupervisorService {
      * by choosing an interpretation, and choosing one is how the C4 hole
      * happened.
      */
-    const declarationProblem = declaredResources.length === 0 ? undefined : describeDeclarationProblem(declaredResources);
+    /**
+     * A DECLARED RESOURCE MUST BE ONE THIS INSTALLATION HAS (round-5 finding 4).
+     *
+     * With a catalog holding only `claude-code/opus`, a declared
+     * `claude-code/sonnet` was probed, gated, authorised and launched, and no
+     * resource record for it existed in durable state at all. TASK-015's frozen
+     * OUT OF SCOPE says resources enter through the existing catalog, and a
+     * declaration was quietly a second way in.
+     *
+     * `resources` is the installation's own catalog, reconciled into durable
+     * state. A resource absent from it has no availability record, no backoff
+     * ladder and no observed billing history — so "the same path the single
+     * routed resource goes through" was never true of it.
+     */
+    const uncatalogued = declaredResources.find(
+      (resource) => !resources.has(resourceKey(resource.provider, resource.model)),
+    );
+    /**
+     * SHAPE FIRST, THEN INSTALLATION. A malformed role or an unknown provider is
+     * a more specific and more useful diagnosis than "not in the catalog", and
+     * putting the catalog check first made a `__proto__` provider refuse for the
+     * wrong reason — the same defect this task keeps finding in its own tests,
+     * appearing in the production message instead.
+     */
+    const declarationProblem =
+      declaredResources.length === 0
+        ? undefined
+        : (describeDeclarationProblem(declaredResources) ??
+          (uncatalogued === undefined
+            ? undefined
+            : `resource ${resourceKey(uncatalogued.provider, uncatalogued.model)} is not in this installation's resource catalog`));
     if (declarationProblem !== undefined) {
       const escalated = await this.escalate(
         state,
@@ -1878,6 +1908,7 @@ export class SupervisorService {
      * lineage cannot be established the review must not proceed at all.
      */
     const ambiguous: string[] = [];
+    const catalogByKey = new Map(this.roadmapCatalog().map((entry) => [entry.key, entry]));
     const visited = new Set<string>();
     const queue: string[] = [item.key];
     while (queue.length > 0) {
@@ -2004,7 +2035,22 @@ export class SupervisorService {
           ambiguous.push(key);
         }
       }
-      queue.push(...entry.dependsOn);
+      /**
+       * EDGES COME FROM THE CATALOG, NOT THE ROW (round-5 finding 3).
+       *
+       * `dependsOn` on the persisted row is mutable, which is why an earlier
+       * round defended against edits by examining EVERY key provenance mentions.
+       * That defence over-reached: reviewing an ancestor excluded resources
+       * because of what they implemented DOWNSTREAM, and a valid reviewer was
+       * refused with WAITING_FOR_RESOURCE.
+       *
+       * The catalog's edges are code, not data, and `reconcileRoadmapWithCatalog`
+       * already refuses a tick whose persisted roadmap disagrees with them. So
+       * they are both tamper-resistant AND correctly directional: ancestors
+       * only. That closes the edit-hiding attack without excluding half the
+       * roadmap.
+       */
+      queue.push(...(catalogByKey.get(key)?.dependsOn ?? entry.dependsOn));
     }
     /**
      * The item under review contributes its OWN run evidence (round-3 finding).
@@ -2111,9 +2157,28 @@ export class SupervisorService {
      * A dependency edit can no longer hide lineage, because the lineage record
      * itself supplies the list.
      */
+    /**
+     * ANCESTRY, PLUS ANYTHING THE CATALOG NO LONGER PLACES (round-5 finding 3).
+     *
+     * This was `visited` UNION every key provenance mentions, which excluded a
+     * resource because of work it did DOWNSTREAM of the item being reviewed.
+     * The reviewer measured it: reviewing ancestor A refused Codex — the only
+     * available reviewer — because Codex had implemented descendant B. C4 says a
+     * reviewer must not review its OWN work; it says nothing about unrelated
+     * work elsewhere in the roadmap, and a gate that refuses valid reviewers is
+     * a gate that gets switched off.
+     *
+     * The ancestry walk above now follows the CATALOG's edges, which a database
+     * edit cannot change, so the union is no longer needed to defend against
+     * edge tampering. What remains in it is keys the catalog does not place at
+     * all — removed or renamed items, whose lineage cannot be positioned and
+     * therefore must still be honoured.
+     */
     const chainKeys = new Set<string>([
       ...visited,
-      ...state.provenance.map((entry) => entry.roadmapKey),
+      ...state.provenance
+        .map((entry) => entry.roadmapKey)
+        .filter((key) => !catalogByKey.has(key)),
     ]);
     for (const key of chainKeys) {
       const entry = byKey.get(key);
