@@ -265,6 +265,22 @@ export function createGhCliClient(deps: GhCliDeps): GitHubClient {
       };
     },
 
+    async branchSha(branch: string): Promise<string | undefined> {
+      try {
+        const raw = await run(deps, gh, [
+          "api",
+          `repos/${deps.repository}/git/ref/heads/${branch}`,
+          "--jq",
+          ".object.sha",
+        ]);
+        const sha = raw.trim();
+        return isCommitSha(sha) ? sha : undefined;
+      } catch {
+        // A branch that does not exist is an ANSWER, not a fault.
+        return undefined;
+      }
+    },
+
     async findPullRequest(headRef: string): Promise<RemotePullRequest | undefined> {
       const raw = await run(deps, gh, [
         "pr",
@@ -365,17 +381,24 @@ export function createGhCliClient(deps: GhCliDeps): GitHubClient {
       const statuses = Array.isArray(row["statuses"]) ? row["statuses"] : [];
 
       let conclusion: CheckConclusion;
-      if (total === 0) {
-        // AC-4: distinct from success, and it stays distinct all the way out.
-        conclusion = "NO_CHECKS_CONFIGURED";
-      } else if (conclusions.length !== total || statuses.length !== total) {
+      if (conclusions.length !== total || statuses.length !== total) {
         /**
-         * ROUND-1 REVIEW, HIGH 4. `every([])` is TRUE, so a response claiming
-         * `total: 1` with empty arrays was read as SUCCESS — a malformed
-         * response failing open into a pass. A count that disagrees with the
-         * rows it counts is not a weaker result; it is an unusable one.
+         * AGREEMENT IS CHECKED FIRST, before any interpretation (round-1
+         * HIGH 4, then round-2 HIGH 4 for the ordering).
+         *
+         * Round 1: `every([])` is TRUE, so `total: 1` with empty arrays read
+         * as SUCCESS. Round 2: the fix sat AFTER the `total === 0` branch, so
+         * `total: 0` with a listed conclusion still read as
+         * NO_CHECKS_CONFIGURED — a contradictory response producing a
+         * confident record of "there are no checks", which is durable evidence
+         * that is simply wrong. A response that disagrees with itself is
+         * unusable in EVERY direction, so the disagreement is caught before
+         * anything is concluded from it.
          */
         conclusion = "FAILURE";
+      } else if (total === 0) {
+        // AC-4: distinct from success, and it stays distinct all the way out.
+        conclusion = "NO_CHECKS_CONFIGURED";
       } else if (statuses.some((entry) => entry !== "completed")) {
         conclusion = "PENDING";
       } else if (conclusions.every((entry) => entry === "success" || entry === "neutral" || entry === "skipped")) {
@@ -402,8 +425,19 @@ export function createGitRepositoryReader(deps: GhCliDeps): GitRepositoryReader 
      * send the write somewhere the gate never observed. This is the value the
      * push target is derived from.
      */
-    async pushUrl(): Promise<string> {
-      return (await run(deps, git, ["remote", "get-url", "--push", "origin"])).trim();
+    async pushUrls(): Promise<readonly string[]> {
+      /**
+       * `--all`, because `git push origin` writes to EVERY configured
+       * `pushurl` and `--push` alone reports only the first (round-2
+       * CRITICAL 1). Reporting one while git writes to two is how the gate
+       * could approve a public repository whose push also reached a private
+       * one.
+       */
+      const raw = await run(deps, git, ["remote", "get-url", "--push", "--all", "origin"]);
+      return raw
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0);
     },
     async revision(rev: string): Promise<string | undefined> {
       try {
@@ -459,6 +493,29 @@ export function createGitRepositoryReader(deps: GhCliDeps): GitRepositoryReader 
         return undefined;
       }
     },
+    /**
+     * Whether this push would introduce Git LFS tracking (round-2 CRITICAL 2).
+     *
+     * LFS storage and bandwidth are metered even on public repositories, so a
+     * candidate adding `filter=lfs` rules turns the push into billed transfer.
+     * Any change to a `.gitattributes` counts: deciding which rules are
+     * "really" LFS from a diff is the kind of cleverness that fails open.
+     */
+    async addsLfs(baseSha: string, headSha: string): Promise<boolean | undefined> {
+      try {
+        const changed = await run(deps, git, [
+          "diff",
+          "--name-only",
+          `${baseSha}..${headSha}`,
+          "--",
+          "*.gitattributes",
+          ".gitattributes",
+        ]);
+        return changed.trim().length > 0;
+      } catch {
+        return undefined;
+      }
+    },
   };
 }
 
@@ -476,7 +533,20 @@ export function createGitPusher(deps: GhCliDeps): GitPusher {
       if (!isCommitSha(input.sha)) {
         throw new Error("pushFastForward requires a full 40-character commit id");
       }
-      await run(deps, git, ["push", "origin", `${input.sha}:refs/heads/${input.branch}`]);
+      /**
+       * PUSHES TO THE URL, NOT TO `origin` (round-2 CRITICAL 1).
+       *
+       * `origin` is an indirection resolved by git config AT PUSH TIME, so the
+       * gate could observe one destination while the push resolved to another
+       * — through a second `pushurl`, or through a config change between the
+       * observation and the write. Naming the URL removes the indirection
+       * entirely: the destination that was observed is the destination
+       * written, with nothing in between that can be reconfigured.
+       */
+      if (!/^https:\/\/github\.com\//.test(input.url)) {
+        throw new Error("pushFastForward requires an https github.com URL");
+      }
+      await run(deps, git, ["push", input.url, `${input.sha}:refs/heads/${input.branch}`]);
     },
   };
 }

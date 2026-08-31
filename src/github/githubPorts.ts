@@ -13,11 +13,14 @@ import type { RemoteCheckStatus, RemotePullRequest, RemoteRepository } from "./c
 /** Reads the LOCAL repository. Separate port: local git is not GitHub. */
 export interface GitRepositoryReader {
   /**
-   * The URL git will ACTUALLY push to (`--push`), which the push target is
-   * derived from. Reading the fetch URL instead let a configured
-   * `remote.origin.pushurl` divert the write past the gate — round-1 CRITICAL 1.
+   * EVERY URL `git push origin` would write to.
+   *
+   * A list rather than a value because git supports multiple `pushurl`
+   * entries and writes to all of them; reporting only the first let the gate
+   * approve one destination while the push reached another (round-2
+   * CRITICAL 1). The caller refuses anything other than exactly one.
    */
-  pushUrl(): Promise<string>;
+  pushUrls(): Promise<readonly string[]>;
   /** Full 40-hex id for a revision, or `undefined` when it cannot be resolved. */
   revision(rev: string): Promise<string | undefined>;
   /** True only when nothing is modified, staged or untracked. */
@@ -28,24 +31,44 @@ export interface GitRepositoryReader {
   isAncestor(ancestor: string, descendant: string): Promise<boolean>;
   /** Whether this push would ADD workflow files; `undefined` when unknown. */
   addsWorkflows(baseSha: string, headSha: string): Promise<boolean | undefined>;
+  /** Whether this push would introduce Git LFS tracking; `undefined` when unknown. */
+  addsLfs(baseSha: string, headSha: string): Promise<boolean | undefined>;
 }
 
 /** The one WRITE this task performs against a remote. */
 export interface GitPusher {
   /**
-   * Pushes `sha` to `branch` on `origin`, FAST-FORWARD ONLY.
+   * Pushes `sha` to `branch` at `url`, FAST-FORWARD ONLY.
+   *
+   * The URL is explicit rather than a remote NAME: `origin` is resolved by git
+   * config at push time, so a named remote could reach a destination other
+   * than the one the gate observed (round-2 CRITICAL 1).
    *
    * There is no force option and no delete option, by construction — ADR-0002
    * lists force push and history rewriting among the things the mandate never
    * authorises, and the safest place to enforce that is an API that cannot
    * express it.
    */
-  pushFastForward(input: { readonly branch: string; readonly sha: string }): Promise<void>;
+  pushFastForward(input: {
+    readonly url: string;
+    readonly branch: string;
+    readonly sha: string;
+  }): Promise<void>;
 }
 
 export interface GitHubClient {
-  /** Repository identity plus the two facts the push verdict is derived from. */
+  /** Repository identity plus the facts the push report is derived from. */
   repository(): Promise<RemoteRepository>;
+  /**
+   * The commit a remote branch points at, or `undefined` when it does not
+   * exist.
+   *
+   * Asked so that publication can tell "this branch already holds the
+   * candidate" from "a pull request exists". Only the first means no write is
+   * needed, and only a publication that needs no write can complete without
+   * the financial gate having anything to authorise.
+   */
+  branchSha(branch: string): Promise<string | undefined>;
   /** The pull request whose head is `headRef`, or `undefined` when none exists. */
   findPullRequest(headRef: string): Promise<RemotePullRequest | undefined>;
   /**

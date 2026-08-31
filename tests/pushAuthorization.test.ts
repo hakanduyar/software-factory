@@ -16,6 +16,8 @@ import { describe, it } from "node:test";
 
 import {
   DENY_ALL_SPENDING,
+  deriveActionClass,
+  describePushLiability,
   evaluateFinancialSafety,
   gitPushAction,
   observePushLiability,
@@ -30,7 +32,7 @@ function verdictFor(action: ReturnType<typeof gitPushAction>) {
   return evaluateFinancialSafety(action, ZERO_SPEND);
 }
 
-/** Every condition satisfied — the ONE shape that may earn a free verdict. */
+/** Every OBSERVABLE channel closed — the best a target can look. */
 function publicUnmetered(
   target = TARGET,
   overrides: Partial<Parameters<typeof observePushLiability>[0]> = {},
@@ -42,24 +44,78 @@ function publicUnmetered(
     repositoryWebhooks: 0,
     configuredWorkflows: 0,
     candidateAddsWorkflows: false,
+    candidateAddsLfs: false,
     ...overrides,
   });
 }
 
-describe("TASK-016 AC-1: the push verdict is earned, never asserted", () => {
-  /**
-   * THE CONTROL. A public repository with no repository-level integrations is
-   * the one case where GitHub's own billing demonstrably cannot meter the
-   * push. If this case ever stops passing, the capability is gone entirely and
-   * every case below would pass vacuously.
-   */
-  it("permits a push to an observed public repository with no integrations", () => {
-    const verdict = verdictFor(
-      gitPushAction({ target: TARGET, observation: publicUnmetered(), description: "publish candidate" }),
-    );
+/** The channels `describePushLiability` reports as OPEN for an observation. */
+function openChannels(observation: PushLiabilityObservation | undefined): readonly string[] {
+  return describePushLiability(observation)
+    .filter((entry) => !entry.closed)
+    .map((entry) => entry.name);
+}
 
-    assert.equal(verdict.allowed, true, `an unmetered push was refused: ${JSON.stringify(verdict)}`);
-    assert.equal(verdict.actionClass, "FREE_REMOTE_ACTION");
+describe("TASK-016 AC-1/AC-2: a push cannot currently be demonstrated free", () => {
+  /**
+   * THE FINDING, PINNED AS A TEST (round-2 CRITICAL 2).
+   *
+   * Two rounds were spent trying to earn a free push verdict from observation.
+   * The reviewer showed that a GitHub App can subscribe to push events
+   * independently of both webhook scopes, and the Factory's credentials cannot
+   * enumerate installations — so a metered channel exists that this process
+   * cannot inspect. Minting `costKnownZero` while admitting that would be the
+   * declared-not-derived mistake the gate exists to prevent.
+   *
+   * So even a PERFECT target refuses, and the refusal is reasoned: the detail
+   * names every channel closed by observation and the one that remains open.
+   */
+  it("refuses even a fully observed, otherwise unmetered target", () => {
+    const action = gitPushAction({
+      target: TARGET,
+      observation: publicUnmetered(),
+      description: "publish candidate",
+    });
+
+    const verdict = verdictFor(action);
+
+    assert.equal(verdict.allowed, false, "a push was minted free despite an unobservable metered channel");
+    assert.equal(verdict.actionClass, "FINANCIAL_ACTION");
+    assert.match(action.detail ?? "", /github-app-subscriptions/, "the refusal does not name the open channel");
+  });
+
+  /**
+   * AND THE REPORT IS REAL, not a constant. Everything observable is reported
+   * CLOSED for a perfect target — which is what makes the refusal informative
+   * rather than a wall, and what would let a future observable App signal flip
+   * the verdict without a new branch.
+   */
+  it("reports every observable channel as closed for a perfect target", () => {
+    const channels = describePushLiability(publicUnmetered());
+
+    const open = channels.filter((entry) => !entry.closed).map((entry) => entry.name);
+    assert.deepEqual(open, ["github-app-subscriptions"], `unexpected open channels: ${open.join(", ")}`);
+  });
+
+  /**
+   * THE CONTROL THAT KEEPS THE MACHINERY HONEST. The gate can still say FREE
+   * for a remote action — so the refusal above is a statement about pushes,
+   * not an artefact of a gate that refuses everything.
+   */
+  it("still classifies a genuinely free remote action as free", () => {
+    assert.equal(
+      deriveActionClass({
+        costKnownZero: true,
+        requiresPaymentMethod: false,
+        canIncurUsageCharges: false,
+        changesBillingConfiguration: false,
+        requiresHumanCredential: false,
+        makesPublic: false,
+        irreversibleDataLoss: false,
+        remote: true,
+      }),
+      "FREE_REMOTE_ACTION",
+    );
   });
 
   /**
@@ -91,52 +147,60 @@ describe("TASK-016 AC-1: the push verdict is earned, never asserted", () => {
   });
 
   /**
-   * THE BINDING. An observation of repository A says nothing about repository
-   * B, and this is the case that fails if the target comparison is removed.
-   * Both observations are genuine and both describe unmetered public
-   * repositories — so ONLY the target mismatch can produce the refusal, and a
-   * sibling guard cannot be what catches it.
+   * AN UNTRUSTED OBSERVATION IS NO OBSERVATION, and that is asserted on the
+   * REPORT rather than on the verdict.
+   *
+   * Every push refuses now, so `allowed === false` proves nothing about these
+   * three guards — it would hold with the binding, the `WeakSet` check and the
+   * observation itself all deleted. What must remain true is that a
+   * mismatched, forged or absent observation contributes NOTHING: the report
+   * shows the observable channels as UNKNOWN rather than as the reassuring
+   * values the object claimed.
    */
-  it("refuses when the observation describes a different repository", () => {
-    const elsewhere = publicUnmetered("someone-else/other-repo");
+  const untrusted: readonly (readonly [string, PushLiabilityObservation | undefined])[] = [
+    // Genuine, but about another repository.
+    ["an observation describing a different repository", publicUnmetered("someone-else/other-repo")],
+    // Structurally perfect, but this module did not produce it.
+    [
+      "an observation this module did not produce",
+      {
+        target: TARGET,
+        visibility: "PUBLIC",
+        ownerType: "USER",
+        repositoryWebhooks: 0,
+        configuredWorkflows: 0,
+        candidateAddsWorkflows: false,
+        candidateAddsLfs: false,
+      },
+    ],
+    ["no observation at all", undefined],
+  ];
 
-    const verdict = verdictFor(
-      gitPushAction({ target: TARGET, observation: elsewhere, description: "publish" }),
-    );
+  for (const [label, observation] of untrusted) {
+    it(`ignores ${label} entirely`, () => {
+      const action = gitPushAction({
+        target: TARGET,
+        ...(observation === undefined ? {} : { observation }),
+        description: "publish",
+      });
 
-    assert.equal(verdict.allowed, false, "a verdict earned for one repository authorised a push to another");
-    assert.equal(verdict.actionClass, "FINANCIAL_ACTION");
-  });
+      assert.equal(verdictFor(action).allowed, false, `${label} earned a free verdict`);
+      // The claimed-good values must not appear: the observation was discarded.
+      assert.match(action.detail ?? "", /visibility UNKNOWN/, `${label} contributed its claimed visibility`);
+      assert.match(action.detail ?? "", /owner UNKNOWN/, `${label} contributed its claimed owner type`);
+      assert.ok(
+        !/webhooks 0/.test(action.detail ?? ""),
+        `${label} contributed its claimed webhook count`,
+      );
+    });
+  }
 
-  /**
-   * THE FORGERY. A structurally identical object that this module did not
-   * produce is not an observation. Without the `WeakSet` check any caller
-   * could assert its own zero liability, which is the "declared, not derived"
-   * hole the whole gate exists to close.
-   */
-  it("refuses an observation this module did not produce", () => {
-    const forged: PushLiabilityObservation = {
-      target: TARGET,
-      visibility: "PUBLIC",
-      ownerType: "USER",
-      repositoryWebhooks: 0,
-      configuredWorkflows: 0,
-      candidateAddsWorkflows: false,
-    };
+  /** The control: a TRUSTED observation does reach the report. */
+  it("uses an observation that is genuine and names the right target", () => {
+    const action = gitPushAction({ target: TARGET, observation: publicUnmetered(), description: "publish" });
 
-    assert.equal(
-      verdictFor(gitPushAction({ target: TARGET, observation: forged, description: "publish" })).allowed,
-      false,
-      "a hand-built observation earned a free verdict",
-    );
-  });
-
-  it("refuses when no observation is supplied at all", () => {
-    assert.equal(
-      verdictFor(gitPushAction({ target: TARGET, description: "publish" })).allowed,
-      false,
-      "an unobserved push was permitted",
-    );
+    assert.match(action.detail ?? "", /visibility PUBLIC/, "a genuine observation was discarded");
+    assert.match(action.detail ?? "", /owner USER/);
   });
 });
 
@@ -152,29 +216,58 @@ describe("TASK-016 AC-2: zero liability must be observed, not assumed", () => {
    * workflows on the target and none introduced by the push, no Actions run can
    * start at all — and runner size cannot bill a run that cannot exist.
    */
+  /**
+   * ASSERTED ON THE CHANNEL REPORT, NOT THE VERDICT.
+   *
+   * Every push refuses now, so a test asserting `allowed === false` would pass
+   * no matter what these observations said — the vacuous-guard trap. What must
+   * remain true is that each mechanism is reported OPEN when present, because
+   * that report is what a human acts on and what a future observable App
+   * signal would combine with.
+   */
   const mechanisms = [
-    ["a private repository", { visibility: "PRIVATE" as const }],
-    ["a visibility that could not be read", { visibility: undefined }],
-    ["an organisation owner, whose org-scoped webhooks this token cannot enumerate", { ownerType: "ORGANIZATION" as const }],
-    ["an owner type that could not be read", { ownerType: undefined }],
-    ["a repository webhook", { repositoryWebhooks: 1 }],
-    ["a webhook count that could not be read", { repositoryWebhooks: undefined }],
-    ["a configured workflow, which a larger runner could bill", { configuredWorkflows: 1 }],
-    ["a workflow count that could not be read", { configuredWorkflows: undefined }],
-    ["a candidate that introduces a workflow", { candidateAddsWorkflows: true }],
-    ["an unknown answer about introduced workflows", { candidateAddsWorkflows: undefined }],
+    ["a private repository", { visibility: "PRIVATE" as const }, "actions-metering"],
+    ["a visibility that could not be read", { visibility: undefined }, "actions-metering"],
+    ["an organisation owner, whose org-scoped webhooks this token cannot enumerate", { ownerType: "ORGANIZATION" as const }, "organisation-webhooks"],
+    ["an owner type that could not be read", { ownerType: undefined }, "organisation-webhooks"],
+    ["a repository webhook", { repositoryWebhooks: 1 }, "repository-webhooks"],
+    ["a webhook count that could not be read", { repositoryWebhooks: undefined }, "repository-webhooks"],
+    ["a configured workflow, which a larger runner could bill", { configuredWorkflows: 1 }, "existing-workflows"],
+    ["a workflow count that could not be read", { configuredWorkflows: undefined }, "existing-workflows"],
+    ["a candidate that introduces a workflow", { candidateAddsWorkflows: true }, "introduced-workflows"],
+    ["an unknown answer about introduced workflows", { candidateAddsWorkflows: undefined }, "introduced-workflows"],
+    ["a candidate that introduces Git LFS, whose transfer is metered", { candidateAddsLfs: true }, "introduced-lfs"],
+    ["an unknown answer about introduced LFS", { candidateAddsLfs: undefined }, "introduced-lfs"],
   ] as const;
 
-  for (const [label, override] of mechanisms) {
-    it(`refuses ${label}`, () => {
+  for (const [label, override, channel] of mechanisms) {
+    it(`reports ${channel} open for ${label}`, () => {
       const observation = publicUnmetered(TARGET, override);
 
-      const verdict = verdictFor(gitPushAction({ target: TARGET, observation, description: "publish" }));
+      const open = openChannels(observation);
 
-      assert.equal(verdict.allowed, false, `${label} was treated as zero liability`);
-      assert.equal(verdict.actionClass, "FINANCIAL_ACTION");
+      assert.ok(open.includes(channel), `${label} did not open ${channel}; open: ${open.join(", ")}`);
+      // And the push still refuses, which it would anyway — asserted so the
+      // pair reads as "this mechanism is why", not "everything refuses".
+      assert.equal(
+        verdictFor(gitPushAction({ target: TARGET, observation, description: "publish" })).allowed,
+        false,
+      );
     });
   }
+
+  /**
+   * The report must DISCRIMINATE: a perfect target opens exactly one channel,
+   * so any mechanism above adds to that rather than being lost in noise.
+   */
+  it("opens only the unobservable channel when everything observable is closed", () => {
+    assert.deepEqual(openChannels(publicUnmetered()), ["github-app-subscriptions"]);
+  });
+
+  /** An absent observation opens EVERYTHING — unknown is not partial credit. */
+  it("opens every channel when there is no observation at all", () => {
+    assert.equal(openChannels(undefined).length, describePushLiability(undefined).length);
+  });
 
   /**
    * AND THE POLICY STILL DOMINATES. Even a fully demonstrated zero-liability
@@ -191,16 +284,23 @@ describe("TASK-016 AC-2: zero liability must be observed, not assumed", () => {
     assert.equal(verdict.allowed, false, "a policy claiming spend authority permitted a push");
   });
 
-  it("refuses an unmetered push under the deny-all policy object", () => {
-    const verdict = evaluateFinancialSafety(
-      gitPushAction({ target: TARGET, observation: publicUnmetered(), description: "publish" }),
-      parseFinancialPolicy(DENY_ALL_SPENDING),
-    );
+  /**
+   * The verdict is decided by the ACTION's class, not by the policy's name —
+   * shown by the pair: a push refuses under a cleanly-parsing deny-all policy
+   * (because the action is financial), while a genuinely free action is still
+   * permitted under that same policy.
+   */
+  it("decides by the action's class, not by the policy's name", () => {
+    const policy = parseFinancialPolicy(DENY_ALL_SPENDING);
 
-    // DENY_ALL_SPENDING parses cleanly and denies spending, so a FREE action is
-    // still permitted — the check here is that the verdict is decided by the
-    // action's class rather than by the policy's name.
-    assert.equal(verdict.allowed, true, `the deny-all policy blocked a free action: ${JSON.stringify(verdict)}`);
+    const push = evaluateFinancialSafety(
+      gitPushAction({ target: TARGET, observation: publicUnmetered(), description: "publish" }),
+      policy,
+    );
+    const free = evaluateFinancialSafety({ kind: "GIT_FETCH", description: "fetch" }, policy);
+
+    assert.equal(push.allowed, false, "a push is financial and must refuse");
+    assert.equal(free.allowed, true, `the deny-all policy blocked a free action: ${JSON.stringify(free)}`);
   });
 });
 

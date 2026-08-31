@@ -799,46 +799,60 @@ different key, a missing key and two keys, and — the control that matters —
 asserts a correctly declared plan is still ACCEPTED, so the guard is not
 satisfied by refusing everything.
 
-## L-14 - A push verdict proves what GitHub itself will meter, not that no App can react
+## L-14 - The Factory cannot push autonomously, because zero liability cannot be demonstrated
 
-`GIT_PUSH` was registered financial with a comment predicting the remedy: "a
-push to a target with demonstrated zero liability could earn a minted action
-later, the way verification commands did." TASK-016 earns it -- but the FIRST
-attempt earned it too cheaply, and the round-1 review was right to refuse it.
+`GIT_PUSH` was registered financial with a comment predicting a remedy: "a push
+to a target with demonstrated zero liability could earn a minted action later,
+the way verification commands did." TASK-016 tried twice to earn it and
+concluded, under independent review, that it cannot be earned today.
 
-**What the first attempt got wrong.** It required only "public repository" and
-"zero repository webhooks". GitHub bills LARGER RUNNERS even on public
-repositories, and organisation-scoped webhooks are outside a repository query,
-so that pair never established zero liability. Converting an incomplete
-observation into `costKnownZero` is exactly the declared-not-derived mistake
-the financial gate exists to prevent.
+**Round 1** offered "public repository, no repository webhooks". The reviewer
+showed GitHub bills LARGER RUNNERS even on public repositories, and that
+organisation-scoped webhooks are outside a repository query.
 
-**What is required now.** All five, each observed in-process immediately before
-the gate, and each failing closed when it cannot be read:
+**Round 2** offered five facts - public, user-owned, no webhooks, no
+workflows, no workflows introduced by the candidate. The reviewer showed two
+channels still open: a GitHub App can subscribe to push events independently
+of both webhook scopes, and a candidate can introduce Git LFS, whose storage
+and bandwidth are metered.
 
-- `visibility` is PUBLIC -- standard runners are not metered there;
-- `ownerType` is USER -- a user account cannot have organisation-level webhooks
-  at all, and this token cannot enumerate an organisation's, so an
-  organisation-owned target is never demonstrable;
-- `repositoryWebhooks` is 0 -- no repository-scoped forwarder to a metered
-  third party;
-- `configuredWorkflows` is 0 -- with no workflows no Actions run can start, so
-  runner size cannot bill a run that cannot exist;
-- `candidateAddsWorkflows` is false -- and the push must not CREATE that
-  possibility, since a push carrying `.github/workflows/*` can trigger the very
-  run it introduces, on a runner it chooses.
+**What is observed now.** Six channels, each failing closed when it cannot be
+read: Actions metering (visibility PUBLIC), organisation webhooks (owner is a
+USER, which cannot have them), repository webhooks (count 0), existing
+workflows (count 0, so no run can start and runner size cannot bill one),
+introduced workflows (the candidate adds none), and introduced LFS (the
+candidate adds no `.gitattributes` changes).
 
-**The residual, stated narrowly.** A GitHub App installation is NOT observable
+**The channel that stays open.** A GitHub App installation is not observable
 with the Factory's credentials: `/repos/:owner/:repo/installation` answers 401
-and `/user/installations` answers 403 for an OAuth token. So a push earning
-`FREE_REMOTE_ACTION` demonstrates that GitHub itself will not meter it and that
-no repository- or organisation-scoped integration exists to forward it -- NOT
-that an App subscription a human previously authorised cannot react to it. That
-residual cannot create NEW autonomous spend by the Factory; it can only
-continue a commitment a human already made.
+and `/user/installations` answers 403 for an OAuth token. An unobservable
+metered channel is an OPEN one, and minting `costKnownZero` while admitting it
+would be the declared-not-derived mistake `financialSafety.ts` exists to
+prevent. So `gitPushAction` derives FINANCIAL for every input, and the Factory
+refuses every remote write.
 
-**Kept honest by:** `tests/pushAuthorization.test.ts` has one case per
-mechanism, each satisfying every other condition so that only the named one can
-produce the refusal, and -- the control that matters -- one case where all five
-hold and the push is PERMITTED, so the guard is not satisfied by refusing
-everything.
+**What the observation is for, then.** The report. A human asked to authorise a
+push receives the exact list of channels closed by observation and the one that
+remains open, rather than an unexplained refusal - the difference between a
+gate and a wall.
+
+**What this does NOT block.** The repository agent's own pushes under ADR-0002
+are governance, not this runtime gate. `AUTONOMOUS_SPEND_LIMIT = 0` constrains
+the FACTORY's autonomous authority, and that is what this limitation is about.
+A publication that needs no remote write - the branch already holds the
+candidate and the pull request already exists - completes normally, because
+there is nothing for the gate to authorise.
+
+**What would change it.** A credential that can enumerate App installations, or
+a GitHub signal that a push cannot bill. Either is a code change that goes
+through review and an independent acceptance gate, exactly as raising the spend
+limit would be - never a data edit, and never an inference.
+
+**Kept honest by:** `tests/pushAuthorization.test.ts` asserts on the CHANNEL
+REPORT rather than on the verdict, because every push refuses and a
+verdict-based assertion would pass no matter what the observation said. Each
+mechanism has a case proving it opens its own channel; a perfect target opens
+exactly one; an absent observation opens all of them; and a separate case shows
+the gate still classifies a genuinely free remote action as free, so the
+refusal is a statement about pushes rather than an artefact of a gate that
+refuses everything.

@@ -86,24 +86,45 @@ export interface PublishDeps {
  * a check. `GIT_FETCH` is free-but-remote in the effects table and triggers
  * nothing on the far side.
  */
+export type LocalStateResult =
+  | { readonly ok: true; readonly state: LocalRepositoryState }
+  | { readonly ok: false; readonly reason: string };
+
 export async function readLocalState(
   git: GitRepositoryReader,
   candidate: ReviewedCandidate,
-): Promise<LocalRepositoryState | undefined> {
+): Promise<LocalStateResult> {
   await git.fetch();
-  const [pushUrl, headSha, baseSha, clean] = await Promise.all([
-    git.pushUrl(),
+  const [pushUrls, headSha, baseSha, clean] = await Promise.all([
+    git.pushUrls(),
     git.revision("HEAD"),
     git.revision(`origin/${candidate.baseRef}`),
     git.isClean(),
   ]);
   if (headSha === undefined || baseSha === undefined) {
-    return undefined;
+    return { ok: false, reason: `HEAD or origin/${candidate.baseRef} could not be resolved to a commit` };
+  }
+  /**
+   * EXACTLY ONE DESTINATION, or there is no single thing to observe
+   * (round-2 CRITICAL 1). `git push origin` writes to EVERY configured
+   * `pushurl`, so more than one means the gate would inspect one repository
+   * while the push also reached another. Refused with its own reason rather
+   * than folded into "could not resolve": a wrong explanation of a correct
+   * refusal is its own defect.
+   */
+  if (pushUrls.length !== 1) {
+    return {
+      ok: false,
+      reason:
+        pushUrls.length === 0
+          ? "no push URL is configured for origin"
+          : `origin has ${pushUrls.length} push URLs, so a push writes to more than one destination and no single target can be observed`,
+    };
   }
   const baseIsAncestorOfHead = await git
     .isAncestor(baseSha, headSha)
     .catch(() => undefined);
-  return { pushUrl, headSha, baseSha, clean, baseIsAncestorOfHead };
+  return { ok: true, state: { pushUrl: pushUrls[0]!, headSha, baseSha, clean, baseIsAncestorOfHead } };
 }
 
 export async function publishCandidate(
@@ -114,14 +135,23 @@ export async function publishCandidate(
     return { kind: "REFUSED", reason: "the candidate does not name a full commit id" };
   }
 
-  const local = await readLocalState(deps.git, candidate);
-  if (local === undefined) {
-    return { kind: "REFUSED", reason: `HEAD or origin/${candidate.baseRef} could not be resolved to a commit` };
+  const read = await readLocalState(deps.git, candidate);
+  if (!read.ok) {
+    return { kind: "REFUSED", reason: read.reason };
   }
+  const local = read.state;
+
+  /**
+   * The repository is fetched BEFORE the preconditions, because the default
+   * branch is one of them: publication may never write it (round-2 HIGH 3),
+   * and that must be refused before anything acts.
+   */
+  const repository = await deps.github.repository();
   const preconditions = checkPublishPreconditions({
     candidate,
     local,
     expectedPushUrl: deps.expectedPushUrl,
+    defaultBranch: repository.defaultBranch,
   });
   if (!preconditions.ok) {
     return { kind: "REFUSED", reason: preconditions.reason };
@@ -147,7 +177,6 @@ export async function publishCandidate(
     };
   }
 
-  const repository = await deps.github.repository();
   /**
    * And the repository we OBSERVED must be the one we will WRITE to. Without
    * this the gate could inspect a safe repository while the push went
@@ -161,25 +190,41 @@ export async function publishCandidate(
   }
 
   /**
-   * IS THE PUSH EVEN NEEDED? Asked before the gate, because the cheapest way
-   * to stay inside a zero-spend policy is not to perform a remote write at
-   * all. An existing PR already pointing at the candidate means the remote
-   * holds this exact commit.
+   * WHAT, IF ANYTHING, WOULD THIS CALL WRITE?
+   *
+   * Asked before the gate, because the cheapest way to stay inside a
+   * zero-spend policy is to perform no remote write at all. Two independent
+   * facts, and conflating them was a defect: the BRANCH already holding the
+   * candidate is what makes a push unnecessary, while a PULL REQUEST existing
+   * is what makes a creation unnecessary. A branch pushed by some other
+   * authorised process — the ADR-0002 repository agent, say — means this call
+   * needs no push even though no pull request exists yet.
    */
-  const existing = await deps.github.findPullRequest(candidate.headRef);
-  const alreadyPublished = existing !== undefined && existing.headSha === candidate.headSha;
+  const [remoteBranchSha, existing] = await Promise.all([
+    deps.github.branchSha(candidate.headRef),
+    deps.github.findPullRequest(candidate.headRef),
+  ]);
+  const needsPush = remoteBranchSha !== candidate.headSha;
+  const needsCreate = existing === undefined;
 
-  let pushed = false;
-  if (!alreadyPublished) {
-    /**
-     * OBSERVED HERE, IN THIS PROCESS, IMMEDIATELY BEFORE THE GATE (AC-2),
-     * including what THIS PUSH would introduce: a candidate carrying
-     * `.github/workflows/*` can trigger the run it adds, on a runner it
-     * chooses, so the target's current emptiness is not sufficient by itself.
-     */
-    const addsWorkflows = await deps.git
-      .addsWorkflows(candidate.baseSha, candidate.headSha)
-      .catch(() => undefined);
+  /**
+   * ONE GATE FOR ANY REMOTE WRITE.
+   *
+   * Both writes this module can perform — the push and the pull-request
+   * creation — reach GitHub through the same channels, so they are authorised
+   * together or not at all. A second, narrower gate for creation would be the
+   * "no shortcut for a sibling" mistake this codebase keeps finding.
+   *
+   * OBSERVED HERE, IN THIS PROCESS, IMMEDIATELY BEFORE THE GATE (AC-2),
+   * including what THIS CANDIDATE would introduce: workflows it adds could
+   * trigger the run they define, and LFS rules it adds turn the push into
+   * metered transfer, so the target's current state is not sufficient alone.
+   */
+  if (needsPush || needsCreate) {
+    const [addsWorkflows, addsLfs] = await Promise.all([
+      deps.git.addsWorkflows(candidate.baseSha, candidate.headSha).catch(() => undefined),
+      deps.git.addsLfs(candidate.baseSha, candidate.headSha).catch(() => undefined),
+    ]);
     const observation = observePushLiability({
       target,
       visibility: repository.visibility,
@@ -187,6 +232,7 @@ export async function publishCandidate(
       repositoryWebhooks: repository.repositoryWebhooks,
       configuredWorkflows: repository.configuredWorkflows,
       candidateAddsWorkflows: addsWorkflows,
+      candidateAddsLfs: addsLfs,
     });
     const action = gitPushAction({
       target,
@@ -198,10 +244,20 @@ export async function publishCandidate(
       return {
         kind: "HUMAN_REQUIRED",
         action,
-        reason: `${verdict.humanActionRequired} Failing target: ${target}.`,
+        reason: `${verdict.humanActionRequired} Failing target: ${target}. ${action.detail ?? ""}`.trim(),
       };
     }
-    await deps.pusher.pushFastForward({ branch: candidate.headRef, sha: candidate.headSha });
+  }
+
+  let pushed = false;
+  if (needsPush) {
+    // The URL that was OBSERVED is the URL that is WRITTEN — no remote name in
+    // between that git could resolve differently (round-2 CRITICAL 1).
+    await deps.pusher.pushFastForward({
+      url: local.pushUrl,
+      branch: candidate.headRef,
+      sha: candidate.headSha,
+    });
     pushed = true;
   }
 
@@ -224,6 +280,7 @@ export async function publishCandidate(
   let pullRequest: RemotePullRequest;
   let created = false;
   if (found === undefined) {
+
     try {
       pullRequest = await deps.github.createPullRequest({
         headRef: candidate.headRef,

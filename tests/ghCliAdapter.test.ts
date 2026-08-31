@@ -14,7 +14,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { createGhCliClient, githubTargetFromUrl } from "../src/adapters/github/ghCliClient.js";
+import { createGhCliClient, createGitPusher, githubTargetFromUrl } from "../src/adapters/github/ghCliClient.js";
 import type { ProcessRequest, ProcessResult, ProcessRunner } from "../src/ports/processRunner.js";
 import type { Timestamp } from "../src/domain/time.js";
 
@@ -222,5 +222,73 @@ describe("TASK-016 HIGH 4: malformed remote responses fail closed", () => {
     const { client: gh } = client({ "check-runs": "{}" });
 
     await assert.rejects(() => gh.checkStatus("11662a1"), /40-character/);
+  });
+
+  /**
+   * ROUND-2 REVIEW, HIGH 4. The agreement check sat AFTER the `total === 0`
+   * branch, so a response claiming zero checks while listing one still
+   * produced a confident NO_CHECKS_CONFIGURED — durable evidence that is
+   * simply wrong. A response that disagrees with itself is unusable in EVERY
+   * direction, so agreement is checked before anything is concluded.
+   */
+  it("refuses a zero count that disagrees with its listed rows", async () => {
+    const { client: gh } = client({
+      "check-runs": JSON.stringify({ total: 0, conclusions: ["success"], statuses: ["completed"] }),
+    });
+
+    const status = await gh.checkStatus(A);
+
+    assert.notEqual(
+      status.conclusion,
+      "NO_CHECKS_CONFIGURED",
+      "a contradictory response was recorded as 'there are no checks'",
+    );
+    assert.equal(status.conclusion, "FAILURE");
+  });
+});
+
+describe("TASK-016 round-2 CRITICAL 1: the pusher writes to the observed URL", () => {
+  /**
+   * `origin` is an indirection git resolves AT PUSH TIME, so a named remote
+   * could reach a destination other than the one the gate observed — through a
+   * second `pushurl`, or a config change between the observation and the
+   * write. Naming the URL removes the indirection, and the argv is where that
+   * is either true or not.
+   */
+  it("passes the URL rather than a remote name to git push", async () => {
+    const seen = runner({ push: "" });
+    const pusher = createGitPusher({
+      processRunner: seen,
+      cwd: "/tmp",
+      repository: REPO,
+      ghPath: "/usr/bin/true",
+      gitPath: "/usr/bin/true",
+    });
+
+    await pusher.pushFastForward({
+      url: "https://github.com/hakanduyar/software-factory.git",
+      branch: "feat/x",
+      sha: A,
+    });
+
+    const pushArgv = seen.seen().find((entry) => entry.startsWith("push "));
+    assert.ok(pushArgv !== undefined, "no push was attempted");
+    assert.match(pushArgv, /https:\/\/github\.com\/hakanduyar\/software-factory\.git/);
+    assert.ok(!pushArgv.includes("origin"), `the push went through a remote name: ${pushArgv}`);
+  });
+
+  it("refuses a push URL that is not a github.com https URL", async () => {
+    const pusher = createGitPusher({
+      processRunner: runner({}),
+      cwd: "/tmp",
+      repository: REPO,
+      ghPath: "/usr/bin/true",
+      gitPath: "/usr/bin/true",
+    });
+
+    await assert.rejects(
+      () => pusher.pushFastForward({ url: "https://evil.example/x.git", branch: "b", sha: A }),
+      /https github\.com URL/,
+    );
   });
 });

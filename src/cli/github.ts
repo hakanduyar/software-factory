@@ -254,11 +254,12 @@ export async function runGithubReadiness(
   const deps = build(args, options);
   const candidate = candidateFrom(args);
 
-  const local = await readLocalState(deps.git, candidate);
-  if (local === undefined) {
-    log(`NOT_READY: HEAD or origin/${safe(args.baseRef)} could not be resolved to a commit`);
+  const read = await readLocalState(deps.git, candidate);
+  if (!read.ok) {
+    log(`NOT_READY: ${safe(read.reason)}`);
     return 1;
   }
+  const local = read.state;
   const repository = await deps.github.repository();
   const pullRequest = await deps.github.findPullRequest(args.headRef);
   const checks = await deps.github.checkStatus(args.headSha);

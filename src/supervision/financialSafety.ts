@@ -587,6 +587,79 @@ export interface PushLiabilityObservation {
   readonly configuredWorkflows: number | undefined;
   /** `undefined` when it could not be established whether this push adds workflows. */
   readonly candidateAddsWorkflows: boolean | undefined;
+  /**
+   * Whether this push would introduce Git LFS tracking.
+   *
+   * ROUND-2 REVIEW. LFS storage and bandwidth are METERED, including on public
+   * repositories, so a candidate adding `.gitattributes` filters can turn a
+   * push into billed transfer. `undefined` is unknown, which is financial.
+   */
+  readonly candidateAddsLfs: boolean | undefined;
+}
+
+/** One metered channel a push to GitHub can open, and whether it was closed. */
+export interface PushLiabilityChannel {
+  readonly name: string;
+  readonly closed: boolean;
+  readonly detail: string;
+}
+
+/**
+ * Every channel by which a push can create metered usage, and what was observed
+ * about each.
+ *
+ * Exported because the REPORT is the point: a push cannot currently be
+ * demonstrated free (see `gitPushAction`), so what a human receives instead is
+ * this — precisely which channels were closed by observation and which remain
+ * open — rather than an unexplained refusal.
+ */
+export function describePushLiability(
+  observation: PushLiabilityObservation | undefined,
+): readonly PushLiabilityChannel[] {
+  const o = observation;
+  const channel = (name: string, closed: boolean, detail: string): PushLiabilityChannel => ({ name, closed, detail });
+  return [
+    channel(
+      "actions-metering",
+      o?.visibility === "PUBLIC",
+      `visibility ${o?.visibility ?? "UNKNOWN"}`,
+    ),
+    channel(
+      "organisation-webhooks",
+      o?.ownerType === "USER",
+      `owner ${o?.ownerType ?? "UNKNOWN"}`,
+    ),
+    channel(
+      "repository-webhooks",
+      o?.repositoryWebhooks === 0,
+      `webhooks ${o?.repositoryWebhooks ?? "unknown"}`,
+    ),
+    channel(
+      "existing-workflows",
+      o?.configuredWorkflows === 0,
+      `workflows ${o?.configuredWorkflows ?? "unknown"}`,
+    ),
+    channel(
+      "introduced-workflows",
+      o?.candidateAddsWorkflows === false,
+      `candidate adds workflows ${o?.candidateAddsWorkflows ?? "unknown"}`,
+    ),
+    channel(
+      "introduced-lfs",
+      o?.candidateAddsLfs === false,
+      `candidate adds LFS ${o?.candidateAddsLfs ?? "unknown"}`,
+    ),
+    /**
+     * NEVER CLOSED, and that is the honest answer rather than a gap.
+     *
+     * A GitHub App can subscribe to push events independently of repository
+     * and organisation webhooks, and the Factory's credentials cannot
+     * enumerate installations: `/repos/:owner/:repo/installation` answers 401
+     * and `/user/installations` answers 403 for an OAuth token. So this
+     * channel cannot be observed, and an unobservable channel is an open one.
+     */
+    channel("github-app-subscriptions", false, "not observable with these credentials"),
+  ];
 }
 
 const PUSH_OBSERVATIONS = new WeakSet<PushLiabilityObservation>();
@@ -606,6 +679,7 @@ export function observePushLiability(input: {
   readonly repositoryWebhooks: number | undefined;
   readonly configuredWorkflows: number | undefined;
   readonly candidateAddsWorkflows: boolean | undefined;
+  readonly candidateAddsLfs: boolean | undefined;
 }): PushLiabilityObservation {
   const observation = Object.freeze({
     target: input.target,
@@ -615,6 +689,7 @@ export function observePushLiability(input: {
     repositoryWebhooks: input.repositoryWebhooks,
     configuredWorkflows: input.configuredWorkflows,
     candidateAddsWorkflows: input.candidateAddsWorkflows,
+    candidateAddsLfs: input.candidateAddsLfs,
   });
   PUSH_OBSERVATIONS.add(observation);
   return observation;
@@ -624,24 +699,41 @@ export function observePushLiability(input: {
  * Builds a push action whose cost verdict is EARNED from an observation of the
  * exact target (TASK-016 AC-1/AC-2).
  *
- * FREE REQUIRES ALL FIVE FACTS, each observed and none merely assumed: a public
- * repository, owned by a user rather than an organisation, with no repository
- * webhooks, no configured workflows, and a candidate that introduces none.
- * Together those say that this push cannot start an Actions run of any runner
- * size and cannot be forwarded by any integration this token can enumerate.
+ * THE VERDICT IS CURRENTLY ALWAYS FINANCIAL, AND THAT IS THE FINDING — not a
+ * gap left for later (round-2 review, CRITICAL 2).
  *
- * Everything else is financial, INCLUDING everything that merely could not be
- * established — a private repository, an unknown visibility, an organisation
- * owner, an unreadable webhook or workflow count, an unknown answer about the
- * candidate, an observation this module did not produce, and an observation
- * describing a different repository than the one being pushed to.
+ * Two rounds were spent trying to earn a free push verdict from observation.
+ * Round 1 offered "public repository, no repository webhooks"; the reviewer
+ * showed larger runners bill even on public repositories and that
+ * organisation webhooks are outside a repository query. Round 2 answered with
+ * five facts — public, user-owned, no webhooks, no workflows, no workflows
+ * introduced — and the reviewer showed two channels still open: a GitHub App
+ * can subscribe to push events independently of both webhook scopes, and a
+ * candidate can introduce Git LFS, whose storage and bandwidth are metered.
  *
- * RESIDUAL, recorded as L-14 rather than glossed: a GitHub App installation is
- * NOT observable with the Factory's scopes (both `/repos/:r/installation` and
- * `/user/installations` refuse an OAuth token). So this demonstrates that
- * GitHub itself will not meter the push and that no repository- or
- * organisation-scoped integration exists to forward it — not that no App
- * subscription a human previously authorised could react to it.
+ * The LFS channel is observable and is now observed. The App channel is NOT:
+ * `/repos/:owner/:repo/installation` answers 401 and `/user/installations`
+ * answers 403 for the Factory's OAuth token. So there exists a metered channel
+ * this process cannot inspect, and "uncertainty is financial" is not a rule
+ * that bends for the channel that happens to be inconvenient. Minting
+ * `costKnownZero` while admitting an unobservable metered channel would be
+ * precisely the declared-not-derived mistake this module exists to prevent —
+ * the reviewer's point, and it is correct.
+ *
+ * SO WHAT THE OBSERVATION IS FOR. It no longer decides the verdict; it builds
+ * the REPORT. A human asked to authorise a push receives the exact list of
+ * channels closed by observation and the one that remains open, instead of an
+ * unexplained refusal — which is the difference between a gate and a wall.
+ *
+ * WHAT WOULD CHANGE THIS. A credential that can enumerate App installations,
+ * or a GitHub signal that a push cannot bill. Either is a code change that
+ * goes through review and an independent acceptance gate, exactly as raising
+ * the spend limit would be — never a data edit, and never an inference.
+ *
+ * NOTE what this does NOT block: the repository-agent's own pushes under
+ * ADR-0002 are governance, not this runtime gate. This function constrains the
+ * FACTORY's autonomous authority, which is what `AUTONOMOUS_SPEND_LIMIT = 0`
+ * is about.
  */
 export function gitPushAction(input: {
   readonly target: string;
@@ -649,21 +741,25 @@ export function gitPushAction(input: {
   readonly description: string;
 }): SupervisedAction {
   const observation = input.observation;
+  /**
+   * The observation must still be genuine and bound to the target, even though
+   * it cannot currently produce a free verdict: it is what the report is built
+   * from, and a report assembled from a forged or mismatched observation would
+   * misinform the human deciding.
+   */
   const trusted =
     observation !== undefined &&
     PUSH_OBSERVATIONS.has(observation) &&
     observation.target === input.target;
-  const visibility: RepositoryVisibility = trusted ? observation.visibility : "UNKNOWN";
-  const ownerType: RepositoryOwnerType = trusted ? observation.ownerType : "UNKNOWN";
-  const webhooks = trusted ? observation.repositoryWebhooks : undefined;
-  const workflows = trusted ? observation.configuredWorkflows : undefined;
-  const addsWorkflows = trusted ? observation.candidateAddsWorkflows : undefined;
-  const unmetered =
-    visibility === "PUBLIC" &&
-    ownerType === "USER" &&
-    webhooks === 0 &&
-    workflows === 0 &&
-    addsWorkflows === false;
+  const channels = describePushLiability(trusted ? observation : undefined);
+  const open = channels.filter((entry) => !entry.closed);
+  /**
+   * `open` is never empty — `github-app-subscriptions` cannot be closed — so
+   * this is always financial. Written as a derivation rather than a constant
+   * so that closing every channel is what would change the verdict, and so a
+   * future observable App signal needs no new branch here.
+   */
+  const unmetered = open.length === 0;
   const derivedEffects = effects({
     remote: true,
     costKnownZero: unmetered,
@@ -673,11 +769,16 @@ export function gitPushAction(input: {
     {
       kind: "GIT_PUSH",
       description: input.description,
-      // Human-readable only; the binding copy lives in the mint record.
+      /**
+       * Human-readable only; the binding copy lives in the mint record. Every
+       * channel's OBSERVED VALUE is printed, closed or open, so the record
+       * shows what was actually established rather than only what failed —
+       * an untrusted observation is then visibly UNKNOWN rather than silently
+       * absent.
+       */
       detail:
-        `target ${input.target}, visibility ${visibility}, owner ${ownerType}, ` +
-        `webhooks ${webhooks ?? "unknown"}, workflows ${workflows ?? "unknown"}, ` +
-        `candidate adds workflows ${addsWorkflows ?? "unknown"}`,
+        `target ${input.target}; open: ${open.map((entry) => entry.name).join(", ")}; ` +
+        `observed: ${channels.map((entry) => entry.detail).join(", ")}`,
       effects: derivedEffects,
     },
     derivedEffects,

@@ -98,7 +98,7 @@ describe("TASK-016: a sha is an identity and a prefix is not", () => {
 
 describe("TASK-016 AC-8: local preconditions fail closed", () => {
   it("permits a clean tree at the reviewed candidate", () => {
-    const verdict = checkPublishPreconditions({ candidate: CANDIDATE, local: local(), expectedPushUrl: URL });
+    const verdict = checkPublishPreconditions({ candidate: CANDIDATE, local: local(), expectedPushUrl: URL, defaultBranch: "main" });
 
     assert.equal(verdict.ok, true, `a valid publish was refused: ${JSON.stringify(verdict)}`);
   });
@@ -108,6 +108,7 @@ describe("TASK-016 AC-8: local preconditions fail closed", () => {
       candidate: CANDIDATE,
       local: local({ clean: false }),
       expectedPushUrl: URL,
+      defaultBranch: "main",
     });
 
     assert.equal(verdict.ok, false);
@@ -127,6 +128,7 @@ describe("TASK-016 AC-8: local preconditions fail closed", () => {
       candidate: CANDIDATE,
       local: local({ pushUrl: "https://github.com/someone-else/other.git" }),
       expectedPushUrl: URL,
+      defaultBranch: "main",
     });
 
     assert.equal(verdict.ok, false);
@@ -139,6 +141,7 @@ describe("TASK-016 AC-8: local preconditions fail closed", () => {
       candidate: CANDIDATE,
       local: local({ headSha: B }),
       expectedPushUrl: URL,
+      defaultBranch: "main",
     });
 
     assert.equal(verdict.ok, false);
@@ -155,6 +158,7 @@ describe("TASK-016 AC-8: local preconditions fail closed", () => {
       candidate: CANDIDATE,
       local: local({ baseSha: BASE_MOVED }),
       expectedPushUrl: URL,
+      defaultBranch: "main",
     });
 
     assert.equal(verdict.ok, false);
@@ -166,6 +170,7 @@ describe("TASK-016 AC-8: local preconditions fail closed", () => {
       candidate: { ...CANDIDATE, headSha: "11662a1" },
       local: local(),
       expectedPushUrl: URL,
+      defaultBranch: "main",
     });
 
     assert.equal(verdict.ok, false);
@@ -183,6 +188,7 @@ describe("TASK-016 AC-8: local preconditions fail closed", () => {
       candidate: CANDIDATE,
       local: local({ baseIsAncestorOfHead: false }),
       expectedPushUrl: URL,
+      defaultBranch: "main",
     });
 
     assert.equal(verdict.ok, false, "an unrelated commit passed as a publishable candidate");
@@ -195,10 +201,67 @@ describe("TASK-016 AC-8: local preconditions fail closed", () => {
       candidate: CANDIDATE,
       local: local({ baseIsAncestorOfHead: undefined }),
       expectedPushUrl: URL,
+      defaultBranch: "main",
     });
 
     assert.equal(verdict.ok, false);
     assert.match(verdict.ok === false ? verdict.reason : "", /could not be established/);
+  });
+
+  /**
+   * ROUND-2 REVIEW, HIGH 3. A candidate declaring `headRef: "main"` passed
+   * every other check and the pusher then wrote `main` directly — which is an
+   * INTEGRATION, explicitly outside this task's frozen scope. On real GitHub
+   * the pull-request creation would fail afterwards because head and base
+   * match, but by then the branch has already moved.
+   */
+  it("refuses a candidate whose head branch is its own base", () => {
+    /**
+     * The base is `release` and the DEFAULT is `main`, deliberately.
+     *
+     * The first version of this case used `main` for both, so the
+     * default-branch guard caught it too and deleting the base-equality guard
+     * left the suite green — my own mutation harness found it. A guard whose
+     * test a sibling also satisfies is not known to work.
+     */
+    const verdict = checkPublishPreconditions({
+      candidate: { ...CANDIDATE, headRef: "release", baseRef: "release" },
+      local: local(),
+      expectedPushUrl: URL,
+      defaultBranch: "main",
+    });
+
+    assert.equal(verdict.ok, false, "publication would have written the base branch directly");
+    assert.match(verdict.ok === false ? verdict.reason : "", /which is its own base/);
+  });
+
+  /**
+   * And the DEFAULT branch specifically, even when it is not this candidate's
+   * base — `main` is not special because it is named `main`, it is special
+   * because the remote says it is the default.
+   */
+  it("refuses a candidate whose head branch is the remote default", () => {
+    const verdict = checkPublishPreconditions({
+      candidate: { ...CANDIDATE, headRef: "trunk", baseRef: "release" },
+      local: local(),
+      expectedPushUrl: URL,
+      defaultBranch: "trunk",
+    });
+
+    assert.equal(verdict.ok, false, "publication would have written the default branch directly");
+    assert.match(verdict.ok === false ? verdict.reason : "", /default branch trunk/);
+  });
+
+  /** The control: an ordinary feature branch is still publishable. */
+  it("permits a head branch that is neither the base nor the default", () => {
+    const verdict = checkPublishPreconditions({
+      candidate: { ...CANDIDATE, headRef: "feat/something", baseRef: "main" },
+      local: local(),
+      expectedPushUrl: URL,
+      defaultBranch: "main",
+    });
+
+    assert.equal(verdict.ok, true, `an ordinary branch was refused: ${JSON.stringify(verdict)}`);
   });
 });
 

@@ -147,8 +147,33 @@ export function checkPublishPreconditions(input: {
   readonly candidate: ReviewedCandidate;
   readonly local: LocalRepositoryState;
   readonly expectedPushUrl: string;
+  /** The remote's default branch, which publication may never write to. */
+  readonly defaultBranch: string;
 }): BindingVerdict {
   const { candidate, local } = input;
+
+  /**
+   * PUBLICATION MAY NOT WRITE THE BASE OR THE DEFAULT BRANCH (round-2 HIGH 3).
+   *
+   * A candidate declaring `headRef: "main"` passed every other check and the
+   * pusher then wrote `main` directly — an INTEGRATION, which TASK-016's
+   * frozen scope explicitly excludes. On real GitHub the pull-request creation
+   * would fail afterwards because head and base match, but by then the branch
+   * has already moved, so the refusal has to come first.
+   *
+   * Checked before anything else because it is a property of the REQUEST, not
+   * of the repository: nothing about the world can make it acceptable.
+   */
+  if (candidate.headRef === candidate.baseRef) {
+    return refuse(
+      `publication would write ${candidate.headRef}, which is its own base; publishing is not integrating`,
+    );
+  }
+  if (candidate.headRef === input.defaultBranch) {
+    return refuse(
+      `publication would write the default branch ${input.defaultBranch} directly; publishing is not integrating`,
+    );
+  }
 
   if (!isCommitSha(candidate.headSha) || !isCommitSha(candidate.baseSha)) {
     return refuse(
@@ -360,6 +385,7 @@ export function checkIntegrationReadiness(input: {
     candidate: input.candidate,
     local: input.local,
     expectedPushUrl: input.expectedPushUrl,
+    defaultBranch: input.repository.defaultBranch,
   });
   if (!preconditions.ok) {
     return preconditions;
