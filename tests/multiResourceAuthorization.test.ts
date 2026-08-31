@@ -247,6 +247,17 @@ describe("TASK-015 AC-1/AC-2: the supervisor authorises the set the work declare
         `a billable ${role} was allowed through: ${JSON.stringify(result)}`,
       );
       assert.equal(executor.ran(), false, `work ran with a billable ${role}`);
+      /**
+       * AND THE REFUSAL NAMES THE RESOURCE (round-10 finding 2). With three
+       * declared resources, a refusal that says only "no autonomous financial
+       * authority" tells the human that SOMETHING would bill and not what —
+       * the one fact they need to act on.
+       */
+      assert.match(
+        result.kind === "WAITING_FOR_HUMAN" ? result.humanActionRequired : "",
+        new RegExp(billable.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+        `the refusal does not name the failing resource ${billable}`,
+      );
     });
 
     it(`stops the whole action when the ${role} is unavailable`, async () => {

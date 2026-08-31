@@ -845,12 +845,24 @@ export class SupervisorService {
 
     const verdict = evaluateFinancialSafety(action, policy);
     if (!verdict.allowed) {
+      /**
+       * THE REFUSAL NAMES THE RESOURCE (round-10 finding 2).
+       *
+       * With three declared resources, "the Factory has no autonomous
+       * financial authority" told a human that SOMETHING would bill and not
+       * WHAT: the failing resource lived only in the action's free-text
+       * detail, which the verdict does not carry forward. AC-3 requires a
+       * named, controlled refusal, and this call site is the one place that
+       * knows the name -- both the routed and the declared paths pass through
+       * here, so naming it once here names it everywhere.
+       */
+      const humanAction = `${verdict.humanActionRequired} Failing resource: ${launching}.`;
       const escalated = await this.escalate(
         state,
         item.key,
         reasonForClass(verdict.actionClass),
-        verdict.humanActionRequired,
-        verdict.reason,
+        humanAction,
+        `${launching}: ${verdict.reason}`,
       );
       void escalated;
       return {
@@ -859,7 +871,7 @@ export class SupervisorService {
           kind: "WAITING_FOR_HUMAN",
           roadmapKey: item.key,
           reason: reasonForClass(verdict.actionClass),
-          humanActionRequired: verdict.humanActionRequired,
+          humanActionRequired: humanAction,
         },
       };
     }
@@ -2517,9 +2529,29 @@ export class SupervisorService {
     return { excluded: [...excluded], ambiguous };
   }
 
-  /** The earliest moment any waiting resource is worth looking at again. */
+  /**
+   * The earliest moment any waiting resource is worth looking at again.
+   *
+   * BOUNDED BY THE CODE CATALOG HERE, IN THE WAKE AUTHORITY ITSELF (round-10
+   * finding 1). `publishWake` runs after EVERY tick outcome, including the
+   * tamper-refusal returns that fire before step 1a's reconciliation -- so a
+   * `rogue:ghost` row in a REFUSED state still supplied the persisted wake
+   * time. Refused state is deliberately not reconciled (writing to it is the
+   * hazard); what must hold instead is that nothing DERIVED from it can carry
+   * an uncatalogued row's schedule into durable state.
+   *
+   * The bound lives in this function rather than at its callers because this
+   * is the only place a wake is computed: making the authority safe covers the
+   * pre-reconciliation paths that exist and any that get added, where a
+   * per-caller filter would be the sibling-call-site mistake again. For every
+   * in-tick caller the filter is a no-op, since step 1a already reconciled.
+   */
   private computeNextWake(state: SupervisorState): Timestamp | undefined {
+    const catalogued = new Set(
+      this.deps.resourceCatalog.map((entry) => resourceKey(entry.provider, entry.model)),
+    );
     const candidates = state.resources
+      .filter((record) => catalogued.has(record.key))
       .map((record) => record.retryAt)
       .filter((value): value is Timestamp => value !== undefined);
     return candidates.length === 0 ? undefined : Math.min(...candidates);

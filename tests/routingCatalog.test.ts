@@ -269,10 +269,13 @@ describe("TASK-015 round-8 finding 1: the catalog reconciles persisted rows", ()
     );
 
     /**
-     * REACHABLE, NOT MERELY PRESENT (round-9, converting a code-reading
-     * argument into evidence): within one tick the gained resource is seeded,
-     * probed by the refresh that follows reconciliation, and routed. A seeded
-     * row that could never be probed would leave this tick unable to advance.
+     * REACHABLE, NOT MERELY PRESENT (round-9). The evidence is INDIRECT and the
+     * indirection is sound: this item's work class requires an AI resource and
+     * the catalog holds exactly one, so ADVANCED entails that the gained
+     * resource was seeded, probed by the refresh that follows reconciliation,
+     * and routed. No `role: "routed"` entry is inspected here — a round-10
+     * review note called an earlier framing of this comment overstated, and it
+     * was.
      */
     const result = await supervisor.service.tick();
     assert.equal(result.kind, "ADVANCED", `the gained resource was never routed: ${JSON.stringify(result)}`);
@@ -281,6 +284,67 @@ describe("TASK-015 round-8 finding 1: the catalog reconciles persisted rows", ()
     assert.ok(
       (after?.resources ?? []).some((record) => record.key === "codex-cli:gpt-5.6-luna"),
       "a catalogued resource with no row was never seeded",
+    );
+  });
+});
+
+describe("TASK-015 round-10 finding 1: a refused tick publishes no rogue schedule", () => {
+  /**
+   * The tamper-refusal paths return BEFORE reconciliation, deliberately —
+   * writing to refused state is the hazard. But `publishWake` runs after every
+   * outcome and committed a wake time supplied by an uncatalogued `rogue:ghost`
+   * row inside the refused state, so a removed resource still controlled
+   * scheduling. The wake authority now bounds its own input by the catalog.
+   *
+   * BOTH halves of the boundary are asserted: the rogue schedule must not be
+   * published, and the rogue ROW must still be there — a reconciliation of
+   * refused state would be its own defect, not a fix.
+   */
+  it("does not let a rogue row in refused state supply the published wake", async () => {
+    const executor = recording();
+    const supervisor = newSupervisor({ probe: permissiveProbe(), executor, resourceCatalog: CATALOG });
+    await seedRoadmap(supervisor, [ITEM]);
+
+    const state = await supervisor.repository.load();
+    assert.ok(state !== undefined);
+    await supervisor.repository.compareAndSave(
+      {
+        ...state,
+        version: state.version + 1,
+        // The tamper: a roadmap title the catalog does not declare.
+        roadmap: state.roadmap.map((entry) =>
+          entry.key === ITEM.key ? { ...entry, title: "tampered definition" } : entry,
+        ),
+        resources: [
+          ...state.resources,
+          {
+            provider: "rogue",
+            model: "ghost",
+            key: "rogue:ghost",
+            state: "USAGE_LIMIT_REACHED" as const,
+            detectedAt: 0,
+            lastCheckedAt: 0,
+            retryAt: 1_800_000_005_000,
+            backoff: { attempt: 3, delayMs: 60_000 },
+          } as never,
+        ],
+      },
+      state.version,
+    );
+
+    const result = await supervisor.service.tick();
+
+    assert.notEqual(result.kind, "ADVANCED", "a tampered roadmap did not stop the tick");
+    assert.equal(executor.ran(), false);
+    const after = await supervisor.repository.load();
+    assert.notEqual(
+      after?.nextWakeAt,
+      1_800_000_005_000,
+      "the published wake was supplied by an uncatalogued row inside refused state",
+    );
+    assert.ok(
+      (after?.resources ?? []).some((record) => record.key === "rogue:ghost"),
+      "refused state was reconciled — the forensic boundary was crossed",
     );
   });
 });
