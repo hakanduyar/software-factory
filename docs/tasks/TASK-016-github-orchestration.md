@@ -68,6 +68,28 @@ hygiene one.
 
 ## Acceptance criteria (FROZEN — may not be edited to fit the implementation)
 
+> **Owner-authorized amendment, AC-5 only.** The criteria frozen at `ac01c22`
+> were internally contradictory: AC-5 required that publication produce a pull
+> request, while AC-1/AC-2 and the round-3 independent adjudication established
+> that a remote write can never be authorized, because an installed GitHub App
+> on the exact target may create an externally metered causal effect the Factory
+> cannot observe with its available credentials. No implementation could satisfy
+> all three.
+>
+> The owner reviewed the conflict (`TASK-016-AC5-SCOPE-CONFLICT.md`), refused to
+> accept the GitHub App residual, refused to weaken ZERO_COST, and directed that
+> UNKNOWN_COST remains DENY. AC-5 alone is amended, replacing the unsatisfiable
+> production obligation with an adoption obligation. This is an owner-authorized
+> scope correction under C1/C2, not implementer self-certification: the
+> implementer reported the conflict and did not choose the resolution.
+>
+> The amendment MUST NOT weaken AC-1, AC-2, ZERO_COST, RemoteWriteAuthorization,
+> the exact-target observation requirement, the Git URL rewrite checks, the LFS
+> checks, the GitHub App residual refusal, candidate SHA binding, check SHA
+> binding, idempotence, credential isolation, or any existing mutation guard.
+> Every other criterion stands exactly as frozen at `ac01c22`, which remains
+> unchanged in history.
+
 **AC-1.** A push is permitted only through an action whose zero-cost effects
 were DERIVED from an observation of the exact push target. The bare
 `GIT_PUSH` kind remains financial. An observation that is absent, was not
@@ -97,13 +119,36 @@ persisted record from "checks ran and succeeded". CI success alone never
 implies acceptance: an independent-review verdict remains separately
 required, and neither substitutes for the other.
 
-**AC-5.** Publication is IDEMPOTENT and resumable. Running the publish action
-twice for the same work item and candidate produces exactly one pull request:
-the second run adopts the existing one rather than creating a second. An
-interrupted run that already created a PR must, on resume, find that PR
-rather than duplicate it, and must not re-push a different tree under the
-same identity. Proven with a scripted client that counts create calls across
-two executions.
+**AC-5 (AMENDED — see "Owner-authorized amendment" below).** IDEMPOTENT
+EXTERNAL PUBLICATION ADOPTION.
+
+1. The Factory MUST NOT perform a remote pull-request-creation write unless the
+   existing zero-cost gate has positively authorized that exact write.
+2. If no matching pull request exists and remote-write authorization cannot be
+   derived, publication returns the HUMAN_REQUIRED outcome carrying the refused
+   action, performs ZERO remote writes, and does not weaken or bypass the
+   zero-cost gate.
+3. A human may create the pull request externally.
+4. On a later run the Factory adopts an externally-created pull request ONLY
+   when it is bound to the expected repository, the expected base identity, and
+   the exact candidate commit SHA. Branch name, pull request number, title or a
+   mutable head name are insufficient on their own.
+5. When exactly one valid matching pull request exists, publication adopts it,
+   binds its check evidence to the exact candidate, and records the publication
+   through the existing durable provenance path.
+6. Repeated execution creates ZERO additional pull requests.
+7. An interrupted and resumed execution rediscovers and adopts the SAME valid
+   pull request rather than duplicating publication.
+8. When zero matching pull requests exist, the outcome is HUMAN_REQUIRED —
+   publication required — and no write occurs.
+9. When more than one valid matching pull request exists, publication FAILS
+   CLOSED as ambiguous remote state: it does not arbitrarily select one, and it
+   does not create another.
+10. Candidate or check evidence describing a different commit must still refuse.
+
+Proven with a scripted client across repeated and interrupted executions,
+counting remote writes (which must be zero on every adoption path), and with
+pure-function cases for the absent, unique, unbindable and ambiguous states.
 
 **AC-6.** GitHub credentials never leave the trusted boundary. The
 credential-bearing environment the `gh` adapter builds is never handed to the
