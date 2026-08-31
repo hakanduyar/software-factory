@@ -140,19 +140,28 @@ export type TickResult =
 /** Backstop against a caller looping ticks without progress. */
 const MAX_REMEDIATION_ATTEMPTS = 5;
 
+/**
+ * What one tick pass hands back: its result, and — only when the pass ran to
+ * a trusted CONCLUSION — the state that vouches for the advisory wake
+ * (round-12 finding 1).
+ *
+ * A `REFUSAL` deliberately has no field a basis could travel in. Round 11
+ * kept "the newest state this tick committed" in an instance field, and the
+ * reviewer measured the gap: a legitimate catalog-upgrade commit at step 0b
+ * followed by a lineage refusal at step 1b left the earlier commit as the
+ * basis, so the refused tick still wrote a wake. Making the basis part of the
+ * outcome's SHAPE means no ordering of commits and refusals can leak one: a
+ * refusal cannot carry what its type cannot express, and a conclusion cannot
+ * be constructed without naming the state that vouches for it.
+ */
+type TickOutcome =
+  | { readonly kind: "REFUSAL"; readonly result: TickResult }
+  | { readonly kind: "CONCLUSION"; readonly result: TickResult; readonly wakeBasis: SupervisorState };
+
 export class SupervisorService {
   private readonly deps: SupervisorServiceDeps;
   private readonly log: (line: string) => void;
   private readonly ownerId: string;
-  /**
-   * The newest state THIS tick has successfully written through the
-   * integrity-enforcing repository (round-11 finding 1). Set only by `commit`,
-   * cleared only by `tick`, consumed only by `publishWake`. The property that
-   * matters — no state ever becomes a wake basis without having been accepted
-   * by `compareAndSave` — holds under any interleaving, because the only
-   * assignment is on a successful write.
-   */
-  private tickCommitted: SupervisorState | undefined;
 
   constructor(deps: SupervisorServiceDeps) {
     this.deps = deps;
@@ -225,17 +234,21 @@ export class SupervisorService {
    * `nextWakeAt` a fact about the state rather than a residue of the path taken
    * to reach it.
    *
-   * AND ONLY FROM STATE THIS TICK WAS WILLING TO WRITE (round-11 finding 1).
-   * The basis resets here and is set by exactly one thing: a successful
-   * `commit`. A tick that refuses its state returns before any commit, so it
-   * has no basis, so `publishWake` publishes nothing and writes nothing — see
-   * `publishWake` for why that is the property, not a courtesy.
+   * AND ONLY FROM A PASS THAT RAN TO A TRUSTED CONCLUSION (round-11 and
+   * round-12, finding 1 both times). Round 11 keyed publication off "the
+   * newest state this tick committed" — an instance field a successful commit
+   * set. Round 12 measured the gap: a catalog-upgrade commit at step 0b
+   * followed by a lineage REFUSAL at step 1b left the earlier commit as the
+   * basis, and the refused tick still wrote a wake. "Committed something" and
+   * "concluded without refusing" are different properties, and only the
+   * second may schedule. So the basis now travels WITH the outcome: a
+   * `REFUSAL` has no field a basis could ride in, no matter what legitimate
+   * housekeeping was committed before the refusal fired.
    */
   async tick(): Promise<TickResult> {
-    this.tickCommitted = undefined;
-    let result: TickResult;
+    let outcome: TickOutcome;
     try {
-      result = await this.runTick();
+      outcome = await this.runTick();
     } catch (error) {
       /**
        * A CORRUPT RECORD IS AN ANSWER, NOT AN EXCEPTION (round-8 HIGH).
@@ -268,8 +281,8 @@ export class SupervisorService {
         ),
       });
     }
-    await this.publishWake(this.tickCommitted);
-    return sanitizeTickResult(result);
+    await this.publishWake(outcome);
+    return sanitizeTickResult(outcome.result);
   }
 
   /**
@@ -318,33 +331,35 @@ export class SupervisorService {
   }
 
   /**
-   * THE WAKE DERIVES ONLY FROM STATE THIS TICK COMMITTED (round-11 finding 1).
+   * THE WAKE DERIVES ONLY FROM A CONCLUDED PASS'S OWN STATE (round-11 and
+   * round-12, finding 1 both times).
    *
-   * The previous version loaded state fresh from the repository, which meant
-   * it published — and COMMITTED — whatever was persisted, including state the
-   * tick had just REFUSED. Round 10 bounded the wake computation by resource
-   * identity; round 11 measured why that was the wrong property: a row whose
-   * identity IS catalogued, tampered to `retryAt=1800000005000` inside a
-   * roadmap-refused state, still supplied the published wake, and the commit
-   * re-persisted the entire refused state with our version stamp on it.
+   * Round 10's version loaded state fresh from the repository, which meant it
+   * published — and COMMITTED — whatever was persisted, including state the
+   * tick had just REFUSED: a row whose identity IS catalogued, tampered to
+   * `retryAt=1800000005000` inside a roadmap-refused state, supplied the
+   * published wake, and the commit re-persisted the entire refused state.
+   * Round 11's version took "the newest state this tick committed"; round 12
+   * measured that a refusal FOLLOWING a legitimate commit (a catalog-upgrade
+   * append, then the lineage check refusing) still published from that
+   * earlier commit.
    *
-   * The sufficient property is not "which rows may schedule" but "which STATE
-   * may schedule": one this tick already wrote through the repository that
-   * enforces the provenance chain and CAS. Refusal paths return before any
-   * commit, so they cannot arrive here with a basis — there is no fresh load
-   * for refused rows to ride in on, and anything written by someone else after
-   * our last commit makes the CAS below fail, which is a skip, not an
-   * endorsement. A missing wake is an advisory loss; a published one derived
-   * from refused state was a removed-or-tampered resource controlling the
-   * scheduler.
+   * The property that holds now: publication requires a `CONCLUSION`, and a
+   * `CONCLUSION` carries the state that vouches for it. A `REFUSAL` has no
+   * basis field at all, so no ordering of commits and refusals inside the
+   * pass can leak a wake out of a refused tick. There is no fresh load for
+   * refused rows to ride in on, and anything written concurrently after the
+   * basis makes the CAS below fail, which is a skip, not an endorsement. A
+   * missing wake is an advisory loss; a published one derived from refused
+   * state was a removed-or-tampered resource controlling the scheduler.
    */
-  private async publishWake(basis: SupervisorState | undefined): Promise<void> {
-    if (basis === undefined) {
-      // The tick wrote nothing: either it refused the state, or nothing needed
-      // writing. In both cases there is nothing trustworthy to derive a wake
-      // from, and nothing is published.
+  private async publishWake(outcome: TickOutcome): Promise<void> {
+    if (outcome.kind !== "CONCLUSION") {
+      // The pass refused durable state. Nothing about it — not even a wake
+      // time — is trustworthy enough to write back.
       return;
     }
+    const basis = outcome.wakeBasis;
     const wake = this.computeNextWake(basis);
     if (basis.nextWakeAt === wake) {
       return;
@@ -378,14 +393,14 @@ export class SupervisorService {
     }
   }
 
-  private async runTick(): Promise<TickResult> {
+  private async runTick(): Promise<TickOutcome> {
     const state = await this.ensureInitialized();
 
     // 0. Refuse before anything tries to WRITE. The repository will not persist
     //    a broken chain, so housekeeping would throw rather than decide.
     const broken = this.brokenChainOutcome(state);
     if (broken !== undefined) {
-      return broken;
+      return { kind: "REFUSAL", result: broken };
     }
 
     /**
@@ -398,7 +413,7 @@ export class SupervisorService {
      */
     const catalogued = await this.catalogState(state);
     if (catalogued.result !== undefined) {
-      return catalogued.result;
+      return { kind: "REFUSAL", result: catalogued.result };
     }
     const defined = catalogued.state;
 
@@ -429,7 +444,9 @@ export class SupervisorService {
     // 1. Reconcile any claim left behind by a previous process.
     const reconciled = await this.reconcileClaim(resourcesReconciled);
     if (reconciled.result !== undefined) {
-      return reconciled.result;
+      // A lost RUNNING claim is an ACTION refusal inside trusted, reconciled
+      // state — the escalation was committed, and that state may schedule.
+      return { kind: "CONCLUSION", result: reconciled.result, wakeBasis: reconciled.state };
     }
     let current = reconciled.state;
 
@@ -452,7 +469,14 @@ export class SupervisorService {
       ),
     });
     if (unproven !== undefined) {
-      return this.unprovenRefusal(current, unproven);
+      /**
+       * A STATE refusal, not an action refusal (round-12 finding 1): lineage
+       * in durable state cannot be trusted, so nothing derived from that
+       * state — including its wake — may be written. The catalog append and
+       * claim housekeeping committed above are legitimate on their own terms,
+       * but they do not make this pass a conclusion.
+       */
+      return { kind: "REFUSAL", result: this.unprovenRefusal(current, unproven) };
     }
 
     // 2. Refresh only resources whose retry is actually due. A resource with a
@@ -478,9 +502,13 @@ export class SupervisorService {
       const settled = await this.commit(current, withWake(current, wake));
       const pending = settled.roadmap.filter((entry) => entry.status !== "DONE");
       return {
-        kind: "IDLE",
-        reason: pending.length === 0 ? "every roadmap item is DONE" : "no roadmap item is actionable right now",
-        ...(wake === undefined ? {} : { nextWakeAt: wake }),
+        kind: "CONCLUSION",
+        result: {
+          kind: "IDLE",
+          reason: pending.length === 0 ? "every roadmap item is DONE" : "no roadmap item is actionable right now",
+          ...(wake === undefined ? {} : { nextWakeAt: wake }),
+        },
+        wakeBasis: settled,
       };
     }
 
@@ -840,7 +868,7 @@ export class SupervisorService {
     reviewer: boolean,
   ): Promise<
     | { readonly ok: true; readonly action: SupervisedAction }
-    | { readonly ok: false; readonly result: TickResult }
+    | { readonly ok: false; readonly state: SupervisorState; readonly result: TickResult }
   > {
     const launching = resourceKey(provider, model);
     const action = launchAiWorkerAction({
@@ -869,8 +897,11 @@ export class SupervisorService {
         humanAction,
         "the cleared resource and the launched resource disagree",
       );
-      void escalated;
-      return { ok: false, result: { kind: "RECOVERY_REQUIRED", reason: `resource binding mismatch on ${item.key}` } };
+      return {
+        ok: false,
+        state: escalated,
+        result: { kind: "RECOVERY_REQUIRED", reason: `resource binding mismatch on ${item.key}` },
+      };
     }
 
     const verdict = evaluateFinancialSafety(action, policy);
@@ -894,9 +925,9 @@ export class SupervisorService {
         humanAction,
         `${launching}: ${verdict.reason}`,
       );
-      void escalated;
       return {
         ok: false,
+        state: escalated,
         result: {
           kind: "WAITING_FOR_HUMAN",
           roadmapKey: item.key,
@@ -908,7 +939,7 @@ export class SupervisorService {
     return { ok: true, action };
   }
 
-  private async runItem(state: SupervisorState, item: RoadmapItem): Promise<TickResult> {
+  private async runItem(state: SupervisorState, item: RoadmapItem): Promise<TickOutcome> {
     /**
      * Rows reaching here are already reconciled against the code catalog by
      * `reconcileResourcesWithCatalog` at the top of the tick (round-8 finding
@@ -969,8 +1000,11 @@ export class SupervisorService {
         `Investigate ${item.key}: the executor could not state which resources its work would launch.`,
         detail,
       );
-      void escalated;
-      return { kind: "RECOVERY_REQUIRED", reason: `resource declaration failed for ${item.key}: ${detail}` };
+      return {
+        kind: "CONCLUSION",
+        result: { kind: "RECOVERY_REQUIRED", reason: `resource declaration failed for ${item.key}: ${detail}` },
+        wakeBasis: escalated,
+      };
     }
     const declaresOwnResources = declaredResources.length > 0;
 
@@ -1022,12 +1056,15 @@ export class SupervisorService {
           humanAction,
           `reviewer independence is unverifiable: no implementer recorded for ${lineage.ambiguous.join(", ")}`,
         );
-        void escalated;
         return {
-          kind: "WAITING_FOR_HUMAN",
-          roadmapKey: item.key,
-          reason: "HUMAN_DECISION_REQUIRED",
-          humanActionRequired: humanAction,
+          kind: "CONCLUSION",
+          result: {
+            kind: "WAITING_FOR_HUMAN",
+            roadmapKey: item.key,
+            reason: "HUMAN_DECISION_REQUIRED",
+            humanActionRequired: humanAction,
+          },
+          wakeBasis: escalated,
         };
       }
 
@@ -1050,8 +1087,11 @@ export class SupervisorService {
             `Adjust the routing policy so ${item.workClass} has an eligible resource.`,
             config.reason,
           );
-          void escalated;
-          return { kind: "RECOVERY_REQUIRED", reason: config.reason };
+          return {
+            kind: "CONCLUSION",
+            result: { kind: "RECOVERY_REQUIRED", reason: config.reason },
+            wakeBasis: escalated,
+          };
         }
         // Correct request, nothing usable now. This is NOT a failure.
         const waiting = await this.commit(state, {
@@ -1060,12 +1100,15 @@ export class SupervisorService {
         });
         const wake = this.computeNextWake(waiting);
         const settled = await this.commit(waiting, withWake(waiting, wake));
-        void settled;
         return {
-          kind: "WAITING_FOR_RESOURCE",
-          roadmapKey: item.key,
-          reason: config.reason,
-          ...(wake === undefined ? {} : { nextWakeAt: wake }),
+          kind: "CONCLUSION",
+          result: {
+            kind: "WAITING_FOR_RESOURCE",
+            roadmapKey: item.key,
+            reason: config.reason,
+            ...(wake === undefined ? {} : { nextWakeAt: wake }),
+          },
+          wakeBasis: settled,
         };
       }
 
@@ -1073,7 +1116,7 @@ export class SupervisorService {
       const observed = await this.probeAndObserve(state, item, config.option.provider, config.option.model);
       state = observed.state;
       if (!observed.ok) {
-        return observed.result;
+        return { kind: "CONCLUSION", result: observed.result, wakeBasis: observed.state };
       }
       confirmedBillingMode = observed.billingMode;
       billingObservation = observed.observation;
@@ -1119,12 +1162,15 @@ export class SupervisorService {
         humanAction,
         "deterministic work must declare its action kinds so every one can be gated before launch",
       );
-      void escalated;
       return {
-        kind: "WAITING_FOR_HUMAN",
-        roadmapKey: item.key,
-        reason: "HUMAN_DECISION_REQUIRED",
-        humanActionRequired: humanAction,
+        kind: "CONCLUSION",
+        result: {
+          kind: "WAITING_FOR_HUMAN",
+          roadmapKey: item.key,
+          reason: "HUMAN_DECISION_REQUIRED",
+          humanActionRequired: humanAction,
+        },
+        wakeBasis: escalated,
       };
     }
 
@@ -1162,12 +1208,15 @@ export class SupervisorService {
           declaredVerdict.humanActionRequired,
           declaredVerdict.reason,
         );
-        void escalated;
         return {
-          kind: "WAITING_FOR_HUMAN",
-          roadmapKey: item.key,
-          reason: reasonForClass(declaredVerdict.actionClass),
-          humanActionRequired: declaredVerdict.humanActionRequired,
+          kind: "CONCLUSION",
+          result: {
+            kind: "WAITING_FOR_HUMAN",
+            roadmapKey: item.key,
+            reason: reasonForClass(declaredVerdict.actionClass),
+            humanActionRequired: declaredVerdict.humanActionRequired,
+          },
+          wakeBasis: escalated,
         };
       }
     }
@@ -1262,8 +1311,14 @@ export class SupervisorService {
         `Correct the resources ${item.key} declares: ${declarationProblem}`,
         declarationProblem,
       );
-      void escalated;
-      return { kind: "RECOVERY_REQUIRED", reason: `${item.key} declared unusable resources: ${declarationProblem}` };
+      return {
+        kind: "CONCLUSION",
+        result: {
+          kind: "RECOVERY_REQUIRED",
+          reason: `${item.key} declared unusable resources: ${declarationProblem}`,
+        },
+        wakeBasis: escalated,
+      };
     }
 
     for (const required of declaredResources) {
@@ -1283,7 +1338,7 @@ export class SupervisorService {
       const observed = await this.probeAndObserve(state, item, required.provider, required.model);
       state = observed.state;
       if (!observed.ok) {
-        return observed.result;
+        return { kind: "CONCLUSION", result: observed.result, wakeBasis: observed.state };
       }
       const gated = await this.gateAiResource(
         state,
@@ -1295,7 +1350,7 @@ export class SupervisorService {
         required.role === "reviewer",
       );
       if (!gated.ok) {
-        return gated.result;
+        return { kind: "CONCLUSION", result: gated.result, wakeBasis: gated.state };
       }
       /**
        * THE IMPLEMENTER'S CLEARED ACTION IS THE ACTION (round-8 finding 2).
@@ -1334,8 +1389,14 @@ export class SupervisorService {
             `Correct the implementer declared by ${item.key}: ${built.reason}`,
             built.reason,
           );
-          void escalated;
-          return { kind: "RECOVERY_REQUIRED", reason: `${item.key} declared an unconfigurable implementer: ${built.reason}` };
+          return {
+            kind: "CONCLUSION",
+            result: {
+              kind: "RECOVERY_REQUIRED",
+              reason: `${item.key} declared an unconfigurable implementer: ${built.reason}`,
+            },
+            wakeBasis: escalated,
+          };
         }
         implementerConfig = built.value;
       }
@@ -1378,7 +1439,14 @@ export class SupervisorService {
         // does not name exactly one implementer, so the loop above must have
         // gated one. Stated rather than assumed, because a silent fallback here
         // would mint an action for a resource nothing launched.
-        return { kind: "RECOVERY_REQUIRED", reason: `${item.key} declared resources but no implementer was gated` };
+        return {
+          kind: "CONCLUSION",
+          result: {
+            kind: "RECOVERY_REQUIRED",
+            reason: `${item.key} declared resources but no implementer was gated`,
+          },
+          wakeBasis: state,
+        };
       }
       action = implementerAction;
     } else if (requiresAi(item.workClass) && config?.ok === true) {
@@ -1392,7 +1460,7 @@ export class SupervisorService {
         item.workClass === "INDEPENDENT_REVIEW",
       );
       if (!gated.ok) {
-        return gated.result;
+        return { kind: "CONCLUSION", result: gated.result, wakeBasis: gated.state };
       }
       action = gated.action;
     } else {
@@ -1409,12 +1477,15 @@ export class SupervisorService {
           verdict.humanActionRequired,
           verdict.reason,
         );
-        void escalated;
         return {
-          kind: "WAITING_FOR_HUMAN",
-          roadmapKey: item.key,
-          reason: reasonForClass(verdict.actionClass),
-          humanActionRequired: verdict.humanActionRequired,
+          kind: "CONCLUSION",
+          result: {
+            kind: "WAITING_FOR_HUMAN",
+            roadmapKey: item.key,
+            reason: reasonForClass(verdict.actionClass),
+            humanActionRequired: verdict.humanActionRequired,
+          },
+          wakeBasis: escalated,
         };
       }
     }
@@ -1431,8 +1502,11 @@ export class SupervisorService {
         `Review roadmap item ${item.key}: it exhausted its ${MAX_REMEDIATION_ATTEMPTS}-attempt remediation budget.`,
         `remediation budget exhausted after ${attempt - 1} attempts`,
       );
-      void escalated;
-      return { kind: "RECOVERY_REQUIRED", reason: `remediation budget exhausted for ${item.key}` };
+      return {
+        kind: "CONCLUSION",
+        result: { kind: "RECOVERY_REQUIRED", reason: `remediation budget exhausted for ${item.key}` },
+        wakeBasis: escalated,
+      };
     }
 
     const actionId = canonicalActionId(item.key, action.kind, attempt);
@@ -1493,8 +1567,11 @@ export class SupervisorService {
         `Investigate ${item.key}: its checkpoint belongs to a different roadmap item.`,
         `checkpoint roadmapKey ${stored.roadmapKey} does not match ${item.key}`,
       );
-      void escalated;
-      return { kind: "RECOVERY_REQUIRED", reason: `checkpoint identity mismatch on ${item.key}` };
+      return {
+        kind: "CONCLUSION",
+        result: { kind: "RECOVERY_REQUIRED", reason: `checkpoint identity mismatch on ${item.key}` },
+        wakeBasis: escalated,
+      };
     }
     const checkpoint =
       stored === undefined ? undefined : { ...stored, actionId, resumedFromActionId: stored.actionId };
@@ -1590,7 +1667,7 @@ export class SupervisorService {
     usedResourceKey: string | undefined,
     runConfig: AiRunConfigRecord | undefined,
     authorized: readonly AuthorizedResource[] = [],
-  ): Promise<TickResult> {
+  ): Promise<TickOutcome> {
     const now = this.deps.clock.now();
     const { activeClaim: _dropped, ...withoutClaim } = state;
     void _dropped;
@@ -1844,10 +1921,13 @@ export class SupervisorService {
         `Investigate ${item.key}: the worker reported running a different model/effort than was authorized. ${reconciled.note}`,
         reconciled.note,
       );
-      void escalated;
       return {
-        kind: "RECOVERY_REQUIRED",
-        reason: `run configuration mismatch on ${item.key}: ${reconciled.note}`,
+        kind: "CONCLUSION",
+        result: {
+          kind: "RECOVERY_REQUIRED",
+          reason: `run configuration mismatch on ${item.key}: ${reconciled.note}`,
+        },
+        wakeBasis: escalated,
       };
     }
 
@@ -1883,8 +1963,11 @@ export class SupervisorService {
         humanAction,
         "AI work completed without a reported run identity",
       );
-      void escalated;
-      return { kind: "RECOVERY_REQUIRED", reason: `unverified completion on ${item.key}` };
+      return {
+        kind: "CONCLUSION",
+        result: { kind: "RECOVERY_REQUIRED", reason: `unverified completion on ${item.key}` },
+        wakeBasis: escalated,
+      };
     }
 
     switch (outcome.kind) {
@@ -1902,9 +1985,12 @@ export class SupervisorService {
           checkpoints: state.checkpoints.filter((entry) => entry.roadmapKey !== item.key),
           resources: markSuccess(state.resources, usedResourceKey, now),
         });
-        void next;
         this.log(`[supervisor] ${item.key} completed; dependents re-evaluated`);
-        return { kind: "ADVANCED", roadmapKey: item.key, actionId, detail };
+        return {
+          kind: "CONCLUSION",
+          result: { kind: "ADVANCED", roadmapKey: item.key, actionId, detail },
+          wakeBasis: next,
+        };
       }
 
       case "CHANGES_REQUIRED": {
@@ -1918,8 +2004,11 @@ export class SupervisorService {
           roadmap: setStatus(withLineage.roadmap, item.key, "ELIGIBLE", detail),
           resources: markSuccess(state.resources, usedResourceKey, now),
         });
-        void next;
-        return { kind: "ADVANCED", roadmapKey: item.key, actionId, detail };
+        return {
+          kind: "CONCLUSION",
+          result: { kind: "ADVANCED", roadmapKey: item.key, actionId, detail },
+          wakeBasis: next,
+        };
       }
 
       case "CHECKPOINT": {
@@ -1962,9 +2051,12 @@ export class SupervisorService {
           }),
           resources: markSuccess(state.resources, usedResourceKey, now),
         });
-        void next;
         this.log(`[supervisor] ${item.key} rolled over to a new session: ${detail}`);
-        return { kind: "ADVANCED", roadmapKey: item.key, actionId, detail };
+        return {
+          kind: "CONCLUSION",
+          result: { kind: "ADVANCED", roadmapKey: item.key, actionId, detail },
+          wakeBasis: next,
+        };
       }
 
       case "HUMAN_REQUIRED": {
@@ -1982,8 +2074,11 @@ export class SupervisorService {
           ? "HUMAN_DECISION_REQUIRED"
           : reasonForClass(verdict.actionClass);
         const escalated = await this.escalate(withLineage, item.key, reason, humanAction, outcome.detail);
-        void escalated;
-        return { kind: "WAITING_FOR_HUMAN", roadmapKey: item.key, reason, humanActionRequired: humanAction };
+        return {
+          kind: "CONCLUSION",
+          result: { kind: "WAITING_FOR_HUMAN", roadmapKey: item.key, reason, humanActionRequired: humanAction },
+          wakeBasis: escalated,
+        };
       }
 
       case "RESOURCE_FAILURE": {
@@ -2027,24 +2122,30 @@ export class SupervisorService {
             `Re-authenticate the provider for ${usedResourceKey ?? "the required resource"} (for example \`claude auth login\` or \`codex login\`).`,
             named.reason,
           );
-          void escalated;
           return {
-            kind: "WAITING_FOR_HUMAN",
-            roadmapKey: item.key,
-            reason: "AUTH_REQUIRED",
-            humanActionRequired: `Re-authenticate the provider for ${usedResourceKey ?? "the required resource"}.`,
+            kind: "CONCLUSION",
+            result: {
+              kind: "WAITING_FOR_HUMAN",
+              roadmapKey: item.key,
+              reason: "AUTH_REQUIRED",
+              humanActionRequired: `Re-authenticate the provider for ${usedResourceKey ?? "the required resource"}.`,
+            },
+            wakeBasis: escalated,
           };
         }
 
         const wake = this.computeNextWake(waiting);
         const settled = await this.commit(waiting, withWake(waiting, wake));
-        void settled;
         this.log(`[supervisor] ${item.key} waiting for resource: ${named.reason}`);
         return {
-          kind: "WAITING_FOR_RESOURCE",
-          roadmapKey: item.key,
-          reason: named.reason,
-          ...(wake === undefined ? {} : { nextWakeAt: wake }),
+          kind: "CONCLUSION",
+          result: {
+            kind: "WAITING_FOR_RESOURCE",
+            roadmapKey: item.key,
+            reason: named.reason,
+            ...(wake === undefined ? {} : { nextWakeAt: wake }),
+          },
+          wakeBasis: settled,
         };
       }
     }
@@ -2770,12 +2871,7 @@ export class SupervisorService {
       updatedAt: this.deps.clock.now(),
     };
     try {
-      const saved = await this.deps.repository.compareAndSave(candidate, previous.version);
-      // Every ACCEPTED write is the tick's newest trusted state, and this is
-      // the only assignment — which is what lets `publishWake` treat "has a
-      // basis" as "the repository vouched for it" (round-11 finding 1).
-      this.tickCommitted = saved;
-      return saved;
+      return await this.deps.repository.compareAndSave(candidate, previous.version);
     } catch (error) {
       if (error instanceof ConcurrencyError) {
         throw new ConcurrencyError("another supervisor tick advanced this state; re-read and retry");

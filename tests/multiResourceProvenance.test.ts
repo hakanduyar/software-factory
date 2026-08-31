@@ -432,5 +432,17 @@ describe("TASK-015 round-11 finding 2: a worker resource failure names its resou
       /claude-code:opus/,
       "the persisted roadmap detail does not name the resource that failed",
     );
+    /**
+     * AND THE PERSISTED RESOURCE DIAGNOSTIC (round-12 finding 2). The round-11
+     * version asserted the result and the roadmap detail; the reviewer mutated
+     * `applyClassification` back to the unnamed classification and this suite
+     * stayed green — the row's own diagnostic was the sink nothing pinned.
+     */
+    const row = (after?.resources ?? []).find((record) => record.key === "claude-code:opus");
+    assert.match(
+      row?.diagnostic ?? "",
+      /claude-code:opus/,
+      "the persisted resource diagnostic does not name the resource that failed",
+    );
   });
 });

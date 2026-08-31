@@ -94,13 +94,28 @@ async function tickWith(
   executor: ScriptedExecutor,
   probeOverrides: Parameters<typeof probeWith>[0] = {},
 ) {
+  const { result } = await tickKeeping(executor, probeOverrides);
+  return result;
+}
+
+/**
+ * Like `tickWith`, but keeps the supervisor so a test can read PERSISTED
+ * state (round-12 finding 3): a refusal that is named in the returned
+ * `TickResult` but unnamed in the durable escalation is the reviewer's
+ * surviving mutation, and only a test that loads the state can pin it.
+ */
+async function tickKeeping(
+  executor: ScriptedExecutor,
+  probeOverrides: Parameters<typeof probeWith>[0] = {},
+) {
   const supervisor = newSupervisor({
     probe: probeWith(probeOverrides),
     executor,
     resourceCatalog: CATALOG,
   });
   await seedRoadmap(supervisor, [ITEM]);
-  return supervisor.service.tick();
+  const result = await supervisor.service.tick();
+  return { result, supervisor };
 }
 
 describe("TASK-015 AC-1/AC-2: the supervisor authorises the set the work declares", () => {
@@ -248,7 +263,7 @@ describe("TASK-015 AC-1/AC-2: the supervisor authorises the set the work declare
             ? "claude-code:opus"
             : "codex-cli:gpt-5.6-luna";
 
-      const result = await tickWith(executor, {
+      const { result, supervisor } = await tickKeeping(executor, {
         [billable.replace(":", ":")]: { state: "AVAILABLE", billingMode: "USAGE_BILLED" },
       });
 
@@ -264,10 +279,38 @@ describe("TASK-015 AC-1/AC-2: the supervisor authorises the set the work declare
        * authority" tells the human that SOMETHING would bill and not what —
        * the one fact they need to act on.
        */
+      const billableRe = new RegExp(billable.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
       assert.match(
         result.kind === "WAITING_FOR_HUMAN" ? result.humanActionRequired : "",
-        new RegExp(billable.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+        billableRe,
         `the refusal does not name the failing resource ${billable}`,
+      );
+      /**
+       * AND SO DO THE PERSISTED SINKS (round-12 finding 3). The reviewer
+       * mutated the escalation back to the unnamed verdict text and this
+       * suite stayed green: only the RETURNED result was pinned, and a
+       * returned result is gone with the process while the escalation is
+       * what a human later reads.
+       */
+      const after = await supervisor.repository.load();
+      const open = (after?.escalations ?? []).find(
+        (entry) => entry.roadmapKey === ITEM.key && !entry.resolved,
+      );
+      assert.match(
+        open?.humanActionRequired ?? "",
+        billableRe,
+        `the persisted escalation does not name the failing resource ${billable}`,
+      );
+      assert.match(
+        open?.detail ?? "",
+        billableRe,
+        `the persisted escalation detail does not name the failing resource ${billable}`,
+      );
+      const persisted = (after?.roadmap ?? []).find((entry) => entry.key === ITEM.key);
+      assert.match(
+        persisted?.humanActionRequired ?? "",
+        billableRe,
+        `the persisted roadmap human action does not name the failing resource ${billable}`,
       );
     });
 

@@ -431,6 +431,100 @@ describe("TASK-015 round-11 finding 1: refused state is not committed, even thro
   });
 });
 
+describe("TASK-015 round-12 finding 1: a legitimate commit before a refusal is not a licence to schedule", () => {
+  /**
+   * The round-11 basis was "the newest state this tick committed" — an
+   * instance field a successful commit set. The reviewer measured the gap: a
+   * catalog-upgrade APPEND at step 0b is a legitimate commit, and the lineage
+   * check at step 1b can refuse AFTERWARDS — the refused tick then still
+   * published a wake from the appended state, so version advanced twice and a
+   * tampered `retryAt` became the persisted schedule.
+   *
+   * The basis now travels WITH the outcome, and a `REFUSAL` has no field to
+   * carry one — so the append lands (it is ordinary housekeeping from CODE),
+   * and nothing else is written: no wake, no second version bump.
+   */
+  it("appends the catalog upgrade but publishes no wake when lineage is then refused", async () => {
+    const executor = recording();
+    const supervisor = newSupervisor({ probe: permissiveProbe(), executor, resourceCatalog: CATALOG });
+    await seedRoadmap(supervisor, [ITEM]);
+
+    const state = await supervisor.repository.load();
+    assert.ok(state !== undefined);
+    await supervisor.repository.compareAndSave(
+      {
+        ...state,
+        version: state.version + 1,
+        // The lineage tamper: an AI item marked DONE with an attempt that
+        // reached a worker, and no IMPLEMENTED_BY record anywhere.
+        roadmap: state.roadmap.map((entry) =>
+          entry.key === ITEM.key ? { ...entry, status: "DONE" as const, attempts: 1 } : entry,
+        ),
+        resources: [
+          ...state.resources.filter((record) => record.key !== "codex-cli:gpt-5.6-luna"),
+          {
+            provider: "codex-cli",
+            model: "gpt-5.6-luna",
+            key: "codex-cli:gpt-5.6-luna",
+            state: "USAGE_LIMIT_REACHED" as const,
+            detectedAt: 0,
+            lastCheckedAt: 0,
+            retryAt: 1_800_000_005_000,
+            backoff: { attempt: 3, delayMs: 60_000 },
+          } as never,
+        ],
+      },
+      state.version,
+    );
+    const tampered = await supervisor.repository.load();
+    assert.ok(tampered !== undefined);
+
+    // The catalog upgrade: an item this installation's CODE now declares and
+    // the persisted roadmap has never seen.
+    supervisor.catalog.push({
+      key: "APPENDED_BY_UPGRADE",
+      title: "Appended by upgrade",
+      dependsOn: [],
+      status: "PENDING",
+      workClass: "NORMAL_IMPLEMENTATION",
+      order: 2,
+    });
+
+    const result = await supervisor.service.tick();
+
+    assert.equal(
+      result.kind,
+      "WAITING_FOR_HUMAN",
+      `lineage-free DONE was not refused: ${JSON.stringify(result)}`,
+    );
+    assert.match(
+      result.kind === "WAITING_FOR_HUMAN" ? result.humanActionRequired : "",
+      /provenance holds no record/,
+      "refused for some reason other than the missing lineage",
+    );
+    assert.equal(executor.ran(), false, "work ran on a roadmap whose lineage was refused");
+
+    const after = await supervisor.repository.load();
+    // The append is legitimate housekeeping and MUST land...
+    assert.ok(
+      (after?.roadmap ?? []).some((entry) => entry.key === "APPENDED_BY_UPGRADE"),
+      "the catalog upgrade was not appended",
+    );
+    // ...and must be the ONLY write: one version bump, no wake publication.
+    assert.equal(
+      after?.version,
+      tampered.version + 1,
+      "a refused tick wrote more than the catalog append",
+    );
+    assert.equal(
+      after?.nextWakeAt,
+      tampered.nextWakeAt,
+      "a refusal after a legitimate commit still published a wake",
+    );
+    assert.notEqual(after?.nextWakeAt, 1_800_000_005_000, "the tampered schedule was published");
+  });
+});
+
 describe("TASK-015 round-7 finding 2: a refresh probe failure is controlled", () => {
   /**
    * Round 3 caught the throw on the IMMEDIATE pre-launch probe and left the
