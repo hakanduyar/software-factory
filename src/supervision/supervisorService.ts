@@ -519,9 +519,33 @@ export class SupervisorService {
         refreshed.push(record);
         continue;
       }
+      /**
+       * A REFRESH PROBE THAT THROWS IS A CLASSIFICATION, NOT A CRASH (round-7
+       * finding 2).
+       *
+       * Round 3 caught the throw on the immediate pre-launch probe and left this
+       * one — the scheduled refresh — uncovered, so a transport failure here
+       * killed the whole tick with an uncaught error rather than producing the
+       * named, controlled refusal AC-3 requires. The same defect, in the sibling
+       * call site nobody looked at.
+       *
+       * A probe that cannot answer is treated as an UNKNOWN_FAILURE for THAT
+       * resource: the ladder backs it off and the rest of the tick proceeds,
+       * which is what a per-resource fault should do.
+       */
       // Zero-token by contract: ResourceProbe implementations may not invoke a
       // model (see supervisorPorts.ts).
-      const classification = await this.deps.probe.probe(record.provider, record.model);
+      let classification: Classification;
+      try {
+        classification = await this.deps.probe.probe(record.provider, record.model);
+      } catch (error) {
+        classification = {
+          state: "UNKNOWN_FAILURE",
+          reason: `probe failed for ${record.key}: ${boundedDiagnostic(
+            error instanceof Error ? error.message : String(error),
+          )}`,
+        };
+      }
       refreshed.push(this.applyClassification(record, classification, now));
       changed = true;
     }
@@ -760,7 +784,25 @@ export class SupervisorService {
   }
 
   private async runItem(state: SupervisorState, item: RoadmapItem): Promise<TickResult> {
-    const resources = new Map(state.resources.map((record) => [record.key, record]));
+    /**
+     * ROUTING CANDIDATES COME FROM THE CODE CATALOG (round-7 finding 1).
+     *
+     * Round 6 anchored the DECLARATION check in `deps.resourceCatalog` and left
+     * routing reading `state.resources` — so the same smuggled row was still
+     * reachable, just by a different door. The reviewer appended an AVAILABLE
+     * `claude-code/sonnet` row to a catalog holding only `opus`, declared
+     * nothing at all, and the router selected and launched it.
+     *
+     * A persisted row carries availability and backoff for a resource this
+     * installation configured. A row for a resource it did NOT configure is not
+     * a candidate, whatever it says about itself.
+     */
+    const catalogued = new Set(
+      this.deps.resourceCatalog.map((entry) => resourceKey(entry.provider, entry.model)),
+    );
+    const resources = new Map(
+      state.resources.filter((record) => catalogued.has(record.key)).map((record) => [record.key, record]),
+    );
 
     // ROUTE. Deterministic work needs no AI resource and therefore can never
     // be blocked by a provider limit — that is what keeps a shortage from
@@ -1094,20 +1136,12 @@ export class SupervisorService {
     /**
      * THE CODE-LEVEL CATALOG, NOT THE PERSISTED ROWS (round-6 finding 1).
      *
-     * This checked `resources`, which is built from `state.resources` -- durable
-     * state that anything with database access can append to. The reviewer added
-     * a valid-looking `claude-code/sonnet` row through the SQLite repository,
-     * reopened the database, and a declaration naming it was probed, gated,
-     * authorised and launched.
-     *
-     * `deps.resourceCatalog` is this installation's configuration in CODE. It is
-     * the same reasoning as the roadmap catalog one layer up, and the same
-     * reasoning as re-deriving a plan's phase from Factory authority: a row is a
-     * claim, and a claim does not get to decide whether a resource may be used.
+     * A declaration naming a resource this installation did not configure was
+     * probed, gated, authorised and launched, because this read `state.resources`
+     * -- durable state anything with database access can append to. It now uses
+     * the same code-level `catalogued` set that bounds routing above, so both
+     * doors are anchored in configuration rather than in rows.
      */
-    const catalogued = new Set(
-      this.deps.resourceCatalog.map((entry) => resourceKey(entry.provider, entry.model)),
-    );
     const uncatalogued = declaredResources.find(
       (resource) => !catalogued.has(resourceKey(resource.provider, resource.model)),
     );

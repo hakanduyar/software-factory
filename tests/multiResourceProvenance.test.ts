@@ -199,8 +199,18 @@ describe("TASK-015 finding 2: identity is reconciled against the set", () => {
    * compared only provider and model.
    */
   it("accepts a member that differs from the routed resource only by effort", async () => {
+    /**
+     * THE PLANNER SHARES THE PROVIDER AND MODEL AND NAMES NO EFFORT, ON PURPOSE.
+     *
+     * Without it this case was sibling-guarded: only one authorised entry had
+     * this provider/model, so deleting the effort term from the lookup still
+     * matched the same entry and the test stayed green. A second candidate that
+     * differs ONLY by effort is what makes the effort comparison decide
+     * anything — the reviewer demonstrated exactly this repair.
+     */
     const executor = executorReporting(
       [
+        { role: "planner", provider: "claude-code", model: "sonnet" },
         { role: "implementer", provider: "claude-code", model: "sonnet", effort: "high" },
         { role: "reviewer", provider: "codex-cli", model: "gpt-5.6-luna" },
       ],
@@ -248,10 +258,18 @@ describe("TASK-015 finding 4: a probe that throws is a controlled refusal", () =
    * `rogue-provider` killed the tick instead of refusing the action.
    */
   it("refuses the action instead of killing the tick", async () => {
+    /**
+     * A CATALOGUED provider whose probe throws (round-7 note).
+     *
+     * The first version used `rogue-provider`, which declaration validation
+     * rejects BEFORE anything is probed — so the probe catch was never reached
+     * and deleting it left this file green. The throw has to come from a
+     * resource that gets as far as being probed.
+     */
     const executor = executorReporting(
       [
         { role: "implementer", provider: "claude-code", model: "opus" },
-        { role: "reviewer", provider: "rogue-provider", model: "m" },
+        { role: "reviewer", provider: "codex-cli", model: "gpt-5.6-luna" },
       ],
       { kind: "COMPLETED", detail: "should never happen" },
     );
@@ -267,8 +285,8 @@ describe("TASK-015 finding 4: a probe that throws is a controlled refusal", () =
       totalProbes: () => healthy.totalProbes(),
       set: (provider, model, classification) => healthy.set(provider, model, classification),
       async probe(provider: string, model: string) {
-        if (provider === "rogue-provider") {
-          throw new Error(`no zero-token probe is defined for provider "${provider}"`);
+        if (provider === "codex-cli") {
+          throw new Error(`probe transport failed for provider "${provider}"`);
         }
         return healthy.probe(provider, model);
       },
