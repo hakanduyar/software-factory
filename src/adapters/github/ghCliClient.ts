@@ -34,7 +34,7 @@ import {
   type RemotePullRequest,
   type RemoteRepository,
 } from "../../github/candidateBinding.js";
-import type { GitHubClient, GitPusher, GitRepositoryReader } from "../../github/githubPorts.js";
+import type { GitHubClient, GitRepositoryReader } from "../../github/githubPorts.js";
 import type { RepositoryOwnerType, RepositoryVisibility } from "../../supervision/financialSafety.js";
 import type { ProcessRunner } from "../../ports/processRunner.js";
 
@@ -416,29 +416,6 @@ export function createGhCliClient(deps: GhCliDeps): GitHubClient {
 export function createGitRepositoryReader(deps: GhCliDeps): GitRepositoryReader {
   const git = resolveExecutable("git", deps.gitPath);
   return {
-    /**
-     * The URL git will ACTUALLY PUSH TO — `--push`, not the fetch URL
-     * (round-1 CRITICAL 1).
-     *
-     * `remote.origin.pushurl` overrides the fetch URL for writes, so reading
-     * the fetch URL and calling it the push target let a configured pushurl
-     * send the write somewhere the gate never observed. This is the value the
-     * push target is derived from.
-     */
-    async pushUrls(): Promise<readonly string[]> {
-      /**
-       * `--all`, because `git push origin` writes to EVERY configured
-       * `pushurl` and `--push` alone reports only the first (round-2
-       * CRITICAL 1). Reporting one while git writes to two is how the gate
-       * could approve a public repository whose push also reached a private
-       * one.
-       */
-      const raw = await run(deps, git, ["remote", "get-url", "--push", "--all", "origin"]);
-      return raw
-        .split("\n")
-        .map((line) => line.trim())
-        .filter((line) => line.length > 0);
-    },
     async revision(rev: string): Promise<string | undefined> {
       try {
         const resolved = (await run(deps, git, ["rev-parse", "--verify", `${rev}^{commit}`])).trim();
@@ -501,92 +478,5 @@ export function createGitRepositoryReader(deps: GhCliDeps): GitRepositoryReader 
      * Any change to a `.gitattributes` counts: deciding which rules are
      * "really" LFS from a diff is the kind of cleverness that fails open.
      */
-    async usesLfs(headSha: string): Promise<boolean | undefined> {
-      try {
-        /**
-         * ANY LFS TRACKING AT THE CANDIDATE, not a CHANGE to it (round-3
-         * HIGH 2).
-         *
-         * The first version compared `.gitattributes` between base and head,
-         * which missed the ordinary case the reviewer built: the base already
-         * tracks `*.bin` through LFS, the candidate adds `new.bin`, and
-         * `.gitattributes` is untouched — so LFS objects upload on push while
-         * the detector reported "adds no LFS".
-         *
-         * Asking whether the candidate tracks anything through LFS at all is
-         * both simpler and stricter: it cannot miss a file that an unchanged
-         * rule already covers. `git grep` against a commit reads the tree, so
-         * no checkout is involved.
-         */
-        const matches = await run(deps, git, [
-          "grep",
-          "-I",
-          "-l",
-          "filter=lfs",
-          headSha,
-          "--",
-          ".gitattributes",
-          "*.gitattributes",
-        ]);
-        return matches.trim().length > 0;
-      } catch (error) {
-        /**
-         * `git grep` exits 1 for "no matches", which is an ANSWER, and
-         * anything else is genuinely unknown. Distinguished by the message the
-         * runner builds, because a bare catch here would report "no LFS" for a
-         * repository it could not read — failing open on the metered channel.
-         */
-        return /exit 1\b/.test(error instanceof Error ? error.message : "") ? false : undefined;
-      }
-    },
-    /**
-     * The URL git will REALLY contact, after `url.*.insteadOf` rewrites
-     * (round-3 HIGH 1).
-     *
-     * Naming a URL explicitly was not enough: git rewrites it from config at
-     * the moment of use, so the destination observed could still differ from
-     * the destination written. `ls-remote --get-url` applies exactly those
-     * rewrites and prints the result without contacting anything.
-     */
-    async effectiveUrl(url: string): Promise<string | undefined> {
-      try {
-        const resolved = (await run(deps, git, ["ls-remote", "--get-url", url])).trim();
-        return resolved.length > 0 ? resolved : undefined;
-      } catch {
-        return undefined;
-      }
-    },
-  };
-}
-
-/**
- * The single remote WRITE.
- *
- * `--force-with-lease` is NOT used, and neither is `--force`: this pushes a
- * fast-forward or it fails. `refs/heads/<branch>` is written explicitly so a
- * ref name that happens to match a tag cannot redirect the push.
- */
-export function createGitPusher(deps: GhCliDeps): GitPusher {
-  const git = resolveExecutable("git", deps.gitPath);
-  return {
-    async pushFastForward(input): Promise<void> {
-      if (!isCommitSha(input.sha)) {
-        throw new Error("pushFastForward requires a full 40-character commit id");
-      }
-      /**
-       * PUSHES TO THE URL, NOT TO `origin` (round-2 CRITICAL 1).
-       *
-       * `origin` is an indirection resolved by git config AT PUSH TIME, so the
-       * gate could observe one destination while the push resolved to another
-       * — through a second `pushurl`, or through a config change between the
-       * observation and the write. Naming the URL removes the indirection
-       * entirely: the destination that was observed is the destination
-       * written, with nothing in between that can be reconfigured.
-       */
-      if (!/^https:\/\/github\.com\//.test(input.url)) {
-        throw new Error("pushFastForward requires an https github.com URL");
-      }
-      await run(deps, git, ["push", input.url, `${input.sha}:refs/heads/${input.branch}`]);
-    },
   };
 }

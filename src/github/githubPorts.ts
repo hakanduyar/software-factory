@@ -6,21 +6,26 @@
  * repository settings, no visibility change, no branch deletion, no force
  * push. A capability that does not exist cannot be reached by mistake, which is
  * a stronger guarantee than one guarded by a check.
+ *
+ * THERE IS NO PUSH HERE EITHER, and that is a finding rather than an omission
+ * (round-4 review, finding 1). Three consecutive rounds each demonstrated a new
+ * way for git to write somewhere other than the destination this process
+ * observed — a second `remote.pushurl`, then `url.*.insteadOf`, then
+ * `url.*.pushInsteadOf` and HTTP redirects. All of them resolve at push time,
+ * so binding the destination means predicting git's resolution rather than
+ * observing it. The reviewer's words were that this "blocks safely retaining
+ * the write path", so the write path is gone.
+ *
+ * A branch reaches the remote through the repository agent under ADR-0002,
+ * which is governance rather than this runtime gate. What remains here is a
+ * pull request created through `gh --repo owner/name`, whose destination is the
+ * argument itself and carries no git-config indirection at all.
  */
 
 import type { RemoteCheckStatus, RemotePullRequest, RemoteRepository } from "./candidateBinding.js";
 
 /** Reads the LOCAL repository. Separate port: local git is not GitHub. */
 export interface GitRepositoryReader {
-  /**
-   * EVERY URL `git push origin` would write to.
-   *
-   * A list rather than a value because git supports multiple `pushurl`
-   * entries and writes to all of them; reporting only the first let the gate
-   * approve one destination while the push reached another (round-2
-   * CRITICAL 1). The caller refuses anything other than exactly one.
-   */
-  pushUrls(): Promise<readonly string[]>;
   /** Full 40-hex id for a revision, or `undefined` when it cannot be resolved. */
   revision(rev: string): Promise<string | undefined>;
   /** True only when nothing is modified, staged or untracked. */
@@ -29,55 +34,27 @@ export interface GitRepositoryReader {
   fetch(): Promise<void>;
   /** True when `ancestor` is reachable from `descendant`. */
   isAncestor(ancestor: string, descendant: string): Promise<boolean>;
-  /** Whether this push would ADD workflow files; `undefined` when unknown. */
+  /**
+   * Whether the candidate ADDS workflow files relative to its base;
+   * `undefined` when unknown.
+   *
+   * Still observed with no push in play: opening a pull request raises
+   * `pull_request` events, and a workflow the candidate introduces can run on
+   * them.
+   */
   addsWorkflows(baseSha: string, headSha: string): Promise<boolean | undefined>;
-  /**
-   * Whether the candidate tracks ANYTHING through Git LFS; `undefined` when
-   * unknown.
-   *
-   * Deliberately not "adds LFS": a rule the base already carries still uploads
-   * metered objects for files the candidate adds under it (round-3 HIGH 2).
-   */
-  usesLfs(headSha: string): Promise<boolean | undefined>;
-  /**
-   * The URL git will really contact after `url.*.insteadOf` rewrites, or
-   * `undefined` when it cannot be resolved (round-3 HIGH 1).
-   */
-  effectiveUrl(url: string): Promise<string | undefined>;
-}
-
-/** The one WRITE this task performs against a remote. */
-export interface GitPusher {
-  /**
-   * Pushes `sha` to `branch` at `url`, FAST-FORWARD ONLY.
-   *
-   * The URL is explicit rather than a remote NAME: `origin` is resolved by git
-   * config at push time, so a named remote could reach a destination other
-   * than the one the gate observed (round-2 CRITICAL 1).
-   *
-   * There is no force option and no delete option, by construction — ADR-0002
-   * lists force push and history rewriting among the things the mandate never
-   * authorises, and the safest place to enforce that is an API that cannot
-   * express it.
-   */
-  pushFastForward(input: {
-    readonly url: string;
-    readonly branch: string;
-    readonly sha: string;
-  }): Promise<void>;
 }
 
 export interface GitHubClient {
-  /** Repository identity plus the facts the push report is derived from. */
+  /** Repository identity plus the facts the liability report is derived from. */
   repository(): Promise<RemoteRepository>;
   /**
    * The commit a remote branch points at, or `undefined` when it does not
    * exist.
    *
-   * Asked so that publication can tell "this branch already holds the
-   * candidate" from "a pull request exists". Only the first means no write is
-   * needed, and only a publication that needs no write can complete without
-   * the financial gate having anything to authorise.
+   * This is what replaced predicting where a push would go: rather than proving
+   * a write will reach the right repository, publication proves the repository
+   * ALREADY holds the exact candidate. Verification instead of prediction.
    */
   branchSha(branch: string): Promise<string | undefined>;
   /** The pull request whose head is `headRef`, or `undefined` when none exists. */

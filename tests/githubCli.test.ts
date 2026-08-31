@@ -24,7 +24,6 @@ const COMPLETE = [
   "--head-ref", "feat/executor-wiring",
   "--base-ref", "main",
   "--repo", "hakanduyar/software-factory",
-  "--remote-url", "https://github.com/hakanduyar/software-factory.git",
 ];
 
 describe("TASK-016: sf github publish refuses malformed invocations", () => {
@@ -85,7 +84,7 @@ describe("TASK-016: sf github publish refuses malformed invocations", () => {
   });
 
   /** Every flag is required: a partially specified candidate is not a candidate. */
-  for (const flag of ["--roadmap-key", "--head", "--base", "--head-ref", "--base-ref", "--repo", "--remote-url"]) {
+  for (const flag of ["--roadmap-key", "--head", "--base", "--head-ref", "--base-ref", "--repo"]) {
     it(`refuses an invocation missing ${flag}`, () => {
       const index = COMPLETE.indexOf(flag);
       const without = [...COMPLETE.slice(0, index), ...COMPLETE.slice(index + 2)];

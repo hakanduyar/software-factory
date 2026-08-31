@@ -56,9 +56,10 @@ Usage:
   sf supervise roadmap    Show the durable roadmap queue and what it is waiting on
   sf github publish --roadmap-key <KEY> --head <SHA> --base <SHA>
                     --head-ref <BRANCH> --base-ref <BRANCH>
-                    --repo <owner/name> --remote-url <URL>
+                    --repo <owner/name>
                       Publish a reviewed candidate as a pull request (TASK-016).
-                      Idempotent; the push is gated on observed zero liability.
+                      Idempotent. Requires the branch to already hold the
+                      candidate; creating the pull request is gated.
   sf github readiness ... [--reviewed]
                       Report whether that candidate is bound to remote state and
                       CI evidence well enough to integrate. Integrates nothing.
@@ -439,7 +440,7 @@ async function main(argv: readonly string[]): Promise<number> {
       const log = (line: string): void => console.log(line);
       const usage =
         "Usage: sf github <publish|readiness> --roadmap-key <KEY> --head <SHA> --base <SHA> " +
-        "--head-ref <BRANCH> --base-ref <BRANCH> --repo <owner/name> --remote-url <URL> [--reviewed]";
+        "--head-ref <BRANCH> --base-ref <BRANCH> --repo <owner/name> [--reviewed]";
 
       if (sub === "publish" || sub === "readiness") {
         /**

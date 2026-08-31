@@ -106,12 +106,6 @@ export interface ReviewedCandidate {
 
 /** What the LOCAL repository looks like right now. */
 export interface LocalRepositoryState {
-  /**
-   * The URL git will actually PUSH to, and the value the target identity is
-   * derived from (round-1 CRITICAL 1). Not the fetch URL: a configured
-   * `remote.origin.pushurl` makes those two different repositories.
-   */
-  readonly pushUrl: string;
   readonly headSha: CommitSha;
   /** Where `origin/<baseRef>` points right now, AFTER a fetch. */
   readonly baseSha: CommitSha;
@@ -146,7 +140,6 @@ function refuse(reason: string): BindingVerdict {
 export function checkPublishPreconditions(input: {
   readonly candidate: ReviewedCandidate;
   readonly local: LocalRepositoryState;
-  readonly expectedPushUrl: string;
   /** The remote's default branch, which publication may never write to. */
   readonly defaultBranch: string;
 }): BindingVerdict {
@@ -182,16 +175,6 @@ export function checkPublishPreconditions(input: {
   }
   if (!isCommitSha(local.headSha) || !isCommitSha(local.baseSha)) {
     return refuse("the local repository did not report full commit ids for HEAD and the base");
-  }
-  /**
-   * The remote URL is compared before anything else that could act. Pushing to
-   * the wrong repository is not recoverable by noticing afterwards, and the
-   * comparison costs one string.
-   */
-  if (local.pushUrl !== input.expectedPushUrl) {
-    return refuse(
-      `git would push to ${JSON.stringify(local.pushUrl)} but this action expects ${JSON.stringify(input.expectedPushUrl)}`,
-    );
   }
   if (!local.clean) {
     return refuse(
@@ -378,13 +361,11 @@ export function checkIntegrationReadiness(input: {
   readonly pullRequest: RemotePullRequest | undefined;
   readonly checks: RemoteCheckStatus | undefined;
   readonly local: LocalRepositoryState;
-  readonly expectedPushUrl: string;
   readonly reviewAccepted: boolean;
 }): BindingVerdict {
   const preconditions = checkPublishPreconditions({
     candidate: input.candidate,
     local: input.local,
-    expectedPushUrl: input.expectedPushUrl,
     defaultBranch: input.repository.defaultBranch,
   });
   if (!preconditions.ok) {

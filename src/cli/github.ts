@@ -12,12 +12,7 @@
  * consumes it.
  */
 
-import {
-  createGhCliClient,
-  createGitPusher,
-  createGitRepositoryReader,
-  githubTargetFromUrl,
-} from "../adapters/github/ghCliClient.js";
+import { createGhCliClient, createGitRepositoryReader } from "../adapters/github/ghCliClient.js";
 import { createNodeProcessRunner } from "../adapters/process/nodeProcessRunner.js";
 import { publishCandidate, type PublishOutcome } from "../github/publishCandidate.js";
 import { publicationDetail, withPublicationRecorded } from "../github/publicationProvenance.js";
@@ -48,7 +43,6 @@ export interface GithubPublishArgs {
   readonly headRef: string;
   readonly baseRef: string;
   readonly repository: string;
-  readonly remoteUrl: string;
 }
 
 /**
@@ -60,7 +54,7 @@ export function parseGithubPublishArgs(
   args: readonly string[],
 ): { readonly ok: true; readonly value: GithubPublishArgs } | { readonly ok: false; readonly error: string } {
   const values = new Map<string, string>();
-  const known = new Set(["--roadmap-key", "--head", "--base", "--head-ref", "--base-ref", "--repo", "--remote-url"]);
+  const known = new Set(["--roadmap-key", "--head", "--base", "--head-ref", "--base-ref", "--repo"]);
 
   for (let index = 0; index < args.length; index += 1) {
     const token = args[index]!;
@@ -105,7 +99,6 @@ export function parseGithubPublishArgs(
       headRef: values.get("--head-ref")!,
       baseRef: values.get("--base-ref")!,
       repository: values.get("--repo")!,
-      remoteUrl: values.get("--remote-url")!,
     },
   };
 }
@@ -129,12 +122,7 @@ function build(args: GithubPublishArgs, options: GithubCliOptions) {
   return {
     github: createGhCliClient(deps),
     git: createGitRepositoryReader(deps),
-    pusher: createGitPusher(deps),
     expectedRepository: args.repository,
-    expectedPushUrl: args.remoteUrl,
-    // The identity comes from the URL git will actually write to; the caller's
-    // `--repo` is checked against it rather than trusted as it (CRITICAL 1).
-    targetFromUrl: githubTargetFromUrl,
     financialPolicy: ZERO_SPEND_POLICY,
   };
 }
@@ -173,15 +161,15 @@ export async function runGithubPublish(
   }
   log(
     `PUBLISHED: pull request #${outcome.pullRequest.number} at ${outcome.pullRequest.headSha} ` +
-      `(${outcome.created ? "created" : "adopted"}, ${outcome.pushed ? "pushed" : "already present"})`,
+      `(${outcome.created ? "created" : "adopted"})`,
   );
   log(`  record: ${safe(publicationDetail({ pullRequest: outcome.pullRequest, checks: outcome.checks }))}`);
 
   /**
    * RECORDED DURABLY, and a failure to record is a FAILURE (AC-4).
    *
-   * The push already happened, so returning success while the chain has no
-   * entry for it would leave durable state disagreeing with the world — the
+   * The publication already happened, so returning success while the chain has
+   * no entry for it would leave durable state disagreeing with the world — the
    * condition the provenance chain exists to make impossible to reach quietly.
    * The record is written through the supervisor's own repository and CAS, so
    * a concurrent tick cannot be overwritten.
@@ -271,7 +259,6 @@ export async function runGithubReadiness(
     pullRequest,
     checks,
     local,
-    expectedPushUrl: args.remoteUrl,
     reviewAccepted: args.reviewAccepted,
   });
 

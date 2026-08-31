@@ -29,7 +29,6 @@ const BASE = "3333333333333333333333333333333333333333";
 const BASE_MOVED = "4444444444444444444444444444444444444444";
 
 const REPO = "hakanduyar/software-factory";
-const URL = "https://github.com/hakanduyar/software-factory.git";
 
 const CANDIDATE: ReviewedCandidate = {
   roadmapKey: "GITHUB_ORCHESTRATION",
@@ -50,7 +49,6 @@ const REPOSITORY: RemoteRepository = {
 
 function local(overrides: Partial<LocalRepositoryState> = {}): LocalRepositoryState {
   return {
-    pushUrl: URL,
     headSha: A,
     baseSha: BASE,
     clean: true,
@@ -98,7 +96,7 @@ describe("TASK-016: a sha is an identity and a prefix is not", () => {
 
 describe("TASK-016 AC-8: local preconditions fail closed", () => {
   it("permits a clean tree at the reviewed candidate", () => {
-    const verdict = checkPublishPreconditions({ candidate: CANDIDATE, local: local(), expectedPushUrl: URL, defaultBranch: "main" });
+    const verdict = checkPublishPreconditions({ candidate: CANDIDATE, local: local(), defaultBranch: "main" });
 
     assert.equal(verdict.ok, true, `a valid publish was refused: ${JSON.stringify(verdict)}`);
   });
@@ -107,7 +105,6 @@ describe("TASK-016 AC-8: local preconditions fail closed", () => {
     const verdict = checkPublishPreconditions({
       candidate: CANDIDATE,
       local: local({ clean: false }),
-      expectedPushUrl: URL,
       defaultBranch: "main",
     });
 
@@ -115,32 +112,10 @@ describe("TASK-016 AC-8: local preconditions fail closed", () => {
     assert.match(verdict.ok === false ? verdict.reason : "", /not clean/);
   });
 
-  /**
-   * The push destination is checked FIRST and separately: pushing to another
-   * repository is not recoverable by noticing afterwards.
-   *
-   * The compared value is the URL git will actually WRITE to (round-1
-   * CRITICAL 1), so the refusal names that rather than the word "origin" — a
-   * configured `remote.origin.pushurl` makes those two different places.
-   */
-  it("refuses a push destination that is not the expected one", () => {
-    const verdict = checkPublishPreconditions({
-      candidate: CANDIDATE,
-      local: local({ pushUrl: "https://github.com/someone-else/other.git" }),
-      expectedPushUrl: URL,
-      defaultBranch: "main",
-    });
-
-    assert.equal(verdict.ok, false);
-    assert.match(verdict.ok === false ? verdict.reason : "", /git would push to/);
-    assert.match(verdict.ok === false ? verdict.reason : "", /someone-else\/other/);
-  });
-
   it("refuses when HEAD is not the reviewed candidate", () => {
     const verdict = checkPublishPreconditions({
       candidate: CANDIDATE,
       local: local({ headSha: B }),
-      expectedPushUrl: URL,
       defaultBranch: "main",
     });
 
@@ -157,7 +132,6 @@ describe("TASK-016 AC-8: local preconditions fail closed", () => {
     const verdict = checkPublishPreconditions({
       candidate: CANDIDATE,
       local: local({ baseSha: BASE_MOVED }),
-      expectedPushUrl: URL,
       defaultBranch: "main",
     });
 
@@ -169,7 +143,6 @@ describe("TASK-016 AC-8: local preconditions fail closed", () => {
     const verdict = checkPublishPreconditions({
       candidate: { ...CANDIDATE, headSha: "11662a1" },
       local: local(),
-      expectedPushUrl: URL,
       defaultBranch: "main",
     });
 
@@ -187,7 +160,6 @@ describe("TASK-016 AC-8: local preconditions fail closed", () => {
     const verdict = checkPublishPreconditions({
       candidate: CANDIDATE,
       local: local({ baseIsAncestorOfHead: false }),
-      expectedPushUrl: URL,
       defaultBranch: "main",
     });
 
@@ -200,7 +172,6 @@ describe("TASK-016 AC-8: local preconditions fail closed", () => {
     const verdict = checkPublishPreconditions({
       candidate: CANDIDATE,
       local: local({ baseIsAncestorOfHead: undefined }),
-      expectedPushUrl: URL,
       defaultBranch: "main",
     });
 
@@ -227,7 +198,6 @@ describe("TASK-016 AC-8: local preconditions fail closed", () => {
     const verdict = checkPublishPreconditions({
       candidate: { ...CANDIDATE, headRef: "release", baseRef: "release" },
       local: local(),
-      expectedPushUrl: URL,
       defaultBranch: "main",
     });
 
@@ -244,7 +214,6 @@ describe("TASK-016 AC-8: local preconditions fail closed", () => {
     const verdict = checkPublishPreconditions({
       candidate: { ...CANDIDATE, headRef: "trunk", baseRef: "release" },
       local: local(),
-      expectedPushUrl: URL,
       defaultBranch: "trunk",
     });
 
@@ -257,7 +226,6 @@ describe("TASK-016 AC-8: local preconditions fail closed", () => {
     const verdict = checkPublishPreconditions({
       candidate: { ...CANDIDATE, headRef: "feat/something", baseRef: "main" },
       local: local(),
-      expectedPushUrl: URL,
       defaultBranch: "main",
     });
 
@@ -454,7 +422,6 @@ describe("TASK-016 AC-4: neither CI nor review substitutes for the other", () =>
     pullRequest: pr(),
     checks: checks(),
     local: local(),
-    expectedPushUrl: URL,
     reviewAccepted: true,
   };
 

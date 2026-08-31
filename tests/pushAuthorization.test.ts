@@ -19,7 +19,7 @@ import {
   deriveActionClass,
   describePushLiability,
   evaluateFinancialSafety,
-  gitPushAction,
+  createPullRequestAction,
   observePushLiability,
   parseFinancialPolicy,
   type PushLiabilityObservation,
@@ -28,7 +28,7 @@ import {
 const ZERO_SPEND = parseFinancialPolicy({ autonomousSpendAllowed: false, autonomousSpendLimit: 0 });
 const TARGET = "hakanduyar/software-factory";
 
-function verdictFor(action: ReturnType<typeof gitPushAction>) {
+function verdictFor(action: ReturnType<typeof createPullRequestAction>) {
   return evaluateFinancialSafety(action, ZERO_SPEND);
 }
 
@@ -44,7 +44,6 @@ function publicUnmetered(
     repositoryWebhooks: 0,
     configuredWorkflows: 0,
     candidateAddsWorkflows: false,
-    candidateUsesLfs: false,
     ...overrides,
   });
 }
@@ -71,7 +70,7 @@ describe("TASK-016 AC-1/AC-2: a push cannot currently be demonstrated free", () 
    * names every channel closed by observation and the one that remains open.
    */
   it("refuses even a fully observed, otherwise unmetered target", () => {
-    const action = gitPushAction({
+    const action = createPullRequestAction({
       target: TARGET,
       observation: publicUnmetered(),
       description: "publish candidate",
@@ -124,13 +123,13 @@ describe("TASK-016 AC-1/AC-2: a push cannot currently be demonstrated free", () 
    * the action object by hand — or copies a minted one, which produces a
    * DIFFERENT object — gets no permission from having the right `kind`.
    */
-  it("refuses a GIT_PUSH that no minter produced", () => {
+  it("refuses a CREATE_PULL_REQUEST that no minter produced", () => {
     const verdict = evaluateFinancialSafety(
-      { kind: "GIT_PUSH", description: "hand-built push" },
+      { kind: "CREATE_PULL_REQUEST", description: "hand-built creation" },
       ZERO_SPEND,
     );
 
-    assert.equal(verdict.allowed, false, "an unminted GIT_PUSH was permitted");
+    assert.equal(verdict.allowed, false, "an unminted CREATE_PULL_REQUEST was permitted");
     assert.equal(verdict.actionClass, "FINANCIAL_ACTION");
   });
 
@@ -140,7 +139,7 @@ describe("TASK-016 AC-1/AC-2: a push cannot currently be demonstrated free", () 
    * for pushes because a new minter is a new chance to get it wrong.
    */
   it("refuses a copy of a minted push action", () => {
-    const minted = gitPushAction({ target: TARGET, observation: publicUnmetered(), description: "publish" });
+    const minted = createPullRequestAction({ target: TARGET, observation: publicUnmetered(), description: "publish" });
     const copied = { ...minted };
 
     assert.equal(verdictFor(copied).allowed, false, "a spread copy of a minted action carried its verdict");
@@ -170,15 +169,14 @@ describe("TASK-016 AC-1/AC-2: a push cannot currently be demonstrated free", () 
         repositoryWebhooks: 0,
         configuredWorkflows: 0,
         candidateAddsWorkflows: false,
-        candidateUsesLfs: false,
-      },
+          },
     ],
     ["no observation at all", undefined],
   ];
 
   for (const [label, observation] of untrusted) {
     it(`ignores ${label} entirely`, () => {
-      const action = gitPushAction({
+      const action = createPullRequestAction({
         target: TARGET,
         ...(observation === undefined ? {} : { observation }),
         description: "publish",
@@ -197,7 +195,7 @@ describe("TASK-016 AC-1/AC-2: a push cannot currently be demonstrated free", () 
 
   /** The control: a TRUSTED observation does reach the report. */
   it("uses an observation that is genuine and names the right target", () => {
-    const action = gitPushAction({ target: TARGET, observation: publicUnmetered(), description: "publish" });
+    const action = createPullRequestAction({ target: TARGET, observation: publicUnmetered(), description: "publish" });
 
     assert.match(action.detail ?? "", /visibility PUBLIC/, "a genuine observation was discarded");
     assert.match(action.detail ?? "", /owner USER/);
@@ -236,8 +234,6 @@ describe("TASK-016 AC-2: zero liability must be observed, not assumed", () => {
     ["a workflow count that could not be read", { configuredWorkflows: undefined }, "existing-workflows"],
     ["a candidate that introduces a workflow", { candidateAddsWorkflows: true }, "introduced-workflows"],
     ["an unknown answer about introduced workflows", { candidateAddsWorkflows: undefined }, "introduced-workflows"],
-    ["a candidate that introduces Git LFS, whose transfer is metered", { candidateUsesLfs: true }, "introduced-lfs"],
-    ["an unknown answer about introduced LFS", { candidateUsesLfs: undefined }, "introduced-lfs"],
   ] as const;
 
   for (const [label, override, channel] of mechanisms) {
@@ -250,7 +246,7 @@ describe("TASK-016 AC-2: zero liability must be observed, not assumed", () => {
       // And the push still refuses, which it would anyway — asserted so the
       // pair reads as "this mechanism is why", not "everything refuses".
       assert.equal(
-        verdictFor(gitPushAction({ target: TARGET, observation, description: "publish" })).allowed,
+        verdictFor(createPullRequestAction({ target: TARGET, observation, description: "publish" })).allowed,
         false,
       );
     });
@@ -277,7 +273,7 @@ describe("TASK-016 AC-2: zero liability must be observed, not assumed", () => {
    */
   it("refuses even an unmetered push when the financial policy is untrusted", () => {
     const verdict = evaluateFinancialSafety(
-      gitPushAction({ target: TARGET, observation: publicUnmetered(), description: "publish" }),
+      createPullRequestAction({ target: TARGET, observation: publicUnmetered(), description: "publish" }),
       parseFinancialPolicy({ autonomousSpendAllowed: true, autonomousSpendLimit: 5 }),
     );
 
@@ -294,7 +290,7 @@ describe("TASK-016 AC-2: zero liability must be observed, not assumed", () => {
     const policy = parseFinancialPolicy(DENY_ALL_SPENDING);
 
     const push = evaluateFinancialSafety(
-      gitPushAction({ target: TARGET, observation: publicUnmetered(), description: "publish" }),
+      createPullRequestAction({ target: TARGET, observation: publicUnmetered(), description: "publish" }),
       policy,
     );
     const free = evaluateFinancialSafety({ kind: "GIT_FETCH", description: "fetch" }, policy);
@@ -324,7 +320,7 @@ describe("TASK-016: the push minter did not widen anything else", () => {
    * across.
    */
   it("does not let a push verdict authorise a different kind", () => {
-    const minted = gitPushAction({ target: TARGET, observation: publicUnmetered(), description: "publish" });
+    const minted = createPullRequestAction({ target: TARGET, observation: publicUnmetered(), description: "publish" });
     const relabelled = { ...minted, kind: "PROVISION_VPS" };
 
     assert.equal(verdictFor(relabelled).allowed, false, "a push verdict authorised provisioning a VPS");

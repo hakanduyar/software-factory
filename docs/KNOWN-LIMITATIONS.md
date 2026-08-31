@@ -799,66 +799,83 @@ different key, a missing key and two keys, and — the control that matters —
 asserts a correctly declared plan is still ACCEPTED, so the guard is not
 satisfied by refusing everything.
 
-## L-14 - The Factory cannot push autonomously, because zero liability cannot be demonstrated
+## L-14 - The Factory does not write to git, and cannot demonstrate a free remote write
+
+Two separate impossibilities, found across five independent review rounds of
+TASK-016. Both are recorded because each on its own would be enough to refuse.
+
+### 1. A push destination cannot be established
 
 `GIT_PUSH` was registered financial with a comment predicting a remedy: "a push
 to a target with demonstrated zero liability could earn a minted action later,
-the way verification commands did." TASK-016 tried twice to earn it and
-concluded, under independent review, that it cannot be earned today.
+the way verification commands did." Earning it required knowing WHERE the push
+would go, and that turned out to be unknowable from configuration:
 
-**Round 1** offered "public repository, no repository webhooks". The reviewer
-showed GitHub bills LARGER RUNNERS even on public repositories, and that
-organisation-scoped webhooks are outside a repository query.
+- round 2: `git remote get-url --push` reports only the FIRST url while
+  `git push origin` writes to every configured `pushurl`;
+- round 3: `url.*.insteadOf` rewrites the url at the moment of use, so naming
+  one explicitly was not enough;
+- round 4: `url.*.pushInsteadOf` and HTTP redirects do the same again, and
+  neither is visible to `ls-remote --get-url`.
 
-**Round 2** offered five facts - public, user-owned, no webhooks, no
-workflows, no workflows introduced by the candidate. The reviewer showed two
-channels still open: a GitHub App can subscribe to push events independently
-of both webhook scopes, and a candidate can introduce Git LFS, whose storage
-and bandwidth are metered.
+Each round closed one layer and the next appeared. All of them resolve at push
+time, so binding the destination means predicting git's resolution rather than
+observing it.
 
-**What is observed now.** The report enumerates SEVEN channels - the six
-observable ones here plus the unobservable one below. Each of these six fails
-closed when it cannot be read: Actions metering (visibility PUBLIC),
-organisation webhooks (owner is a USER, which cannot have them), repository
-webhooks (count 0), existing workflows (count 0, so no run can start and runner
-size cannot bill one), introduced workflows (the candidate adds none), and Git
-LFS (the candidate TRACKS nothing through it).
+**So the Factory does not push.** There is no `GitPusher` and no `git push`
+anywhere in it. Publication VERIFIES that the remote branch already holds the
+exact candidate and refuses otherwise; getting the branch there is the
+repository agent's job under ADR-0002, which is governance rather than this
+runtime gate. `GIT_PUSH` is back in the effects table as financial, and nothing
+mints it.
 
-That last one is deliberately about tracking rather than about a change to the
-rules: a rule the base already carries still uploads metered objects for files
-the candidate adds under it, so comparing `.gitattributes` between base and
-head missed the ordinary case entirely.
+### 2. A remote write cannot be demonstrated free
 
-**The channel that stays open.** A GitHub App installation is not observable
+The one remaining write is creating a pull request. Its liability channels are
+observed and reported, and six of the seven are closed for this repository:
+Actions metering (visibility PUBLIC), organisation webhooks (owner is a USER,
+which cannot have them), repository webhooks (count 0), existing workflows
+(count 0), introduced workflows (the candidate adds none), and the target
+identity itself.
+
+The seventh cannot be closed. A GitHub App can subscribe to repository events
+independently of both webhook scopes, and App installations are NOT observable
 with the Factory's credentials: `/repos/:owner/:repo/installation` answers 401
 and `/user/installations` answers 403 for an OAuth token. An unobservable
 metered channel is an OPEN one, and minting `costKnownZero` while admitting it
 would be the declared-not-derived mistake `financialSafety.ts` exists to
-prevent. So `gitPushAction` derives FINANCIAL for every input, and the Factory
-refuses every remote write.
+prevent.
 
-**What the observation is for, then.** The report. A human asked to authorise a
-push receives the exact list of channels closed by observation and the one that
-remains open, rather than an unexplained refusal - the difference between a
-gate and a wall.
+The round-3 review adjudicated the counter-argument explicitly: this is NOT the
+`npm test` residual that `ZERO_COST_COMMANDS` already accepts. That one is
+pre-existing LOCAL execution trust; a remote write creates an EXTERNAL event,
+and a human having installed an App does not authorise the Factory's causal
+spending.
 
-**What this does NOT block.** The repository agent's own pushes under ADR-0002
-are governance, not this runtime gate. `AUTONOMOUS_SPEND_LIMIT = 0` constrains
-the FACTORY's autonomous authority, and that is what this limitation is about.
-A publication that needs no remote write - the branch already holds the
-candidate and the pull request already exists - completes normally, because
-there is nothing for the gate to authorise.
+**So `createPullRequestAction` derives FINANCIAL for every input**, and a
+publication that must write anything stops for a human. A publication that must
+write NOTHING - the branch already holds the candidate and the pull request
+already exists - completes normally, because there is nothing to authorise.
 
-**What would change it.** A credential that can enumerate App installations, or
-a GitHub signal that a push cannot bill. Either is a code change that goes
-through review and an independent acceptance gate, exactly as raising the spend
-limit would be - never a data edit, and never an inference.
+### What the observation is for, then
+
+The report. A human asked to authorise the write receives the exact list of
+channels closed by observation and the one that remains open, rather than an
+unexplained refusal - the difference between a gate and a wall.
+
+### What would change either half
+
+For the destination: nothing available. For the liability: a credential that
+can enumerate App installations, or a GitHub signal that a write cannot bill.
+Either is a code change that goes through review and an independent acceptance
+gate, exactly as raising the spend limit would be - never a data edit, and
+never an inference.
 
 **Kept honest by:** `tests/pushAuthorization.test.ts` asserts on the CHANNEL
-REPORT rather than on the verdict, because every push refuses and a
+REPORT rather than on the verdict, because every write refuses and a
 verdict-based assertion would pass no matter what the observation said. Each
 mechanism has a case proving it opens its own channel; a perfect target opens
 exactly one; an absent observation opens all of them; and a separate case shows
 the gate still classifies a genuinely free remote action as free, so the
-refusal is a statement about pushes rather than an artefact of a gate that
-refuses everything.
+refusal is a statement about remote writes rather than an artefact of a gate
+that refuses everything.

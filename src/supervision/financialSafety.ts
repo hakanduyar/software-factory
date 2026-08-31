@@ -210,18 +210,20 @@ const KNOWN_ACTION_EFFECTS_TABLE: Record<string, ActionEffects> = {
    * can hit a metered endpoint. Neither is performed by TASK-006, so making them
    * human-gated costs nothing today and removes a claim that was never proven.
    *
-   * `GIT_PUSH` HAS SINCE EARNED ITS MINTER (TASK-016), which is why it is no
-   * longer listed here. That paragraph predicted the shape exactly — "a push to
-   * a target with demonstrated zero liability could earn a minted action later,
-   * the way verification commands did" — so the entry moved rather than
-   * softened: `GIT_PUSH` is now RESOURCE-PARAMETERISED, its verdict comes from
-   * `gitPushAction` against an observation of the exact target, and a bare
-   * `{ kind: "GIT_PUSH" }` that no minter produced has no record, which is no
-   * knowledge, which is financial. Strictly narrower than a table entry: this
-   * kind can no longer be classified at all without evidence.
+   * TASK-016 TRIED TO EARN IT AND DID NOT. Four review rounds established two
+   * things. First, zero liability cannot be demonstrated while a GitHub App
+   * installation is unobservable with the Factory's credentials. Second — and
+   * this is why the entry is back rather than merely unminted — the
+   * DESTINATION of a push cannot be established either: `remote.pushurl`,
+   * `url.*.insteadOf`, `url.*.pushInsteadOf` and HTTP redirects each resolve at
+   * push time, and three consecutive rounds each found a new layer after the
+   * previous one was closed.
    *
-   * `PROBE_RESOURCE_REMOTE` has earned nothing and stays exactly as it was.
+   * So the Factory does not push at all. There is no minter for `GIT_PUSH`, no
+   * pusher in the adapter, and this entry is what classifies the kind if anyone
+   * ever constructs one: financial, as it has been since F5-FIN-4.
    */
+  GIT_PUSH: effects({ remote: true, costKnownZero: false, canIncurUsageCharges: true }),
   PROBE_RESOURCE_REMOTE: effects({ remote: true, costKnownZero: false, canIncurUsageCharges: true }),
   /**
    * NOTE: `LAUNCH_AI_WORKER`/`LAUNCH_AI_REVIEWER` are deliberately ABSENT.
@@ -336,7 +338,7 @@ export type BillingMode = (typeof BILLING_MODES)[number];
  * make one permissive.
  */
 const RESOURCE_PARAMETERISED_KINDS: ReadonlySet<string> = Object.freeze(
-  new Set(["LAUNCH_AI_WORKER", "LAUNCH_AI_REVIEWER", "RUN_VERIFICATION_COMMAND", "GIT_PUSH"]),
+  new Set(["LAUNCH_AI_WORKER", "LAUNCH_AI_REVIEWER", "RUN_VERIFICATION_COMMAND", "CREATE_PULL_REQUEST"]),
 ) as ReadonlySet<string>;
 
 /**
@@ -587,14 +589,6 @@ export interface PushLiabilityObservation {
   readonly configuredWorkflows: number | undefined;
   /** `undefined` when it could not be established whether this push adds workflows. */
   readonly candidateAddsWorkflows: boolean | undefined;
-  /**
-   * Whether this push would introduce Git LFS tracking.
-   *
-   * ROUND-2 REVIEW. LFS storage and bandwidth are METERED, including on public
-   * repositories, so a candidate adding `.gitattributes` filters can turn a
-   * push into billed transfer. `undefined` is unknown, which is financial.
-   */
-  readonly candidateUsesLfs: boolean | undefined;
 }
 
 /** One metered channel a push to GitHub can open, and whether it was closed. */
@@ -644,11 +638,6 @@ export function describePushLiability(
       o?.candidateAddsWorkflows === false,
       `candidate adds workflows ${o?.candidateAddsWorkflows ?? "unknown"}`,
     ),
-    channel(
-      "introduced-lfs",
-      o?.candidateUsesLfs === false,
-      `candidate uses LFS ${o?.candidateUsesLfs ?? "unknown"}`,
-    ),
     /**
      * NEVER CLOSED, and that is the honest answer rather than a gap.
      *
@@ -679,7 +668,6 @@ export function observePushLiability(input: {
   readonly repositoryWebhooks: number | undefined;
   readonly configuredWorkflows: number | undefined;
   readonly candidateAddsWorkflows: boolean | undefined;
-  readonly candidateUsesLfs: boolean | undefined;
 }): PushLiabilityObservation {
   const observation = Object.freeze({
     target: input.target,
@@ -689,53 +677,67 @@ export function observePushLiability(input: {
     repositoryWebhooks: input.repositoryWebhooks,
     configuredWorkflows: input.configuredWorkflows,
     candidateAddsWorkflows: input.candidateAddsWorkflows,
-    candidateUsesLfs: input.candidateUsesLfs,
   });
   PUSH_OBSERVATIONS.add(observation);
   return observation;
 }
 
 /**
- * Builds a push action whose cost verdict is EARNED from an observation of the
+ * Builds the action for the one remote write this build can perform — creating
+ * a pull request — whose cost verdict is derived from an observation of the
  * exact target (TASK-016 AC-1/AC-2).
+ *
+ * WHY THIS IS NOT A PUSH ANY MORE (round-4 review, finding 1). Three
+ * consecutive rounds each found a new way for git to write somewhere other
+ * than the destination this process observed: a second `remote.pushurl`, then
+ * `url.*.insteadOf`, then `url.*.pushInsteadOf` and HTTP redirects. Each
+ * resolves at push time, so binding the destination means predicting git's
+ * resolution rather than observing it — and the reviewer's own words were that
+ * this "blocks safely retaining the write path".
+ *
+ * So the write path is gone. The Factory never runs `git push`; a branch
+ * reaches the remote through the repository agent under ADR-0002, which is
+ * governance rather than this runtime gate. What remains is a pull request
+ * created through `gh --repo owner/name`, whose destination is the argument
+ * itself and carries no git-config indirection at all.
  *
  * THE VERDICT IS CURRENTLY ALWAYS FINANCIAL, AND THAT IS THE FINDING — not a
  * gap left for later (round-2 review, CRITICAL 2).
  *
- * Two rounds were spent trying to earn a free push verdict from observation.
- * Round 1 offered "public repository, no repository webhooks"; the reviewer
- * showed larger runners bill even on public repositories and that
- * organisation webhooks are outside a repository query. Round 2 answered with
- * five facts — public, user-owned, no webhooks, no workflows, no workflows
- * introduced — and the reviewer showed two channels still open: a GitHub App
- * can subscribe to push events independently of both webhook scopes, and a
- * candidate can introduce Git LFS, whose storage and bandwidth are metered.
+ * Two rounds were spent trying to earn a free verdict from observation. Round 1
+ * offered "public repository, no repository webhooks"; the reviewer showed
+ * larger runners bill even on public repositories and that organisation
+ * webhooks are outside a repository query. Round 2 answered with five facts and
+ * the reviewer showed a channel still open: a GitHub App can subscribe to
+ * repository events independently of both webhook scopes.
  *
- * The LFS channel is observable and is now observed. The App channel is NOT:
- * `/repos/:owner/:repo/installation` answers 401 and `/user/installations`
- * answers 403 for the Factory's OAuth token. So there exists a metered channel
- * this process cannot inspect, and "uncertainty is financial" is not a rule
- * that bends for the channel that happens to be inconvenient. Minting
- * `costKnownZero` while admitting an unobservable metered channel would be
- * precisely the declared-not-derived mistake this module exists to prevent —
- * the reviewer's point, and it is correct.
+ * That channel is NOT observable: `/repos/:owner/:repo/installation` answers
+ * 401 and `/user/installations` answers 403 for the Factory's OAuth token. So a
+ * metered channel exists that this process cannot inspect, and "uncertainty is
+ * financial" is not a rule that bends for the channel that happens to be
+ * inconvenient. Minting `costKnownZero` while admitting it would be precisely
+ * the declared-not-derived mistake this module exists to prevent — the
+ * reviewer's point, and it is correct. Their round-3 adjudication settled the
+ * counter-argument too: this is NOT the `npm test` residual, because a remote
+ * write creates an external event, and a human having installed an App does not
+ * authorise the Factory's causal spending.
  *
  * SO WHAT THE OBSERVATION IS FOR. It no longer decides the verdict; it builds
- * the REPORT. A human asked to authorise a push receives the exact list of
+ * the REPORT. A human asked to authorise the write receives the exact list of
  * channels closed by observation and the one that remains open, instead of an
  * unexplained refusal — which is the difference between a gate and a wall.
  *
  * WHAT WOULD CHANGE THIS. A credential that can enumerate App installations,
- * or a GitHub signal that a push cannot bill. Either is a code change that
+ * or a GitHub signal that the write cannot bill. Either is a code change that
  * goes through review and an independent acceptance gate, exactly as raising
  * the spend limit would be — never a data edit, and never an inference.
  *
- * NOTE what this does NOT block: the repository-agent's own pushes under
+ * NOTE what this does NOT block: the repository agent's own pushes under
  * ADR-0002 are governance, not this runtime gate. This function constrains the
  * FACTORY's autonomous authority, which is what `AUTONOMOUS_SPEND_LIMIT = 0`
  * is about.
  */
-export function gitPushAction(input: {
+export function createPullRequestAction(input: {
   readonly target: string;
   readonly observation?: PushLiabilityObservation;
   readonly description: string;
@@ -767,7 +769,7 @@ export function gitPushAction(input: {
   });
   return mint(
     {
-      kind: "GIT_PUSH",
+      kind: "CREATE_PULL_REQUEST",
       description: input.description,
       /**
        * Human-readable only; the binding copy lives in the mint record. Every
