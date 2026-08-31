@@ -371,6 +371,41 @@ describe("TASK-015 finding 4: a probe that throws is a controlled refusal", () =
     const supervisor = newSupervisor({ probe, executor, resourceCatalog: CATALOG });
     await seedRoadmap(supervisor, [ITEM]);
 
+    /**
+     * A waiting resource with a KNOWN retry, persisted before the tick
+     * (round-13 finding 2). The probe-throw refusal concludes in the state
+     * its escalation committed; a stale pre-escalation basis loses that
+     * commit, fails the CAS, and silently drops the wake this retry asks
+     * for. Asserting the published wake is what makes the fresh-basis rule
+     * observable at all.
+     */
+    const seeded = await supervisor.repository.load();
+    assert.ok(seeded !== undefined);
+    await supervisor.repository.compareAndSave(
+      {
+        ...seeded,
+        version: seeded.version + 1,
+        resources: [
+          ...seeded.resources.filter((record) => record.key !== "codex-cli:gpt-5.6-luna"),
+          {
+            provider: "codex-cli",
+            model: "gpt-5.6-luna",
+            key: "codex-cli:gpt-5.6-luna",
+            state: "USAGE_LIMIT_REACHED" as const,
+            detectedAt: 1_799_999_940_000,
+            // Recently checked, retry within the ladder's reach: a PLAUSIBLE
+            // waiting row. One checked at 0 with a far retry trips the
+            // forged-retryAt guard and is deliberately re-probed — which is
+            // that guard doing its job, not the path this case is about.
+            lastCheckedAt: 1_799_999_940_000,
+            retryAt: 1_800_000_300_000,
+            backoff: { attempt: 3, delayMs: 60_000 },
+          } as never,
+        ],
+      },
+      seeded.version,
+    );
+
     const result = await supervisor.service.tick();
 
     assert.equal(result.kind, "RECOVERY_REQUIRED", "the tick did not refuse in a controlled way");
@@ -385,6 +420,33 @@ describe("TASK-015 finding 4: a probe that throws is a controlled refusal", () =
       result.kind === "RECOVERY_REQUIRED" ? result.reason : "",
       /codex-cli:gpt-5\.6-luna/,
       "the refusal does not name the resource whose probe threw",
+    );
+    /**
+     * AND THE PERSISTED ESCALATION (round-13 finding 5): what a human later
+     * reads must name the resource, not just the returned result that is gone
+     * with the process. The reviewer's genericizing mutation survived because
+     * nothing loaded durable state here.
+     */
+    const after = await supervisor.repository.load();
+    const open = (after?.escalations ?? []).find(
+      (entry) => entry.roadmapKey === ITEM.key && !entry.resolved,
+    );
+    assert.match(
+      open?.humanActionRequired ?? "",
+      /codex-cli:gpt-5\.6-luna/,
+      "the persisted escalation does not name the resource whose probe threw",
+    );
+    assert.match(
+      open?.detail ?? "",
+      /codex-cli:gpt-5\.6-luna/,
+      "the persisted escalation detail does not name the resource whose probe threw",
+    );
+    // The trusted conclusion still publishes the wake the waiting resource
+    // asked for — from the escalated state, not a stale snapshot.
+    assert.equal(
+      after?.nextWakeAt,
+      1_800_000_300_000,
+      "the refusal's conclusion failed to publish the wake from its own committed state",
     );
   });
 });

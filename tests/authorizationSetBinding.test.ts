@@ -23,6 +23,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import { createPlanBackedExecutor, type PlanAdvancer } from "../src/supervision/planBackedExecutor.js";
+import type { AiRunConfigRecord } from "../src/supervision/modelEnforcement.js";
 import type { AuthorizedResource, WorkOutcome } from "../src/supervision/supervisorPorts.js";
 import type { Plan } from "../src/planning/planTypes.js";
 import type { RoadmapItem } from "../src/supervision/supervisorTypes.js";
@@ -43,6 +44,21 @@ const ITEM: RoadmapItem = {
 const AUTHORIZED: readonly AuthorizedResource[] = [
   { role: "implementer", provider: "claude-code", model: "opus", billingMode: "INCLUDED_SUBSCRIPTION" },
 ];
+
+/**
+ * A routed singleton record that MATCHES the plan's worker. Deliberately a
+ * fixture the legacy fallback would clear: the empty-set case below can only
+ * pass through the set branch refusing, never through the fallback accepting.
+ */
+const SINGLETON_CONFIG: AiRunConfigRecord = {
+  requestedProvider: "claude-code",
+  requestedModel: "opus",
+  effectiveProvider: "claude-code",
+  effectiveModel: "opus",
+  verification: "UNVERIFIED",
+  argvEvidence: ["claude", "--model", "opus"],
+  note: "scripted for tests",
+};
 
 function planRunning(worker: { tool: string; model: string; effort?: string }): Plan {
   return {
@@ -85,6 +101,10 @@ function advancer(): PlanAdvancer & {
  */
 async function execute(
   reads: readonly Plan[],
+  options: {
+    readonly authorized?: readonly AuthorizedResource[];
+    readonly config?: AiRunConfigRecord;
+  } = {},
 ): Promise<{ outcome: WorkOutcome; resumed: string[]; pinned: (string | undefined)[] }> {
   const queue = [...reads];
   const planning = advancer();
@@ -104,7 +124,8 @@ async function execute(
   const outcome = await executor.execute({
     item: ITEM,
     actionId: "action-1",
-    authorizedResources: AUTHORIZED,
+    authorizedResources: options.authorized ?? AUTHORIZED,
+    ...(options.config === undefined ? {} : { config: options.config }),
   });
   return { outcome, resumed: planning.resumed, pinned: planning.pinned };
 }
@@ -145,6 +166,26 @@ describe("TASK-015: membership in the authorised set is exact", () => {
     assert.deepEqual(resumed, [], "an unauthorised model ran because its provider was authorised");
     assert.equal(outcome.kind, "HUMAN_REQUIRED");
     assert.match(outcome.kind === "HUMAN_REQUIRED" ? outcome.detail : "", /sonnet/);
+  });
+
+  /**
+   * AN EXPLICITLY EMPTY SET AUTHORIZES NOTHING (round-13 finding 4).
+   *
+   * `[]` used to fall through to the legacy singleton check, so a caller that
+   * explicitly authorized NOTHING had its plan driven on the routed record
+   * anyway. The matching `config` is the point of this fixture: the fallback
+   * WOULD clear it, so the refusal can only come from the set branch treating
+   * a supplied-but-empty set as the authority it is.
+   */
+  it("refuses every resource when the authorized set is explicitly empty", async () => {
+    const { outcome, resumed } = await execute(
+      [planRunning({ tool: "claude-code", model: "opus" })],
+      { authorized: [], config: SINGLETON_CONFIG },
+    );
+
+    assert.deepEqual(resumed, [], "an explicitly empty authorization set still drove the plan");
+    assert.equal(outcome.kind, "HUMAN_REQUIRED");
+    assert.match(outcome.kind === "HUMAN_REQUIRED" ? outcome.detail : "", /empty set/);
   });
 
   /**

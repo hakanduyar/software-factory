@@ -327,16 +327,38 @@ describe("TASK-015 AC-1/AC-2: the supervisor authorises the set the work declare
             ? "claude-code:opus"
             : "codex-cli:gpt-5.6-luna";
 
-      const result = await tickWith(executor, { [missing]: { state: "USAGE_LIMIT_REACHED" } });
+      const { result, supervisor } = await tickKeeping(executor, {
+        [missing]: { state: "USAGE_LIMIT_REACHED" },
+      });
 
       assert.equal(result.kind, "WAITING_FOR_RESOURCE", `an unavailable ${role} was allowed through`);
       assert.equal(executor.ran(), false, `work ran with an unavailable ${role}`);
       // Round-11 finding 2: the wait must name WHICH member is unavailable,
       // per role, or a name-removal mutation survives the whole loop.
+      const missingRe = new RegExp(missing.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
       assert.match(
         result.kind === "WAITING_FOR_RESOURCE" ? result.reason : "",
-        new RegExp(missing.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+        missingRe,
         `the wait does not name the unavailable ${role} (${missing})`,
+      );
+      /**
+       * AND THE PERSISTED SINKS (round-13 findings 3 and 5): the roadmap
+       * detail an operator reads later, and the resource row's own
+       * diagnostic. Both named these in code; neither was load-bearing, and
+       * the reviewer's mutations survived.
+       */
+      const after = await supervisor.repository.load();
+      const persisted = (after?.roadmap ?? []).find((entry) => entry.key === ITEM.key);
+      assert.match(
+        persisted?.detail ?? "",
+        missingRe,
+        `the persisted roadmap detail does not name the unavailable ${role} (${missing})`,
+      );
+      const row = (after?.resources ?? []).find((record) => record.key === missing);
+      assert.match(
+        row?.diagnostic ?? "",
+        missingRe,
+        `the persisted resource diagnostic does not name the unavailable ${role} (${missing})`,
       );
     });
   }

@@ -441,43 +441,62 @@ export class SupervisorService {
      */
     const resourcesReconciled = await this.reconcileResourcesWithCatalog(defined);
 
-    // 1. Reconcile any claim left behind by a previous process.
-    const reconciled = await this.reconcileClaim(resourcesReconciled);
-    if (reconciled.result !== undefined) {
-      // A lost RUNNING claim is an ACTION refusal inside trusted, reconciled
-      // state — the escalation was committed, and that state may schedule.
-      return { kind: "CONCLUSION", result: reconciled.result, wakeBasis: reconciled.state };
-    }
-    let current = reconciled.state;
-
     /**
-     * 1b. WORK THAT REACHED A WORKER MUST HAVE LEFT LINEAGE (round-11 review).
+     * 1b. WORK THAT REACHED A WORKER MUST HAVE LEFT LINEAGE — checked BEFORE
+     * any conclusion exists to hand a wake basis over (round-13 finding 1).
      *
-     * AFTER reconciliation, deliberately. The signal is
-     * `attempts - unlaunchedAttempts`, and it is reconciliation that proves an
-     * attempt never launched — asking before it runs would refuse an item whose
-     * pending claim is about to be cleared as never-launched, which is an
-     * ordinary crash rather than a deletion.
+     * This check used to run after `reconcileClaim`, because a pending claim's
+     * attempt has not launched yet and counting it would refuse an ordinary
+     * crash. The reviewer measured what that ordering cost: a lost RUNNING
+     * claim returns a CONCLUSION, so a state whose LINEAGE was already invalid
+     * — an AI item DONE with no record of anything having run — reached a
+     * conclusion through the claim path and published a wake.
      *
-     * Before step 3, equally deliberately: eligibility and selection are what
-     * lineage protects, and both happen below.
+     * The ordering was standing in for a narrower fact: the ACTIVE claim
+     * explains exactly one attempt of exactly its own item. So that attempt is
+     * discounted here, in the view this check reads, and the check runs first.
+     * An ordinary crash (a live claim, no other gap) passes and recovery
+     * proceeds; a lineage gap the claim cannot explain — a DONE item without
+     * provenance, or launched attempts beyond the claimed one — refuses the
+     * whole state before any path can conclude on it. The DONE branch ignores
+     * attempts entirely, so a claim never excuses a completed item.
      */
+    const claimKey = resourcesReconciled.activeClaim?.roadmapKey;
+    const lineageView =
+      claimKey === undefined
+        ? resourcesReconciled.roadmap
+        : resourcesReconciled.roadmap.map((entry) =>
+            entry.key === claimKey
+              ? { ...entry, unlaunchedAttempts: (entry.unlaunchedAttempts ?? 0) + 1 }
+              : entry,
+          );
     const unproven = unprovenCompletion({
-      roadmap: current.roadmap,
+      roadmap: lineageView,
       implementedKeys: new Set(
-        current.provenance.filter((entry) => entry.kind === "IMPLEMENTED_BY").map((entry) => entry.roadmapKey),
+        resourcesReconciled.provenance
+          .filter((entry) => entry.kind === "IMPLEMENTED_BY")
+          .map((entry) => entry.roadmapKey),
       ),
     });
     if (unproven !== undefined) {
       /**
        * A STATE refusal, not an action refusal (round-12 finding 1): lineage
        * in durable state cannot be trusted, so nothing derived from that
-       * state — including its wake — may be written. The catalog append and
-       * claim housekeeping committed above are legitimate on their own terms,
-       * but they do not make this pass a conclusion.
+       * state — including its wake — may be written, and the claim it holds
+       * is left exactly where it is for a human to inspect.
        */
-      return { kind: "REFUSAL", result: this.unprovenRefusal(current, unproven) };
+      return { kind: "REFUSAL", result: this.unprovenRefusal(resourcesReconciled, unproven) };
     }
+
+    // 1. Reconcile any claim left behind by a previous process.
+    const reconciled = await this.reconcileClaim(resourcesReconciled);
+    if (reconciled.result !== undefined) {
+      // A lost RUNNING claim is an ACTION refusal inside trusted, reconciled
+      // state whose lineage was just checked — the escalation was committed,
+      // and that state may schedule.
+      return { kind: "CONCLUSION", result: reconciled.result, wakeBasis: reconciled.state };
+    }
+    let current = reconciled.state;
 
     // 2. Refresh only resources whose retry is actually due. A resource with a
     //    known retryAt in the future is deliberately NOT probed: probing early
@@ -702,7 +721,16 @@ export class SupervisorService {
    * told us when to look again.
    */
   private applyClassification(record: ResourceRecord, classification: Classification, now: Timestamp): ResourceRecord {
-    const diagnostic = boundedDiagnostic(classification.reason);
+    /**
+     * THE ROW'S DIAGNOSTIC NAMES ITS RESOURCE, HERE (round-13 finding 3).
+     *
+     * Every row write goes through this function, and this function is handed
+     * the record — the one place that always knows the key. Naming at each
+     * caller left the immediate-probe path unnamed while the failure path was
+     * named, which is the sibling mistake in diagnostic form. Callers pass
+     * the RAW classification; the prefix is this function's job alone.
+     */
+    const diagnostic = boundedDiagnostic(`${record.key}: ${classification.reason}`);
 
     if (classification.state === "AVAILABLE") {
       return {
@@ -803,8 +831,11 @@ export class SupervisorService {
       const detail = boundedDiagnostic(error instanceof Error ? error.message : String(error));
       const reason = `${chosen} could not be probed before launch: ${detail}`;
       const escalated = await this.escalate(state, item.key, "RECOVERY_REQUIRED", `Investigate ${item.key}: ${reason}`, reason);
-      void escalated;
-      return { ok: false, state, result: { kind: "RECOVERY_REQUIRED", reason } };
+      // The ESCALATED state is what this refusal concluded in (round-13
+      // finding 2): returning the pre-escalation snapshot handed callers a
+      // stale wake basis — behaviourally invisible today, and a violation of
+      // the TickOutcome invariant all the same.
+      return { ok: false, state: escalated, result: { kind: "RECOVERY_REQUIRED", reason } };
     }
     const now = this.deps.clock.now();
     let next = await this.commit(state, {
@@ -2090,8 +2121,10 @@ export class SupervisorService {
          * failure signature" reached the tick result, the roadmap detail and
          * the resource diagnostic with the resource's key in NONE of them —
          * which CLI failed was the one fact an operator needed. Named here so
-         * every sink below inherits it, rather than at each sink, which is the
-         * sibling mistake in message form.
+         * the result, roadmap and escalation sinks below inherit it. The
+         * resource ROW takes the raw classification: `applyClassification`
+         * prefixes the row's own key itself (round-13 finding 3), so passing
+         * the named copy would print the key twice.
          */
         const named = {
           ...classification,
@@ -2101,7 +2134,7 @@ export class SupervisorService {
               : `${usedResourceKey}: ${classification.reason}`,
         };
         const resources = state.resources.map((record) =>
-          record.key === usedResourceKey ? this.applyClassification(record, named, now) : record,
+          record.key === usedResourceKey ? this.applyClassification(record, classification, now) : record,
         );
         const waiting = await this.commit(state, {
           ...withLineage,

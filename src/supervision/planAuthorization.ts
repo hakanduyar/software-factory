@@ -156,15 +156,23 @@ export function checkPlanAuthorization(
    * resource absent from the set is refused exactly as it was when the set had
    * one element — and the set exists only because each member went through the
    * supervisor's probe and financial gate individually.
+   *
+   * A SUPPLIED set is the authority even when it is EMPTY (round-13
+   * finding 4). `[]` used to fall through to the legacy singleton, so a
+   * caller that explicitly authorized NOTHING had its plan driven on the
+   * routed record anyway. An empty set is a statement — this action may
+   * launch no resources — and every declared role must therefore refuse.
+   * Only an ABSENT set means the caller predates sets and falls back to the
+   * single-record check below.
    */
-  if (authorized !== undefined && authorized.length > 0) {
+  if (authorized !== undefined) {
     for (const resource of resources) {
       if (!coveredBy(resource, authorized)) {
         return {
           ok: false,
           reason:
             `plan ${plan.id} would run its ${resource.role} on ${format(resource)}, which is not in the set this ` +
-            `action authorized (${authorized.map((entry) => `${entry.provider}/${entry.model}`).join(", ")}). ` +
+            `action authorized (${authorized.length === 0 ? "an explicitly empty set" : authorized.map((entry) => `${entry.provider}/${entry.model}`).join(", ")}). ` +
             `Refusing to launch: every resource that can actually execute must have been probed and gated, and ` +
             `this one was not`,
         };

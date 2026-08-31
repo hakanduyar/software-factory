@@ -17,7 +17,7 @@ import { cleanupTempDbs } from "./support/factoryFixtures.js";
 import { newSupervisor, scriptedProbe, seedRoadmap } from "./support/supervisorFixtures.js";
 import type { ScriptedExecutor, ScriptedProbe } from "./support/supervisorFixtures.js";
 import type { WorkExecutionInput, WorkOutcome } from "../src/supervision/supervisorPorts.js";
-import type { RoadmapItem } from "../src/supervision/supervisorTypes.js";
+import type { RoadmapItem, SupervisorState } from "../src/supervision/supervisorTypes.js";
 
 after(cleanupTempDbs);
 
@@ -522,6 +522,127 @@ describe("TASK-015 round-12 finding 1: a legitimate commit before a refusal is n
       "a refusal after a legitimate commit still published a wake",
     );
     assert.notEqual(after?.nextWakeAt, 1_800_000_005_000, "the tampered schedule was published");
+  });
+});
+
+describe("TASK-015 round-13 finding 1: a lost claim does not carry a lineage-refused state to a conclusion", () => {
+  const TAMPERED_RETRY = 1_800_000_300_000;
+
+  function lostClaimTamper(state: SupervisorState, itemPatch: Partial<RoadmapItem>) {
+    return {
+      ...state,
+      version: state.version + 1,
+      roadmap: state.roadmap.map((entry) =>
+        entry.key === ITEM.key ? { ...entry, ...itemPatch } : entry,
+      ),
+      resources: [
+        ...state.resources.filter((record) => record.key !== "codex-cli:gpt-5.6-luna"),
+        {
+          provider: "codex-cli",
+          model: "gpt-5.6-luna",
+          key: "codex-cli:gpt-5.6-luna",
+          state: "USAGE_LIMIT_REACHED" as const,
+          detectedAt: 0,
+          lastCheckedAt: 0,
+          retryAt: TAMPERED_RETRY,
+          backoff: { attempt: 3, delayMs: 60_000 },
+        } as never,
+      ],
+      activeClaim: {
+        actionId: "a-lost",
+        roadmapKey: ITEM.key,
+        kind: "LAUNCH_AI_WORKER",
+        state: "RUNNING" as const,
+        ownerId: "a-previous-process",
+        attempt: 1,
+        claimedAt: 0,
+      } as never,
+    };
+  }
+
+  /**
+   * The reviewer's reproduction: `reconcileClaim` returned a CONCLUSION for
+   * the lost claim BEFORE the lineage check ran, so a state holding an AI
+   * item DONE with no record of anything having run reached a conclusion and
+   * published its tampered retryAt as the wake (version 3 -> 5).
+   *
+   * The lineage check now runs FIRST, with the live claim's own attempt
+   * discounted — so a gap the claim cannot explain refuses the whole state
+   * before any path can conclude on it, and the claim is left in place,
+   * untouched, for a human to inspect.
+   */
+  it("refuses lineage before the lost claim can conclude, and writes nothing", async () => {
+    const executor = recording();
+    const supervisor = newSupervisor({ probe: permissiveProbe(), executor, resourceCatalog: CATALOG });
+    await seedRoadmap(supervisor, [ITEM]);
+
+    const state = await supervisor.repository.load();
+    assert.ok(state !== undefined);
+    await supervisor.repository.compareAndSave(
+      lostClaimTamper(state, { status: "DONE", attempts: 1 }),
+      state.version,
+    );
+    const tampered = await supervisor.repository.load();
+    assert.ok(tampered !== undefined);
+
+    const result = await supervisor.service.tick();
+
+    assert.equal(
+      result.kind,
+      "WAITING_FOR_HUMAN",
+      `lineage-free DONE was not refused: ${JSON.stringify(result)}`,
+    );
+    assert.match(
+      result.kind === "WAITING_FOR_HUMAN" ? result.humanActionRequired : "",
+      /provenance holds no record/,
+      "refused for some reason other than the missing lineage",
+    );
+    assert.equal(executor.ran(), false);
+
+    const after = await supervisor.repository.load();
+    assert.equal(after?.version, tampered.version, "a refused tick wrote to refused state");
+    assert.equal(
+      after?.nextWakeAt,
+      tampered.nextWakeAt,
+      "the lost-claim path carried refused state to a published wake",
+    );
+    assert.notEqual(after?.nextWakeAt, TAMPERED_RETRY, "the tampered schedule was published");
+    assert.ok(after?.activeClaim !== undefined, "the claim was reconciled — refused state was written to");
+  });
+
+  /**
+   * THE CONTROL that keeps the discount honest: an ordinary crash — a live
+   * item mid-run, one attempt, its claim lost — is exactly the state whose
+   * lineage gap the claim itself explains. It must still reach RECOVERY, and
+   * its trusted conclusion must still publish the wake the resource asks for.
+   * Remove the discount and this case refuses; remove the pre-check and the
+   * case above concludes. Each half pins the other.
+   */
+  it("still recovers an ordinary lost claim, and its conclusion still publishes the wake", async () => {
+    const executor = recording();
+    const supervisor = newSupervisor({ probe: permissiveProbe(), executor, resourceCatalog: CATALOG });
+    await seedRoadmap(supervisor, [ITEM]);
+
+    const state = await supervisor.repository.load();
+    assert.ok(state !== undefined);
+    await supervisor.repository.compareAndSave(
+      lostClaimTamper(state, { status: "ACTIVE", attempts: 1 }),
+      state.version,
+    );
+
+    const result = await supervisor.service.tick();
+
+    assert.equal(
+      result.kind,
+      "RECOVERY_REQUIRED",
+      `an ordinary crash was not recovered: ${JSON.stringify(result)}`,
+    );
+    const after = await supervisor.repository.load();
+    assert.equal(
+      after?.nextWakeAt,
+      TAMPERED_RETRY,
+      "a trusted recovery conclusion failed to publish the wake its resource asked for",
+    );
   });
 });
 
