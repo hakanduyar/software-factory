@@ -23,6 +23,7 @@
  */
 
 import type { RemoteCheckStatus, RemotePullRequest, RemoteRepository } from "./candidateBinding.js";
+import type { RemoteWriteAuthorization } from "../supervision/financialSafety.js";
 
 /** Reads the LOCAL repository. Separate port: local git is not GitHub. */
 export interface GitRepositoryReader {
@@ -62,17 +63,28 @@ export interface GitHubClient {
   /**
    * Creates a pull request and returns it.
    *
-   * Callers must call `findPullRequest` first: this method does not
+   * REQUIRES PROOF THAT THE GATE ALLOWED IT (round-6 review, finding 1).
+   * Exporting a client with a write method exported a way to write without
+   * passing the gate, wherever that client was constructed. The authorization
+   * can only be obtained from `authorizeRemoteWrite`, which mints one only on
+   * an ALLOWED verdict it computed itself — so this method cannot be reached
+   * by a caller that skipped the gate, rather than merely being expected not
+   * to be.
+   *
+   * Callers must still call `findPullRequest` first: this method does not
    * de-duplicate, because a client that silently returned an existing PR would
    * make the idempotence AC-5 depends on untestable at the level where it
    * actually matters.
    */
-  createPullRequest(input: {
-    readonly headRef: string;
-    readonly baseRef: string;
-    readonly title: string;
-    readonly body: string;
-  }): Promise<RemotePullRequest>;
+  createPullRequest(
+    input: {
+      readonly headRef: string;
+      readonly baseRef: string;
+      readonly title: string;
+      readonly body: string;
+    },
+    authorization: RemoteWriteAuthorization,
+  ): Promise<RemotePullRequest>;
   /** Check status for one commit, always carrying the sha it describes. */
   checkStatus(sha: string): Promise<RemoteCheckStatus>;
 }

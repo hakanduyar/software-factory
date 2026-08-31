@@ -15,6 +15,13 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import { createGhCliClient, githubTargetFromUrl } from "../src/adapters/github/ghCliClient.js";
+import {
+  authorizeRemoteWrite,
+  createPullRequestAction,
+  launchAiWorkerAction,
+  observeBilling,
+  parseFinancialPolicy,
+} from "../src/supervision/financialSafety.js";
 import type { ProcessRequest, ProcessResult, ProcessRunner } from "../src/ports/processRunner.js";
 import type { Timestamp } from "../src/domain/time.js";
 
@@ -96,6 +103,100 @@ describe("TASK-016 CRITICAL 1: the push target is derived from the push URL", ()
       assert.equal(githubTargetFromUrl(url), undefined);
     });
   }
+});
+
+describe("TASK-016 round-6 finding 1: the REAL adapter refuses an unauthorized write", () => {
+  /**
+   * The round-6 tests in `publishCandidate.test.ts` run against a scripted
+   * double that enforces this rule because I wrote it to. That proves the
+   * DOUBLE refuses. `createGhCliClient` is the exported capability an attacker
+   * or a careless caller would actually hold, so the guard has to be pinned
+   * here — on the object that can really reach GitHub.
+   */
+  it("refuses a create with no authorization, without running gh", async () => {
+    const { client: gh, runner: r } = client({});
+
+    await assert.rejects(
+      () => gh.createPullRequest(
+        { headRef: "feat/x", baseRef: "main", title: "t", body: "b" },
+        undefined as never,
+      ),
+      /authorizeRemoteWrite/,
+      "the real adapter accepted an unauthorized write",
+    );
+    // The refusal must precede the subprocess: a write attempted and then
+    // regretted is still a write.
+    assert.deepEqual(r.seen(), [], "gh was invoked before the authorization was checked");
+  });
+
+  it("refuses a hand-built object shaped like an authorization", async () => {
+    const { client: gh, runner: r } = client({});
+
+    await assert.rejects(
+      () => gh.createPullRequest(
+        { headRef: "feat/x", baseRef: "main", title: "t", body: "b" },
+        { kind: "CREATE_PULL_REQUEST" },
+      ),
+      /authorizeRemoteWrite/,
+      "a forged authorization reached the real adapter",
+    );
+    assert.deepEqual(r.seen(), []);
+  });
+
+  /**
+   * An authorization minted for a DIFFERENT action is not proof about this
+   * one. A locally-hosted worker IS mintable at zero cost, so this is a REAL
+   * token — one the gate genuinely issued, carrying genuine WeakSet
+   * provenance — presented at the wrong door. Testing forgery alone would
+   * leave the kind comparison unpinned, and provenance without identity was
+   * itself an earlier finding.
+   */
+  it("refuses an authorization minted for a different action kind", async () => {
+    const minted = authorizeRemoteWrite(
+      launchAiWorkerAction({
+        resourceKey: "ollama:qwen2.5-coder:7b",
+        observation: observeBilling({
+          provider: "ollama",
+          model: "qwen2.5-coder:7b",
+          billingMode: "INCLUDED_SUBSCRIPTION",
+        }),
+        description: "a local worker, which the gate really does allow",
+      }),
+      parseFinancialPolicy({ autonomousSpendAllowed: false, autonomousSpendLimit: 0 }),
+    );
+
+    // Non-vacuity: if this ever stops minting, the case below would degrade
+    // into the forgery test above without saying so.
+    assert.equal(minted.ok, true, "the premise failed: no genuine token was minted to misuse");
+    if (!minted.ok) return;
+    const token = minted.authorization;
+    const { client: gh, runner: r } = client({});
+
+    await assert.rejects(
+      () => gh.createPullRequest(
+        { headRef: "feat/x", baseRef: "main", title: "t", body: "b" },
+        token as never,
+      ),
+      /authorizeRemoteWrite/,
+      "an authorization for another action kind opened the write",
+    );
+    assert.deepEqual(r.seen(), []);
+  });
+
+  /**
+   * THE CONTROL, and the one that matters most: the gate mints NOTHING for the
+   * action publication would perform, so the refusal above is not merely a
+   * missing-argument check. If this ever starts minting, the assertion below
+   * fails and forces the question to be answered deliberately.
+   */
+  it("mints no authorization for a pull request against a real repository", () => {
+    const minted = authorizeRemoteWrite(
+      createPullRequestAction({ target: REPO, description: "publish" }),
+      parseFinancialPolicy({ autonomousSpendAllowed: false, autonomousSpendLimit: 0 }),
+    );
+
+    assert.equal(minted.ok, false, "the gate minted a write authorization for a pull request");
+  });
 });
 
 describe("TASK-016 HIGH 4: malformed remote responses fail closed", () => {

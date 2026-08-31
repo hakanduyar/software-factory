@@ -88,6 +88,53 @@ describe("TASK-016 AC-4: the persisted record distinguishes absent checks from p
   });
 });
 
+describe("TASK-016 round-6 finding 2: the recorder binds the evidence it writes", () => {
+  /**
+   * `publishCandidate` validates the check sha, but this recorder is EXPORTED,
+   * so a caller reaching it directly could write a status describing one commit
+   * into a record naming another — and a hash-anchored chain makes that wrong
+   * fact permanent and credible.
+   *
+   * The reviewer's reproduction: PR head A, check sha B, `ok: true`,
+   * `detail: checks SUCCESS (1) for B`, `resourceKey: A`.
+   */
+  it("refuses to record a check status describing a different commit", () => {
+    const result = withPublicationRecorded(emptyState(), {
+      roadmapKey: "GITHUB_ORCHESTRATION",
+      pullRequest: PR,
+      checks: { sha: "2222222222222222222222222222222222222222", conclusion: "SUCCESS", total: 1 },
+      recordedAt: 2_000,
+    });
+
+    assert.equal(result.ok, false, "unbound evidence was written into the chain");
+    assert.match(result.ok === false ? result.reason : "", /evidence for another commit/);
+  });
+
+  /** The control: evidence about the right commit still records. */
+  it("records a check status that describes the pull request's own commit", () => {
+    const result = withPublicationRecorded(emptyState(), {
+      roadmapKey: "GITHUB_ORCHESTRATION",
+      pullRequest: PR,
+      checks: { sha: A, conclusion: "SUCCESS", total: 1 },
+      recordedAt: 2_000,
+    });
+
+    assert.equal(result.ok, true, `bound evidence was refused: ${JSON.stringify(result)}`);
+  });
+
+  /** An absent status is not a mismatch: it is its own recorded fact. */
+  it("records an unretrieved status without complaining about binding", () => {
+    const result = withPublicationRecorded(emptyState(), {
+      roadmapKey: "GITHUB_ORCHESTRATION",
+      pullRequest: PR,
+      checks: undefined,
+      recordedAt: 2_000,
+    });
+
+    assert.equal(result.ok, true);
+  });
+});
+
 describe("TASK-016: the publication joins the verifiable chain", () => {
   it("appends an entry that verifies and re-anchors", () => {
     const result = withPublicationRecorded(emptyState(), {

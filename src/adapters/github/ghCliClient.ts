@@ -35,6 +35,7 @@ import {
   type RemoteRepository,
 } from "../../github/candidateBinding.js";
 import type { GitHubClient, GitRepositoryReader } from "../../github/githubPorts.js";
+import { isRemoteWriteAuthorized } from "../../supervision/financialSafety.js";
 import type { RepositoryOwnerType, RepositoryVisibility } from "../../supervision/financialSafety.js";
 import type { ProcessRunner } from "../../ports/processRunner.js";
 
@@ -335,7 +336,18 @@ export function createGhCliClient(deps: GhCliDeps): GitHubClient {
       };
     },
 
-    async createPullRequest(input): Promise<RemotePullRequest> {
+    async createPullRequest(input, authorization): Promise<RemotePullRequest> {
+      /**
+       * REFUSED WITHOUT PROOF (round-6 review, finding 1). The check is here,
+       * at the point of the write, because that is the only place no caller
+       * can route around — a guard in the orchestrator protects the
+       * orchestrator, not the capability.
+       */
+      if (!isRemoteWriteAuthorized(authorization, "CREATE_PULL_REQUEST")) {
+        throw new Error(
+          "createPullRequest requires an authorization minted by authorizeRemoteWrite for CREATE_PULL_REQUEST",
+        );
+      }
       await run(deps, gh, [
         "pr",
         "create",

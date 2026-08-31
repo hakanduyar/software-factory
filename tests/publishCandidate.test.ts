@@ -31,6 +31,12 @@ import type {
   ReviewedCandidate,
 } from "../src/github/candidateBinding.js";
 import type { GitHubClient, GitRepositoryReader } from "../src/github/githubPorts.js";
+import {
+  authorizeRemoteWrite,
+  createPullRequestAction,
+  isRemoteWriteAuthorized,
+  parseFinancialPolicy,
+} from "../src/supervision/financialSafety.js";
 
 const A = "1111111111111111111111111111111111111111";
 const B = "2222222222222222222222222222222222222222";
@@ -61,6 +67,7 @@ interface Scripted {
   readonly git: GitRepositoryReader;
   creates(): number;
   finds(): number;
+  authorization(): unknown;
   gitCalls(): readonly string[];
 }
 
@@ -91,6 +98,7 @@ function scripted(options: {
   const queue = options.pullRequests === undefined ? undefined : [...options.pullRequests];
   let createCount = 0;
   let findCount = 0;
+  let lastAuthorization: unknown;
   const gitCalls: string[] = [];
 
   const repository: RemoteRepository = {
@@ -117,8 +125,14 @@ function scripted(options: {
       }
       return pullRequest;
     },
-    async createPullRequest(input): Promise<RemotePullRequest> {
+    async createPullRequest(input, authorization): Promise<RemotePullRequest> {
       createCount += 1;
+      lastAuthorization = authorization;
+      // The fake enforces what the real adapter enforces; a permissive double
+      // would make the authorization untested where it matters.
+      if (!isRemoteWriteAuthorized(authorization, "CREATE_PULL_REQUEST")) {
+        throw new Error("createPullRequest requires an authorization minted by authorizeRemoteWrite");
+      }
       // GitHub REFUSES a second open pull request for one head/base, so
       // `createFails` models the losing side of a race.
       if (options.createFails === true) {
@@ -164,6 +178,7 @@ function scripted(options: {
     },
     creates: () => createCount,
     finds: () => findCount,
+    authorization: () => lastAuthorization,
     gitCalls: () => gitCalls,
   };
 }
@@ -441,6 +456,61 @@ describe("TASK-016 AC-8: publication refuses before it acts", () => {
  * nothing is created when one already exists — plus, structurally, that the
  * module exposes no ungated way to write at all.
  */
+describe("TASK-016 round-6 finding 1: the write demands proof the gate allowed it", () => {
+  /**
+   * Round 5 made the create/adopt helper private, which fixed the MODULE. It
+   * did not fix the ADAPTER: a client with a write method is a write
+   * capability wherever it is constructed, and `createGhCliClient` is
+   * exported. The remedy the reviewer named in round 5 is now implemented —
+   * an unforgeable post-gate capability — and the objection I raised then is
+   * answered by minting it ONLY from an allowed verdict the gate computed
+   * itself, which a caller can neither supply nor forge.
+   */
+  it("refuses a create with no authorization at all", async () => {
+    const s = scripted();
+
+    await assert.rejects(
+      () => s.client.createPullRequest(
+        { headRef: "x", baseRef: "main", title: "t", body: "b" },
+        undefined as never,
+      ),
+      /authorizeRemoteWrite/,
+      "an unauthorized write was accepted",
+    );
+  });
+
+  it("refuses a hand-built object that looks like an authorization", async () => {
+    const s = scripted();
+
+    await assert.rejects(
+      () => s.client.createPullRequest(
+        { headRef: "x", baseRef: "main", title: "t", body: "b" },
+        { kind: "CREATE_PULL_REQUEST" },
+      ),
+      /authorizeRemoteWrite/,
+      "a forged authorization was accepted",
+    );
+  });
+
+  /**
+   * And the gate does not mint one for this action today, so the write is
+   * unreachable by construction rather than by discipline.
+   */
+  it("mints no authorization for the action publication would perform", () => {
+    const action = createPullRequestAction({
+      target: REPO,
+      description: "publish",
+    });
+
+    const result = authorizeRemoteWrite(
+      action,
+      parseFinancialPolicy({ autonomousSpendAllowed: false, autonomousSpendLimit: 0 }),
+    );
+
+    assert.equal(result.ok, false, "the gate minted a write authorization");
+  });
+});
+
 describe("TASK-016 round-5 finding 1: no ungated write is reachable", () => {
   it("exports no helper that can create a pull request", async () => {
     const module = await import("../src/github/publishCandidate.js");

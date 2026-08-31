@@ -63,6 +63,22 @@ export function withPublicationRecorded(
     readonly recordedAt: number;
   },
 ): PublicationRecordResult {
+  /**
+   * EVIDENCE IS BOUND HERE TOO (round-6 review, finding 2).
+   *
+   * `publishCandidate` validates the check sha, but this recorder is EXPORTED,
+   * so a caller reaching it directly could write a status describing one commit
+   * into a record naming another — and a hash-anchored chain makes that wrong
+   * fact permanent and credible. The check belongs at the durable-state
+   * boundary as well as at the orchestration one: a record is not a place to
+   * discover that its own evidence was about something else.
+   */
+  if (input.checks !== undefined && input.checks.sha !== input.pullRequest.headSha) {
+    return {
+      ok: false,
+      reason: `the check status describes ${input.checks.sha} but the pull request is at ${input.pullRequest.headSha}; evidence for another commit must not be recorded against this one`,
+    };
+  }
   const appended = appendProvenance(state.provenance, {
     kind: "PUBLISHED_AS",
     roadmapKey: input.roadmapKey,

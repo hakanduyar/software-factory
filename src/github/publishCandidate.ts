@@ -40,12 +40,21 @@ import {
 } from "./candidateBinding.js";
 import type { GitHubClient, GitRepositoryReader } from "./githubPorts.js";
 import {
-  evaluateFinancialSafety,
+  authorizeRemoteWrite,
   createPullRequestAction,
   observePushLiability,
   parseFinancialPolicy,
+  type RemoteWriteAuthorization,
   type SupervisedAction,
 } from "../supervision/financialSafety.js";
+
+/**
+ * A placeholder passed when no write is needed, so the parameter is never
+ * optional. It is NOT an authorization: the adapter refuses it, which is what
+ * makes "adopting an existing pull request performs no write" true by
+ * construction rather than by inspection.
+ */
+const UNAUTHORIZED: RemoteWriteAuthorization = Object.freeze({ kind: "NONE" });
 
 export type PublishOutcome =
   | {
@@ -142,6 +151,7 @@ export async function readLocalState(
 async function ensurePullRequest(
   github: GitHubClient,
   candidate: ReviewedCandidate,
+  authorization: RemoteWriteAuthorization,
   known?: RemotePullRequest,
 ): Promise<
   | { readonly ok: true; readonly pullRequest: RemotePullRequest; readonly created: boolean }
@@ -152,7 +162,8 @@ async function ensurePullRequest(
     return { ok: true, pullRequest: found, created: false };
   }
   try {
-    const pullRequest = await github.createPullRequest({
+    const pullRequest = await github.createPullRequest(
+      {
       headRef: candidate.headRef,
       baseRef: candidate.baseRef,
       title: `${candidate.roadmapKey}: ${candidate.headSha.slice(0, 12)}`,
@@ -169,7 +180,9 @@ async function ensurePullRequest(
         "",
         "Acceptance is recorded by the Factory's independent review process, not by this pull request.",
       ].join("\n"),
-    });
+      },
+      authorization,
+    );
     return { ok: true, pullRequest, created: true };
   } catch (error) {
     const adopted = await github.findPullRequest(candidate.headRef);
@@ -262,6 +275,7 @@ export async function publishCandidate(
    * on the `pull_request` event the creation raises.
    */
   const needsCreate = existing === undefined;
+  let writeAuthorization: RemoteWriteAuthorization | undefined;
   if (needsCreate) {
     const addsWorkflows = await deps.git
       .addsWorkflows(candidate.baseSha, candidate.headSha)
@@ -279,14 +293,23 @@ export async function publishCandidate(
       observation,
       description: `open a pull request for ${candidate.roadmapKey} candidate ${candidate.headSha}`,
     });
-    const verdict = evaluateFinancialSafety(action, parseFinancialPolicy(deps.financialPolicy));
-    if (!verdict.allowed) {
+    /**
+     * THE GATE MINTS THE PROOF (round-6 review, finding 1). A verdict the
+     * caller merely reads can be ignored by the next caller; an authorization
+     * the WRITE demands cannot be. `authorizeRemoteWrite` evaluates the gate
+     * itself and mints only on an allowed verdict, so there is no arrangement
+     * of callers that reaches a write without one.
+     */
+    const authorized = authorizeRemoteWrite(action, parseFinancialPolicy(deps.financialPolicy));
+    if (!authorized.ok) {
+      const verdict = authorized.verdict;
       return {
         kind: "HUMAN_REQUIRED",
         action,
-        reason: `${verdict.humanActionRequired} Failing target: ${target}. ${action.detail ?? ""}`.trim(),
+        reason: `${verdict.allowed ? "" : verdict.humanActionRequired} Failing target: ${target}. ${action.detail ?? ""}`.trim(),
       };
     }
+    writeAuthorization = authorized.authorization;
   }
 
   /**
@@ -299,7 +322,20 @@ export async function publishCandidate(
    * observed that the gate stops publication before this point, so the
    * behaviour had no positive demonstration while it was inline here.
    */
-  const ensured = await ensurePullRequest(deps.github, candidate, existing);
+  /**
+   * Unreachable without proof: `needsCreate` is the only path that mints one,
+   * and it returns HUMAN_REQUIRED when the gate refuses. Stated rather than
+   * assumed, because a silent fallback here would be a write without a gate.
+   */
+  if (writeAuthorization === undefined && existing === undefined) {
+    return { kind: "REFUSED", reason: "no write authorization was minted for a publication that needs one" };
+  }
+  const ensured = await ensurePullRequest(
+    deps.github,
+    candidate,
+    writeAuthorization ?? UNAUTHORIZED,
+    existing,
+  );
   if (!ensured.ok) {
     return { kind: "REFUSED", reason: ensured.reason };
   }

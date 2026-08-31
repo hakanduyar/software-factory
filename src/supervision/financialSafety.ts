@@ -1096,3 +1096,73 @@ export function evaluateFinancialSafety(action: SupervisedAction, policy: Financ
 
   return { allowed: true, actionClass: effective };
 }
+
+/**
+ * PROOF THAT A REMOTE WRITE WAS AUTHORISED, unforgeable by construction
+ * (round-6 review, finding 1).
+ *
+ * The adapter exposes `createPullRequest`, so exporting the client exported a
+ * way to write without passing the gate — the same defect the round-5 review
+ * found in `ensurePullRequest`, one layer further out. Making the helper
+ * private fixed the module; it did not fix the ADAPTER, because a client with
+ * a write method is a write capability wherever it is constructed.
+ *
+ * Round 5 offered the remedy this implements: "require an unforgeable
+ * post-gate capability". The objection I raised then — that any token a test
+ * can obtain, a bypasser can obtain — is answered by making the token
+ * obtainable ONLY from an ALLOWED verdict this module computed itself. A
+ * caller cannot supply the verdict, cannot reach the `WeakSet`, and cannot
+ * copy a token it never received.
+ *
+ * The consequence today is that the write is structurally unreachable, because
+ * `CREATE_PULL_REQUEST` never earns an allowed verdict while a GitHub App
+ * installation is unobservable. That is not a workaround: it is the same
+ * refusal the gate already returns, now enforced at the point of the write
+ * rather than trusted to a caller's discipline.
+ */
+export interface RemoteWriteAuthorization {
+  /** The action kind this authorization was issued for. */
+  readonly kind: string;
+}
+
+const REMOTE_WRITE_AUTHORIZATIONS = new WeakSet<RemoteWriteAuthorization>();
+
+export type RemoteWriteAuthorizationResult =
+  | { readonly ok: true; readonly authorization: RemoteWriteAuthorization }
+  | { readonly ok: false; readonly verdict: FinancialVerdict };
+
+/**
+ * Evaluates the gate and, ONLY on an allowed verdict, mints proof of it.
+ *
+ * Takes the action and the policy rather than a verdict, so the caller cannot
+ * hand in a verdict it wrote itself — the F4-2 lesson applied to authorization
+ * instead of to effects.
+ */
+export function authorizeRemoteWrite(
+  action: SupervisedAction,
+  policy: FinancialPolicyResult,
+): RemoteWriteAuthorizationResult {
+  const verdict = evaluateFinancialSafety(action, policy);
+  if (!verdict.allowed) {
+    return { ok: false, verdict };
+  }
+  const authorization: RemoteWriteAuthorization = Object.freeze({ kind: action.kind });
+  REMOTE_WRITE_AUTHORIZATIONS.add(authorization);
+  return { ok: true, authorization };
+}
+
+/**
+ * Whether this object is a genuine authorization for THIS kind of write.
+ *
+ * The kind is compared as well as the provenance, because an authorization
+ * minted for one action says nothing about another — the F5-SEC-1 rule, which
+ * exists because binding provenance without binding identity was itself a
+ * finding.
+ */
+export function isRemoteWriteAuthorized(candidate: unknown, kind: string): boolean {
+  if (typeof candidate !== "object" || candidate === null) {
+    return false;
+  }
+  const authorization = candidate as RemoteWriteAuthorization;
+  return REMOTE_WRITE_AUTHORIZATIONS.has(authorization) && authorization.kind === kind;
+}
