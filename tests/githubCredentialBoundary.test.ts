@@ -257,12 +257,32 @@ describe("TASK-016 AC-6: a token in captured process output reaches nothing dura
    * Git answers normally so publication gets far enough to talk to GitHub;
    * `gh` then fails the way a real expired-credential failure does, with the
    * token echoed in its diagnostics.
+   *
+   * IT RECORDS WHAT IT WAS ASKED (round-9 review). The previous version
+   * answered only `remote get-url`, so when `originTarget()` moved to
+   * `ls-remote --get-url` the call fell through to the gh-failure branch,
+   * publication refused at the origin guard, and the redaction assertions
+   * passed without a token ever entering the system. A fixture that goes stale
+   * silently is worse than no fixture: it reports a property nobody tested.
    */
-  function runner(): ProcessRunner {
+  function runner(): ProcessRunner & { seen(): readonly string[] } {
+    const seen: string[] = [];
     return {
+      seen: () => seen,
       async run(request: ProcessRequest): Promise<ProcessResult> {
         const argv = request.argv.join(" ");
-        if (argv.includes("remote get-url")) {
+        // The EXECUTABLE is recorded, not just the argv: "did a gh process
+        // run" is the actual question, and it cannot be answered by matching
+        // subcommand spellings that move.
+        seen.push(`${request.executable} ${argv}`);
+        /**
+         * Both spellings, because this fixture must not decide which one the
+         * adapter is allowed to use. `originTarget` asks git to EXPAND the url
+         * (`ls-remote --get-url`); the reachability assertion below is what
+         * pins that it really got through, so answering both here costs
+         * nothing and removes one way for this file to rot.
+         */
+        if (argv.includes("ls-remote --get-url") || argv.includes("remote get-url")) {
           return result(`https://github.com/${REPO}.git\n`, "", 0);
         }
         if (argv.includes("rev-parse") && argv.includes("HEAD")) {
@@ -287,14 +307,41 @@ describe("TASK-016 AC-6: a token in captured process output reaches nothing dura
     };
   }
 
+  /**
+   * Distinct sentinel paths so the two tools are TELLABLE APART in the record.
+   * Nothing is launched — the runner is scripted — and `resolveExecutable`
+   * requires only that an override be absolute.
+   */
+  const GH = "/usr/bin/sentinel-gh";
+  const GIT = "/usr/bin/sentinel-git";
+
   function deps() {
-    const shared = { processRunner: runner(), cwd: "/tmp", repository: REPO };
+    const processRunner = runner();
+    const shared = { processRunner, cwd: "/tmp", repository: REPO };
     return {
-      github: createGhCliClient({ ...shared, ghPath: "/usr/bin/true", gitPath: "/usr/bin/true" }),
-      git: createGitRepositoryReader({ ...shared, ghPath: "/usr/bin/true", gitPath: "/usr/bin/true" }),
+      github: createGhCliClient({ ...shared, ghPath: GH, gitPath: GIT }),
+      git: createGitRepositoryReader({ ...shared, ghPath: GH, gitPath: GIT }),
       expectedRepository: REPO,
       financialPolicy: { autonomousSpendAllowed: false, autonomousSpendLimit: 0 },
+      processRunner,
     };
+  }
+
+  /**
+   * THE REACHABILITY ASSERTION every case below shares.
+   *
+   * A token can only be redacted if it entered, and it can only enter if a
+   * `gh` command actually ran. Asserting this separately from the absence of
+   * the token is the difference between "no token leaked" and "no token was
+   * ever produced" — two statements that look identical in a passing test and
+   * mean opposite things.
+   */
+  function assertReachedGitHub(seen: readonly string[]): void {
+    const github = seen.filter((entry) => entry.startsWith(`${GH} `));
+    assert.ok(
+      github.length > 0,
+      `publication never reached GitHub, so no token entered the system: ${seen.join(" | ")}`,
+    );
   }
 
   function emptyState(): SupervisorState {
@@ -330,16 +377,17 @@ describe("TASK-016 AC-6: a token in captured process output reaches nothing dura
   });
 
   it("does not carry the token out of the adapter in a thrown error", async () => {
-    const { github } = deps();
+    const d = deps();
 
     await assert.rejects(
-      () => github.repository(),
+      () => d.github.repository(),
       (error: unknown) => {
         const text = error instanceof Error ? `${error.message}\n${error.stack ?? ""}` : String(error);
         assert.ok(!text.includes(LEAK), "the adapter threw an error carrying a GitHub token");
         return true;
       },
     );
+    assertReachedGitHub(d.processRunner.seen());
   });
 
   /**
@@ -348,14 +396,36 @@ describe("TASK-016 AC-6: a token in captured process output reaches nothing dura
    * what it produces.
    */
   it("does not carry the token out of publication, whatever the outcome", async () => {
+    const d = deps();
     let text: string;
     try {
-      text = JSON.stringify(await publishCandidate(deps(), CANDIDATE));
+      text = JSON.stringify(await publishCandidate(d, CANDIDATE));
     } catch (error) {
       text = error instanceof Error ? `${error.message}\n${error.stack ?? ""}` : String(error);
     }
 
+    // Reachability FIRST: without it, "no token in the outcome" is also what a
+    // publication that stopped before GitHub would report.
+    assertReachedGitHub(d.processRunner.seen());
     assert.ok(!text.includes(LEAK), "a GitHub token reached the publication outcome");
+  });
+
+  /**
+   * The origin guard must not be what ends this run — that was exactly the
+   * stale-fixture failure. Asserted directly so the next call-site move fails
+   * here rather than quietly disarming the cases above.
+   */
+  it("gets past the origin guard, so the credential path is genuinely exercised", async () => {
+    const d = deps();
+
+    const outcome = await publishCandidate(d, CANDIDATE).catch(() => undefined);
+
+    const reason = outcome !== undefined && outcome.kind !== "PUBLISHED" ? outcome.reason : "";
+    assert.ok(
+      !/local origin/.test(reason),
+      `publication stopped at the origin guard, so nothing downstream was tested: ${reason}`,
+    );
+    assertReachedGitHub(d.processRunner.seen());
   });
 
   /**
@@ -363,14 +433,16 @@ describe("TASK-016 AC-6: a token in captured process output reaches nothing dura
    * so this models the log boundary with the same function the CLI uses.
    */
   it("does not carry the token into a logged line", async () => {
+    const d = deps();
     let reason: string;
     try {
-      const outcome = await publishCandidate(deps(), CANDIDATE);
+      const outcome = await publishCandidate(d, CANDIDATE);
       reason = outcome.kind === "PUBLISHED" ? "published" : outcome.reason;
     } catch (error) {
       reason = error instanceof Error ? error.message : String(error);
     }
 
+    assertReachedGitHub(d.processRunner.seen());
     assert.ok(!boundedDiagnostic(reason).includes(LEAK), "a GitHub token reached a logged line");
   });
 
