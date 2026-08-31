@@ -118,3 +118,22 @@ C3 problem: it trains a reader to retry until green, which is exactly how a real
 regression gets waved through. The discipline that makes retrying defensible
 here is that every failure ever observed has been in this ONE file, and is
 nameable in advance.
+
+## Mutation-harness versioning (parallel structural audit, TASK-015 round 9)
+
+The mutation harness that produces this branch's kill/survive evidence lives in
+session scratchpad files, outside the repository. After it silently corrupted a
+source file in round 8 (multi-edit mutations re-captured mutated text as the
+baseline), it was hardened: run-start byte+SHA-256 baselines, hash-verified
+restores, and a hard abort on any mismatch. What remains open:
+
+- the harness is not versioned in the repository, so its evidence is not
+  reproducible from the repo alone (a C8 gap);
+- older, still-buggy variants sit beside it in the scratchpad and nothing
+  prevents their reuse;
+- there is no committed regression test replaying the two-edits-one-file
+  corruption.
+
+The fix is a `scripts/mutation/` harness with a self-test, reviewed under its
+own criteria. Deferred rather than folded into TASK-015, whose frozen scope is
+multi-resource authorization, not evidence tooling.

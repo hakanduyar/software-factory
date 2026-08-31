@@ -82,8 +82,18 @@ describe("TASK-015 round-3 finding 3: a declaration is validated as inert data",
    * capability.
    */
   it("refuses an effort this build cannot vouch for", async () => {
+    /**
+     * THE BAD EFFORT IS ON THE REVIEWER, DELIBERATELY — the eighth
+     * sibling-guarded test, found by my own hardened harness rather than by
+     * review. With the bad effort on the IMPLEMENTER, deleting the unified
+     * validator's effort check changed nothing observable: the
+     * implementer-config builder calls `planAiRunConfig` again for the
+     * implementer specifically, and refused there. Only planner and reviewer
+     * efforts have NO second validator, so only they can pin this one.
+     */
     const executor = declaringRaw([
-      { role: "implementer", provider: "claude-code", model: "opus", effort: "not-a-real-effort" },
+      { role: "implementer", provider: "claude-code", model: "opus" },
+      { role: "reviewer", provider: "codex-cli", model: "gpt-5.6-luna", effort: "not-a-real-effort" },
     ]);
 
     const result = await tickWith(executor);
@@ -91,6 +101,46 @@ describe("TASK-015 round-3 finding 3: a declaration is validated as inert data",
     assert.equal(result.kind, "RECOVERY_REQUIRED");
     assert.match(result.kind === "RECOVERY_REQUIRED" ? result.reason : "", /effort/);
     assert.equal(executor.calls().length, 0, "an unvouched effort was launched");
+  });
+
+  /**
+   * AND THE PLANNER, for the same reason as the reviewer above: only the
+   * implementer has a sibling revalidator (the implementer-config builder), so
+   * planner and reviewer are the two roles whose efforts ONLY the unified
+   * validator can refuse — each needs its own case or a bypass scoped to one of
+   * them survives.
+   */
+  it("refuses an unvouched effort on the planner too", async () => {
+    const executor = declaringRaw([
+      { role: "planner", provider: "claude-code", model: "opus", effort: "not-a-real-effort" },
+      { role: "implementer", provider: "claude-code", model: "opus" },
+      { role: "reviewer", provider: "codex-cli", model: "gpt-5.6-luna" },
+    ]);
+
+    const result = await tickWith(executor);
+
+    assert.equal(result.kind, "RECOVERY_REQUIRED");
+    assert.match(result.kind === "RECOVERY_REQUIRED" ? result.reason : "", /effort/);
+    assert.equal(executor.calls().length, 0, "an unvouched planner effort was launched");
+  });
+
+  /**
+   * THE CONTROL THE PREVIOUS VALIDATOR FAILED (round-9 finding 2). `max` is a
+   * documented Claude effort and `planAiRunConfig` accepts it — but the old
+   * parallel validator applied the CODEX effort list to every provider, so a
+   * valid `claude-code/opus:max` declaration was refused. One validator now
+   * answers "can this build launch it" for both routed and declared resources.
+   */
+  it("accepts a declared claude effort the installed CLI documents (max)", async () => {
+    const executor = declaringRaw([
+      { role: "implementer", provider: "claude-code", model: "opus", effort: "max" },
+      { role: "reviewer", provider: "codex-cli", model: "gpt-5.6-luna" },
+    ]);
+
+    const result = await tickWith(executor);
+
+    assert.equal(result.kind, "ADVANCED", `a valid claude max effort was refused: ${JSON.stringify(result)}`);
+    assert.equal(executor.calls().length, 1);
   });
 
   /**

@@ -120,10 +120,10 @@ describe("TASK-015 AC-1/AC-2: the supervisor authorises the set the work declare
     assert.equal(result.kind, "ADVANCED", `expected the item to run, got ${result.kind}`);
     assert.equal(executor.ran(), true);
     /**
-     * The DECLARED roles share one identity. The router's own choice is a
-     * legitimate additional member of the set — it was probed and gated like
-     * every other — so the assertion is about what the work declared, not about
-     * the set being a single element.
+     * The DECLARED roles share one identity. Since round 8 nothing is routed
+     * for work that declares its own resources, so `routed` can no longer
+     * appear in this set — the filter below is retained only so the assertion
+     * stays meaningful if that ever regresses.
      */
     const declaredIdentities = new Set(
       executor
@@ -317,14 +317,21 @@ describe("TASK-015 AC-1/AC-2: the supervisor authorises the set the work declare
       "the unused routed resource was authorised anyway",
     );
     /**
-     * A PROBE COUNT WOULD NOT DISTINGUISH ANYTHING HERE, and asserting one was a
-     * mistake worth recording: the SCHEDULED REFRESH probes every catalogued
-     * resource each tick, so sonnet is probed whether or not it was routed. The
-     * property this case pins is that a fully-free declaration is not refused by
-     * a resource outside it, and the mutation that must fail it is the one
-     * restoring the whole original order -- routing selected AND gated before
-     * the declaration is even asked for.
+     * EXACTLY ONE PROBE (round-9 finding 3). An earlier comment here said a
+     * probe count could not distinguish anything, and that was half right: a
+     * count of ZERO cannot, because the scheduled refresh legitimately probes
+     * every catalogued resource once. A count of EXACTLY ONE can — the routing
+     * path's pre-launch confirmation (F4-3) would add a SECOND probe of the
+     * resource it selects. The reviewer proved the outcome alone was not
+     * enough: with routing restored by a single compiled edit, the routed
+     * resource was probed but never gated, the declared implementer's action
+     * still won, and this test passed while its named guard was gone.
      */
+    assert.equal(
+      probe.probeCount("claude-code", "sonnet"),
+      1,
+      "the unused routed resource was probed a second time, so routing ran for declared work",
+    );
   });
 
   /**

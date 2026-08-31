@@ -41,7 +41,6 @@ import {
 } from "./financialSafety.js";
 import {
   reconcileReportedIdentity,
-  SUPPORTED_CODEX_EFFORTS,
   SUPPORTED_MODELS,
   type AiRunConfigRecord,
 } from "./modelEnforcement.js";
@@ -374,8 +373,31 @@ export class SupervisorService {
     }
     const defined = catalogued.state;
 
+    /**
+     * 1a. RESOURCES RECONCILE BEFORE ANY PATH THAT CAN PUBLISH A WAKE
+     * (round-8 finding 1, ordering half found in round 9).
+     *
+     * Round 8 made this the single chokepoint and placed it before refresh --
+     * but `reconcileClaim` below can RETURN EARLY (a lost RUNNING claim), and
+     * `publishWake` then computes the next wake from the raw persisted rows. The
+     * reviewer measured it: an uncatalogued `rogue:ghost` row survived a
+     * lost-owner early return and supplied the published wake time, so removed
+     * catalog entries still controlled scheduling.
+     *
+     * So the chokepoint runs here, after the two tamper-refusal gates and before
+     * anything else. The tamper-refusal paths above (broken chain, roadmap
+     * disagreement) deliberately do NOT reconcile: those states are refused
+     * precisely because WRITING to them is the hazard, and their advisory wake
+     * is not recomputed from state the tick refused to touch.
+     *
+     * Filtering at each reader is how this task repeatedly left a sibling call
+     * site open; reconciling once, here, means every later reader -- refresh,
+     * `anyUsable`, wake, routing, declaration -- sees configuration, not rows.
+     */
+    const resourcesReconciled = await this.reconcileResourcesWithCatalog(defined);
+
     // 1. Reconcile any claim left behind by a previous process.
-    const reconciled = await this.reconcileClaim(defined);
+    const reconciled = await this.reconcileClaim(resourcesReconciled);
     if (reconciled.result !== undefined) {
       return reconciled.result;
     }
@@ -406,23 +428,7 @@ export class SupervisorService {
     // 2. Refresh only resources whose retry is actually due. A resource with a
     //    known retryAt in the future is deliberately NOT probed: probing early
     //    costs something and tells us nothing new.
-    /**
-     * ONE CHOKEPOINT, NOT FOUR FILTERS (round-8 finding 1).
-     *
-     * Round 7 filtered ROUTING candidates by the code catalog and left refresh,
-     * usability promotion and wake calculation reading the persisted rows
-     * directly. The reviewer used that: a stale AVAILABLE row for a resource the
-     * catalog no longer carries promoted a waiting AI item, which then blocked
-     * an eligible deterministic one. And a resource ADDED to the catalog was
-     * never seeded, so it could never be probed or routed.
-     *
-     * Filtering at each reader is how this task has repeatedly left a sibling
-     * call site open. Reconciling ONCE, here, means every later reader --
-     * refresh, `anyUsable`, wake, routing, declaration -- is already looking at
-     * configuration rather than at rows.
-     */
-    current = await this.reconcileResourcesWithCatalog(current);
-
+    // Resources were reconciled at step 1a, before any early return.
     current = await this.refreshDueResources(current);
 
     // 3. Recompute eligibility: from the dependency DAG, and from whether any
@@ -549,7 +555,21 @@ export class SupervisorService {
     const kept = state.resources.filter((record) => catalogued.has(record.key));
     const present = new Set(kept.map((record) => record.key));
     const now = this.deps.clock.now();
-    const added = [...catalogued.entries()]
+    /**
+     * EACH LITERAL IS PINNED WITH `satisfies` (parallel structural audit,
+     * round 9). The first version wrote `reason:` -- a field `ResourceRecord`
+     * does not have -- and the explicit field-by-field serializer silently
+     * DROPPED it on persist: the code claimed to record why, and the record
+     * lost it.
+     *
+     * An array annotation alone was tried first and MEASURED not to bite: the
+     * `reason` regression still compiled under `const added: ResourceRecord[]`,
+     * because freshness does not survive the filter/map chain. `satisfies` on
+     * the literal itself does perform excess-property checking, so the
+     * regression is now a compile error -- and the mutation harness verifies
+     * that by expecting the mutated source NOT to compile.
+     */
+    const added: ResourceRecord[] = [...catalogued.entries()]
       .filter(([key]) => !present.has(key))
       .map(([key, entry]) => ({
         provider: entry.provider,
@@ -560,11 +580,11 @@ export class SupervisorService {
         // availability, which is the inversion this whole boundary exists to
         // prevent.
         state: "UNKNOWN_FAILURE" as const,
-        reason: "newly configured; not probed yet",
+        diagnostic: "newly configured; not probed yet",
         detectedAt: now,
         lastCheckedAt: 0 as typeof now,
         backoff: NO_BACKOFF,
-      }));
+      } satisfies ResourceRecord));
 
     if (kept.length === state.resources.length && added.length === 0) {
       return state;
@@ -1378,7 +1398,15 @@ export class SupervisorService {
       actionId,
       roadmapKey: item.key,
       kind: action.kind,
-      ...(config?.ok === true ? { resourceKey: resourceKey(config.option.provider, config.option.model) } : {}),
+      // The durable in-flight claim names the resource that will actually
+      // run: the declared implementer when there is one (round-9 note), else
+      // the routed choice. A claim naming a resource nothing launches is a
+      // record that is wrong while the work is still in flight.
+      ...(implementerConfig !== undefined
+        ? { resourceKey: resourceKey(implementerConfig.effectiveProvider, implementerConfig.effectiveModel) }
+        : config?.ok === true
+          ? { resourceKey: resourceKey(config.option.provider, config.option.model) }
+          : {}),
       state: "CLAIMED",
       ownerId: this.ownerId,
       attempt,
@@ -1643,20 +1671,22 @@ export class SupervisorService {
       entry.model === record.effectiveModel &&
       entry.effort === record.effectiveEffort;
 
+    /**
+     * THE MEMBER BASIS IS BUILT FIELD BY FIELD TOO (round-9 finding 4).
+     *
+     * This branch SPREAD `runConfig` and overrode fields conditionally -- so
+     * when the member named no effort, the implementer's effort survived the
+     * spread into the member's record. That inheritance is the same defect
+     * round 4 fixed in `asRecord`, in the sibling branch; and it MASKED the
+     * effort-membership term: with the term deleted, a report matched the
+     * effortless planner first, yet the inherited effort made reconciliation
+     * appear to agree. The reviewer's compiled mutation survived on exactly
+     * that. `asRecord` inherits nothing, so the mutation now dies.
+     */
     const basis =
       runConfig === undefined || member === undefined || sameAsBasis(member, implementerBasis)
         ? implementerBasis
-        : {
-            ...runConfig,
-            requestedProvider: member.provider,
-            requestedModel: member.model,
-            ...(member.effort === undefined ? {} : { requestedEffort: member.effort }),
-            effectiveProvider: member.provider,
-            effectiveModel: member.model,
-            ...(member.effort === undefined ? {} : { effectiveEffort: member.effort }),
-            argvEvidence: [],
-            note: `${runConfig.note}; reconciled against the authorised ${member.role} resource`,
-          };
+        : asRecord(member, `reconciled against the authorised ${member.role} resource`);
     const reconciled =
       basis === undefined
         ? undefined
@@ -3173,21 +3203,30 @@ function describeDeclarationProblem(declared: readonly RequiredResource[]): stri
     if (!Object.hasOwn(SUPPORTED_MODELS, resource.provider)) {
       return `provider ${JSON.stringify(boundedDiagnostic(resource.provider))} is not a provider this build can launch`;
     }
-    const models = SUPPORTED_MODELS[resource.provider as keyof typeof SUPPORTED_MODELS];
-    if (!Array.isArray(models) || !models.includes(resource.model)) {
-      return `model ${JSON.stringify(boundedDiagnostic(resource.model))} is not a supported model for ${resource.provider}`;
-    }
     /**
-     * EFFORT IS VALIDATED TOO. `not-a-real-effort` was accepted and reached a
-     * launch. `modelEnforcement` refuses an effort it cannot vouch for when it
-     * builds a run configuration, and the set path skipped that entirely — so a
-     * capability this task added was weaker than the path it widened.
+     * ONE VALIDATOR FOR "CAN THIS BUILD LAUNCH IT" (round-9 finding 2).
+     *
+     * The previous version kept a PARALLEL validator here: its own
+     * `SUPPORTED_MODELS` lookup plus the CODEX effort list applied to EVERY
+     * provider. Two validators for one question is the sibling pattern in
+     * validation form, and the reviewer found its predicted divergence:
+     * `claude-code/opus:max` -- which the installed CLI documents and
+     * `planAiRunConfig` accepts -- was refused on the declared path only.
+     *
+     * `planAiRunConfig` is the validator routing already uses (inside
+     * `selectResource`), so declared and routed resources now answer the same
+     * question in the same place. The record is DISCARDED: this is validation;
+     * the implementer's real record is built at gating time.
      */
-    if (
-      resource.effort !== undefined &&
-      !(SUPPORTED_CODEX_EFFORTS as readonly string[]).includes(resource.effort)
-    ) {
-      return `effort ${JSON.stringify(boundedDiagnostic(resource.effort))} is not one of ${SUPPORTED_CODEX_EFFORTS.join(", ")}`;
+    const probe = planAiRunConfig({
+      provider: resource.provider as keyof typeof SUPPORTED_MODELS,
+      model: resource.model,
+      ...(resource.effort === undefined ? {} : { effort: resource.effort }),
+      role:
+        resource.role === "planner" ? "PLANNER" : resource.role === "implementer" ? "IMPLEMENTER" : "REVIEWER",
+    });
+    if (!probe.ok) {
+      return `resource ${resource.provider}/${resource.model} cannot be launched by this build: ${probe.reason}`;
     }
   }
 

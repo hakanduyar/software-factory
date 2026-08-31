@@ -79,6 +79,8 @@ describe("TASK-015 round-7 finding 1: routing is bounded by the code catalog", (
    * selecting one: `runItem` built its candidate map from `state.resources`, so
    * appending an AVAILABLE `claude-code/sonnet` row was enough to have it
    * routed and launched, ahead of the only resource this installation carries.
+   * Since round 8 the guard is the reconciliation chokepoint at the top of the
+   * tick; this test pins that chokepoint through the routing observable.
    */
   it("does not route a resource that exists only as a persisted row", async () => {
     const executor = recording();
@@ -190,6 +192,66 @@ describe("TASK-015 round-8 finding 1: the catalog reconciles persisted rows", ()
   });
 
   /**
+   * RECONCILIATION RUNS BEFORE ANY EARLY RETURN CAN PUBLISH A WAKE (round-9
+   * finding 1).
+   *
+   * The chokepoint sat after `reconcileClaim`, which returns early on a lost
+   * RUNNING claim — and `publishWake` then computed the next wake from the raw
+   * rows. The reviewer measured an uncatalogued `rogue:ghost` row supplying the
+   * published wake time after exactly that early return, so a removed catalog
+   * entry still controlled scheduling.
+   */
+  it("drops uncatalogued rows even on a tick that returns early", async () => {
+    const executor = recording();
+    const supervisor = newSupervisor({ probe: permissiveProbe(), executor, resourceCatalog: CATALOG });
+    await seedRoadmap(supervisor, [ITEM]);
+
+    const state = await supervisor.repository.load();
+    assert.ok(state !== undefined);
+    await supervisor.repository.compareAndSave(
+      {
+        ...state,
+        version: state.version + 1,
+        resources: [
+          ...state.resources,
+          {
+            provider: "rogue",
+            model: "ghost",
+            key: "rogue:ghost",
+            state: "USAGE_LIMIT_REACHED" as const,
+            detectedAt: 0,
+            lastCheckedAt: 0,
+            retryAt: 1_800_000_005_000,
+            backoff: { attempt: 3, delayMs: 60_000 },
+          } as never,
+        ],
+        // A RUNNING claim owned by a process that no longer exists: the tick
+        // must return early rather than act, which is the window the reviewer
+        // used.
+        activeClaim: {
+          actionId: "a-lost",
+          roadmapKey: ITEM.key,
+          kind: "LAUNCH_AI_WORKER",
+          state: "RUNNING" as const,
+          ownerId: "a-previous-process",
+          attempt: 1,
+          claimedAt: 0,
+        } as never,
+      },
+      state.version,
+    );
+
+    const result = await supervisor.service.tick();
+
+    assert.notEqual(result.kind, "ADVANCED", "a lost RUNNING claim did not stop the tick");
+    const after = await supervisor.repository.load();
+    assert.ok(
+      !(after?.resources ?? []).some((record) => record.key === "rogue:ghost"),
+      "an uncatalogued row survived to control wake publication on an early-return tick",
+    );
+  });
+
+  /**
    * AND A RESOURCE ADDED TO THE CATALOG IS SEEDED, or it could never be probed
    * or routed at all — the other half of the same disagreement.
    */
@@ -206,7 +268,14 @@ describe("TASK-015 round-8 finding 1: the catalog reconciles persisted rows", ()
       state.version,
     );
 
-    await supervisor.service.tick();
+    /**
+     * REACHABLE, NOT MERELY PRESENT (round-9, converting a code-reading
+     * argument into evidence): within one tick the gained resource is seeded,
+     * probed by the refresh that follows reconciliation, and routed. A seeded
+     * row that could never be probed would leave this tick unable to advance.
+     */
+    const result = await supervisor.service.tick();
+    assert.equal(result.kind, "ADVANCED", `the gained resource was never routed: ${JSON.stringify(result)}`);
 
     const after = await supervisor.repository.load();
     assert.ok(
