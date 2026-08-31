@@ -282,7 +282,7 @@ export function createGhCliClient(deps: GhCliDeps): GitHubClient {
       }
     },
 
-    async findPullRequest(headRef: string): Promise<RemotePullRequest | undefined> {
+    async listPullRequests(headRef: string): Promise<readonly RemotePullRequest[]> {
       const raw = await run(deps, gh, [
         "pr",
         "list",
@@ -306,34 +306,35 @@ export function createGhCliClient(deps: GhCliDeps): GitHubClient {
       if (!Array.isArray(parsed)) {
         throw new Error("gh pr list did not return an array");
       }
-      if (parsed.length === 0) {
-        return undefined;
-      }
       /**
-       * MORE THAN ONE OPEN PR FOR ONE BRANCH IS AMBIGUOUS, and ambiguity is
-       * refused rather than resolved by picking the first. GitHub does not
-       * normally permit it, which is precisely why encountering it means
-       * something is not as assumed.
+       * EVERY entry is parsed and returned. The adapter no longer chooses:
+       * it used to throw when more than one was open and silently take
+       * `parsed[0]` when none were, which is arbitrary selection wearing a
+       * different hat. `selectAdoptablePullRequest` decides, and refuses
+       * ambiguity rather than resolving it.
+       *
+       * Parsing stays STRICT — a malformed entry throws rather than being
+       * skipped, because dropping an unreadable pull request from the list is
+       * how a listing of two becomes an unambiguous listing of one.
        */
-      const open = parsed.filter(
-        (entry) => typeof entry === "object" && entry !== null && (entry as Record<string, unknown>)["state"] === "OPEN",
-      );
-      if (open.length > 1) {
-        throw new Error(`more than one open pull request reports head ${JSON.stringify(headRef)}`);
-      }
-      const chosen = (open[0] ?? parsed[0]) as Record<string, unknown>;
-      const number = chosen["number"];
-      if (typeof number !== "number" || !Number.isSafeInteger(number)) {
-        throw new Error("gh pr list did not report a usable pull request number");
-      }
-      return {
-        number,
-        state: stateOf(chosen["state"]),
-        headRef: requireString(chosen, "headRefName", "gh pr list"),
-        headSha: requireSha(chosen, "headRefOid", "gh pr list"),
-        baseRef: requireString(chosen, "baseRefName", "gh pr list"),
-        baseSha: requireSha(chosen, "baseRefOid", "gh pr list"),
-      };
+      return parsed.map((entry) => {
+        if (typeof entry !== "object" || entry === null) {
+          throw new Error("gh pr list returned an entry that is not an object");
+        }
+        const record = entry as Record<string, unknown>;
+        const number = record["number"];
+        if (typeof number !== "number" || !Number.isSafeInteger(number)) {
+          throw new Error("gh pr list did not report a usable pull request number");
+        }
+        return {
+          number,
+          state: stateOf(record["state"]),
+          headRef: requireString(record, "headRefName", "gh pr list"),
+          headSha: requireSha(record, "headRefOid", "gh pr list"),
+          baseRef: requireString(record, "baseRefName", "gh pr list"),
+          baseSha: requireSha(record, "baseRefOid", "gh pr list"),
+        };
+      });
     },
 
     async createPullRequest(input, authorization): Promise<RemotePullRequest> {
@@ -343,9 +344,32 @@ export function createGhCliClient(deps: GhCliDeps): GitHubClient {
        * can route around — a guard in the orchestrator protects the
        * orchestrator, not the capability.
        */
-      if (!isRemoteWriteAuthorized(authorization, "CREATE_PULL_REQUEST")) {
+      /**
+       * THE TARGET IS THIS CLIENT'S OWN, NOT THE TOKEN'S (round-7 HIGH 2).
+       *
+       * Stated as its own comparison with its own message, and that is a
+       * deliberate redundancy: `isRemoteWriteAuthorized` below already refuses
+       * a target mismatch, so deleting these four lines changes not WHETHER a
+       * mismatched token is refused but only WHY.
+       *
+       * It earns its place by being OBSERVABLE. Asking the token where it may
+       * be spent — `isRemoteWriteAuthorized(auth, kind, auth.target)` — is the
+       * whole of the round-7 finding, and it is a mutation that no test could
+       * catch through the combined check alone, because a genuine
+       * CREATE_PULL_REQUEST token cannot be minted (the App channel never
+       * closes) and every obtainable token fails on KIND first. Splitting the
+       * comparison out is what makes "the adapter names its own repository"
+       * a fact a test can hold, rather than a line a reader must trust.
+       */
+      const claimed = (authorization as { readonly target?: unknown } | undefined)?.target;
+      if (claimed !== deps.repository) {
         throw new Error(
-          "createPullRequest requires an authorization minted by authorizeRemoteWrite for CREATE_PULL_REQUEST",
+          `the authorization names target ${JSON.stringify(String(claimed))} but this client writes to ${deps.repository}; authorizeRemoteWrite must issue for the repository being written`,
+        );
+      }
+      if (!isRemoteWriteAuthorized(authorization, "CREATE_PULL_REQUEST", deps.repository)) {
+        throw new Error(
+          `createPullRequest requires an authorization minted by authorizeRemoteWrite for CREATE_PULL_REQUEST on ${deps.repository}`,
         );
       }
       await run(deps, gh, [
@@ -367,11 +391,13 @@ export function createGhCliClient(deps: GhCliDeps): GitHubClient {
        * output, so the object returned carries the same SHA-bound shape every
        * other path produces. `gh pr create` prints a URL; a URL is a label.
        */
-      const created = await this.findPullRequest(input.headRef);
-      if (created === undefined) {
-        throw new Error(`the pull request for ${input.headRef} could not be read back after creation`);
+      const created = await this.listPullRequests(input.headRef);
+      if (created.length !== 1) {
+        throw new Error(
+          `the pull request for ${input.headRef} could not be read back unambiguously after creation (${created.length} reported)`,
+        );
       }
-      return created;
+      return created[0]!;
     },
 
     async checkStatus(sha: string): Promise<RemoteCheckStatus> {
@@ -439,6 +465,22 @@ export function createGitRepositoryReader(deps: GhCliDeps): GitRepositoryReader 
     },
     async isClean(): Promise<boolean> {
       return (await run(deps, git, ["status", "--porcelain"])).trim().length === 0;
+    },
+    /**
+     * Where `origin` actually points (AC-8).
+     *
+     * `get-url` reports the FETCH url, which is the one `git fetch` uses and so
+     * the one that decides what `origin/<base>` contains — the fact this check
+     * is about. An unparseable or absent remote yields `undefined`, which the
+     * core treats as a refusal rather than as permission.
+     */
+    async originTarget(): Promise<string | undefined> {
+      try {
+        const url = (await run(deps, git, ["remote", "get-url", "origin"])).trim();
+        return githubTargetFromUrl(url);
+      } catch {
+        return undefined;
+      }
     },
     /**
      * Refreshes remote-tracking refs so `origin/<base>` is not a stale answer

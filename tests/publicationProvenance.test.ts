@@ -135,6 +135,61 @@ describe("TASK-016 round-6 finding 2: the recorder binds the evidence it writes"
   });
 });
 
+describe("TASK-016 round-7 HIGH 3: incoherent evidence never becomes durable", () => {
+  /**
+   * Matching SHAs made the evidence ABOUT the right commit. It said nothing
+   * about whether the evidence MEANT anything, so `SUCCESS (0)`,
+   * `NO_CHECKS_CONFIGURED (3)` and a conclusion that is not a conclusion all
+   * recorded happily — and a hash-linked chain then made them permanent and
+   * credible.
+   */
+  for (const [label, checks] of [
+    ["a success that counted nothing", { sha: A, conclusion: "SUCCESS", total: 0 }],
+    ["no checks configured, yet three counted", { sha: A, conclusion: "NO_CHECKS_CONFIGURED", total: 3 }],
+    ["a conclusion that is not one", { sha: A, conclusion: "NOT_A_REAL_CONCLUSION", total: 1 }],
+    ["a negative count", { sha: A, conclusion: "SUCCESS", total: -1 }],
+    ["a fractional count", { sha: A, conclusion: "SUCCESS", total: 1.5 }],
+  ] as const) {
+    it(`refuses to record ${label}`, () => {
+      const result = withPublicationRecorded(emptyState(), {
+        roadmapKey: "GITHUB_ORCHESTRATION",
+        pullRequest: PR,
+        checks: checks as unknown as RemoteCheckStatus,
+        recordedAt: 2_000,
+      });
+
+      assert.equal(result.ok, false, `${label} was written into the chain`);
+    });
+  }
+
+  /**
+   * THE CONTROLS. Both legitimate shapes must still record, or the guard above
+   * would be indistinguishable from refusing everything — and the one this
+   * repository actually produces today is the second.
+   */
+  it("records a genuine success", () => {
+    const result = withPublicationRecorded(emptyState(), {
+      roadmapKey: "GITHUB_ORCHESTRATION",
+      pullRequest: PR,
+      checks: { sha: A, conclusion: "SUCCESS", total: 3 },
+      recordedAt: 2_000,
+    });
+
+    assert.equal(result.ok, true, `a coherent success was refused: ${JSON.stringify(result)}`);
+  });
+
+  it("records a genuine absence of checks", () => {
+    const result = withPublicationRecorded(emptyState(), {
+      roadmapKey: "GITHUB_ORCHESTRATION",
+      pullRequest: PR,
+      checks: { sha: A, conclusion: "NO_CHECKS_CONFIGURED", total: 0 },
+      recordedAt: 2_000,
+    });
+
+    assert.equal(result.ok, true, `the state this repository produces today was refused: ${JSON.stringify(result)}`);
+  });
+});
+
 describe("TASK-016: the publication joins the verifiable chain", () => {
   it("appends an entry that verifies and re-anchors", () => {
     const result = withPublicationRecorded(emptyState(), {

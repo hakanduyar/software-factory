@@ -121,7 +121,10 @@ describe("TASK-016 round-6 finding 1: the REAL adapter refuses an unauthorized w
         { headRef: "feat/x", baseRef: "main", title: "t", body: "b" },
         undefined as never,
       ),
-      /authorizeRemoteWrite/,
+      // The TARGET comparison catches this one, because `undefined` names no
+      // repository. Asserted specifically so the case cannot silently start
+      // passing because some other guard happened to fire.
+      /names target "undefined" but this client writes to/,
       "the real adapter accepted an unauthorized write",
     );
     // The refusal must precede the subprocess: a write attempted and then
@@ -135,9 +138,12 @@ describe("TASK-016 round-6 finding 1: the REAL adapter refuses an unauthorized w
     await assert.rejects(
       () => gh.createPullRequest(
         { headRef: "feat/x", baseRef: "main", title: "t", body: "b" },
-        { kind: "CREATE_PULL_REQUEST" },
+        { kind: "CREATE_PULL_REQUEST", target: REPO },
       ),
-      /authorizeRemoteWrite/,
+      // Names the right target, so ONLY the provenance check can refuse it —
+      // which is what makes this a test of the WeakSet rather than of the
+      // target comparison above.
+      /requires an authorization minted by authorizeRemoteWrite/,
       "a forged authorization reached the real adapter",
     );
     assert.deepEqual(r.seen(), []);
@@ -177,10 +183,104 @@ describe("TASK-016 round-6 finding 1: the REAL adapter refuses an unauthorized w
         { headRef: "feat/x", baseRef: "main", title: "t", body: "b" },
         token as never,
       ),
-      /authorizeRemoteWrite/,
-      "an authorization for another action kind opened the write",
+      // A genuine worker token names `ollama:...`, so the target guard reaches
+      // it first. Both facts are true of it and the message states which one
+      // was decisive.
+      /names target .*ollama.*but this client writes to/,
+      "an authorization minted elsewhere opened the write",
     );
     assert.deepEqual(r.seen(), []);
+  });
+
+  /**
+   * THE TARGET COMES FROM THE CLIENT, NOT FROM THE TOKEN (round-7 HIGH 2).
+   *
+   * A genuine token minted for `ollama:qwen2.5-coder:7b` is presented to a
+   * client that writes to `hakanduyar/software-factory`. If the adapter asked
+   * the TOKEN where it may be spent, the comparison would succeed and only the
+   * kind would refuse — so the message is asserted, not merely the rejection.
+   */
+  it("refuses a token whose target is not the repository this client writes to", async () => {
+    const minted = authorizeRemoteWrite(
+      launchAiWorkerAction({
+        resourceKey: "ollama:qwen2.5-coder:7b",
+        observation: observeBilling({
+          provider: "ollama",
+          model: "qwen2.5-coder:7b",
+          billingMode: "INCLUDED_SUBSCRIPTION",
+        }),
+        description: "a local worker",
+      }),
+      parseFinancialPolicy({ autonomousSpendAllowed: false, autonomousSpendLimit: 0 }),
+    );
+    assert.equal(minted.ok, true, "the premise failed: no genuine token to present");
+    if (!minted.ok) return;
+
+    const { client: gh, runner: r } = client({});
+
+    await assert.rejects(
+      () => gh.createPullRequest(
+        { headRef: "feat/x", baseRef: "main", title: "t", body: "b" },
+        minted.authorization,
+      ),
+      /names target .*ollama.*but this client writes to hakanduyar\/software-factory/,
+      "the adapter accepted the token's own idea of where it may be spent",
+    );
+    assert.deepEqual(r.seen(), []);
+  });
+
+  /**
+   * THE KIND IS DEMANDED SPECIFICALLY, isolated from the target comparison.
+   *
+   * Every genuinely mintable token names a target like `ollama:model`, so the
+   * target guard reaches all of them first and the KIND comparison never gets
+   * to decide anything — which is exactly why replacing the literal
+   * `"CREATE_PULL_REQUEST"` with the token's OWN kind survived mutation.
+   *
+   * So the client here is configured with a repository that EQUALS the token's
+   * target. That is a nonsense repository name, and deliberately so: it is the
+   * only arrangement in which the target matches and the kind is the sole
+   * remaining question. (It is possible because the adapter does not validate
+   * the shape of the repository it is constructed with — recorded rather than
+   * changed, because the repository comes from a trusted CLI argument and
+   * narrowing it belongs to whatever work owns that argument.)
+   */
+  it("demands the CREATE_PULL_REQUEST kind even when the target matches", async () => {
+    const RESOURCE = "ollama:qwen2.5-coder:7b";
+    const minted = authorizeRemoteWrite(
+      launchAiWorkerAction({
+        resourceKey: RESOURCE,
+        observation: observeBilling({
+          provider: "ollama",
+          model: "qwen2.5-coder:7b",
+          billingMode: "INCLUDED_SUBSCRIPTION",
+        }),
+        description: "a local worker",
+      }),
+      parseFinancialPolicy({ autonomousSpendAllowed: false, autonomousSpendLimit: 0 }),
+    );
+    assert.equal(minted.ok, true, "the premise failed: no genuine token to present");
+    if (!minted.ok) return;
+
+    const seenRunner = runner({});
+    const gh = createGhCliClient({
+      processRunner: seenRunner,
+      cwd: "/tmp",
+      // Matches the token's target, so ONLY the kind can refuse.
+      repository: RESOURCE,
+      ghPath: "/usr/bin/true",
+      gitPath: "/usr/bin/true",
+    });
+
+    await assert.rejects(
+      () => gh.createPullRequest(
+        { headRef: "feat/x", baseRef: "main", title: "t", body: "b" },
+        minted.authorization,
+      ),
+      /requires an authorization minted by authorizeRemoteWrite for CREATE_PULL_REQUEST/,
+      "a token of another kind opened the write once its target matched",
+    );
+    assert.deepEqual(seenRunner.seen(), [], "gh ran before the kind was checked");
   });
 
   /**
@@ -196,6 +296,69 @@ describe("TASK-016 round-6 finding 1: the REAL adapter refuses an unauthorized w
     );
 
     assert.equal(minted.ok, false, "the gate minted a write authorization for a pull request");
+  });
+});
+
+describe("TASK-016 AC-5 (amended): the adapter reports every pull request it is told about", () => {
+  function entry(number: number, headSha: string, state = "OPEN") {
+    return {
+      number,
+      state,
+      headRefName: "feat/executor-wiring",
+      headRefOid: headSha,
+      baseRefName: "main",
+      baseRefOid: "3333333333333333333333333333333333333333",
+    };
+  }
+
+  /**
+   * THE ADAPTER NO LONGER CHOOSES. It used to throw when more than one was open
+   * and silently take `parsed[0]` when none were — arbitrary selection wearing
+   * a different hat. Ambiguity is now a fact the adapter REPORTS and
+   * `selectAdoptablePullRequest` refuses.
+   */
+  it("returns both pull requests when the remote reports two", async () => {
+    const { client: gh } = client({
+      "pr list": JSON.stringify([entry(7, A), entry(9, A)]),
+    });
+
+    const listed = await gh.listPullRequests("feat/executor-wiring");
+
+    assert.equal(listed.length, 2, "the adapter narrowed an ambiguous listing to one");
+    assert.deepEqual(listed.map((pr) => pr.number).sort((x, y) => x - y), [7, 9]);
+  });
+
+  /** Including when NONE are open, which is where `parsed[0]` used to be taken. */
+  it("returns every closed pull request rather than picking one", async () => {
+    const { client: gh } = client({
+      "pr list": JSON.stringify([entry(7, A, "CLOSED"), entry(9, A, "MERGED")]),
+    });
+
+    const listed = await gh.listPullRequests("feat/executor-wiring");
+
+    assert.equal(listed.length, 2, "a closed listing was narrowed to one");
+  });
+
+  it("returns an empty list when the remote reports none", async () => {
+    const { client: gh } = client({ "pr list": "[]" });
+
+    assert.deepEqual(await gh.listPullRequests("feat/executor-wiring"), []);
+  });
+
+  /**
+   * A malformed entry THROWS rather than being skipped: dropping an unreadable
+   * pull request is how a listing of two becomes an unambiguous listing of one.
+   */
+  it("refuses a listing containing an entry it cannot read", async () => {
+    const { client: gh } = client({
+      "pr list": JSON.stringify([entry(7, A), { number: "not-a-number" }]),
+    });
+
+    await assert.rejects(
+      () => gh.listPullRequests("feat/executor-wiring"),
+      /pull request number/,
+      "an unreadable entry was silently dropped from the listing",
+    );
   });
 });
 
@@ -399,4 +562,3 @@ describe("TASK-016 HIGH 4: malformed remote responses fail closed", () => {
     assert.equal(status.conclusion, "FAILURE");
   });
 });
-

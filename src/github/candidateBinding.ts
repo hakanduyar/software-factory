@@ -224,6 +224,106 @@ export function checkPublishPreconditions(input: {
  * base advancing, a PR being closed and reopened are all ordinary — which is
  * exactly why they must be checked rather than assumed away.
  */
+/**
+ * Which pull request, if any, this candidate may ADOPT (AC-5 amended, 4/5/8/9).
+ *
+ * Publication cannot create a pull request: the zero-cost gate never authorizes
+ * the write, because an installed GitHub App on the target can meter it and is
+ * not observable with these credentials. So a human creates the pull request,
+ * and the Factory's job is to ADOPT the right one — which makes "the right one"
+ * a question that must be answered by identity rather than by convenience.
+ *
+ * FOUR OUTCOMES, because collapsing them loses the distinction that matters:
+ *
+ *   ADOPT       exactly one listed pull request BINDS to this candidate
+ *   ABSENT      none exist; a human must publish, and no write happens here
+ *   UNBINDABLE  some exist, none bind — the head moved, the base differs, the
+ *               state is not OPEN. NOT the same as absent: creating another
+ *               pull request would be wrong, so this is a refusal, not a
+ *               request for publication.
+ *   AMBIGUOUS   more than one binds. GitHub does not normally permit this,
+ *               which is exactly why encountering it means something is not as
+ *               assumed. Fail closed: do not pick one, do not create another.
+ *
+ * The ambiguity decision lives HERE rather than in the adapter on purpose. The
+ * adapter used to throw on multiple open pull requests, and — when none were
+ * open — fall back to `parsed[0]`, which is arbitrary selection by another
+ * name. A pure function makes both the choice and its absence testable.
+ *
+ * A repeated listing of the SAME number still counts as more than one. A remote
+ * that reports one pull request twice is not a remote whose count we should be
+ * quietly correcting.
+ */
+export type PullRequestAdoption =
+  | { readonly kind: "ADOPT"; readonly pullRequest: RemotePullRequest }
+  | { readonly kind: "ABSENT"; readonly reason: string }
+  | { readonly kind: "UNBINDABLE"; readonly reason: string }
+  | { readonly kind: "AMBIGUOUS"; readonly reason: string; readonly numbers: readonly number[] };
+
+export function selectAdoptablePullRequest(input: {
+  readonly candidate: ReviewedCandidate;
+  readonly repository: RemoteRepository;
+  readonly expectedRepository: string;
+  readonly pullRequests: readonly RemotePullRequest[];
+}): PullRequestAdoption {
+  /**
+   * Checked before anything else so this function is correct on its own rather
+   * than only in the caller that already checked. An empty listing from the
+   * WRONG repository must not read as "none exist, please publish".
+   */
+  if (input.repository.nameWithOwner !== input.expectedRepository) {
+    return {
+      kind: "UNBINDABLE",
+      reason: `the remote reports repository ${JSON.stringify(input.repository.nameWithOwner)} but this action expects ${JSON.stringify(input.expectedRepository)}`,
+    };
+  }
+
+  const bound = input.pullRequests.filter(
+    (pullRequest) =>
+      checkRemoteCandidateBinding({
+        candidate: input.candidate,
+        repository: input.repository,
+        expectedRepository: input.expectedRepository,
+        pullRequest,
+      }).ok,
+  );
+
+  if (bound.length > 1) {
+    const numbers = bound.map((pullRequest) => pullRequest.number);
+    return {
+      kind: "AMBIGUOUS",
+      reason: `${bound.length} pull requests bind to ${input.candidate.headSha} (#${numbers.join(", #")}); ambiguous remote state is refused rather than resolved by choosing one`,
+      numbers,
+    };
+  }
+  if (bound.length === 1) {
+    return { kind: "ADOPT", pullRequest: bound[0]! };
+  }
+  if (input.pullRequests.length === 0) {
+    return {
+      kind: "ABSENT",
+      reason: `no pull request exists for ${input.candidate.headRef} on ${input.expectedRepository}`,
+    };
+  }
+  /**
+   * Pull requests exist but none bind. The FIRST refusal is reported verbatim,
+   * because "pull request #7 now points at B but A was reviewed" is the fact
+   * the operator needs — a generic "none matched" would discard it.
+   */
+  const first = checkRemoteCandidateBinding({
+    candidate: input.candidate,
+    repository: input.repository,
+    expectedRepository: input.expectedRepository,
+    pullRequest: input.pullRequests[0],
+  });
+  return {
+    kind: "UNBINDABLE",
+    reason: first.ok
+      ? "a pull request bound and was then filtered out, which cannot happen"
+      : first.reason,
+  };
+}
+
 export function checkRemoteCandidateBinding(input: {
   readonly candidate: ReviewedCandidate;
   readonly repository: RemoteRepository;
@@ -283,6 +383,49 @@ export function checkRemoteCandidateBinding(input: {
  * "the remote moved" and "the evidence is about a different commit" need
  * different words in front of a human.
  */
+/**
+ * Whether a check status is INTERNALLY COHERENT (round-7 review, HIGH 3).
+ *
+ * Distinct from `checkCheckEvidence`, which asks whether the status is a PASS.
+ * This asks a smaller and earlier question — is this a thing that could have
+ * happened? — because the recorder must write `NO_CHECKS_CONFIGURED (0)`, which
+ * is a legitimate fact and not a pass, while refusing `SUCCESS (0)`,
+ * `NO_CHECKS_CONFIGURED (3)` and a conclusion that is not a conclusion.
+ *
+ * The reviewer's point is that a hash-linked append-only chain makes whatever
+ * it records permanent AND credible, so nonsense recorded there is worse than
+ * nonsense discarded. `CheckConclusion` is a compile-time type and the adapter
+ * parses untrusted remote text, so the membership test has to exist at runtime.
+ */
+export function checkStatusCoherent(checks: RemoteCheckStatus): BindingVerdict {
+  if (!isCommitSha(checks.sha)) {
+    return refuse(`the check status did not name a full commit id (${JSON.stringify(checks.sha)})`);
+  }
+  if (!(CHECK_CONCLUSIONS as readonly string[]).includes(checks.conclusion)) {
+    return refuse(
+      `${JSON.stringify(String(checks.conclusion))} is not a check conclusion this Factory recognises`,
+    );
+  }
+  if (!Number.isSafeInteger(checks.total) || checks.total < 0) {
+    return refuse(
+      `the check status counted ${JSON.stringify(checks.total)} checks, which is not a count`,
+    );
+  }
+  /**
+   * The two contradictions that would otherwise read as evidence: a success
+   * that counted nothing, and an absence of checks that counted some.
+   */
+  if (checks.conclusion === "SUCCESS" && checks.total === 0) {
+    return refuse(`the check status claims SUCCESS for ${checks.sha} but counted no checks`);
+  }
+  if (checks.conclusion === "NO_CHECKS_CONFIGURED" && checks.total !== 0) {
+    return refuse(
+      `the check status claims no checks are configured for ${checks.sha} but counted ${checks.total}`,
+    );
+  }
+  return { ok: true };
+}
+
 export function checkCheckEvidence(input: {
   readonly candidate: ReviewedCandidate;
   readonly checks: RemoteCheckStatus | undefined;

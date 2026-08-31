@@ -16,7 +16,15 @@ import { readFileSync } from "node:fs";
 import {
   GITHUB_CLI_ENV_ALLOWLIST,
   GITHUB_CLI_ENVIRONMENT_POLICY,
+  createGhCliClient,
+  createGitRepositoryReader,
 } from "../src/adapters/github/ghCliClient.js";
+import { publishCandidate } from "../src/github/publishCandidate.js";
+import { withPublicationRecorded } from "../src/github/publicationProvenance.js";
+import type { ProcessRequest, ProcessResult, ProcessRunner } from "../src/ports/processRunner.js";
+import type { ReviewedCandidate } from "../src/github/candidateBinding.js";
+import type { SupervisorState } from "../src/supervision/supervisorTypes.js";
+import type { Timestamp } from "../src/domain/time.js";
 import { ISOLATED_EXECUTOR_ENV_ALLOWLIST } from "../src/adapters/supervision/isolatedExecutor.js";
 import { buildWorkerEnvironment, redactSecrets } from "../src/adapters/workers/environmentPolicy.js";
 import { boundedDiagnostic } from "../src/supervision/resourceClassifier.js";
@@ -201,5 +209,196 @@ describe("TASK-016 AC-6: the adapter itself cannot be talked into leaking", () =
     for (const forbidden of ["--force", "force-with-lease", "--delete", "push -f", "reset --hard"]) {
       assert.ok(!source.includes(forbidden), `the adapter can ${forbidden}`);
     }
+  });
+});
+
+/**
+ * AC-6 END TO END (round-7 review, BLOCKING 5).
+ *
+ * The cases above exercise the redactors directly, which proves the redactors
+ * work and NOT that anything actually calls them. This drives the REAL adapter
+ * over a scripted `ProcessRunner` whose captured output carries a token-shaped
+ * value, and follows that value outward through every place it could come to
+ * rest: the thrown error, the publication outcome, the line the CLI would log,
+ * and the durable provenance record.
+ *
+ * Offline: the scripted runner never launches anything.
+ */
+describe("TASK-016 AC-6: a token in captured process output reaches nothing durable", () => {
+  const LEAK = "ghs_0123456789abcdefghijklmnopqrstuvwxyzAB";
+  const HEAD = "1111111111111111111111111111111111111111";
+  const BASE = "3333333333333333333333333333333333333333";
+  const REPO = "hakanduyar/software-factory";
+
+  const CANDIDATE: ReviewedCandidate = {
+    roadmapKey: "GITHUB_ORCHESTRATION",
+    headSha: HEAD,
+    baseSha: BASE,
+    baseRef: "main",
+    headRef: "feat/executor-wiring",
+  };
+
+  function result(stdout: string, stderr: string, exitCode: number): ProcessResult {
+    return {
+      terminationReason: "EXITED",
+      exitCode,
+      signal: null,
+      stdout,
+      stderr,
+      stdoutTruncated: false,
+      stderrTruncated: false,
+      startedAt: 0 as Timestamp,
+      finishedAt: 1 as Timestamp,
+      durationMs: 1,
+    };
+  }
+
+  /**
+   * Git answers normally so publication gets far enough to talk to GitHub;
+   * `gh` then fails the way a real expired-credential failure does, with the
+   * token echoed in its diagnostics.
+   */
+  function runner(): ProcessRunner {
+    return {
+      async run(request: ProcessRequest): Promise<ProcessResult> {
+        const argv = request.argv.join(" ");
+        if (argv.includes("remote get-url")) {
+          return result(`https://github.com/${REPO}.git\n`, "", 0);
+        }
+        if (argv.includes("rev-parse") && argv.includes("HEAD")) {
+          return result(`${HEAD}\n`, "", 0);
+        }
+        if (argv.includes("rev-parse")) {
+          return result(`${BASE}\n`, "", 0);
+        }
+        if (argv.includes("status --porcelain")) {
+          return result("", "", 0);
+        }
+        if (argv.includes("fetch") || argv.includes("merge-base")) {
+          return result("", "", 0);
+        }
+        // Everything reaching GitHub fails, loudly, with the credential in it.
+        return result(
+          `{"error":"bad credentials, sent ${LEAK}"}`,
+          `gh: authorization header was Bearer ${LEAK} and the request was rejected`,
+          1,
+        );
+      },
+    };
+  }
+
+  function deps() {
+    const shared = { processRunner: runner(), cwd: "/tmp", repository: REPO };
+    return {
+      github: createGhCliClient({ ...shared, ghPath: "/usr/bin/true", gitPath: "/usr/bin/true" }),
+      git: createGitRepositoryReader({ ...shared, ghPath: "/usr/bin/true", gitPath: "/usr/bin/true" }),
+      expectedRepository: REPO,
+      financialPolicy: { autonomousSpendAllowed: false, autonomousSpendLimit: 0 },
+    };
+  }
+
+  function emptyState(): SupervisorState {
+    return {
+      version: 1,
+      financialPolicy: { autonomousSpendAllowed: false, autonomousSpendLimit: 0 },
+      resources: [],
+      roadmap: [],
+      checkpoints: [],
+      escalations: [],
+      provenance: [],
+      updatedAt: 1_000,
+    };
+  }
+
+  /**
+   * The value has to actually be in the captured output, or every assertion
+   * below would pass against a test that plants nothing. This asserts the
+   * PREMISE before asserting the property.
+   */
+  it("really does plant the token in what the process returns", async () => {
+    const produced = await runner().run({
+      executable: "/usr/bin/true",
+      argv: ["repo", "view"],
+      cwd: "/tmp",
+      env: {},
+      timeoutMs: 1_000,
+      maxOutputBytes: 1_000,
+    });
+
+    assert.ok(produced.stderr.includes(LEAK), "the fixture does not contain the token it claims to");
+    assert.ok(produced.stdout.includes(LEAK), "the fixture does not contain the token it claims to");
+  });
+
+  it("does not carry the token out of the adapter in a thrown error", async () => {
+    const { github } = deps();
+
+    await assert.rejects(
+      () => github.repository(),
+      (error: unknown) => {
+        const text = error instanceof Error ? `${error.message}\n${error.stack ?? ""}` : String(error);
+        assert.ok(!text.includes(LEAK), "the adapter threw an error carrying a GitHub token");
+        return true;
+      },
+    );
+  });
+
+  /**
+   * The whole orchestration, not just the adapter. Whatever publication decides
+   * — refusal, escalation or a thrown error — the token must not be anywhere in
+   * what it produces.
+   */
+  it("does not carry the token out of publication, whatever the outcome", async () => {
+    let text: string;
+    try {
+      text = JSON.stringify(await publishCandidate(deps(), CANDIDATE));
+    } catch (error) {
+      text = error instanceof Error ? `${error.message}\n${error.stack ?? ""}` : String(error);
+    }
+
+    assert.ok(!text.includes(LEAK), "a GitHub token reached the publication outcome");
+  });
+
+  /**
+   * The line the CLI would print. `safe()` in the CLI is `boundedDiagnostic`,
+   * so this models the log boundary with the same function the CLI uses.
+   */
+  it("does not carry the token into a logged line", async () => {
+    let reason: string;
+    try {
+      const outcome = await publishCandidate(deps(), CANDIDATE);
+      reason = outcome.kind === "PUBLISHED" ? "published" : outcome.reason;
+    } catch (error) {
+      reason = error instanceof Error ? error.message : String(error);
+    }
+
+    assert.ok(!boundedDiagnostic(reason).includes(LEAK), "a GitHub token reached a logged line");
+  });
+
+  /**
+   * And the durable chain, which is the one that matters most: an entry is
+   * hash-linked and append-only, so a token recorded there is a token published
+   * permanently in a public repository.
+   */
+  it("does not carry the token into the provenance chain", () => {
+    const recorded = withPublicationRecorded(emptyState(), {
+      roadmapKey: `GITHUB_ORCHESTRATION ${LEAK}`,
+      pullRequest: {
+        number: 7,
+        state: "OPEN",
+        headRef: CANDIDATE.headRef,
+        headSha: HEAD,
+        baseRef: "main",
+        baseSha: BASE,
+      },
+      checks: { sha: HEAD, conclusion: "NO_CHECKS_CONFIGURED", total: 0 },
+      recordedAt: 2_000,
+    });
+
+    assert.equal(recorded.ok, true, `the control failed to record: ${JSON.stringify(recorded)}`);
+    if (!recorded.ok) return;
+    assert.ok(
+      !JSON.stringify(recorded.state).includes(LEAK),
+      "a GitHub token was hashed into the provenance chain",
+    );
   });
 });

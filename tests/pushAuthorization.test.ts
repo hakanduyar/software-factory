@@ -15,6 +15,10 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import {
+  authorizeRemoteWrite,
+  isRemoteWriteAuthorized,
+  launchAiWorkerAction,
+  observeBilling,
   DENY_ALL_SPENDING,
   deriveActionClass,
   describePushLiability,
@@ -333,5 +337,153 @@ describe("TASK-016: the push minter did not widen anything else", () => {
       false,
       "a remote probe became free",
     );
+  });
+});
+
+describe("TASK-016 round-7 HIGH 1: the authorization takes its identity from the mint", () => {
+  /**
+   * THE REVIEWER'S ATTACK. `action.kind` is a property READ, and a property can
+   * be an accessor. An object whose `kind` answers `GIT_FETCH` while the gate
+   * is looking — earning a free-remote verdict — and `CREATE_PULL_REQUEST` when
+   * the minting looks a moment later produced a write authorization from a
+   * verdict about something else entirely. One object, two answers.
+   */
+  function shifting(kinds: readonly string[]) {
+    let reads = 0;
+    return {
+      get kind(): string {
+        const answer = kinds[Math.min(reads, kinds.length - 1)]!;
+        reads += 1;
+        return answer;
+      },
+      description: "a pull request wearing a fetch's clothes",
+      detail: "",
+    } as unknown as Parameters<typeof authorizeRemoteWrite>[0];
+  }
+
+  /**
+   * THE REPRODUCTION, and the read ORDER is the whole of it. The token has to
+   * name a write, so `CREATE_PULL_REQUEST` must be the answer whoever mints it
+   * receives; the gate has to be looking at something free, so `GIT_FETCH` —
+   * registered free-but-remote — must be the answer the gate receives.
+   *
+   * This ordering is not incidental: with the kinds the other way round the
+   * gate refuses on its own, the case passes against an implementation that
+   * reads the object, and it proves nothing. My first version had it backwards
+   * and the mutation harness caught it.
+   */
+  it("mints nothing when the write kind is read first and a free kind second", () => {
+    const result = authorizeRemoteWrite(shifting(["CREATE_PULL_REQUEST", "GIT_FETCH"]), ZERO_SPEND);
+
+    assert.equal(result.ok, false, "a shifting kind minted a write authorization");
+  });
+
+  /** The other order refuses too, so no read sequence is a way through. */
+  it("mints nothing when the free kind is read first and the write kind second", () => {
+    const result = authorizeRemoteWrite(shifting(["GIT_FETCH", "CREATE_PULL_REQUEST"]), ZERO_SPEND);
+
+    assert.equal(result.ok, false, "a shifting kind minted a write authorization");
+  });
+
+  /**
+   * NON-VACUITY FOR THE ORDERING ITSELF. A stable `GIT_FETCH` action IS allowed
+   * by the gate, so the refusals above are about the identity being untrusted
+   * rather than about `GIT_FETCH` being refused — which is what would make the
+   * accessor case meaningless.
+   */
+  it("shows a stable GIT_FETCH is one the gate itself allows", () => {
+    const verdict = evaluateFinancialSafety(
+      { kind: "GIT_FETCH", description: "refresh remote-tracking refs" },
+      ZERO_SPEND,
+    );
+
+    assert.equal(verdict.allowed, true, "the premise failed: GIT_FETCH is not a free action");
+  });
+
+  /**
+   * The general rule the fix rests on, stated on its own so it cannot be
+   * satisfied by special-casing accessors: an action nobody minted has no
+   * trustworthy identity, whatever its fields say.
+   */
+  it("mints nothing for a hand-built action object", () => {
+    const handmade = {
+      kind: "CREATE_PULL_REQUEST",
+      description: "handmade",
+      detail: "",
+      effects: { remote: true, costKnownZero: true, canIncurUsageCharges: false },
+    } as unknown as Parameters<typeof authorizeRemoteWrite>[0];
+
+    const result = authorizeRemoteWrite(handmade, ZERO_SPEND);
+
+    assert.equal(result.ok, false, "an unminted action produced a write authorization");
+  });
+
+  /**
+   * NON-VACUITY. The two refusals above must not be true merely because this
+   * gate refuses everything: a genuinely minted, genuinely allowed action DOES
+   * produce a token, so the cases above are about identity rather than about
+   * the gate's mood.
+   */
+  it("still mints for a genuinely minted action the gate allows", () => {
+    const result = authorizeRemoteWrite(
+      launchAiWorkerAction({
+        resourceKey: "ollama:qwen2.5-coder:7b",
+        observation: observeBilling({
+          provider: "ollama",
+          model: "qwen2.5-coder:7b",
+          billingMode: "INCLUDED_SUBSCRIPTION",
+        }),
+        description: "a local worker",
+      }),
+      ZERO_SPEND,
+    );
+
+    assert.equal(result.ok, true, "the premise failed: nothing mints, so nothing above is proven");
+  });
+});
+
+describe("TASK-016 round-7 HIGH 2: the authorization is bound to its target", () => {
+  /** A real token, minted by the gate, carrying a real target. */
+  function minted() {
+    const result = authorizeRemoteWrite(
+      launchAiWorkerAction({
+        resourceKey: "ollama:qwen2.5-coder:7b",
+        observation: observeBilling({
+          provider: "ollama",
+          model: "qwen2.5-coder:7b",
+          billingMode: "INCLUDED_SUBSCRIPTION",
+        }),
+        description: "a local worker",
+      }),
+      ZERO_SPEND,
+    );
+    assert.equal(result.ok, true, "the premise failed: no genuine token to bind");
+    return result.ok ? result.authorization : undefined;
+  }
+
+  it("accepts the token for the exact target it was minted for", () => {
+    assert.equal(
+      isRemoteWriteAuthorized(minted(), "LAUNCH_AI_WORKER", "ollama:qwen2.5-coder:7b"),
+      true,
+      "a genuine token was rejected for its own target",
+    );
+  });
+
+  /**
+   * THE REVIEWER'S SECOND ATTACK, isolated so only the TARGET comparison can
+   * decide it: same genuine token, same kind, different target. The liability
+   * observation that earned the verdict described one place and said nothing
+   * about the other.
+   */
+  it("rejects the same token presented for a different target", () => {
+    assert.equal(
+      isRemoteWriteAuthorized(minted(), "LAUNCH_AI_WORKER", "ollama:some-metered-model"),
+      false,
+      "a token minted for one target authorized a write to another",
+    );
+  });
+
+  it("rejects a token whose target is empty", () => {
+    assert.equal(isRemoteWriteAuthorized(minted(), "LAUNCH_AI_WORKER", ""), false);
   });
 });

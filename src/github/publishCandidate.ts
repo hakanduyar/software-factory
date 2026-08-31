@@ -31,11 +31,12 @@
 
 import {
   checkPublishPreconditions,
-  checkRemoteCandidateBinding,
+  selectAdoptablePullRequest,
   isCommitSha,
   type LocalRepositoryState,
   type RemoteCheckStatus,
   type RemotePullRequest,
+  type RemoteRepository,
   type ReviewedCandidate,
 } from "./candidateBinding.js";
 import type { GitHubClient, GitRepositoryReader } from "./githubPorts.js";
@@ -54,7 +55,7 @@ import {
  * makes "adopting an existing pull request performs no write" true by
  * construction rather than by inspection.
  */
-const UNAUTHORIZED: RemoteWriteAuthorization = Object.freeze({ kind: "NONE" });
+const UNAUTHORIZED: RemoteWriteAuthorization = Object.freeze({ kind: "NONE", target: "" });
 
 export type PublishOutcome =
   | {
@@ -151,15 +152,15 @@ export async function readLocalState(
 async function ensurePullRequest(
   github: GitHubClient,
   candidate: ReviewedCandidate,
+  repository: RemoteRepository,
   authorization: RemoteWriteAuthorization,
   known?: RemotePullRequest,
 ): Promise<
   | { readonly ok: true; readonly pullRequest: RemotePullRequest; readonly created: boolean }
   | { readonly ok: false; readonly reason: string }
 > {
-  const found = known ?? (await github.findPullRequest(candidate.headRef));
-  if (found !== undefined) {
-    return { ok: true, pullRequest: found, created: false };
+  if (known !== undefined) {
+    return { ok: true, pullRequest: known, created: false };
   }
   try {
     const pullRequest = await github.createPullRequest(
@@ -185,14 +186,25 @@ async function ensurePullRequest(
     );
     return { ok: true, pullRequest, created: true };
   } catch (error) {
-    const adopted = await github.findPullRequest(candidate.headRef);
-    if (adopted === undefined) {
+    /**
+     * A create that lost a race is adopted only if the remote now holds ONE
+     * pull request that binds to this candidate. Adopting whatever appeared
+     * would be how a lost race turns into publishing someone else's commit.
+     */
+    const after = await github.listPullRequests(candidate.headRef);
+    const adopted = selectAdoptablePullRequest({
+      candidate,
+      repository,
+      expectedRepository: repository.nameWithOwner,
+      pullRequests: after,
+    });
+    if (adopted.kind !== "ADOPT") {
       return {
         ok: false,
-        reason: `creating the pull request failed and none exists: ${error instanceof Error ? error.message : String(error)}`,
+        reason: `creating the pull request failed and no single bound pull request exists (${adopted.kind}): ${error instanceof Error ? error.message : String(error)}`,
       };
     }
-    return { ok: true, pullRequest: adopted, created: false };
+    return { ok: true, pullRequest: adopted.pullRequest, created: false };
   }
 }
 
@@ -202,6 +214,27 @@ export async function publishCandidate(
 ): Promise<PublishOutcome> {
   if (!isCommitSha(candidate.headSha)) {
     return { kind: "REFUSED", reason: "the candidate does not name a full commit id" };
+  }
+
+  /**
+   * WHERE `origin` POINTS, CHECKED BEFORE ANYTHING IS READ THROUGH IT (AC-8).
+   *
+   * `readLocalState` resolves the base from `origin/<base>` after fetching
+   * `origin`. If `origin` is not the repository this action is permitted to
+   * touch, then the base SHA, the ancestry and the "has the base moved" check
+   * were all computed against a repository nobody verified — while the `gh`
+   * client addressed the right one and reported agreement. The two halves must
+   * name the same place, and this is the half that was never checked.
+   */
+  const originTarget = await deps.git.originTarget();
+  if (originTarget !== deps.expectedRepository) {
+    return {
+      kind: "REFUSED",
+      reason:
+        originTarget === undefined
+          ? `the local origin remote is absent or is not a GitHub repository url, so ${deps.expectedRepository} cannot be confirmed as the base's source`
+          : `the local origin points at ${JSON.stringify(originTarget)} but this action expects ${JSON.stringify(deps.expectedRepository)}`,
+    };
   }
 
   const read = await readLocalState(deps.git, candidate);
@@ -251,9 +284,9 @@ export async function publishCandidate(
    * branch there is the repository agent's job under ADR-0002, not the
    * Factory's.
    */
-  const [remoteBranchSha, existing] = await Promise.all([
+  const [remoteBranchSha, listed] = await Promise.all([
     deps.github.branchSha(candidate.headRef),
-    deps.github.findPullRequest(candidate.headRef),
+    deps.github.listPullRequests(candidate.headRef),
   ]);
   if (remoteBranchSha !== candidate.headSha) {
     return {
@@ -274,6 +307,34 @@ export async function publishCandidate(
    * including what THIS CANDIDATE would introduce: a workflow it adds can run
    * on the `pull_request` event the creation raises.
    */
+  /**
+   * WHICH PULL REQUEST, IF ANY, THIS CANDIDATE MAY ADOPT (AC-5 amended).
+   *
+   * Publication cannot create one — the gate never authorizes the write — so
+   * the operative question is whether a human already published this exact
+   * commit. Four answers, and three of them are not "proceed":
+   *
+   *   AMBIGUOUS   more than one bound pull request. Fail closed. Choosing one
+   *               would be inventing an answer, and creating another would
+   *               compound it.
+   *   UNBINDABLE  pull requests exist but none is this candidate. Refuse — a
+   *               human publishing the WRONG commit is not a reason to publish
+   *               a second one.
+   *   ABSENT      none exist. A human must publish; the gate is still consulted
+   *               below so the refusal comes from the gate rather than from an
+   *               assumption about it.
+   */
+  const selection = selectAdoptablePullRequest({
+    candidate,
+    repository,
+    expectedRepository: target,
+    pullRequests: listed,
+  });
+  if (selection.kind === "AMBIGUOUS" || selection.kind === "UNBINDABLE") {
+    return { kind: "REFUSED", reason: selection.reason };
+  }
+  const existing = selection.kind === "ADOPT" ? selection.pullRequest : undefined;
+
   const needsCreate = existing === undefined;
   let writeAuthorization: RemoteWriteAuthorization | undefined;
   if (needsCreate) {
@@ -306,7 +367,12 @@ export async function publishCandidate(
       return {
         kind: "HUMAN_REQUIRED",
         action,
-        reason: `${verdict.allowed ? "" : verdict.humanActionRequired} Failing target: ${target}. ${action.detail ?? ""}`.trim(),
+        /**
+         * Names the human action the amended AC-5 anticipates. The gate's own
+         * text still leads, because the REASON is the gate's refusal — the
+         * remedy is a consequence of it, not a substitute for it.
+         */
+        reason: `${verdict.allowed ? "" : verdict.humanActionRequired} Failing target: ${target}. ${action.detail ?? ""} A human may open this pull request externally; a later run will adopt it once it names ${candidate.headSha}.`.trim(),
       };
     }
     writeAuthorization = authorized.authorization;
@@ -333,6 +399,7 @@ export async function publishCandidate(
   const ensured = await ensurePullRequest(
     deps.github,
     candidate,
+    repository,
     writeAuthorization ?? UNAUTHORIZED,
     existing,
   );
@@ -354,23 +421,16 @@ export async function publishCandidate(
    * The re-read is also what the RETURNED pull request is built from, so the
    * record and the binding describe one observation rather than two.
    */
-  const current = await deps.github.findPullRequest(candidate.headRef);
-  if (current === undefined) {
-    return {
-      kind: "REFUSED",
-      reason: `the pull request for ${candidate.headRef} could not be read back after acting`,
-    };
-  }
-  const pullRequest = current;
-  const rebound = checkRemoteCandidateBinding({
+  const rebound = selectAdoptablePullRequest({
     candidate,
     repository,
     expectedRepository: target,
-    pullRequest,
+    pullRequests: await deps.github.listPullRequests(candidate.headRef),
   });
-  if (!rebound.ok) {
+  if (rebound.kind !== "ADOPT") {
     return { kind: "REFUSED", reason: rebound.reason };
   }
+  const pullRequest = rebound.pullRequest;
 
   /**
    * The check status is read AFTER the binding holds, and a failure to read it

@@ -1123,6 +1123,16 @@ export function evaluateFinancialSafety(action: SupervisedAction, policy: Financ
 export interface RemoteWriteAuthorization {
   /** The action kind this authorization was issued for. */
   readonly kind: string;
+  /**
+   * The exact target it was issued for (round-7 review, HIGH 2).
+   *
+   * A token carrying only a KIND says "some pull request may be created",
+   * which is not what any gate ever decided. The reviewer minted a token for
+   * one repository and opened a write through a client configured for
+   * another; the liability observation that earned the verdict was about the
+   * first repository and said nothing about the second.
+   */
+  readonly target: string;
 }
 
 const REMOTE_WRITE_AUTHORIZATIONS = new WeakSet<RemoteWriteAuthorization>();
@@ -1137,32 +1147,75 @@ export type RemoteWriteAuthorizationResult =
  * Takes the action and the policy rather than a verdict, so the caller cannot
  * hand in a verdict it wrote itself — the F4-2 lesson applied to authorization
  * instead of to effects.
+ *
+ * THE IDENTITY COMES FROM THE MINT, NEVER FROM THE OBJECT (round-7 review,
+ * HIGH 1). `action.kind` is a property read, and a property can be an
+ * accessor: the reviewer passed an action whose `kind` returned `GIT_FETCH`
+ * while the gate was reading it — earning a free-remote verdict — and
+ * `CREATE_PULL_REQUEST` when the minting read it a moment later. One object,
+ * two answers, and the write was authorized on a verdict about something else.
+ *
+ * Requiring a MINT RECORD closes it by construction rather than by comparing
+ * reads. Records live in a module-private WeakMap keyed by frozen objects that
+ * only `mint` creates, and `mint` snapshots its input with a spread — so a
+ * minted action's `kind` is a data property that cannot answer twice, and an
+ * object carrying an accessor was never minted at all. The same record supplies
+ * the TARGET, so the token cannot claim a repository the verdict never saw.
  */
 export function authorizeRemoteWrite(
   action: SupervisedAction,
   policy: FinancialPolicyResult,
 ): RemoteWriteAuthorizationResult {
+  const record = MINTED.get(action);
+  if (record === undefined || record.resourceKey === undefined) {
+    return {
+      ok: false,
+      verdict: {
+        allowed: false,
+        actionClass: "FINANCIAL_ACTION",
+        reason:
+          record === undefined
+            ? "the action was not produced by a minter, so its identity cannot be trusted"
+            : "the minted action names no target, so an authorization could not be bound to one",
+        humanActionRequired:
+          "Build the action with its own constructor so its identity and target are minted, then retry.",
+      },
+    };
+  }
   const verdict = evaluateFinancialSafety(action, policy);
   if (!verdict.allowed) {
     return { ok: false, verdict };
   }
-  const authorization: RemoteWriteAuthorization = Object.freeze({ kind: action.kind });
+  const authorization: RemoteWriteAuthorization = Object.freeze({
+    kind: record.kind,
+    target: record.resourceKey,
+  });
   REMOTE_WRITE_AUTHORIZATIONS.add(authorization);
   return { ok: true, authorization };
 }
 
 /**
- * Whether this object is a genuine authorization for THIS kind of write.
+ * Whether this object is a genuine authorization for THIS kind of write against
+ * THIS target.
  *
- * The kind is compared as well as the provenance, because an authorization
- * minted for one action says nothing about another — the F5-SEC-1 rule, which
- * exists because binding provenance without binding identity was itself a
- * finding.
+ * Kind AND target are compared as well as provenance. An authorization minted
+ * for one action says nothing about another (F5-SEC-1, which exists because
+ * binding provenance without binding identity was itself a finding), and an
+ * authorization minted for one repository says nothing about another
+ * (round-7 HIGH 2, which is the same lesson one level out: the observation
+ * that earned the verdict described a specific repository).
+ *
+ * Reading the token's fields is safe: membership in the WeakSet proves this
+ * object came from `authorizeRemoteWrite`, which froze it with data properties.
  */
-export function isRemoteWriteAuthorized(candidate: unknown, kind: string): boolean {
+export function isRemoteWriteAuthorized(candidate: unknown, kind: string, target: string): boolean {
   if (typeof candidate !== "object" || candidate === null) {
     return false;
   }
   const authorization = candidate as RemoteWriteAuthorization;
-  return REMOTE_WRITE_AUTHORIZATIONS.has(authorization) && authorization.kind === kind;
+  return (
+    REMOTE_WRITE_AUTHORIZATIONS.has(authorization) &&
+    authorization.kind === kind &&
+    authorization.target === target
+  );
 }

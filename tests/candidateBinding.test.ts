@@ -21,6 +21,7 @@ import {
   type RemotePullRequest,
   type RemoteRepository,
   type ReviewedCandidate,
+  selectAdoptablePullRequest,
 } from "../src/github/candidateBinding.js";
 
 const A = "1111111111111111111111111111111111111111";
@@ -465,5 +466,113 @@ describe("TASK-016 AC-4: neither CI nor review substitutes for the other", () =>
 
     assert.equal(verdict.ok, false);
     assert.match(verdict.ok === false ? verdict.reason : "", /not clean/);
+  });
+});
+
+
+describe("TASK-016 AC-5 (amended): which pull request may be adopted", () => {
+  const repository: RemoteRepository = {
+    nameWithOwner: "hakanduyar/software-factory",
+    defaultBranch: "main",
+    visibility: "PUBLIC",
+    ownerType: "USER",
+    repositoryWebhooks: 0,
+    configuredWorkflows: 0,
+  };
+  const candidate: ReviewedCandidate = {
+    roadmapKey: "GITHUB_ORCHESTRATION",
+    headSha: A,
+    baseSha: BASE,
+    baseRef: "main",
+    headRef: "feat/executor-wiring",
+  };
+  const bound: RemotePullRequest = {
+    number: 7,
+    state: "OPEN",
+    headRef: candidate.headRef,
+    headSha: A,
+    baseRef: "main",
+    baseSha: BASE,
+  };
+  const select = (pullRequests: readonly RemotePullRequest[]) =>
+    selectAdoptablePullRequest({
+      candidate,
+      repository,
+      expectedRepository: repository.nameWithOwner,
+      pullRequests,
+    });
+
+  it("adopts the single pull request that binds", () => {
+    const outcome = select([bound]);
+
+    assert.equal(outcome.kind, "ADOPT");
+    if (outcome.kind !== "ADOPT") return;
+    assert.equal(outcome.pullRequest.number, 7);
+  });
+
+  /** An unrelated pull request in the listing must not make the match unclear. */
+  it("adopts the bound one even when unbound pull requests are listed beside it", () => {
+    const outcome = select([{ ...bound, number: 3, headSha: B }, bound]);
+
+    assert.equal(outcome.kind, "ADOPT");
+    if (outcome.kind !== "ADOPT") return;
+    assert.equal(outcome.pullRequest.number, 7);
+  });
+
+  it("reports ABSENT when the remote lists nothing", () => {
+    assert.equal(select([]).kind, "ABSENT");
+  });
+
+  /**
+   * Distinguished from ABSENT on purpose: something IS published, so the
+   * remedy is not "publish this candidate" but "look at what is there".
+   */
+  it("reports UNBINDABLE when pull requests exist but none names the candidate", () => {
+    const outcome = select([{ ...bound, headSha: B }]);
+
+    assert.equal(outcome.kind, "UNBINDABLE");
+    if (outcome.kind !== "UNBINDABLE") return;
+    assert.match(outcome.reason, new RegExp(B), "the specific reason was discarded");
+  });
+
+  it("reports UNBINDABLE for a pull request that is not OPEN", () => {
+    assert.equal(select([{ ...bound, state: "MERGED" }]).kind, "UNBINDABLE");
+  });
+
+  it("reports UNBINDABLE for a pull request against a different base", () => {
+    assert.equal(select([{ ...bound, baseSha: B }]).kind, "UNBINDABLE");
+  });
+
+  it("fails closed when two pull requests bind", () => {
+    const outcome = select([bound, { ...bound, number: 9 }]);
+
+    assert.equal(outcome.kind, "AMBIGUOUS");
+    if (outcome.kind !== "AMBIGUOUS") return;
+    assert.deepEqual([...outcome.numbers].sort((x, y) => x - y), [7, 9]);
+  });
+
+  /**
+   * The same pull request reported twice is still more than one. A remote whose
+   * count we quietly correct is a remote we have stopped reading.
+   */
+  it("fails closed when the same pull request is listed twice", () => {
+    assert.equal(select([bound, bound]).kind, "AMBIGUOUS");
+  });
+
+  /**
+   * An empty listing from the WRONG repository must not read as "none exist,
+   * please publish" — which is what a caller-side-only check would allow.
+   */
+  it("refuses a listing from a repository other than the expected one", () => {
+    const outcome = selectAdoptablePullRequest({
+      candidate,
+      repository: { ...repository, nameWithOwner: "someone-else/software-factory" },
+      expectedRepository: repository.nameWithOwner,
+      pullRequests: [],
+    });
+
+    assert.equal(outcome.kind, "UNBINDABLE");
+    if (outcome.kind !== "UNBINDABLE") return;
+    assert.match(outcome.reason, /someone-else/);
   });
 });

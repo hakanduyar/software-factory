@@ -249,7 +249,19 @@ export async function runGithubReadiness(
   }
   const local = read.state;
   const repository = await deps.github.repository();
-  const pullRequest = await deps.github.findPullRequest(args.headRef);
+  /**
+   * READINESS READS THE SAME LIST PUBLICATION DOES (AC-5 amended, 9).
+   *
+   * Reporting readiness from an arbitrarily chosen pull request would let the
+   * command answer "ready" about a different one than publication would adopt.
+   * Ambiguity is reported as not-ready rather than resolved here.
+   */
+  const listed = await deps.github.listPullRequests(args.headRef);
+  if (listed.length > 1) {
+    log(`NOT_READY: ${safe(`${listed.length} pull requests report head ${args.headRef}; ambiguous remote state`)}`);
+    return 1;
+  }
+  const pullRequest = listed[0];
   const checks = await deps.github.checkStatus(args.headSha);
 
   const verdict = checkIntegrationReadiness({

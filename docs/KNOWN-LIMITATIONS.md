@@ -879,3 +879,43 @@ exactly one; an absent observation opens all of them; and a separate case shows
 the gate still classifies a genuinely free remote action as free, so the
 refusal is a statement about remote writes rather than an artefact of a gate
 that refuses everything.
+
+## L-15 - The liability observation proves who built it, not that GitHub was asked
+
+Raised as a non-blocking note by the TASK-016 round-7 independent review, in
+its own words: the observation constructor "accepts caller-supplied liability
+facts; its `WeakSet` proves construction by that function, not that GitHub was
+actually queried."
+
+This is correct and worth stating precisely, because the mechanism is easy to
+over-read. `observePushLiability` puts its result in a module-private `WeakSet`
+and `createPullRequestAction` refuses any observation that is absent from it or
+that describes a different target. What that establishes is a chain of custody:
+these numbers came through the observer, and they are about this repository.
+What it does NOT establish is that the numbers are true. A caller that passes
+`repositoryWebhooks: 0` while the repository has nine gets an observation the
+gate will trust, because the observer's job is to bind facts to a target rather
+than to fetch them.
+
+### Why it is not urgent today
+
+Every path that matters refuses anyway. `github-app-subscriptions` cannot be
+closed by any observation, so `createPullRequestAction` derives FINANCIAL for
+every input and no remote write is ever authorised. A caller who lied about the
+webhook count would change the REPORT a human reads, not the verdict. The lie
+would also have to come from inside the trusted orchestration boundary, which
+already holds the GitHub credential and could simply use it.
+
+### What would close it
+
+Have the adapter, not the caller, construct the observation - `observePush-
+Liability` moves behind the `GitHubClient` port, so the only way to obtain one
+is to have actually asked GitHub. The reason that is not done here is scope: it
+changes the port's shape and the observation's provenance model, and TASK-016's
+criteria are frozen. It belongs with `CLEAN_ROOM_CI` or with whatever work
+first needs an observation to be evidence rather than custody.
+
+**Kept honest by:** nothing yet - which is the point of recording it. The
+existing `tests/pushAuthorization.test.ts` cases prove the binding and the
+provenance, and deliberately claim nothing about truthfulness.
+

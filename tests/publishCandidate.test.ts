@@ -74,8 +74,12 @@ interface Scripted {
 function scripted(options: {
   readonly repository?: Partial<RemoteRepository>;
   readonly pullRequest?: RemotePullRequest;
-  /** Answers `findPullRequest` in order; the last value repeats. */
-  readonly pullRequests?: readonly (RemotePullRequest | undefined)[];
+  /**
+   * Answers `listPullRequests` in order; the LAST list repeats. A queue of
+   * lists is what models an interrupted run: the remote answers differently
+   * on the second call because a human published in between.
+   */
+  readonly pullRequests?: readonly (readonly RemotePullRequest[])[];
   readonly local?: {
     headSha?: string;
     baseSha?: string;
@@ -93,6 +97,11 @@ function scripted(options: {
   readonly remoteBranchSha?: string | null;
   /** What `checkStatus` reports as ITS sha; defaults to the one requested. */
   readonly checkStatusSha?: string;
+  /**
+   * What the LOCAL `origin` resolves to. `undefined` (the default) means the
+   * expected repository; `null` means origin is absent or unparseable.
+   */
+  readonly originTarget?: string | null;
 } = {}): Scripted {
   let pullRequest = options.pullRequest;
   const queue = options.pullRequests === undefined ? undefined : [...options.pullRequests];
@@ -118,19 +127,19 @@ function scripted(options: {
     async branchSha(): Promise<string | undefined> {
       return options.remoteBranchSha === undefined ? A : (options.remoteBranchSha ?? undefined);
     },
-    async findPullRequest(): Promise<RemotePullRequest | undefined> {
+    async listPullRequests(): Promise<readonly RemotePullRequest[]> {
       findCount += 1;
       if (queue !== undefined) {
-        return queue.length > 1 ? queue.shift() : queue[0];
+        return (queue.length > 1 ? queue.shift() : queue[0]) ?? [];
       }
-      return pullRequest;
+      return pullRequest === undefined ? [] : [pullRequest];
     },
     async createPullRequest(input, authorization): Promise<RemotePullRequest> {
       createCount += 1;
       lastAuthorization = authorization;
       // The fake enforces what the real adapter enforces; a permissive double
       // would make the authorization untested where it matters.
-      if (!isRemoteWriteAuthorized(authorization, "CREATE_PULL_REQUEST")) {
+      if (!isRemoteWriteAuthorized(authorization, "CREATE_PULL_REQUEST", REPO)) {
         throw new Error("createPullRequest requires an authorization minted by authorizeRemoteWrite");
       }
       // GitHub REFUSES a second open pull request for one head/base, so
@@ -175,6 +184,10 @@ function scripted(options: {
         gitCalls.push("addsWorkflows");
         return options.local?.addsWorkflows ?? false;
       },
+      async originTarget(): Promise<string | undefined> {
+        gitCalls.push("originTarget");
+        return options.originTarget === undefined ? REPO : (options.originTarget ?? undefined);
+      },
     },
     creates: () => createCount,
     finds: () => findCount,
@@ -192,6 +205,146 @@ function deps(s: Scripted, overrides: Partial<PublishDeps> = {}): PublishDeps {
     ...overrides,
   };
 }
+
+describe("TASK-016 AC-8: an unexpected local origin refuses", () => {
+  /**
+   * THE GAP THE ROUND-7 REVIEW NAMED. The base a candidate is measured against
+   * is read from `origin/<base>`, and nothing ever checked where `origin`
+   * points — so the ancestry, the base SHA and the "has the base moved" check
+   * could all be computed against a repository nobody verified, while the `gh`
+   * client addressed the right one and agreed.
+   */
+  it("refuses when the local origin points at a different repository", async () => {
+    const s = scripted({ pullRequest: EXISTING_PR, originTarget: "someone-else/software-factory" });
+
+    const outcome = await publishCandidate(deps(s), CANDIDATE);
+
+    assert.equal(outcome.kind, "REFUSED", `an unexpected origin was accepted: ${JSON.stringify(outcome)}`);
+    if (outcome.kind !== "REFUSED") return;
+    assert.match(outcome.reason, /someone-else/);
+  });
+
+  it("refuses when the local origin is absent or not a GitHub url", async () => {
+    const s = scripted({ pullRequest: EXISTING_PR, originTarget: null });
+
+    const outcome = await publishCandidate(deps(s), CANDIDATE);
+
+    assert.equal(outcome.kind, "REFUSED", `an unresolvable origin was accepted: ${JSON.stringify(outcome)}`);
+  });
+
+  /**
+   * AND IT IS CHECKED BEFORE THE BASE IS READ. Refusing after resolving
+   * `origin/<base>` would mean the refusal came too late to matter: the value
+   * it was protecting had already been taken from the wrong place.
+   */
+  it("checks the origin before resolving anything through it", async () => {
+    const s = scripted({ pullRequest: EXISTING_PR, originTarget: "someone-else/software-factory" });
+
+    await publishCandidate(deps(s), CANDIDATE);
+
+    const calls = s.gitCalls();
+    assert.ok(calls.includes("originTarget"), "the origin was never read");
+    assert.equal(calls[0], "originTarget", `the origin was checked after ${JSON.stringify(calls[0])}`);
+    assert.ok(!calls.includes("fetch"), "the repository was fetched through an unverified origin");
+  });
+});
+
+describe("TASK-016 AC-5 (amended): idempotent external publication adoption", () => {
+  /**
+   * THE POSITIVE CASE THE AMENDED CRITERION IS ABOUT. A human opened the pull
+   * request; the Factory finds it, verifies it names the exact reviewed commit
+   * against the exact reviewed base, adopts it, and writes NOTHING.
+   */
+  it("adopts a human-created pull request bound to the exact candidate", async () => {
+    const s = scripted({ pullRequest: EXISTING_PR });
+
+    const outcome = await publishCandidate(deps(s), CANDIDATE);
+
+    assert.equal(outcome.kind, "PUBLISHED", `not published: ${JSON.stringify(outcome)}`);
+    if (outcome.kind !== "PUBLISHED") return;
+    assert.equal(outcome.created, false, "the Factory claimed to have created the pull request");
+    assert.equal(outcome.pullRequest.number, 7);
+    assert.equal(outcome.pullRequest.headSha, A);
+    assert.equal(s.creates(), 0, "a remote write occurred on an adoption path");
+  });
+
+  it("adopts the SAME pull request on a second run and writes nothing either time", async () => {
+    const s = scripted({ pullRequest: EXISTING_PR });
+
+    const first = await publishCandidate(deps(s), CANDIDATE);
+    const second = await publishCandidate(deps(s), CANDIDATE);
+
+    assert.equal(first.kind, "PUBLISHED");
+    assert.equal(second.kind, "PUBLISHED");
+    if (first.kind !== "PUBLISHED" || second.kind !== "PUBLISHED") return;
+    assert.equal(first.pullRequest.number, second.pullRequest.number, "a second run adopted a different pull request");
+    assert.equal(s.creates(), 0, "repeated execution performed a remote write");
+  });
+
+  /**
+   * THE INTERRUPTED RUN (amended AC-5, 7). The first execution found nothing
+   * and stopped at the gate; a human then published; the resumed execution
+   * rediscovers and adopts that same pull request without duplicating.
+   */
+  it("rediscovers and adopts the same pull request when a run is resumed", async () => {
+    const s = scripted({ pullRequests: [[], [EXISTING_PR]] });
+
+    const interrupted = await publishCandidate(deps(s), CANDIDATE);
+    assert.equal(interrupted.kind, "HUMAN_REQUIRED", `expected the gate to stop the first run: ${JSON.stringify(interrupted)}`);
+
+    const resumed = await publishCandidate(deps(s), CANDIDATE);
+    assert.equal(resumed.kind, "PUBLISHED", `the resumed run did not adopt: ${JSON.stringify(resumed)}`);
+    if (resumed.kind !== "PUBLISHED") return;
+    assert.equal(resumed.pullRequest.number, 7);
+    assert.equal(resumed.created, false);
+    assert.equal(s.creates(), 0, "the resumed run duplicated publication");
+  });
+
+  /** Amended AC-5, 8: nothing to adopt means a human must publish. No write. */
+  it("stops at HUMAN_REQUIRED when no pull request exists, and writes nothing", async () => {
+    const s = scripted({ pullRequests: [[]] });
+
+    const outcome = await publishCandidate(deps(s), CANDIDATE);
+
+    assert.equal(outcome.kind, "HUMAN_REQUIRED", `expected HUMAN_REQUIRED: ${JSON.stringify(outcome)}`);
+    if (outcome.kind !== "HUMAN_REQUIRED") return;
+    assert.match(outcome.reason, /externally/, "the refusal does not say what the human should do");
+    assert.equal(s.creates(), 0, "a write was attempted with no authorization");
+  });
+
+  /**
+   * Amended AC-5, 9: two bound pull requests is a state GitHub does not
+   * normally permit, so it means something is not as assumed. Fail closed —
+   * and in particular do NOT create a third.
+   */
+  it("fails closed when more than one pull request binds to the candidate", async () => {
+    const s = scripted({
+      pullRequests: [[EXISTING_PR, { ...EXISTING_PR, number: 9 }]],
+    });
+
+    const outcome = await publishCandidate(deps(s), CANDIDATE);
+
+    assert.equal(outcome.kind, "REFUSED", `ambiguity was resolved instead of refused: ${JSON.stringify(outcome)}`);
+    if (outcome.kind !== "REFUSED") return;
+    assert.match(outcome.reason, /ambiguous/i);
+    assert.equal(s.creates(), 0, "a pull request was created while the remote state was ambiguous");
+  });
+
+  /**
+   * Pull requests exist, but for a commit nobody reviewed. That is NOT a
+   * request for publication: creating another would publish a second thing.
+   */
+  it("refuses when pull requests exist but none names the candidate", async () => {
+    const s = scripted({ pullRequests: [[{ ...EXISTING_PR, headSha: B }]] });
+
+    const outcome = await publishCandidate(deps(s), CANDIDATE);
+
+    assert.equal(outcome.kind, "REFUSED", `expected a refusal: ${JSON.stringify(outcome)}`);
+    if (outcome.kind !== "REFUSED") return;
+    assert.match(outcome.reason, new RegExp(B));
+    assert.equal(s.creates(), 0);
+  });
+});
 
 describe("TASK-016 AC-5: publication is idempotent", () => {
   it("completes without writing anything when the remote already holds the candidate", async () => {
@@ -246,7 +399,7 @@ describe("TASK-016 round-4 finding 3: the rebind re-reads rather than trusting a
    */
   it("refuses when the pull request moved after the first read", async () => {
     const s = scripted({
-      pullRequests: [EXISTING_PR, { ...EXISTING_PR, headSha: B }],
+      pullRequests: [[EXISTING_PR], [{ ...EXISTING_PR, headSha: B }]],
     });
 
     const outcome = await publishCandidate(deps(s), CANDIDATE);
@@ -256,7 +409,7 @@ describe("TASK-016 round-4 finding 3: the rebind re-reads rather than trusting a
   });
 
   it("reports the pull request as the re-read describes it", async () => {
-    const s = scripted({ pullRequests: [EXISTING_PR, { ...EXISTING_PR, number: 12 }] });
+    const s = scripted({ pullRequests: [[EXISTING_PR], [{ ...EXISTING_PR, number: 12 }]] });
 
     const outcome = await publishCandidate(deps(s), CANDIDATE);
 
@@ -485,7 +638,7 @@ describe("TASK-016 round-6 finding 1: the write demands proof the gate allowed i
     await assert.rejects(
       () => s.client.createPullRequest(
         { headRef: "x", baseRef: "main", title: "t", body: "b" },
-        { kind: "CREATE_PULL_REQUEST" },
+        { kind: "CREATE_PULL_REQUEST", target: REPO },
       ),
       /authorizeRemoteWrite/,
       "a forged authorization was accepted",

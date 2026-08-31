@@ -20,6 +20,7 @@
  */
 
 import { anchorFor, appendProvenance, type ProvenanceEntry } from "../supervision/provenanceChain.js";
+import { checkStatusCoherent } from "./candidateBinding.js";
 import type { RemoteCheckStatus, RemotePullRequest } from "./candidateBinding.js";
 import type { SupervisorState } from "../supervision/supervisorTypes.js";
 
@@ -78,6 +79,22 @@ export function withPublicationRecorded(
       ok: false,
       reason: `the check status describes ${input.checks.sha} but the pull request is at ${input.pullRequest.headSha}; evidence for another commit must not be recorded against this one`,
     };
+  }
+  /**
+   * AND IT MUST BE COHERENT (round-7 review, HIGH 3).
+   *
+   * Matching SHAs made the evidence ABOUT the right commit; it said nothing
+   * about whether the evidence meant anything. `SUCCESS (0)`,
+   * `NO_CHECKS_CONFIGURED (3)` and a conclusion that is not a conclusion all
+   * recorded happily, and a hash-linked chain then made them permanent and
+   * credible. A record is the last place to catch this and the worst place to
+   * discover it later.
+   */
+  if (input.checks !== undefined) {
+    const coherent = checkStatusCoherent(input.checks);
+    if (!coherent.ok) {
+      return { ok: false, reason: coherent.reason };
+    }
   }
   const appended = appendProvenance(state.provenance, {
     kind: "PUBLISHED_AS",

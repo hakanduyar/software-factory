@@ -33,6 +33,21 @@ export interface GitRepositoryReader {
   isClean(): Promise<boolean>;
   /** Refreshes remote-tracking refs, so `origin/<base>` is not a stale answer. */
   fetch(): Promise<void>;
+  /**
+   * `owner/name` that the local `origin` remote actually points at, or
+   * `undefined` when it is absent or is not a GitHub repository URL.
+   *
+   * REQUIRED BY AC-8, and missing until the round-7 review said so. The base a
+   * candidate is measured against is read from `origin/<base>`, so an `origin`
+   * pointing somewhere unexpected means the ancestry, the base SHA and the
+   * "has the base moved" check were all computed against a repository nobody
+   * verified — while the `gh` client addressed the right one and agreed.
+   *
+   * The URL is PARSED in the adapter, because parsing remote text is what
+   * adapters are for; the comparison happens in the core, because deciding what
+   * is expected is not the adapter's business.
+   */
+  originTarget(): Promise<string | undefined>;
   /** True when `ancestor` is reachable from `descendant`. */
   isAncestor(ancestor: string, descendant: string): Promise<boolean>;
   /**
@@ -58,8 +73,17 @@ export interface GitHubClient {
    * ALREADY holds the exact candidate. Verification instead of prediction.
    */
   branchSha(branch: string): Promise<string | undefined>;
-  /** The pull request whose head is `headRef`, or `undefined` when none exists. */
-  findPullRequest(headRef: string): Promise<RemotePullRequest | undefined>;
+  /**
+   * EVERY pull request the remote reports for `headRef`, in the order given.
+   *
+   * A LIST rather than an Option (AC-5 amended, 9). Returning one pull request
+   * forced the adapter to decide what "the" pull request was, and it decided
+   * badly: it threw when several were open, and picked `parsed[0]` when none
+   * were. Both are answers to a question the adapter has no standing to
+   * answer. `selectAdoptablePullRequest` decides, purely, and fails closed on
+   * ambiguity instead of resolving it.
+   */
+  listPullRequests(headRef: string): Promise<readonly RemotePullRequest[]>;
   /**
    * Creates a pull request and returns it.
    *
