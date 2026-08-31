@@ -798,3 +798,38 @@ well, which the entry originally got backwards.
 different key, a missing key and two keys, and — the control that matters —
 asserts a correctly declared plan is still ACCEPTED, so the guard is not
 satisfied by refusing everything.
+
+## L-14 — A push verdict proves REPOSITORY-level zero liability, not global zero liability
+
+`GIT_PUSH` was registered financial with a comment predicting the remedy: "a
+push to a target with demonstrated zero liability could earn a minted action
+later, the way verification commands did." TASK-016 earns it. `gitPushAction`
+derives `costKnownZero` from an observation of the exact target, and only two
+observed facts make a push free: the repository is PUBLIC, so GitHub does not
+meter Actions minutes against it, and it has ZERO repository-level webhooks, so
+no configured integration can hand the push to a metered third party.
+
+**What that does not cover.** The observation reads
+`repos/:owner/:name/hooks`, which is repository scope. An ORGANISATION-level
+webhook, a GitHub App installed across the account, or a third-party service
+subscribed through some other mechanism is invisible to it. So a push earning
+`FREE_REMOTE_ACTION` means "no repository-level liability was demonstrable",
+never "no liability can exist anywhere".
+
+**Why this is acceptable as a floor rather than a hole.** Every uncertainty
+resolves financial: a private repository, a visibility that could not be read,
+a hooks endpoint that errored, an observation naming a different repository,
+and an observation this module did not produce all yield UNKNOWN, which is
+financial, which refuses. The residual is therefore an over-permission only in
+the narrow case where a billing integration exists at a scope this query cannot
+see — and closing it needs org-scope credentials the Factory deliberately does
+not hold.
+
+**The narrower true statement, for anyone reading a provenance record later:**
+this repository is public and has no webhooks, both observed per push, so no
+push the Factory has made could consume a metered GitHub allowance.
+
+**Kept honest by:** `tests/pushAuthorization.test.ts` has a case for every
+refusing condition, and — the control that matters — one case where an
+observed public repository with zero integrations is PERMITTED, so the guard is
+not satisfied by refusing everything.

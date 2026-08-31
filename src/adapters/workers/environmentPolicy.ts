@@ -87,8 +87,18 @@ const SECRET_PATTERNS: readonly RegExp[] = [
    */
   /sk-(?:proj|svcacct|admin)-[A-Za-z0-9_-]{10,}/g,
   /sk-[A-Za-z0-9]{20,}/g,
-  /ghp_[A-Za-z0-9]{20,}/g,
-  /gho_[A-Za-z0-9]{20,}/g,
+  /**
+   * EVERY GitHub token prefix, not the two that happened to be thought of
+   * (TASK-016).
+   *
+   * `ghp_` (classic PAT) and `gho_` (OAuth) were covered; `ghs_` (App
+   * installation), `ghu_` (user-to-server) and `ghr_` (refresh) were not — and
+   * an installation token is exactly what a GitHub integration hands back.
+   * This is the `sk-proj-` lesson applied BEFORE a leak rather than after one:
+   * a redactor is only as current as the formats it has been taught, so one
+   * rule covers the vendor's whole prefix family.
+   */
+  /gh[pousr]_[A-Za-z0-9]{20,}/g,
   /github_pat_[A-Za-z0-9_]{20,}/g,
   /xox[baprs]-[A-Za-z0-9-]{10,}/g,
   /AKIA[0-9A-Z]{16}/g,

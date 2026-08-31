@@ -44,7 +44,15 @@ export const GENESIS_DIGEST = "prov-genesis";
  */
 export const MAX_CHAIN_ENTRIES = 10_000;
 
-export const PROVENANCE_KINDS = ["IMPLEMENTED_BY", "RUN_CONFIGURED", "BLOCKED"] as const;
+/**
+ * `PUBLISHED_AS` was added by TASK-016: which commit of a roadmap item reached
+ * the remote, and what CI said about that exact commit. It belongs in this
+ * chain rather than in a second store because it is the same class of fact the
+ * chain already holds — what actually happened to an item — and because a
+ * publication record that could be edited without breaking a digest would be
+ * worth less than no record at all.
+ */
+export const PROVENANCE_KINDS = ["IMPLEMENTED_BY", "RUN_CONFIGURED", "BLOCKED", "PUBLISHED_AS"] as const;
 export type ProvenanceKind = (typeof PROVENANCE_KINDS)[number];
 
 export interface ProvenanceEntry {

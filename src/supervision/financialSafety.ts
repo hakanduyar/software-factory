@@ -210,11 +210,18 @@ const KNOWN_ACTION_EFFECTS_TABLE: Record<string, ActionEffects> = {
    * can hit a metered endpoint. Neither is performed by TASK-006, so making them
    * human-gated costs nothing today and removes a claim that was never proven.
    *
-   * A push to a target with demonstrated zero liability could earn a minted
-   * action later, the way verification commands did. It has not, so it does not
-   * get the verdict.
+   * `GIT_PUSH` HAS SINCE EARNED ITS MINTER (TASK-016), which is why it is no
+   * longer listed here. That paragraph predicted the shape exactly — "a push to
+   * a target with demonstrated zero liability could earn a minted action later,
+   * the way verification commands did" — so the entry moved rather than
+   * softened: `GIT_PUSH` is now RESOURCE-PARAMETERISED, its verdict comes from
+   * `gitPushAction` against an observation of the exact target, and a bare
+   * `{ kind: "GIT_PUSH" }` that no minter produced has no record, which is no
+   * knowledge, which is financial. Strictly narrower than a table entry: this
+   * kind can no longer be classified at all without evidence.
+   *
+   * `PROBE_RESOURCE_REMOTE` has earned nothing and stays exactly as it was.
    */
-  GIT_PUSH: effects({ remote: true, costKnownZero: false, canIncurUsageCharges: true }),
   PROBE_RESOURCE_REMOTE: effects({ remote: true, costKnownZero: false, canIncurUsageCharges: true }),
   /**
    * NOTE: `LAUNCH_AI_WORKER`/`LAUNCH_AI_REVIEWER` are deliberately ABSENT.
@@ -329,7 +336,7 @@ export type BillingMode = (typeof BILLING_MODES)[number];
  * make one permissive.
  */
 const RESOURCE_PARAMETERISED_KINDS: ReadonlySet<string> = Object.freeze(
-  new Set(["LAUNCH_AI_WORKER", "LAUNCH_AI_REVIEWER", "RUN_VERIFICATION_COMMAND"]),
+  new Set(["LAUNCH_AI_WORKER", "LAUNCH_AI_REVIEWER", "RUN_VERIFICATION_COMMAND", "GIT_PUSH"]),
 ) as ReadonlySet<string>;
 
 /**
@@ -518,6 +525,117 @@ export function launchAiWorkerAction(input: {
     },
     derivedEffects,
     input.resourceKey,
+  );
+}
+
+/** How a remote repository is exposed, as OBSERVED — never as configured. */
+export const REPOSITORY_VISIBILITIES = ["PUBLIC", "PRIVATE", "UNKNOWN"] as const;
+
+export type RepositoryVisibility = (typeof REPOSITORY_VISIBILITIES)[number];
+
+/**
+ * What an in-process query reported about ONE push target's billing posture.
+ *
+ * The same shape and the same rules as `BillingObservation`, for the same
+ * reason: `GIT_PUSH` is registered financial in the table above because "a push
+ * can start paid CI, fire paid webhooks, or consume the GitHub Actions
+ * allowance", and that comment names the remedy — a push to a target with
+ * DEMONSTRATED zero liability may earn a minted action, the way verification
+ * commands did.
+ *
+ * `target` is the repository this observation is ABOUT, so a verdict earned for
+ * one repository cannot authorise a push to another (the F6-FIN-1 rule, applied
+ * to push targets instead of resources).
+ */
+export interface RepositoryBillingObservation {
+  /** `owner/name`, as reported by the query that observed it. */
+  readonly target: string;
+  readonly visibility: RepositoryVisibility;
+  /**
+   * How many repository-level integrations could turn a push into someone's
+   * bill. `undefined` means the count could not be established, which is
+   * UNKNOWN, which is financial.
+   */
+  readonly billableIntegrations: number | undefined;
+}
+
+const REPOSITORY_OBSERVATIONS = new WeakSet<RepositoryBillingObservation>();
+
+/**
+ * Records what a REMOTE QUERY reported about a push target.
+ *
+ * Call this only with the result of an actual query performed in this process,
+ * immediately before the gate — the same discipline F4-3 imposed on billing
+ * probes, and for the same reason: a persisted row describing a repository is
+ * not evidence about the repository as it is now.
+ */
+export function observeRepositoryBilling(input: {
+  readonly target: string;
+  readonly visibility: RepositoryVisibility | undefined;
+  readonly billableIntegrations: number | undefined;
+}): RepositoryBillingObservation {
+  const observation = Object.freeze({
+    target: input.target,
+    // Absent observation is UNKNOWN, and unknown is financial.
+    visibility: input.visibility ?? "UNKNOWN",
+    billableIntegrations: input.billableIntegrations,
+  });
+  REPOSITORY_OBSERVATIONS.add(observation);
+  return observation;
+}
+
+/**
+ * Builds a push action whose cost verdict is EARNED from an observation of the
+ * exact target (TASK-016 AC-1/AC-2).
+ *
+ * WHAT MAKES A PUSH FREE HERE, stated so it can be attacked rather than
+ * assumed. GitHub does not meter Actions minutes for PUBLIC repositories, so a
+ * push to one cannot consume the allowance the runtime amendment protects. That
+ * covers GitHub's own billing and nothing else, so a second condition carries
+ * the rest: zero repository-level integrations, because a webhook can hand the
+ * push to a metered third party whose bill this process cannot see.
+ *
+ * Every other case is financial, INCLUDING the ones that merely cannot be
+ * established: a private repository, an unknown visibility, an integration
+ * count that could not be read, an observation this module did not produce, and
+ * an observation describing a different repository than the one being pushed
+ * to. Uncertainty is financial — that rule is what makes the verdict worth
+ * anything.
+ *
+ * RESIDUAL, recorded in docs/KNOWN-LIMITATIONS.md rather than glossed: this
+ * observes REPOSITORY-level exposure. An organisation-level or GitHub-App
+ * integration that bills on push is not visible here, so a push earning
+ * FREE_REMOTE_ACTION means "no repository-level liability was demonstrable",
+ * not "no liability can exist anywhere".
+ */
+export function gitPushAction(input: {
+  readonly target: string;
+  readonly observation?: RepositoryBillingObservation;
+  readonly description: string;
+}): SupervisedAction {
+  const observation = input.observation;
+  const trusted =
+    observation !== undefined &&
+    REPOSITORY_OBSERVATIONS.has(observation) &&
+    observation.target === input.target;
+  const visibility: RepositoryVisibility = trusted ? observation.visibility : "UNKNOWN";
+  const integrations = trusted ? observation.billableIntegrations : undefined;
+  const unmetered = visibility === "PUBLIC" && integrations === 0;
+  const derivedEffects = effects({
+    remote: true,
+    costKnownZero: unmetered,
+    canIncurUsageCharges: !unmetered,
+  });
+  return mint(
+    {
+      kind: "GIT_PUSH",
+      description: input.description,
+      // Human-readable only; the binding copy lives in the mint record.
+      detail: `target ${input.target}, visibility ${visibility}, integrations ${integrations ?? "unknown"}`,
+      effects: derivedEffects,
+    },
+    derivedEffects,
+    input.target,
   );
 }
 

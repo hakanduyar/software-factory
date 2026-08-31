@@ -54,6 +54,14 @@ Usage:
   sf supervise status     Show supervisor state, spending policy and open escalations
   sf supervise resources  Show per-resource availability, retry times and backoff
   sf supervise roadmap    Show the durable roadmap queue and what it is waiting on
+  sf github publish --roadmap-key <KEY> --head <SHA> --base <SHA>
+                    --head-ref <BRANCH> --base-ref <BRANCH>
+                    --repo <owner/name> --remote-url <URL>
+                      Publish a reviewed candidate as a pull request (TASK-016).
+                      Idempotent; the push is gated on observed zero liability.
+  sf github readiness ... [--reviewed]
+                      Report whether that candidate is bound to remote state and
+                      CI evidence well enough to integrate. Integrates nothing.
   sf help             Show this message
 `;
 
@@ -423,6 +431,40 @@ async function main(argv: readonly string[]): Promise<number> {
         return runSuperviseBlock({ ...parsed.value, log });
       }
       console.error(`Usage: sf supervise <tick|status|resources|roadmap|block>`);
+      return 1;
+    }
+    case "github": {
+      const sub = argv[1];
+      const { parseGithubPublishArgs, runGithubPublish, runGithubReadiness } = await import("./github.js");
+      const log = (line: string): void => console.log(line);
+      const usage =
+        "Usage: sf github <publish|readiness> --roadmap-key <KEY> --head <SHA> --base <SHA> " +
+        "--head-ref <BRANCH> --base-ref <BRANCH> --repo <owner/name> --remote-url <URL> [--reviewed]";
+
+      if (sub === "publish" || sub === "readiness") {
+        /**
+         * `--reviewed` is stripped before parsing rather than added to the
+         * shared parser: it is meaningful only to `readiness`, and a flag that
+         * silently does nothing on `publish` would be a lie about what the
+         * command consulted.
+         */
+        const rest = argv.slice(2).filter((token) => token !== "--reviewed");
+        const reviewAccepted = argv.slice(2).includes("--reviewed");
+        if (sub === "publish" && reviewAccepted) {
+          console.error("--reviewed is only meaningful for `sf github readiness`");
+          return 1;
+        }
+        const parsed = parseGithubPublishArgs(rest);
+        if (!parsed.ok) {
+          console.error(parsed.error);
+          console.error(usage);
+          return 1;
+        }
+        return sub === "publish"
+          ? await runGithubPublish(parsed.value, { log })
+          : await runGithubReadiness({ ...parsed.value, reviewAccepted }, { log });
+      }
+      console.error(usage);
       return 1;
     }
     case "help":
