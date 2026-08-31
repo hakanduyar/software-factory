@@ -111,16 +111,27 @@ export async function readLocalState(
 /**
  * Find-or-create-or-adopt for one candidate's pull request (AC-5).
  *
- * EXTRACTED AS ITS OWN SEAM (round-3 HIGH 3). With every remote write refused,
- * this logic was never executed by any test — `publishCandidate` stops at the
- * gate first, so the create/adopt behaviour the frozen AC-5 describes had no
- * positive demonstration at all, only a proof that the race cannot begin.
+ * MODULE-PRIVATE, and that is the whole point (round-5 review, finding 1).
  *
- * Extracting it changes nothing about the production gate: `publishCandidate`
- * still refuses before reaching here. What it buys is that the BEHAVIOUR can be
- * exercised directly, so "creates when none exists", "adopts an existing one"
- * and "adopts the winner of a creation race" are demonstrated rather than
- * asserted in a comment.
+ * Round 3 asked for this behaviour to be extracted so it could be exercised
+ * rather than asserted in a comment, and it was — as an EXPORTED function.
+ * Round 4 then showed what that cost: an exported helper that calls
+ * `createPullRequest` without minting an action or consulting the gate is a
+ * way around the gate, whatever the intended caller does. The reviewer's
+ * instruction was "private, or require an unforgeable post-gate capability".
+ *
+ * Private is the honest choice. A capability object would still have to be
+ * obtainable by whoever calls the function, and any way of obtaining one that
+ * a test could use is a way an ungated caller could use too. Not exporting the
+ * function removes the question instead of answering it.
+ *
+ * WHAT THAT COSTS, stated rather than glossed: the CREATE half of AC-5 is no
+ * longer executed by any test, because the only caller refuses first and the
+ * function cannot be reached from outside. What remains demonstrated through
+ * `publishCandidate` is the half that matters operationally — two runs produce
+ * one pull request, an interrupted run adopts rather than duplicating, and
+ * nothing is created when one already exists. The create/adopt/race logic is
+ * retained per the round-3 instruction not to discard it.
  *
  * FIND BEFORE CREATE, and let the remote arbitrate: GitHub refuses a second
  * open pull request for the same head and base, so a failed creation is
@@ -128,7 +139,7 @@ export async function readLocalState(
  * no pull request afterwards stays a failure — adoption must not swallow real
  * errors.
  */
-export async function ensurePullRequest(
+async function ensurePullRequest(
   github: GitHubClient,
   candidate: ReviewedCandidate,
   known?: RemotePullRequest,
@@ -337,6 +348,31 @@ export async function publishCandidate(
     checks = await deps.github.checkStatus(candidate.headSha);
   } catch {
     checks = undefined;
+  }
+
+  /**
+   * AND THE STATUS MUST DESCRIBE THIS COMMIT (round-5 review, finding 2).
+   *
+   * `checkCheckEvidence` refuses a mismatched sha, but publication never
+   * asked it — so a client returning a status for a DIFFERENT commit had that
+   * status reported and, through `publicationDetail`, written into the
+   * provenance chain. Unbound evidence recorded as if it were bound is
+   * precisely what AC-4 exists to prevent, and a durable record is the worst
+   * place to discover it later.
+   *
+   * The binding is checked here rather than trusted from the adapter because
+   * this is the last point before the value escapes into a record. The
+   * CONCLUSION is still not interpreted here: a mismatch is a refusal about
+   * identity, not a judgement about whether checks passed.
+   */
+  if (checks !== undefined && !isCommitSha(checks.sha)) {
+    return { kind: "REFUSED", reason: "the check status did not name a full commit id" };
+  }
+  if (checks !== undefined && checks.sha !== candidate.headSha) {
+    return {
+      kind: "REFUSED",
+      reason: `the check status describes ${checks.sha} but the candidate is ${candidate.headSha}; evidence for another commit must not be recorded against this one`,
+    };
   }
 
   return { kind: "PUBLISHED", pullRequest, created, checks };

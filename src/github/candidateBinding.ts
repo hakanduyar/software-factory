@@ -309,6 +309,14 @@ export function checkCheckEvidence(input: {
    * ABSENCE IS NOT SUCCESS. This repository has no workflows, so this is the
    * value it produces today — and the temptation to read "nothing failed" as
    * "everything passed" is exactly the reading AC-4 forbids.
+   *
+   * REDUNDANT FOR THE VERDICT, AND SAID SO PLAINLY (round-5 review note). The
+   * SUCCESS allowlist below already refuses this value, so deleting this branch
+   * changes not WHETHER the candidate is refused but only WHY. It is kept for
+   * the reason string, because "no checks are configured" and "the status is
+   * not a pass" send an operator to completely different places — and the test
+   * asserts the reason rather than merely the refusal. A reader should not
+   * mistake this for a second line of defence.
    */
   if (checks.conclusion === "NO_CHECKS_CONFIGURED") {
     return refuse(

@@ -23,7 +23,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { ensurePullRequest, publishCandidate, type PublishDeps } from "../src/github/publishCandidate.js";
+import { publishCandidate, type PublishDeps } from "../src/github/publishCandidate.js";
 import type {
   RemoteCheckStatus,
   RemotePullRequest,
@@ -84,6 +84,8 @@ function scripted(options: {
    * does not exist at all.
    */
   readonly remoteBranchSha?: string | null;
+  /** What `checkStatus` reports as ITS sha; defaults to the one requested. */
+  readonly checkStatusSha?: string;
 } = {}): Scripted {
   let pullRequest = options.pullRequest;
   const queue = options.pullRequests === undefined ? undefined : [...options.pullRequests];
@@ -133,7 +135,7 @@ function scripted(options: {
       return pullRequest;
     },
     async checkStatus(sha): Promise<RemoteCheckStatus> {
-      return { sha, conclusion: "NO_CHECKS_CONFIGURED", total: 0 };
+      return { sha: options.checkStatusSha ?? sha, conclusion: "NO_CHECKS_CONFIGURED", total: 0 };
     },
   };
 
@@ -422,84 +424,85 @@ describe("TASK-016 AC-8: publication refuses before it acts", () => {
   });
 });
 
-describe("TASK-016 AC-5 (round-3 HIGH 3): the create/adopt behaviour, demonstrated directly", () => {
-  /**
-   * The frozen AC-5 describes create-or-adopt behaviour that `publishCandidate`
-   * cannot reach, because the gate refuses the write first. The reviewer's
-   * instruction was to keep the behaviour and prove it through a separately
-   * testable seam rather than delete it — and AC-5's own text prescribes
-   * exactly this shape: "proven with a scripted client that counts create calls
-   * across two executions".
-   */
-  it("creates a pull request when none exists", async () => {
-    const s = scripted();
+/**
+ * WHY THERE IS NO DIRECT-SEAM SUITE HERE ANY MORE.
+ *
+ * Round 3 asked for the create/adopt behaviour to be exercised through an
+ * extracted seam, and it was — exported. Round 5 showed what that cost: an
+ * exported helper reaching `createPullRequest` without minting an action or
+ * consulting the gate is a way AROUND the gate, whatever the intended caller
+ * does. Their instruction was "private, or require an unforgeable post-gate
+ * capability", and private is the honest answer: any capability a test could
+ * obtain, an ungated caller could obtain too.
+ *
+ * So the CREATE half is no longer executed. What is demonstrated below through
+ * the public function is the half that matters operationally — two runs yield
+ * one pull request, an interrupted run adopts rather than duplicating, and
+ * nothing is created when one already exists — plus, structurally, that the
+ * module exposes no ungated way to write at all.
+ */
+describe("TASK-016 round-5 finding 1: no ungated write is reachable", () => {
+  it("exports no helper that can create a pull request", async () => {
+    const module = await import("../src/github/publishCandidate.js");
 
-    const result = await ensurePullRequest(s.client, CANDIDATE);
-
-    assert.equal(result.ok, true, `creation failed: ${JSON.stringify(result)}`);
-    if (!result.ok) return;
-    assert.equal(result.created, true, "an existing pull request was reported");
-    assert.equal(s.creates(), 1, "the pull request was not created exactly once");
+    assert.ok(
+      !Object.keys(module).includes("ensurePullRequest"),
+      "the create/adopt helper is exported, which is a path around the financial gate",
+    );
   });
 
-  it("adopts an existing pull request instead of creating a second", async () => {
+  /**
+   * And the only exported function that can reach a write refuses before
+   * reaching it — asserted by counting, because "the gate came first" is a
+   * claim about order.
+   */
+  it("creates nothing through the only exported entry point", async () => {
+    const s = scripted();
+
+    const outcome = await publishCandidate(deps(s), CANDIDATE);
+
+    assert.equal(outcome.kind, "HUMAN_REQUIRED");
+    assert.equal(s.creates(), 0, "the exported entry point reached a write");
+  });
+});
+
+describe("TASK-016 round-5 finding 2: check evidence is bound before it is reported", () => {
+  /**
+   * THE REPRODUCTION. `checkCheckEvidence` refuses a mismatched sha, but
+   * publication never asked it — so a client returning a status for a
+   * DIFFERENT commit had that status reported and, through
+   * `publicationDetail`, written into the provenance chain. Unbound evidence
+   * recorded as if it were bound is what AC-4 exists to prevent.
+   *
+   * This is also the reviewer's "sixth gap": every fixture returned the
+   * requested sha, so replacing the result with a constant would have
+   * survived. This one does not return the requested sha.
+   */
+  it("refuses a check status that describes a different commit", async () => {
+    const s = scripted({ pullRequest: EXISTING_PR, checkStatusSha: B });
+
+    const outcome = await publishCandidate(deps(s), CANDIDATE);
+
+    assert.equal(outcome.kind, "REFUSED", `unbound evidence was published: ${JSON.stringify(outcome)}`);
+    assert.match(outcome.kind === "REFUSED" ? outcome.reason : "", /evidence for another commit/);
+  });
+
+  it("refuses a check status that does not name a full commit id", async () => {
+    const s = scripted({ pullRequest: EXISTING_PR, checkStatusSha: "11662a1" });
+
+    const outcome = await publishCandidate(deps(s), CANDIDATE);
+
+    assert.equal(outcome.kind, "REFUSED");
+    assert.match(outcome.kind === "REFUSED" ? outcome.reason : "", /full commit id/);
+  });
+
+  /** The control: a correctly bound status still publishes. */
+  it("publishes when the check status describes the candidate", async () => {
     const s = scripted({ pullRequest: EXISTING_PR });
 
-    const result = await ensurePullRequest(s.client, CANDIDATE);
+    const outcome = await publishCandidate(deps(s), CANDIDATE);
 
-    assert.equal(result.ok, true);
-    if (!result.ok) return;
-    assert.equal(result.created, false, "an existing pull request was duplicated");
-    assert.equal(result.pullRequest.number, EXISTING_PR.number);
-    assert.equal(s.creates(), 0);
-  });
-
-  it("creates once across two runs", async () => {
-    const s = scripted();
-
-    const first = await ensurePullRequest(s.client, CANDIDATE);
-    const second = await ensurePullRequest(s.client, CANDIDATE);
-
-    assert.equal(first.ok && first.created, true, "the first run did not create");
-    assert.equal(second.ok && second.created, false, "the second run created a duplicate");
-    assert.equal(s.creates(), 1, "more than one pull request was created for one candidate");
-  });
-
-  /**
-   * THE LOST RACE. GitHub refuses a second open pull request for the same head
-   * and base, so the losing run must ADOPT the winner's rather than failing.
-   */
-  it("adopts the pull request that won a creation race", async () => {
-    const s = scripted({ createFails: true });
-    let attempted = false;
-    const racing: GitHubClient = {
-      ...s.client,
-      async findPullRequest(headRef: string): Promise<RemotePullRequest | undefined> {
-        return attempted
-          ? { number: 9, state: "OPEN", headRef, headSha: A, baseRef: "main", baseSha: BASE }
-          : undefined;
-      },
-      async createPullRequest(input) {
-        attempted = true;
-        return s.client.createPullRequest(input);
-      },
-    };
-
-    const result = await ensurePullRequest(racing, CANDIDATE);
-
-    assert.equal(result.ok, true, `the losing run failed instead of adopting: ${JSON.stringify(result)}`);
-    if (!result.ok) return;
-    assert.equal(result.pullRequest.number, 9, "the winner's pull request was not adopted");
-    assert.equal(result.created, false, "the losing run reported creating a pull request");
-  });
-
-  it("fails when creation fails and no pull request appears", async () => {
-    const s = scripted({ createFails: true });
-
-    const result = await ensurePullRequest(s.client, CANDIDATE);
-
-    assert.equal(result.ok, false, "a failed creation was reported as success");
-    assert.match(result.ok === false ? result.reason : "", /creating the pull request failed/);
+    assert.equal(outcome.kind, "PUBLISHED", JSON.stringify(outcome));
   });
 });
 

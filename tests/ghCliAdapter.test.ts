@@ -299,4 +299,3 @@ describe("TASK-016 HIGH 4: malformed remote responses fail closed", () => {
   });
 });
 
-
