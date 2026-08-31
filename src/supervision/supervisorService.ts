@@ -144,6 +144,15 @@ export class SupervisorService {
   private readonly deps: SupervisorServiceDeps;
   private readonly log: (line: string) => void;
   private readonly ownerId: string;
+  /**
+   * The newest state THIS tick has successfully written through the
+   * integrity-enforcing repository (round-11 finding 1). Set only by `commit`,
+   * cleared only by `tick`, consumed only by `publishWake`. The property that
+   * matters — no state ever becomes a wake basis without having been accepted
+   * by `compareAndSave` — holds under any interleaving, because the only
+   * assignment is on a successful write.
+   */
+  private tickCommitted: SupervisorState | undefined;
 
   constructor(deps: SupervisorServiceDeps) {
     this.deps = deps;
@@ -215,8 +224,15 @@ export class SupervisorService {
    * had long since recovered. Recomputing at a single exit point makes
    * `nextWakeAt` a fact about the state rather than a residue of the path taken
    * to reach it.
+   *
+   * AND ONLY FROM STATE THIS TICK WAS WILLING TO WRITE (round-11 finding 1).
+   * The basis resets here and is set by exactly one thing: a successful
+   * `commit`. A tick that refuses its state returns before any commit, so it
+   * has no basis, so `publishWake` publishes nothing and writes nothing — see
+   * `publishWake` for why that is the property, not a courtesy.
    */
   async tick(): Promise<TickResult> {
+    this.tickCommitted = undefined;
     let result: TickResult;
     try {
       result = await this.runTick();
@@ -252,7 +268,7 @@ export class SupervisorService {
         ),
       });
     }
-    await this.publishWake();
+    await this.publishWake(this.tickCommitted);
     return sanitizeTickResult(result);
   }
 
@@ -301,27 +317,40 @@ export class SupervisorService {
     return { ok: true };
   }
 
-  private async publishWake(): Promise<void> {
-    let state: SupervisorState | undefined;
+  /**
+   * THE WAKE DERIVES ONLY FROM STATE THIS TICK COMMITTED (round-11 finding 1).
+   *
+   * The previous version loaded state fresh from the repository, which meant
+   * it published — and COMMITTED — whatever was persisted, including state the
+   * tick had just REFUSED. Round 10 bounded the wake computation by resource
+   * identity; round 11 measured why that was the wrong property: a row whose
+   * identity IS catalogued, tampered to `retryAt=1800000005000` inside a
+   * roadmap-refused state, still supplied the published wake, and the commit
+   * re-persisted the entire refused state with our version stamp on it.
+   *
+   * The sufficient property is not "which rows may schedule" but "which STATE
+   * may schedule": one this tick already wrote through the repository that
+   * enforces the provenance chain and CAS. Refusal paths return before any
+   * commit, so they cannot arrive here with a basis — there is no fresh load
+   * for refused rows to ride in on, and anything written by someone else after
+   * our last commit makes the CAS below fail, which is a skip, not an
+   * endorsement. A missing wake is an advisory loss; a published one derived
+   * from refused state was a removed-or-tampered resource controlling the
+   * scheduler.
+   */
+  private async publishWake(basis: SupervisorState | undefined): Promise<void> {
+    if (basis === undefined) {
+      // The tick wrote nothing: either it refused the state, or nothing needed
+      // writing. In both cases there is nothing trustworthy to derive a wake
+      // from, and nothing is published.
+      return;
+    }
+    const wake = this.computeNextWake(basis);
+    if (basis.nextWakeAt === wake) {
+      return;
+    }
     try {
-      state = await this.deps.repository.load();
-    } catch (error) {
-      // Same rule, one step earlier: state too corrupt to READ is not this
-      // tick's verdict either, and `runTick` has already produced one.
-      if (!(error instanceof PersistenceCorruptionError)) {
-        throw error;
-      }
-      return;
-    }
-    if (state === undefined) {
-      return;
-    }
-    const wake = this.computeNextWake(state);
-    if (state.nextWakeAt === wake) {
-      return;
-    }
-    try {
-      await this.commit(state, withWake(state, wake));
+      await this.commit(basis, withWake(basis, wake));
     } catch (error) {
       /**
        * ADVISORY BOOKKEEPING, and that has to mean it CANNOT decide the tick
@@ -387,8 +416,9 @@ export class SupervisorService {
      * So the chokepoint runs here, after the two tamper-refusal gates and before
      * anything else. The tamper-refusal paths above (broken chain, roadmap
      * disagreement) deliberately do NOT reconcile: those states are refused
-     * precisely because WRITING to them is the hazard, and their advisory wake
-     * is not recomputed from state the tick refused to touch.
+     * precisely because WRITING to them is the hazard — and since round 11,
+     * `publishWake` cannot even see them, because it derives only from a state
+     * this tick committed and a refusal commits nothing.
      *
      * Filtering at each reader is how this task repeatedly left a sibling call
      * site open; reconciling once, here, means every later reader -- refresh,
@@ -1959,8 +1989,24 @@ export class SupervisorService {
       case "RESOURCE_FAILURE": {
         // The SUPERVISOR classifies; the executor only reports facts.
         const classification = classifyOutcome(outcome);
+        /**
+         * THE FAILURE NAMES ITS RESOURCE, ONCE, WHERE IT IS CLASSIFIED
+         * (round-11 finding 2). "provider CLI exited 1 with no recognised
+         * failure signature" reached the tick result, the roadmap detail and
+         * the resource diagnostic with the resource's key in NONE of them —
+         * which CLI failed was the one fact an operator needed. Named here so
+         * every sink below inherits it, rather than at each sink, which is the
+         * sibling mistake in message form.
+         */
+        const named = {
+          ...classification,
+          reason:
+            usedResourceKey === undefined
+              ? classification.reason
+              : `${usedResourceKey}: ${classification.reason}`,
+        };
         const resources = state.resources.map((record) =>
-          record.key === usedResourceKey ? this.applyClassification(record, classification, now) : record,
+          record.key === usedResourceKey ? this.applyClassification(record, named, now) : record,
         );
         const waiting = await this.commit(state, {
           ...withLineage,
@@ -1968,18 +2014,18 @@ export class SupervisorService {
           roadmap: setStatus(
             withLineage.roadmap,
             item.key,
-            classification.state === "AUTH_REQUIRED" ? "WAITING_FOR_HUMAN_REQUIRED" : "WAITING_FOR_RESOURCE",
-            boundedDiagnostic(classification.reason),
+            named.state === "AUTH_REQUIRED" ? "WAITING_FOR_HUMAN_REQUIRED" : "WAITING_FOR_RESOURCE",
+            boundedDiagnostic(named.reason),
           ),
         });
 
-        if (classification.state === "AUTH_REQUIRED") {
+        if (named.state === "AUTH_REQUIRED") {
           const escalated = await this.escalate(
             waiting,
             item.key,
             "AUTH_REQUIRED",
             `Re-authenticate the provider for ${usedResourceKey ?? "the required resource"} (for example \`claude auth login\` or \`codex login\`).`,
-            classification.reason,
+            named.reason,
           );
           void escalated;
           return {
@@ -1993,11 +2039,11 @@ export class SupervisorService {
         const wake = this.computeNextWake(waiting);
         const settled = await this.commit(waiting, withWake(waiting, wake));
         void settled;
-        this.log(`[supervisor] ${item.key} waiting for resource: ${classification.reason}`);
+        this.log(`[supervisor] ${item.key} waiting for resource: ${named.reason}`);
         return {
           kind: "WAITING_FOR_RESOURCE",
           roadmapKey: item.key,
-          reason: classification.reason,
+          reason: named.reason,
           ...(wake === undefined ? {} : { nextWakeAt: wake }),
         };
       }
@@ -2532,26 +2578,24 @@ export class SupervisorService {
   /**
    * The earliest moment any waiting resource is worth looking at again.
    *
-   * BOUNDED BY THE CODE CATALOG HERE, IN THE WAKE AUTHORITY ITSELF (round-10
-   * finding 1). `publishWake` runs after EVERY tick outcome, including the
-   * tamper-refusal returns that fire before step 1a's reconciliation -- so a
-   * `rogue:ghost` row in a REFUSED state still supplied the persisted wake
-   * time. Refused state is deliberately not reconciled (writing to it is the
-   * hazard); what must hold instead is that nothing DERIVED from it can carry
-   * an uncatalogued row's schedule into durable state.
+   * Round 10 bounded this input by the code catalog, in the wake authority
+   * itself, so an uncatalogued row in a REFUSED state could not supply the
+   * published wake. Round 11 measured why identity was the WRONG property: a
+   * row whose identity IS catalogued, tampered inside that same refused state,
+   * still published — and the publish re-committed the refused state besides.
+   * The property that actually holds now is stronger and lives where the wake
+   * is COMMITTED: `publishWake` derives only from a state this tick itself
+   * wrote through the repository, so refused state cannot reach this function
+   * through the publish path at all, and every in-tick caller runs after step
+   * 1a's reconciliation.
    *
-   * The bound lives in this function rather than at its callers because this
-   * is the only place a wake is computed: making the authority safe covers the
-   * pre-reconciliation paths that exist and any that get added, where a
-   * per-caller filter would be the sibling-call-site mistake again. For every
-   * in-tick caller the filter is a no-op, since step 1a already reconciled.
+   * The round-10 identity filter is therefore REMOVED rather than kept: on
+   * every reachable input it had become a no-op, and a control that no test
+   * can make fail is indistinguishable from a deleted one — keeping it would
+   * decorate the function with an assurance nothing enforces.
    */
   private computeNextWake(state: SupervisorState): Timestamp | undefined {
-    const catalogued = new Set(
-      this.deps.resourceCatalog.map((entry) => resourceKey(entry.provider, entry.model)),
-    );
     const candidates = state.resources
-      .filter((record) => catalogued.has(record.key))
       .map((record) => record.retryAt)
       .filter((value): value is Timestamp => value !== undefined);
     return candidates.length === 0 ? undefined : Math.min(...candidates);
@@ -2726,7 +2770,12 @@ export class SupervisorService {
       updatedAt: this.deps.clock.now(),
     };
     try {
-      return await this.deps.repository.compareAndSave(candidate, previous.version);
+      const saved = await this.deps.repository.compareAndSave(candidate, previous.version);
+      // Every ACCEPTED write is the tick's newest trusted state, and this is
+      // the only assignment — which is what lets `publishWake` treat "has a
+      // basis" as "the repository vouched for it" (round-11 finding 1).
+      this.tickCommitted = saved;
+      return saved;
     } catch (error) {
       if (error instanceof ConcurrencyError) {
         throw new ConcurrencyError("another supervisor tick advanced this state; re-read and retry");
@@ -3220,8 +3269,18 @@ const ROUTED_ROLE = "routed";
  */
 function describeDeclarationProblem(declared: readonly RequiredResource[]): string | undefined {
   for (const resource of declared) {
+    /**
+     * EVERY PROBLEM NAMES THE DECLARED RESOURCE IT IS ABOUT (round-11
+     * finding 2). Three declared resources, one refusal: `role "reviewr" is
+     * not one of ...` told the operator WHAT was wrong and not WHICH row to
+     * fix. Built before any field is validated, so it is available to every
+     * branch — bounded per field, because each field is executor text.
+     */
+    const identity = `declared ${boundedDiagnostic(String(resource.role))} ${boundedDiagnostic(String(resource.provider))}/${boundedDiagnostic(String(resource.model))}${
+      resource.effort === undefined ? "" : `:${boundedDiagnostic(String(resource.effort))}`
+    }`;
     if (!(REQUIRED_RESOURCE_ROLES as readonly string[]).includes(resource.role)) {
-      return `role ${JSON.stringify(boundedDiagnostic(String(resource.role)))} is not one of ${REQUIRED_RESOURCE_ROLES.join(", ")}`;
+      return `${identity}: role ${JSON.stringify(boundedDiagnostic(String(resource.role)))} is not one of ${REQUIRED_RESOURCE_ROLES.join(", ")}`;
     }
     /**
      * `Object.hasOwn` RATHER THAN INDEXING (round-3 finding 3).
@@ -3233,7 +3292,7 @@ function describeDeclarationProblem(declared: readonly RequiredResource[]): stri
      * properties of the table are providers.
      */
     if (!Object.hasOwn(SUPPORTED_MODELS, resource.provider)) {
-      return `provider ${JSON.stringify(boundedDiagnostic(resource.provider))} is not a provider this build can launch`;
+      return `${identity}: provider ${JSON.stringify(boundedDiagnostic(resource.provider))} is not a provider this build can launch`;
     }
     /**
      * ONE VALIDATOR FOR "CAN THIS BUILD LAUNCH IT" (round-9 finding 2).
@@ -3258,7 +3317,7 @@ function describeDeclarationProblem(declared: readonly RequiredResource[]): stri
         resource.role === "planner" ? "PLANNER" : resource.role === "implementer" ? "IMPLEMENTER" : "REVIEWER",
     });
     if (!probe.ok) {
-      return `resource ${resource.provider}/${resource.model} cannot be launched by this build: ${probe.reason}`;
+      return `${identity}: cannot be launched by this build: ${probe.reason}`;
     }
   }
 

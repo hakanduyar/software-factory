@@ -291,14 +291,16 @@ describe("TASK-015 round-8 finding 1: the catalog reconciles persisted rows", ()
 describe("TASK-015 round-10 finding 1: a refused tick publishes no rogue schedule", () => {
   /**
    * The tamper-refusal paths return BEFORE reconciliation, deliberately —
-   * writing to refused state is the hazard. But `publishWake` runs after every
+   * writing to refused state is the hazard. But `publishWake` ran after every
    * outcome and committed a wake time supplied by an uncatalogued `rogue:ghost`
    * row inside the refused state, so a removed resource still controlled
-   * scheduling. The wake authority now bounds its own input by the catalog.
+   * scheduling. Since round 11, `publishWake` derives only from a state the
+   * tick itself committed — a refusal commits nothing, so it publishes nothing
+   * and WRITES nothing.
    *
-   * BOTH halves of the boundary are asserted: the rogue schedule must not be
-   * published, and the rogue ROW must still be there — a reconciliation of
-   * refused state would be its own defect, not a fix.
+   * All three facts are asserted: the rogue schedule must not be published,
+   * the refused state must not be written at all, and the rogue ROW must still
+   * be there — a reconciliation of refused state would be its own defect.
    */
   it("does not let a rogue row in refused state supply the published wake", async () => {
     const executor = recording();
@@ -331,12 +333,15 @@ describe("TASK-015 round-10 finding 1: a refused tick publishes no rogue schedul
       },
       state.version,
     );
+    const tampered = await supervisor.repository.load();
+    assert.ok(tampered !== undefined);
 
     const result = await supervisor.service.tick();
 
     assert.notEqual(result.kind, "ADVANCED", "a tampered roadmap did not stop the tick");
     assert.equal(executor.ran(), false);
     const after = await supervisor.repository.load();
+    assert.equal(after?.version, tampered.version, "a refused tick wrote to refused state");
     assert.notEqual(
       after?.nextWakeAt,
       1_800_000_005_000,
@@ -345,6 +350,83 @@ describe("TASK-015 round-10 finding 1: a refused tick publishes no rogue schedul
     assert.ok(
       (after?.resources ?? []).some((record) => record.key === "rogue:ghost"),
       "refused state was reconciled — the forensic boundary was crossed",
+    );
+  });
+});
+
+describe("TASK-015 round-11 finding 1: refused state is not committed, even through a catalogued row", () => {
+  /**
+   * Round 10 bounded the wake computation by resource IDENTITY, and the
+   * reviewer measured why that was the wrong property: a row whose identity IS
+   * catalogued, tampered to `retryAt=1800000005000` inside a roadmap-refused
+   * state, still supplied the published wake — and `publishWake`'s commit
+   * re-persisted the ENTIRE refused state, version stamp and tampered roadmap
+   * title included, as if the supervisor endorsed it.
+   *
+   * The property that holds now: a wake derives only from a state this tick
+   * itself wrote, and a refusal writes nothing. So the tampered value must not
+   * be published, the version must not advance, and the tampered row and title
+   * must both still be there, untouched, for a human to inspect.
+   */
+  it("does not let a tampered catalogued row publish, and does not write the refused state back", async () => {
+    const executor = recording();
+    const supervisor = newSupervisor({ probe: permissiveProbe(), executor, resourceCatalog: CATALOG });
+    await seedRoadmap(supervisor, [ITEM]);
+
+    const state = await supervisor.repository.load();
+    assert.ok(state !== undefined);
+    await supervisor.repository.compareAndSave(
+      {
+        ...state,
+        version: state.version + 1,
+        // The same structural tamper as round 10: a title the catalog does not
+        // declare, which makes the tick refuse the whole state.
+        roadmap: state.roadmap.map((entry) =>
+          entry.key === ITEM.key ? { ...entry, title: "tampered definition" } : entry,
+        ),
+        resources: [
+          // The difference from round 10: the scheduling row's identity IS in
+          // the catalog, so an identity bound cannot reject it. Only "refused
+          // state publishes nothing" can.
+          ...state.resources.filter((record) => record.key !== "codex-cli:gpt-5.6-luna"),
+          {
+            provider: "codex-cli",
+            model: "gpt-5.6-luna",
+            key: "codex-cli:gpt-5.6-luna",
+            state: "USAGE_LIMIT_REACHED" as const,
+            detectedAt: 0,
+            lastCheckedAt: 0,
+            retryAt: 1_800_000_005_000,
+            backoff: { attempt: 3, delayMs: 60_000 },
+          } as never,
+        ],
+      },
+      state.version,
+    );
+    const tampered = await supervisor.repository.load();
+    assert.ok(tampered !== undefined);
+
+    const result = await supervisor.service.tick();
+
+    assert.equal(result.kind, "WAITING_FOR_HUMAN", "a tampered roadmap did not stop the tick");
+    assert.equal(executor.ran(), false, "work ran inside refused state");
+    const after = await supervisor.repository.load();
+    assert.equal(after?.version, tampered.version, "a refused tick committed the refused state");
+    assert.equal(
+      after?.nextWakeAt,
+      tampered.nextWakeAt,
+      "a tampered catalogued row inside refused state supplied the published wake",
+    );
+    assert.notEqual(after?.nextWakeAt, 1_800_000_005_000, "the tampered schedule was published");
+    assert.ok(
+      (after?.roadmap ?? []).some((entry) => entry.title === "tampered definition"),
+      "the tampered title is gone — refused state was written to",
+    );
+    assert.ok(
+      (after?.resources ?? []).some(
+        (record) => record.key === "codex-cli:gpt-5.6-luna" && record.retryAt === 1_800_000_005_000,
+      ),
+      "the tampered row is gone — refused state was written to",
     );
   });
 });

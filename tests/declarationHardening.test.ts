@@ -234,6 +234,16 @@ describe("TASK-015 round-5 finding 4: declarations enter through the catalog", (
       /resource catalog/,
       "refused for some reason other than the missing catalog entry",
     );
+    /**
+     * AND THE REFUSAL NAMES THE UNCATALOGUED RESOURCE (round-11 finding 2).
+     * The message named it all along; nothing asserted the name, so the
+     * reviewer's name-removal mutation survived this suite.
+     */
+    assert.match(
+      result.kind === "RECOVERY_REQUIRED" ? result.reason : "",
+      /claude-code:sonnet/,
+      "the refusal does not name the uncatalogued resource",
+    );
     assert.equal(executor.calls().length, 0, "an uncatalogued resource was launched");
   });
 

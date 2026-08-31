@@ -251,6 +251,13 @@ describe("TASK-015 round-2 finding 3: an ambiguous declaration is refused", () =
       /is not one of/,
       "refused for some reason other than the unrecognised role",
     );
+    // Round-11 finding 2: the refusal must identify WHICH declared row is
+    // wrong, not only what is wrong with it.
+    assert.match(
+      result.kind === "RECOVERY_REQUIRED" ? result.reason : "",
+      /reviewr codex-cli\/gpt-5\.6-luna/,
+      "the refusal does not identify the declared resource with the bad role",
+    );
     assert.equal(executor.calls().length, 0, "work ran on an unrecognised role");
   });
 

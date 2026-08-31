@@ -187,6 +187,17 @@ describe("TASK-015 AC-1/AC-2: the supervisor authorises the set the work declare
 
     assert.equal(result.kind, "WAITING_FOR_RESOURCE");
     assert.equal(executor.ran(), false, "work ran despite an unavailable member");
+    /**
+     * AND THE WAIT NAMES THE RESOURCE (round-11 finding 2). The refusal text
+     * existed and named it; no test asserted the name, so the reviewer's
+     * name-removal mutation survived this suite. "Which of three members is
+     * unavailable" is the fact the wait is about.
+     */
+    assert.match(
+      result.kind === "WAITING_FOR_RESOURCE" ? result.reason : "",
+      /codex-cli:gpt-5\.6-luna/,
+      "the wait does not name the unavailable resource",
+    );
   });
 
   /**
@@ -277,6 +288,13 @@ describe("TASK-015 AC-1/AC-2: the supervisor authorises the set the work declare
 
       assert.equal(result.kind, "WAITING_FOR_RESOURCE", `an unavailable ${role} was allowed through`);
       assert.equal(executor.ran(), false, `work ran with an unavailable ${role}`);
+      // Round-11 finding 2: the wait must name WHICH member is unavailable,
+      // per role, or a name-removal mutation survives the whole loop.
+      assert.match(
+        result.kind === "WAITING_FOR_RESOURCE" ? result.reason : "",
+        new RegExp(missing.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+        `the wait does not name the unavailable ${role} (${missing})`,
+      );
     });
   }
 

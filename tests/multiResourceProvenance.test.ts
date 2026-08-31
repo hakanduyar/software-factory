@@ -375,5 +375,62 @@ describe("TASK-015 finding 4: a probe that throws is a controlled refusal", () =
 
     assert.equal(result.kind, "RECOVERY_REQUIRED", "the tick did not refuse in a controlled way");
     assert.equal(executor.calls().length, 0, "work ran despite an unprobeable member");
+    /**
+     * AND THE REFUSAL NAMES THE UNPROBEABLE RESOURCE (round-11 finding 2). The
+     * message named it all along; nothing asserted the name, so the reviewer's
+     * name-removal mutation survived this suite — a refusal that is correct
+     * for a reason the test does not pin.
+     */
+    assert.match(
+      result.kind === "RECOVERY_REQUIRED" ? result.reason : "",
+      /codex-cli:gpt-5\.6-luna/,
+      "the refusal does not name the resource whose probe threw",
+    );
+  });
+});
+
+describe("TASK-015 round-11 finding 2: a worker resource failure names its resource", () => {
+  /**
+   * A routed worker failed with "provider CLI exited 1 with no recognised
+   * failure signature", and that text reached the tick result, the persisted
+   * roadmap detail and the resource diagnostic with the resource's key in NONE
+   * of them. Three declared resources, one failure: WHICH CLI failed is the
+   * fact an operator acts on, and it lived only in free text that does not
+   * carry forward.
+   */
+  it("carries the failing resource's key into the result and the roadmap detail", async () => {
+    const executor = executorReporting(
+      [
+        { role: "implementer", provider: "claude-code", model: "opus" },
+        { role: "reviewer", provider: "codex-cli", model: "gpt-5.6-luna" },
+      ],
+      {
+        // The reviewer's reproduction: an exit the classifier has no signature
+        // for, which produces "provider CLI exited 1 with no recognised
+        // failure signature" — previously with no resource key anywhere.
+        kind: "RESOURCE_FAILURE",
+        process: { terminationReason: "EXITED", exitCode: 1, stdout: "", stderr: "" },
+      },
+    );
+    const supervisor = newSupervisor({ probe: healthyProbe(), executor, resourceCatalog: CATALOG });
+    await seedRoadmap(supervisor, [ITEM]);
+
+    const result = await supervisor.service.tick();
+
+    assert.equal(result.kind, "WAITING_FOR_RESOURCE", `expected a resource wait: ${JSON.stringify(result)}`);
+    // The implementer is the resource the run was launched as, so the failure
+    // is ITS failure — the same identity `lastRunConfig` and lineage carry.
+    assert.match(
+      result.kind === "WAITING_FOR_RESOURCE" ? result.reason : "",
+      /claude-code:opus/,
+      "the failure does not name the resource that failed",
+    );
+    const after = await supervisor.repository.load();
+    const item = (after?.roadmap ?? []).find((entry) => entry.key === ITEM.key);
+    assert.match(
+      item?.detail ?? "",
+      /claude-code:opus/,
+      "the persisted roadmap detail does not name the resource that failed",
+    );
   });
 });
