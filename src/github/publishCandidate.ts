@@ -8,14 +8,16 @@
  *
  * The order of operations is the design:
  *
- *   1. local preconditions   — refuse before anything acts
- *   2. observe the target    — in this process, immediately before the gate
- *   3. gate the push         — the verdict is EARNED from that observation
- *   4. push                  — only if the gate cleared it
- *   5. find-or-create the PR — find FIRST, so a re-run adopts rather than duplicates
- *   6. re-bind               — the remote must still describe the reviewed commit
+ *   1. fetch                 — so the base is not a stale local answer
+ *   2. local preconditions   — refuse before anything acts, ancestry included
+ *   3. derive the target     — from the URL git will ACTUALLY push to
+ *   4. observe that target   — in this process, immediately before the gate
+ *   5. gate the push         — the verdict is EARNED from that observation
+ *   6. push                  — only if the gate cleared it
+ *   7. find-or-create the PR — find FIRST; a create conflict ADOPTS
+ *   8. re-bind               — the remote must still describe the reviewed commit
  *
- * Steps 2 and 3 are adjacent on purpose (F4-3): an observation is evidence
+ * Steps 4 and 5 are adjacent on purpose (F4-3): an observation is evidence
  * about a moment, and a gate consulting a stale one is deciding about the past.
  */
 
@@ -32,7 +34,7 @@ import type { GitHubClient, GitPusher, GitRepositoryReader } from "./githubPorts
 import {
   evaluateFinancialSafety,
   gitPushAction,
-  observeRepositoryBilling,
+  observePushLiability,
   parseFinancialPolicy,
   type SupervisedAction,
 } from "../supervision/financialSafety.js";
@@ -47,9 +49,8 @@ export type PublishOutcome =
       readonly pushed: boolean;
       /**
        * CI evidence for the published commit, carried out so the caller can
-       * RECORD it (AC-4). Retrieved after the remote settled, and `undefined`
-       * only when the status could not be read — which the record states as its
-       * own fact rather than as an absence of checks.
+       * RECORD it (AC-4). `undefined` only when the status could not be read —
+       * which the record states as its own fact rather than as "no checks".
        */
       readonly checks: RemoteCheckStatus | undefined;
     }
@@ -64,28 +65,45 @@ export interface PublishDeps {
   readonly github: GitHubClient;
   readonly git: GitRepositoryReader;
   readonly pusher: GitPusher;
-  /** `owner/name` this action is permitted to touch. */
+  /**
+   * `owner/name` this action is permitted to touch. An EXPECTATION that the
+   * derived target must match — never the source of the target itself.
+   */
   readonly expectedRepository: string;
-  readonly expectedRemoteUrl: string;
+  /** The URL git must be about to push to, asserted by the caller. */
+  readonly expectedPushUrl: string;
+  /** Derives `owner/name` from a push URL; `undefined` when it is not GitHub. */
+  readonly targetFromUrl: (url: string) => string | undefined;
   /** The supervisor's stored policy, parsed by the same strict parser as everywhere else. */
   readonly financialPolicy: unknown;
 }
 
-/** Reads the local repository into the shape the pure checks consume. */
+/**
+ * Reads the local repository into the shape the pure checks consume.
+ *
+ * FETCHES FIRST (round-1 HIGH 3): `origin/<base>` is a local cache, and
+ * deciding that the base has not moved by consulting a stale copy of it is not
+ * a check. `GIT_FETCH` is free-but-remote in the effects table and triggers
+ * nothing on the far side.
+ */
 export async function readLocalState(
   git: GitRepositoryReader,
-  baseRef: string,
+  candidate: ReviewedCandidate,
 ): Promise<LocalRepositoryState | undefined> {
-  const [remoteUrl, headSha, baseSha, clean] = await Promise.all([
-    git.remoteUrl(),
+  await git.fetch();
+  const [pushUrl, headSha, baseSha, clean] = await Promise.all([
+    git.pushUrl(),
     git.revision("HEAD"),
-    git.revision(`origin/${baseRef}`),
+    git.revision(`origin/${candidate.baseRef}`),
     git.isClean(),
   ]);
   if (headSha === undefined || baseSha === undefined) {
     return undefined;
   }
-  return { remoteUrl, headSha, baseSha, clean };
+  const baseIsAncestorOfHead = await git
+    .isAncestor(baseSha, headSha)
+    .catch(() => undefined);
+  return { pushUrl, headSha, baseSha, clean, baseIsAncestorOfHead };
 }
 
 export async function publishCandidate(
@@ -96,24 +114,49 @@ export async function publishCandidate(
     return { kind: "REFUSED", reason: "the candidate does not name a full commit id" };
   }
 
-  const local = await readLocalState(deps.git, candidate.baseRef);
+  const local = await readLocalState(deps.git, candidate);
   if (local === undefined) {
     return { kind: "REFUSED", reason: `HEAD or origin/${candidate.baseRef} could not be resolved to a commit` };
   }
   const preconditions = checkPublishPreconditions({
     candidate,
     local,
-    expectedRemoteUrl: deps.expectedRemoteUrl,
+    expectedPushUrl: deps.expectedPushUrl,
   });
   if (!preconditions.ok) {
     return { kind: "REFUSED", reason: preconditions.reason };
   }
 
-  const repository = await deps.github.repository();
-  if (repository.nameWithOwner !== deps.expectedRepository) {
+  /**
+   * THE TARGET IS DERIVED FROM WHERE THE PUSH WILL GO (round-1 CRITICAL 1).
+   *
+   * `expectedRepository` and `expectedPushUrl` were two independent
+   * caller-supplied strings, so a URL for one repository could be paired with
+   * the NAME of another — earning a free verdict from a repository that would
+   * never be written to. The identity now comes from the push URL itself, and
+   * the caller's expectation is checked against it rather than trusted as it.
+   */
+  const target = deps.targetFromUrl(local.pushUrl);
+  if (target === undefined) {
+    return { kind: "REFUSED", reason: `the push URL ${JSON.stringify(local.pushUrl)} is not a GitHub repository URL` };
+  }
+  if (target !== deps.expectedRepository) {
     return {
       kind: "REFUSED",
-      reason: `the remote reports ${JSON.stringify(repository.nameWithOwner)} but this action expects ${JSON.stringify(deps.expectedRepository)}`,
+      reason: `git would push to ${target} but this action expects ${deps.expectedRepository}`,
+    };
+  }
+
+  const repository = await deps.github.repository();
+  /**
+   * And the repository we OBSERVED must be the one we will WRITE to. Without
+   * this the gate could inspect a safe repository while the push went
+   * elsewhere — which is the same defect one level up.
+   */
+  if (repository.nameWithOwner !== target) {
+    return {
+      kind: "REFUSED",
+      reason: `the observed repository is ${JSON.stringify(repository.nameWithOwner)} but the push target is ${JSON.stringify(target)}`,
     };
   }
 
@@ -129,17 +172,24 @@ export async function publishCandidate(
   let pushed = false;
   if (!alreadyPublished) {
     /**
-     * OBSERVED HERE, IN THIS PROCESS, IMMEDIATELY BEFORE THE GATE (AC-2). The
-     * repository row above was fetched moments ago by this same call; nothing
-     * persisted contributes to this decision.
+     * OBSERVED HERE, IN THIS PROCESS, IMMEDIATELY BEFORE THE GATE (AC-2),
+     * including what THIS PUSH would introduce: a candidate carrying
+     * `.github/workflows/*` can trigger the run it adds, on a runner it
+     * chooses, so the target's current emptiness is not sufficient by itself.
      */
-    const observation = observeRepositoryBilling({
-      target: repository.nameWithOwner,
+    const addsWorkflows = await deps.git
+      .addsWorkflows(candidate.baseSha, candidate.headSha)
+      .catch(() => undefined);
+    const observation = observePushLiability({
+      target,
       visibility: repository.visibility,
-      billableIntegrations: repository.billableIntegrations,
+      ownerType: repository.ownerType,
+      repositoryWebhooks: repository.repositoryWebhooks,
+      configuredWorkflows: repository.configuredWorkflows,
+      candidateAddsWorkflows: addsWorkflows,
     });
     const action = gitPushAction({
-      target: repository.nameWithOwner,
+      target,
       observation,
       description: `publish ${candidate.roadmapKey} candidate ${candidate.headSha} to ${candidate.headRef}`,
     });
@@ -148,7 +198,7 @@ export async function publishCandidate(
       return {
         kind: "HUMAN_REQUIRED",
         action,
-        reason: `${verdict.humanActionRequired} Failing target: ${repository.nameWithOwner}.`,
+        reason: `${verdict.humanActionRequired} Failing target: ${target}.`,
       };
     }
     await deps.pusher.pushFastForward({ branch: candidate.headRef, sha: candidate.headSha });
@@ -156,34 +206,54 @@ export async function publishCandidate(
   }
 
   /**
-   * FIND BEFORE CREATE (AC-5). `existing` was read before the push; re-reading
-   * after it is what makes an interrupted run safe — a previous attempt may
-   * have created the PR and died before recording it, and creating a second
-   * one would leave two lifecycles for one work item.
+   * FIND BEFORE CREATE (AC-5), AND LET THE REMOTE BE THE ARBITER.
+   *
+   * Re-reading after the push is what makes an interrupted run safe: a
+   * previous attempt may have created the PR and died before recording it.
+   *
+   * ROUND-1 REVIEW, HIGH 5. Find-then-create is not atomic, so two concurrent
+   * runs could both find nothing and both create. The serialization point that
+   * actually exists is GITHUB: it refuses a second open pull request for the
+   * same head and base. So a failed creation is not assumed fatal — it is
+   * followed by a re-find, and an existing PR is ADOPTED. The race therefore
+   * ends with one pull request and one of the two runs reporting `created`.
+   * (The push itself is idempotent: two pushes of the same sha to the same ref
+   * leave the ref at that sha.)
    */
   const found = existing ?? (await deps.github.findPullRequest(candidate.headRef));
   let pullRequest: RemotePullRequest;
   let created = false;
   if (found === undefined) {
-    pullRequest = await deps.github.createPullRequest({
-      headRef: candidate.headRef,
-      baseRef: candidate.baseRef,
-      title: `${candidate.roadmapKey}: ${candidate.headSha.slice(0, 12)}`,
-      /**
-       * The body carries IDENTITY, not conclusions. It states which commit is
-       * proposed and against which base; it does not claim the work is
-       * accepted, because a PR body is not an acceptance and this module is
-       * not the thing that decides one.
-       */
-      body: [
-        `Roadmap item: ${candidate.roadmapKey}`,
-        `Candidate commit: ${candidate.headSha}`,
-        `Reviewed against base: ${candidate.baseSha} (${candidate.baseRef})`,
-        "",
-        "Acceptance is recorded by the Factory's independent review process, not by this pull request.",
-      ].join("\n"),
-    });
-    created = true;
+    try {
+      pullRequest = await deps.github.createPullRequest({
+        headRef: candidate.headRef,
+        baseRef: candidate.baseRef,
+        title: `${candidate.roadmapKey}: ${candidate.headSha.slice(0, 12)}`,
+        /**
+         * The body carries IDENTITY, not conclusions. It states which commit
+         * is proposed and against which base; it does not claim the work is
+         * accepted, because a PR body is not an acceptance and this module is
+         * not the thing that decides one.
+         */
+        body: [
+          `Roadmap item: ${candidate.roadmapKey}`,
+          `Candidate commit: ${candidate.headSha}`,
+          `Reviewed against base: ${candidate.baseSha} (${candidate.baseRef})`,
+          "",
+          "Acceptance is recorded by the Factory's independent review process, not by this pull request.",
+        ].join("\n"),
+      });
+      created = true;
+    } catch (error) {
+      const adopted = await deps.github.findPullRequest(candidate.headRef);
+      if (adopted === undefined) {
+        return {
+          kind: "REFUSED",
+          reason: `creating the pull request failed and none exists: ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+      pullRequest = adopted;
+    }
   } else {
     pullRequest = found;
   }
@@ -197,7 +267,7 @@ export async function publishCandidate(
   const rebound = checkRemoteCandidateBinding({
     candidate,
     repository,
-    expectedRepository: deps.expectedRepository,
+    expectedRepository: target,
     pullRequest,
   });
   if (!rebound.ok) {

@@ -534,53 +534,89 @@ export const REPOSITORY_VISIBILITIES = ["PUBLIC", "PRIVATE", "UNKNOWN"] as const
 export type RepositoryVisibility = (typeof REPOSITORY_VISIBILITIES)[number];
 
 /**
- * What an in-process query reported about ONE push target's billing posture.
- *
- * The same shape and the same rules as `BillingObservation`, for the same
- * reason: `GIT_PUSH` is registered financial in the table above because "a push
- * can start paid CI, fire paid webhooks, or consume the GitHub Actions
- * allowance", and that comment names the remedy — a push to a target with
- * DEMONSTRATED zero liability may earn a minted action, the way verification
- * commands did.
- *
- * `target` is the repository this observation is ABOUT, so a verdict earned for
- * one repository cannot authorise a push to another (the F6-FIN-1 rule, applied
- * to push targets instead of resources).
+ * Who owns the target. An ORGANIZATION can carry organisation-level webhooks
+ * and policies a repository-scope query cannot see; a USER account cannot have
+ * them at all, so the distinction is load-bearing rather than descriptive.
  */
-export interface RepositoryBillingObservation {
-  /** `owner/name`, as reported by the query that observed it. */
-  readonly target: string;
-  readonly visibility: RepositoryVisibility;
-  /**
-   * How many repository-level integrations could turn a push into someone's
-   * bill. `undefined` means the count could not be established, which is
-   * UNKNOWN, which is financial.
-   */
-  readonly billableIntegrations: number | undefined;
-}
+export const REPOSITORY_OWNER_TYPES = ["USER", "ORGANIZATION", "UNKNOWN"] as const;
 
-const REPOSITORY_OBSERVATIONS = new WeakSet<RepositoryBillingObservation>();
+export type RepositoryOwnerType = (typeof REPOSITORY_OWNER_TYPES)[number];
 
 /**
- * Records what a REMOTE QUERY reported about a push target.
+ * What an in-process query reported about ONE PUSH — the target's posture AND
+ * what this particular push would introduce.
  *
- * Call this only with the result of an actual query performed in this process,
- * immediately before the gate — the same discipline F4-3 imposed on billing
- * probes, and for the same reason: a persisted row describing a repository is
- * not evidence about the repository as it is now.
+ * ROUND-1 REVIEW, CRITICAL 2. The first version observed only "public" and
+ * "no repository webhooks" and called that zero liability. The reviewer showed
+ * it is not: GitHub bills LARGER RUNNERS even on public repositories, and
+ * organisation-scoped webhooks are outside a repository query. Converting that
+ * incomplete observation into `costKnownZero` was exactly the declared-not-
+ * derived mistake this module exists to prevent.
+ *
+ * So the observation now covers every mechanism by which a push to GitHub can
+ * start something billable, and each one fails closed when it cannot be read:
+ *
+ *   - `visibility`      PUBLIC repositories are not metered for standard runners.
+ *   - `ownerType`       a USER account cannot have organisation-level webhooks;
+ *                       an ORGANIZATION can, and this token cannot enumerate
+ *                       them, so an organisation target is never demonstrable.
+ *   - `repositoryWebhooks`  a repo webhook can forward the push to a metered
+ *                       third party.
+ *   - `configuredWorkflows` with ZERO workflows no Actions run can start at
+ *                       all, which is what closes the larger-runner case: runner
+ *                       size cannot bill a run that cannot exist.
+ *   - `candidateAddsWorkflows`  and the push itself must not CREATE that
+ *                       possibility. A push carrying `.github/workflows/*` can
+ *                       trigger the very run it introduces, on a runner it
+ *                       chooses. Observing only the target's current state
+ *                       would miss it.
+ *
+ * `target` is the repository this observation is ABOUT, so a verdict earned for
+ * one repository cannot authorise a push to another (F6-FIN-1 applied to push
+ * targets), and the caller must derive that target from the URL git will
+ * actually write to — see round-1 CRITICAL 1.
  */
-export function observeRepositoryBilling(input: {
+export interface PushLiabilityObservation {
+  /** `owner/name`, derived from the URL the push will actually be sent to. */
+  readonly target: string;
+  readonly visibility: RepositoryVisibility;
+  readonly ownerType: RepositoryOwnerType;
+  /** `undefined` when the count could not be established — unknown is financial. */
+  readonly repositoryWebhooks: number | undefined;
+  /** `undefined` when the count could not be established. */
+  readonly configuredWorkflows: number | undefined;
+  /** `undefined` when it could not be established whether this push adds workflows. */
+  readonly candidateAddsWorkflows: boolean | undefined;
+}
+
+const PUSH_OBSERVATIONS = new WeakSet<PushLiabilityObservation>();
+
+/**
+ * Records what an in-process query reported about one push.
+ *
+ * Call this only with the result of queries performed in THIS process,
+ * immediately before the gate — the discipline F4-3 imposed on billing probes,
+ * for the same reason: a persisted row describing a repository is not evidence
+ * about the repository as it is now.
+ */
+export function observePushLiability(input: {
   readonly target: string;
   readonly visibility: RepositoryVisibility | undefined;
-  readonly billableIntegrations: number | undefined;
-}): RepositoryBillingObservation {
+  readonly ownerType: RepositoryOwnerType | undefined;
+  readonly repositoryWebhooks: number | undefined;
+  readonly configuredWorkflows: number | undefined;
+  readonly candidateAddsWorkflows: boolean | undefined;
+}): PushLiabilityObservation {
   const observation = Object.freeze({
     target: input.target,
     // Absent observation is UNKNOWN, and unknown is financial.
     visibility: input.visibility ?? "UNKNOWN",
-    billableIntegrations: input.billableIntegrations,
+    ownerType: input.ownerType ?? "UNKNOWN",
+    repositoryWebhooks: input.repositoryWebhooks,
+    configuredWorkflows: input.configuredWorkflows,
+    candidateAddsWorkflows: input.candidateAddsWorkflows,
   });
-  REPOSITORY_OBSERVATIONS.add(observation);
+  PUSH_OBSERVATIONS.add(observation);
   return observation;
 }
 
@@ -588,39 +624,46 @@ export function observeRepositoryBilling(input: {
  * Builds a push action whose cost verdict is EARNED from an observation of the
  * exact target (TASK-016 AC-1/AC-2).
  *
- * WHAT MAKES A PUSH FREE HERE, stated so it can be attacked rather than
- * assumed. GitHub does not meter Actions minutes for PUBLIC repositories, so a
- * push to one cannot consume the allowance the runtime amendment protects. That
- * covers GitHub's own billing and nothing else, so a second condition carries
- * the rest: zero repository-level integrations, because a webhook can hand the
- * push to a metered third party whose bill this process cannot see.
+ * FREE REQUIRES ALL FIVE FACTS, each observed and none merely assumed: a public
+ * repository, owned by a user rather than an organisation, with no repository
+ * webhooks, no configured workflows, and a candidate that introduces none.
+ * Together those say that this push cannot start an Actions run of any runner
+ * size and cannot be forwarded by any integration this token can enumerate.
  *
- * Every other case is financial, INCLUDING the ones that merely cannot be
- * established: a private repository, an unknown visibility, an integration
- * count that could not be read, an observation this module did not produce, and
- * an observation describing a different repository than the one being pushed
- * to. Uncertainty is financial — that rule is what makes the verdict worth
- * anything.
+ * Everything else is financial, INCLUDING everything that merely could not be
+ * established — a private repository, an unknown visibility, an organisation
+ * owner, an unreadable webhook or workflow count, an unknown answer about the
+ * candidate, an observation this module did not produce, and an observation
+ * describing a different repository than the one being pushed to.
  *
- * RESIDUAL, recorded in docs/KNOWN-LIMITATIONS.md rather than glossed: this
- * observes REPOSITORY-level exposure. An organisation-level or GitHub-App
- * integration that bills on push is not visible here, so a push earning
- * FREE_REMOTE_ACTION means "no repository-level liability was demonstrable",
- * not "no liability can exist anywhere".
+ * RESIDUAL, recorded as L-14 rather than glossed: a GitHub App installation is
+ * NOT observable with the Factory's scopes (both `/repos/:r/installation` and
+ * `/user/installations` refuse an OAuth token). So this demonstrates that
+ * GitHub itself will not meter the push and that no repository- or
+ * organisation-scoped integration exists to forward it — not that no App
+ * subscription a human previously authorised could react to it.
  */
 export function gitPushAction(input: {
   readonly target: string;
-  readonly observation?: RepositoryBillingObservation;
+  readonly observation?: PushLiabilityObservation;
   readonly description: string;
 }): SupervisedAction {
   const observation = input.observation;
   const trusted =
     observation !== undefined &&
-    REPOSITORY_OBSERVATIONS.has(observation) &&
+    PUSH_OBSERVATIONS.has(observation) &&
     observation.target === input.target;
   const visibility: RepositoryVisibility = trusted ? observation.visibility : "UNKNOWN";
-  const integrations = trusted ? observation.billableIntegrations : undefined;
-  const unmetered = visibility === "PUBLIC" && integrations === 0;
+  const ownerType: RepositoryOwnerType = trusted ? observation.ownerType : "UNKNOWN";
+  const webhooks = trusted ? observation.repositoryWebhooks : undefined;
+  const workflows = trusted ? observation.configuredWorkflows : undefined;
+  const addsWorkflows = trusted ? observation.candidateAddsWorkflows : undefined;
+  const unmetered =
+    visibility === "PUBLIC" &&
+    ownerType === "USER" &&
+    webhooks === 0 &&
+    workflows === 0 &&
+    addsWorkflows === false;
   const derivedEffects = effects({
     remote: true,
     costKnownZero: unmetered,
@@ -631,7 +674,10 @@ export function gitPushAction(input: {
       kind: "GIT_PUSH",
       description: input.description,
       // Human-readable only; the binding copy lives in the mint record.
-      detail: `target ${input.target}, visibility ${visibility}, integrations ${integrations ?? "unknown"}`,
+      detail:
+        `target ${input.target}, visibility ${visibility}, owner ${ownerType}, ` +
+        `webhooks ${webhooks ?? "unknown"}, workflows ${workflows ?? "unknown"}, ` +
+        `candidate adds workflows ${addsWorkflows ?? "unknown"}`,
       effects: derivedEffects,
     },
     derivedEffects,

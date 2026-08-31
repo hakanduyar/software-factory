@@ -12,7 +12,12 @@
  * consumes it.
  */
 
-import { createGhCliClient, createGitPusher, createGitRepositoryReader } from "../adapters/github/ghCliClient.js";
+import {
+  createGhCliClient,
+  createGitPusher,
+  createGitRepositoryReader,
+  githubTargetFromUrl,
+} from "../adapters/github/ghCliClient.js";
 import { createNodeProcessRunner } from "../adapters/process/nodeProcessRunner.js";
 import { publishCandidate, type PublishOutcome } from "../github/publishCandidate.js";
 import { publicationDetail, withPublicationRecorded } from "../github/publicationProvenance.js";
@@ -126,7 +131,10 @@ function build(args: GithubPublishArgs, options: GithubCliOptions) {
     git: createGitRepositoryReader(deps),
     pusher: createGitPusher(deps),
     expectedRepository: args.repository,
-    expectedRemoteUrl: args.remoteUrl,
+    expectedPushUrl: args.remoteUrl,
+    // The identity comes from the URL git will actually write to; the caller's
+    // `--repo` is checked against it rather than trusted as it (CRITICAL 1).
+    targetFromUrl: githubTargetFromUrl,
     financialPolicy: ZERO_SPEND_POLICY,
   };
 }
@@ -246,7 +254,7 @@ export async function runGithubReadiness(
   const deps = build(args, options);
   const candidate = candidateFrom(args);
 
-  const local = await readLocalState(deps.git, args.baseRef);
+  const local = await readLocalState(deps.git, candidate);
   if (local === undefined) {
     log(`NOT_READY: HEAD or origin/${safe(args.baseRef)} could not be resolved to a commit`);
     return 1;
@@ -262,7 +270,7 @@ export async function runGithubReadiness(
     pullRequest,
     checks,
     local,
-    expectedRemoteUrl: args.remoteUrl,
+    expectedPushUrl: args.remoteUrl,
     reviewAccepted: args.reviewAccepted,
   });
 

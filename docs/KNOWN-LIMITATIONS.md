@@ -799,37 +799,46 @@ different key, a missing key and two keys, and — the control that matters —
 asserts a correctly declared plan is still ACCEPTED, so the guard is not
 satisfied by refusing everything.
 
-## L-14 — A push verdict proves REPOSITORY-level zero liability, not global zero liability
+## L-14 - A push verdict proves what GitHub itself will meter, not that no App can react
 
 `GIT_PUSH` was registered financial with a comment predicting the remedy: "a
 push to a target with demonstrated zero liability could earn a minted action
-later, the way verification commands did." TASK-016 earns it. `gitPushAction`
-derives `costKnownZero` from an observation of the exact target, and only two
-observed facts make a push free: the repository is PUBLIC, so GitHub does not
-meter Actions minutes against it, and it has ZERO repository-level webhooks, so
-no configured integration can hand the push to a metered third party.
+later, the way verification commands did." TASK-016 earns it -- but the FIRST
+attempt earned it too cheaply, and the round-1 review was right to refuse it.
 
-**What that does not cover.** The observation reads
-`repos/:owner/:name/hooks`, which is repository scope. An ORGANISATION-level
-webhook, a GitHub App installed across the account, or a third-party service
-subscribed through some other mechanism is invisible to it. So a push earning
-`FREE_REMOTE_ACTION` means "no repository-level liability was demonstrable",
-never "no liability can exist anywhere".
+**What the first attempt got wrong.** It required only "public repository" and
+"zero repository webhooks". GitHub bills LARGER RUNNERS even on public
+repositories, and organisation-scoped webhooks are outside a repository query,
+so that pair never established zero liability. Converting an incomplete
+observation into `costKnownZero` is exactly the declared-not-derived mistake
+the financial gate exists to prevent.
 
-**Why this is acceptable as a floor rather than a hole.** Every uncertainty
-resolves financial: a private repository, a visibility that could not be read,
-a hooks endpoint that errored, an observation naming a different repository,
-and an observation this module did not produce all yield UNKNOWN, which is
-financial, which refuses. The residual is therefore an over-permission only in
-the narrow case where a billing integration exists at a scope this query cannot
-see — and closing it needs org-scope credentials the Factory deliberately does
-not hold.
+**What is required now.** All five, each observed in-process immediately before
+the gate, and each failing closed when it cannot be read:
 
-**The narrower true statement, for anyone reading a provenance record later:**
-this repository is public and has no webhooks, both observed per push, so no
-push the Factory has made could consume a metered GitHub allowance.
+- `visibility` is PUBLIC -- standard runners are not metered there;
+- `ownerType` is USER -- a user account cannot have organisation-level webhooks
+  at all, and this token cannot enumerate an organisation's, so an
+  organisation-owned target is never demonstrable;
+- `repositoryWebhooks` is 0 -- no repository-scoped forwarder to a metered
+  third party;
+- `configuredWorkflows` is 0 -- with no workflows no Actions run can start, so
+  runner size cannot bill a run that cannot exist;
+- `candidateAddsWorkflows` is false -- and the push must not CREATE that
+  possibility, since a push carrying `.github/workflows/*` can trigger the very
+  run it introduces, on a runner it chooses.
 
-**Kept honest by:** `tests/pushAuthorization.test.ts` has a case for every
-refusing condition, and — the control that matters — one case where an
-observed public repository with zero integrations is PERMITTED, so the guard is
-not satisfied by refusing everything.
+**The residual, stated narrowly.** A GitHub App installation is NOT observable
+with the Factory's credentials: `/repos/:owner/:repo/installation` answers 401
+and `/user/installations` answers 403 for an OAuth token. So a push earning
+`FREE_REMOTE_ACTION` demonstrates that GitHub itself will not meter it and that
+no repository- or organisation-scoped integration exists to forward it -- NOT
+that an App subscription a human previously authorised cannot react to it. That
+residual cannot create NEW autonomous spend by the Factory; it can only
+continue a commitment a human already made.
+
+**Kept honest by:** `tests/pushAuthorization.test.ts` has one case per
+mechanism, each satisfying every other condition so that only the named one can
+produce the refusal, and -- the control that matters -- one case where all five
+hold and the push is PERMITTED, so the guard is not satisfied by refusing
+everything.

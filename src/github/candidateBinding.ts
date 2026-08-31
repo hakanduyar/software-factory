@@ -18,7 +18,7 @@
  * default when a human pushes one more commit while a review is running.
  */
 
-import type { RepositoryVisibility } from "../supervision/financialSafety.js";
+import type { RepositoryOwnerType, RepositoryVisibility } from "../supervision/financialSafety.js";
 
 /** A commit id, as it came back from git or from GitHub. */
 export type CommitSha = string;
@@ -45,8 +45,12 @@ export interface RemoteRepository {
   readonly nameWithOwner: string;
   readonly defaultBranch: string;
   readonly visibility: RepositoryVisibility;
-  /** Repository-level integrations; `undefined` when the count is unknown. */
-  readonly billableIntegrations: number | undefined;
+  /** USER or ORGANIZATION — decides whether org-scoped webhooks can exist. */
+  readonly ownerType: RepositoryOwnerType;
+  /** Repository webhooks; `undefined` when the count could not be established. */
+  readonly repositoryWebhooks: number | undefined;
+  /** Configured Actions workflows; `undefined` when unknown. */
+  readonly configuredWorkflows: number | undefined;
 }
 
 export const PULL_REQUEST_STATES = ["OPEN", "CLOSED", "MERGED"] as const;
@@ -102,13 +106,26 @@ export interface ReviewedCandidate {
 
 /** What the LOCAL repository looks like right now. */
 export interface LocalRepositoryState {
-  /** The `origin` URL, to prove we are talking about the repository we think we are. */
-  readonly remoteUrl: string;
+  /**
+   * The URL git will actually PUSH to, and the value the target identity is
+   * derived from (round-1 CRITICAL 1). Not the fetch URL: a configured
+   * `remote.origin.pushurl` makes those two different repositories.
+   */
+  readonly pushUrl: string;
   readonly headSha: CommitSha;
-  /** Where `origin/<baseRef>` points right now. */
+  /** Where `origin/<baseRef>` points right now, AFTER a fetch. */
   readonly baseSha: CommitSha;
   /** False when anything is uncommitted, staged or untracked. */
   readonly clean: boolean;
+  /**
+   * Whether the base is an ANCESTOR of the candidate.
+   *
+   * ROUND-1 REVIEW, HIGH 3. Equality of two shas says they are the ones that
+   * were reviewed; it says nothing about whether the candidate can actually be
+   * fast-forwarded onto the base. Two unrelated commits passed every equality
+   * check. `undefined` means it could not be established, which refuses.
+   */
+  readonly baseIsAncestorOfHead: boolean | undefined;
 }
 
 export type BindingVerdict =
@@ -129,7 +146,7 @@ function refuse(reason: string): BindingVerdict {
 export function checkPublishPreconditions(input: {
   readonly candidate: ReviewedCandidate;
   readonly local: LocalRepositoryState;
-  readonly expectedRemoteUrl: string;
+  readonly expectedPushUrl: string;
 }): BindingVerdict {
   const { candidate, local } = input;
 
@@ -146,9 +163,9 @@ export function checkPublishPreconditions(input: {
    * the wrong repository is not recoverable by noticing afterwards, and the
    * comparison costs one string.
    */
-  if (local.remoteUrl !== input.expectedRemoteUrl) {
+  if (local.pushUrl !== input.expectedPushUrl) {
     return refuse(
-      `the local 'origin' is ${JSON.stringify(local.remoteUrl)} but this action expects ${JSON.stringify(input.expectedRemoteUrl)}`,
+      `git would push to ${JSON.stringify(local.pushUrl)} but this action expects ${JSON.stringify(input.expectedPushUrl)}`,
     );
   }
   if (!local.clean) {
@@ -170,6 +187,22 @@ export function checkPublishPreconditions(input: {
   if (local.baseSha !== candidate.baseSha) {
     return refuse(
       `${candidate.baseRef} was ${candidate.baseSha} when the candidate was reviewed and is ${local.baseSha} now; the review does not describe this base`,
+    );
+  }
+  /**
+   * AND THE CANDIDATE MUST ACTUALLY SIT ON THAT BASE (round-1 HIGH 3).
+   *
+   * Equality proves the two shas are the reviewed ones. It does not prove the
+   * candidate descends from the base — two unrelated commits satisfy every
+   * check above — and a candidate that does not descend from its base cannot
+   * be fast-forwarded onto it, so the publication being prepared is not the
+   * one anybody could integrate. `undefined` is unknown, which refuses.
+   */
+  if (local.baseIsAncestorOfHead !== true) {
+    return refuse(
+      local.baseIsAncestorOfHead === false
+        ? `${candidate.baseSha} is not an ancestor of ${candidate.headSha}; the candidate does not sit on the base it claims`
+        : `whether ${candidate.baseSha} is an ancestor of ${candidate.headSha} could not be established`,
     );
   }
   return { ok: true };
@@ -274,18 +307,26 @@ export function checkCheckEvidence(input: {
       `no checks are configured for ${candidate.headSha}; the absence of a failure is not evidence of a pass`,
     );
   }
-  if (checks.conclusion === "PENDING") {
-    return refuse(`checks for ${candidate.headSha} have not finished`);
-  }
-  if (checks.conclusion === "FAILURE") {
-    return refuse(`checks failed for ${candidate.headSha}`);
+  /**
+   * SUCCESS IS AN ALLOWLIST, NOT THE ABSENCE OF KNOWN FAILURES (round-1
+   * HIGH 4). Enumerating PENDING and FAILURE and accepting everything else let
+   * an unrecognised conclusion — a value from a future API, or a malformed
+   * one — fall through to a pass. Only the one value that means success is
+   * success.
+   */
+  if (checks.conclusion !== "SUCCESS") {
+    return refuse(
+      `the check status for ${candidate.headSha} is ${JSON.stringify(String(checks.conclusion))}, which is not a pass`,
+    );
   }
   /**
    * A SUCCESS that counted nothing is a contradiction, and contradictions are
    * refused rather than resolved in the permissive direction.
    */
-  if (checks.total <= 0) {
-    return refuse(`the check status for ${candidate.headSha} claims success but counted ${checks.total} checks`);
+  if (!Number.isSafeInteger(checks.total) || checks.total <= 0) {
+    return refuse(
+      `the check status for ${candidate.headSha} claims success but counted ${JSON.stringify(checks.total)} checks`,
+    );
   }
   return { ok: true };
 }
@@ -312,13 +353,13 @@ export function checkIntegrationReadiness(input: {
   readonly pullRequest: RemotePullRequest | undefined;
   readonly checks: RemoteCheckStatus | undefined;
   readonly local: LocalRepositoryState;
-  readonly expectedRemoteUrl: string;
+  readonly expectedPushUrl: string;
   readonly reviewAccepted: boolean;
 }): BindingVerdict {
   const preconditions = checkPublishPreconditions({
     candidate: input.candidate,
     local: input.local,
-    expectedRemoteUrl: input.expectedRemoteUrl,
+    expectedPushUrl: input.expectedPushUrl,
   });
   if (!preconditions.ok) {
     return preconditions;

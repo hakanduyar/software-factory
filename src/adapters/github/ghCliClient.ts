@@ -35,7 +35,7 @@ import {
   type RemoteRepository,
 } from "../../github/candidateBinding.js";
 import type { GitHubClient, GitPusher, GitRepositoryReader } from "../../github/githubPorts.js";
-import type { RepositoryVisibility } from "../../supervision/financialSafety.js";
+import type { RepositoryOwnerType, RepositoryVisibility } from "../../supervision/financialSafety.js";
 import type { ProcessRunner } from "../../ports/processRunner.js";
 
 /**
@@ -174,6 +174,48 @@ function visibilityOf(raw: unknown): RepositoryVisibility {
   return raw === "PUBLIC" ? "PUBLIC" : raw === "PRIVATE" ? "PRIVATE" : "UNKNOWN";
 }
 
+function ownerTypeOf(raw: unknown): RepositoryOwnerType {
+  return raw === "User" ? "USER" : raw === "Organization" ? "ORGANIZATION" : "UNKNOWN";
+}
+
+/**
+ * A count, or `undefined` when the text is not exactly a count.
+ *
+ * ROUND-1 REVIEW, HIGH 4. `Number.parseInt` reads a leading number and
+ * DISCARDS the rest, so `"0trailing-garbage"` became a confident zero — a
+ * malformed response failing OPEN into "no webhooks". A remote-supplied string
+ * is parsed strictly or not at all.
+ */
+function strictCount(raw: string): number | undefined {
+  const text = raw.trim();
+  if (!/^\d+$/.test(text)) {
+    return undefined;
+  }
+  const value = Number(text);
+  return Number.isSafeInteger(value) ? value : undefined;
+}
+
+/**
+ * `owner/name` from a git remote URL, or `undefined` when it is not a GitHub
+ * URL this adapter understands.
+ *
+ * ROUND-1 REVIEW, CRITICAL 1. The push target must be derived from the URL git
+ * will ACTUALLY write to, never from a second caller-supplied string that is
+ * merely asserted to describe it.
+ */
+export function githubTargetFromUrl(url: string): string | undefined {
+  const text = url.trim().replace(/\.git$/, "");
+  const https = /^https:\/\/(?:[^@/]+@)?github\.com\/([^/]+)\/([^/]+)$/.exec(text);
+  if (https !== null) {
+    return `${https[1]}/${https[2]}`;
+  }
+  const ssh = /^(?:ssh:\/\/)?git@github\.com[:/]([^/]+)\/([^/]+)$/.exec(text);
+  if (ssh !== null) {
+    return `${ssh[1]}/${ssh[2]}`;
+  }
+  return undefined;
+}
+
 function stateOf(raw: unknown): PullRequestState {
   return raw === "OPEN" ? "OPEN" : raw === "MERGED" ? "MERGED" : "CLOSED";
 }
@@ -183,47 +225,43 @@ export function createGhCliClient(deps: GhCliDeps): GitHubClient {
 
   return {
     async repository(): Promise<RemoteRepository> {
+      /**
+       * `owner.type` comes from the REST view rather than `gh repo view`,
+       * because the distinction between a user and an organisation decides
+       * whether organisation-scoped webhooks can exist at all — and that is a
+       * financial fact, not a cosmetic one (round-1 CRITICAL 2).
+       */
       const raw = await run(deps, gh, [
-        "repo",
-        "view",
-        deps.repository,
-        "--json",
-        "nameWithOwner,visibility,defaultBranchRef",
+        "api",
+        `repos/${deps.repository}`,
+        "--jq",
+        "{nameWithOwner: .full_name, visibility: (.visibility | ascii_upcase), defaultBranch: .default_branch, ownerType: .owner.type}",
       ]);
-      const row = parseObject(raw, "gh repo view");
-      const defaultBranchRef = row["defaultBranchRef"];
-      const defaultBranch =
-        typeof defaultBranchRef === "object" && defaultBranchRef !== null
-          ? requireString(defaultBranchRef as Record<string, unknown>, "name", "gh repo view")
-          : (() => {
-              throw new Error("gh repo view did not report a default branch");
-            })();
+      const row = parseObject(raw, "gh api repos");
 
       /**
-       * The integration count is a SEPARATE call that is allowed to fail
-       * softly into `undefined` — which the push verdict treats as unknown,
-       * which is financial. Soft here means "we could not establish it", never
-       * "there are none": the difference is the whole guard.
+       * Each count is a SEPARATE call allowed to fail softly into `undefined`
+       * — which the push verdict treats as unknown, which is financial. Soft
+       * here means "we could not establish it", never "there are none": the
+       * difference is the whole guard.
        */
-      let billableIntegrations: number | undefined;
-      try {
-        const hooks = await run(deps, gh, [
-          "api",
-          `repos/${deps.repository}/hooks`,
-          "--jq",
-          "length",
-        ]);
-        const count = Number.parseInt(hooks.trim(), 10);
-        billableIntegrations = Number.isSafeInteger(count) && count >= 0 ? count : undefined;
-      } catch {
-        billableIntegrations = undefined;
-      }
+      const count = async (path: string, jq: string): Promise<number | undefined> => {
+        try {
+          return strictCount(await run(deps, gh, ["api", path, "--jq", jq]));
+        } catch {
+          return undefined;
+        }
+      };
 
       return {
-        nameWithOwner: requireString(row, "nameWithOwner", "gh repo view"),
-        defaultBranch,
+        nameWithOwner: requireString(row, "nameWithOwner", "gh api repos"),
+        defaultBranch: requireString(row, "defaultBranch", "gh api repos"),
         visibility: visibilityOf(row["visibility"]),
-        billableIntegrations,
+        ownerType: ownerTypeOf(row["ownerType"]),
+        repositoryWebhooks: await count(`repos/${deps.repository}/hooks`, "length"),
+        // Zero workflows means no Actions run can start, which is what makes
+        // runner size — including billable larger runners — unreachable.
+        configuredWorkflows: await count(`repos/${deps.repository}/actions/workflows`, ".total_count"),
       };
     },
 
@@ -330,6 +368,14 @@ export function createGhCliClient(deps: GhCliDeps): GitHubClient {
       if (total === 0) {
         // AC-4: distinct from success, and it stays distinct all the way out.
         conclusion = "NO_CHECKS_CONFIGURED";
+      } else if (conclusions.length !== total || statuses.length !== total) {
+        /**
+         * ROUND-1 REVIEW, HIGH 4. `every([])` is TRUE, so a response claiming
+         * `total: 1` with empty arrays was read as SUCCESS — a malformed
+         * response failing open into a pass. A count that disagrees with the
+         * rows it counts is not a weaker result; it is an unusable one.
+         */
+        conclusion = "FAILURE";
       } else if (statuses.some((entry) => entry !== "completed")) {
         conclusion = "PENDING";
       } else if (conclusions.every((entry) => entry === "success" || entry === "neutral" || entry === "skipped")) {
@@ -347,8 +393,17 @@ export function createGhCliClient(deps: GhCliDeps): GitHubClient {
 export function createGitRepositoryReader(deps: GhCliDeps): GitRepositoryReader {
   const git = resolveExecutable("git", deps.gitPath);
   return {
-    async remoteUrl(): Promise<string> {
-      return (await run(deps, git, ["remote", "get-url", "origin"])).trim();
+    /**
+     * The URL git will ACTUALLY PUSH TO — `--push`, not the fetch URL
+     * (round-1 CRITICAL 1).
+     *
+     * `remote.origin.pushurl` overrides the fetch URL for writes, so reading
+     * the fetch URL and calling it the push target let a configured pushurl
+     * send the write somewhere the gate never observed. This is the value the
+     * push target is derived from.
+     */
+    async pushUrl(): Promise<string> {
+      return (await run(deps, git, ["remote", "get-url", "--push", "origin"])).trim();
     },
     async revision(rev: string): Promise<string | undefined> {
       try {
@@ -361,6 +416,48 @@ export function createGitRepositoryReader(deps: GhCliDeps): GitRepositoryReader 
     },
     async isClean(): Promise<boolean> {
       return (await run(deps, git, ["status", "--porcelain"])).trim().length === 0;
+    },
+    /**
+     * Refreshes remote-tracking refs so `origin/<base>` is not a stale answer
+     * (round-1 HIGH 3). `GIT_FETCH` is registered free-but-remote in the
+     * effects table; it triggers nothing on the far side.
+     */
+    async fetch(): Promise<void> {
+      await run(deps, git, ["fetch", "origin", "--quiet"]);
+    },
+    /** True when `ancestor` is reachable from `descendant`. */
+    async isAncestor(ancestor: string, descendant: string): Promise<boolean> {
+      try {
+        await run(deps, git, ["merge-base", "--is-ancestor", ancestor, descendant]);
+        return true;
+      } catch {
+        // A non-zero exit is the ANSWER here ("no"), not a fault — the same
+        // documented exception `sf plan status` relies on.
+        return false;
+      }
+    },
+    /**
+     * Whether pushing `head` would ADD workflow files that the base does not
+     * already have.
+     *
+     * A push carrying `.github/workflows/*` can trigger the very run it
+     * introduces, on a runner it chooses — so "the target has no workflows"
+     * is not sufficient unless this push keeps it that way.
+     */
+    async addsWorkflows(baseSha: string, headSha: string): Promise<boolean | undefined> {
+      try {
+        const changed = await run(deps, git, [
+          "diff",
+          "--name-only",
+          `${baseSha}..${headSha}`,
+          "--",
+          ".github/workflows",
+        ]);
+        return changed.trim().length > 0;
+      } catch {
+        // Unknown, which the gate treats as financial.
+        return undefined;
+      }
     },
   };
 }

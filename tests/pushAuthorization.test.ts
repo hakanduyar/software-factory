@@ -18,9 +18,9 @@ import {
   DENY_ALL_SPENDING,
   evaluateFinancialSafety,
   gitPushAction,
-  observeRepositoryBilling,
+  observePushLiability,
   parseFinancialPolicy,
-  type RepositoryBillingObservation,
+  type PushLiabilityObservation,
 } from "../src/supervision/financialSafety.js";
 
 const ZERO_SPEND = parseFinancialPolicy({ autonomousSpendAllowed: false, autonomousSpendLimit: 0 });
@@ -30,8 +30,20 @@ function verdictFor(action: ReturnType<typeof gitPushAction>) {
   return evaluateFinancialSafety(action, ZERO_SPEND);
 }
 
-function publicUnmetered(target = TARGET): RepositoryBillingObservation {
-  return observeRepositoryBilling({ target, visibility: "PUBLIC", billableIntegrations: 0 });
+/** Every condition satisfied — the ONE shape that may earn a free verdict. */
+function publicUnmetered(
+  target = TARGET,
+  overrides: Partial<Parameters<typeof observePushLiability>[0]> = {},
+): PushLiabilityObservation {
+  return observePushLiability({
+    target,
+    visibility: "PUBLIC",
+    ownerType: "USER",
+    repositoryWebhooks: 0,
+    configuredWorkflows: 0,
+    candidateAddsWorkflows: false,
+    ...overrides,
+  });
 }
 
 describe("TASK-016 AC-1: the push verdict is earned, never asserted", () => {
@@ -103,10 +115,13 @@ describe("TASK-016 AC-1: the push verdict is earned, never asserted", () => {
    * hole the whole gate exists to close.
    */
   it("refuses an observation this module did not produce", () => {
-    const forged: RepositoryBillingObservation = {
+    const forged: PushLiabilityObservation = {
       target: TARGET,
       visibility: "PUBLIC",
-      billableIntegrations: 0,
+      ownerType: "USER",
+      repositoryWebhooks: 0,
+      configuredWorkflows: 0,
+      candidateAddsWorkflows: false,
     };
 
     assert.equal(
@@ -127,75 +142,39 @@ describe("TASK-016 AC-1: the push verdict is earned, never asserted", () => {
 
 describe("TASK-016 AC-2: zero liability must be observed, not assumed", () => {
   /**
-   * A PRIVATE REPOSITORY METERS ACTIONS MINUTES. Whether the allowance is
-   * currently exhausted is irrelevant — an allowance that meters is a
-   * liability, and `AUTONOMOUS_SPEND_LIMIT = 0` has no room for one.
+   * ONE CASE PER MECHANISM by which a push to GitHub can start something
+   * billable. Each fixture satisfies EVERY other condition, so only the named
+   * one can produce the refusal — a sibling guard cannot be what catches it.
+   *
+   * The `configuredWorkflows` and `candidateAddsWorkflows` cases exist because
+   * of round-1 CRITICAL 2: GitHub bills LARGER RUNNERS even on public
+   * repositories, so "public" alone never established zero liability. With no
+   * workflows on the target and none introduced by the push, no Actions run can
+   * start at all — and runner size cannot bill a run that cannot exist.
    */
-  it("refuses a push to a private repository", () => {
-    const observation = observeRepositoryBilling({
-      target: TARGET,
-      visibility: "PRIVATE",
-      billableIntegrations: 0,
+  const mechanisms = [
+    ["a private repository", { visibility: "PRIVATE" as const }],
+    ["a visibility that could not be read", { visibility: undefined }],
+    ["an organisation owner, whose org-scoped webhooks this token cannot enumerate", { ownerType: "ORGANIZATION" as const }],
+    ["an owner type that could not be read", { ownerType: undefined }],
+    ["a repository webhook", { repositoryWebhooks: 1 }],
+    ["a webhook count that could not be read", { repositoryWebhooks: undefined }],
+    ["a configured workflow, which a larger runner could bill", { configuredWorkflows: 1 }],
+    ["a workflow count that could not be read", { configuredWorkflows: undefined }],
+    ["a candidate that introduces a workflow", { candidateAddsWorkflows: true }],
+    ["an unknown answer about introduced workflows", { candidateAddsWorkflows: undefined }],
+  ] as const;
+
+  for (const [label, override] of mechanisms) {
+    it(`refuses ${label}`, () => {
+      const observation = publicUnmetered(TARGET, override);
+
+      const verdict = verdictFor(gitPushAction({ target: TARGET, observation, description: "publish" }));
+
+      assert.equal(verdict.allowed, false, `${label} was treated as zero liability`);
+      assert.equal(verdict.actionClass, "FINANCIAL_ACTION");
     });
-
-    const verdict = verdictFor(gitPushAction({ target: TARGET, observation, description: "publish" }));
-
-    assert.equal(verdict.allowed, false, "a push to a private repository was permitted");
-    assert.equal(verdict.actionClass, "FINANCIAL_ACTION");
-  });
-
-  /** Visibility that could not be established is UNKNOWN, and unknown is financial. */
-  it("refuses when visibility could not be determined", () => {
-    const observation = observeRepositoryBilling({
-      target: TARGET,
-      visibility: undefined,
-      billableIntegrations: 0,
-    });
-
-    assert.equal(
-      verdictFor(gitPushAction({ target: TARGET, observation, description: "publish" })).allowed,
-      false,
-      "an unknown visibility was treated as safe",
-    );
-  });
-
-  /**
-   * A WEBHOOK CAN HAND THE PUSH TO A METERED THIRD PARTY. The repository is
-   * public here, so the visibility half of the rule is satisfied and only the
-   * integration count can produce the refusal.
-   */
-  it("refuses when the repository has a billable integration", () => {
-    const observation = observeRepositoryBilling({
-      target: TARGET,
-      visibility: "PUBLIC",
-      billableIntegrations: 1,
-    });
-
-    assert.equal(
-      verdictFor(gitPushAction({ target: TARGET, observation, description: "publish" })).allowed,
-      false,
-      "a repository with a webhook was treated as unmetered",
-    );
-  });
-
-  /**
-   * AN UNCOUNTABLE INTEGRATION LIST IS NOT AN EMPTY ONE. The adapter degrades
-   * to `undefined` when the hooks endpoint cannot be read, and that must not
-   * arrive here as zero.
-   */
-  it("refuses when the integration count could not be established", () => {
-    const observation = observeRepositoryBilling({
-      target: TARGET,
-      visibility: "PUBLIC",
-      billableIntegrations: undefined,
-    });
-
-    assert.equal(
-      verdictFor(gitPushAction({ target: TARGET, observation, description: "publish" })).allowed,
-      false,
-      "an unknown integration count was treated as none",
-    );
-  });
+  }
 
   /**
    * AND THE POLICY STILL DOMINATES. Even a fully demonstrated zero-liability

@@ -12,12 +12,22 @@ import type { RemoteCheckStatus, RemotePullRequest, RemoteRepository } from "./c
 
 /** Reads the LOCAL repository. Separate port: local git is not GitHub. */
 export interface GitRepositoryReader {
-  /** The `origin` push URL. */
-  remoteUrl(): Promise<string>;
+  /**
+   * The URL git will ACTUALLY push to (`--push`), which the push target is
+   * derived from. Reading the fetch URL instead let a configured
+   * `remote.origin.pushurl` divert the write past the gate — round-1 CRITICAL 1.
+   */
+  pushUrl(): Promise<string>;
   /** Full 40-hex id for a revision, or `undefined` when it cannot be resolved. */
   revision(rev: string): Promise<string | undefined>;
   /** True only when nothing is modified, staged or untracked. */
   isClean(): Promise<boolean>;
+  /** Refreshes remote-tracking refs, so `origin/<base>` is not a stale answer. */
+  fetch(): Promise<void>;
+  /** True when `ancestor` is reachable from `descendant`. */
+  isAncestor(ancestor: string, descendant: string): Promise<boolean>;
+  /** Whether this push would ADD workflow files; `undefined` when unknown. */
+  addsWorkflows(baseSha: string, headSha: string): Promise<boolean | undefined>;
 }
 
 /** The one WRITE this task performs against a remote. */

@@ -43,11 +43,20 @@ const REPOSITORY: RemoteRepository = {
   nameWithOwner: REPO,
   defaultBranch: "main",
   visibility: "PUBLIC",
-  billableIntegrations: 0,
+  ownerType: "USER",
+  repositoryWebhooks: 0,
+  configuredWorkflows: 0,
 };
 
 function local(overrides: Partial<LocalRepositoryState> = {}): LocalRepositoryState {
-  return { remoteUrl: URL, headSha: A, baseSha: BASE, clean: true, ...overrides };
+  return {
+    pushUrl: URL,
+    headSha: A,
+    baseSha: BASE,
+    clean: true,
+    baseIsAncestorOfHead: true,
+    ...overrides,
+  };
 }
 
 function pr(overrides: Partial<RemotePullRequest> = {}): RemotePullRequest {
@@ -89,7 +98,7 @@ describe("TASK-016: a sha is an identity and a prefix is not", () => {
 
 describe("TASK-016 AC-8: local preconditions fail closed", () => {
   it("permits a clean tree at the reviewed candidate", () => {
-    const verdict = checkPublishPreconditions({ candidate: CANDIDATE, local: local(), expectedRemoteUrl: URL });
+    const verdict = checkPublishPreconditions({ candidate: CANDIDATE, local: local(), expectedPushUrl: URL });
 
     assert.equal(verdict.ok, true, `a valid publish was refused: ${JSON.stringify(verdict)}`);
   });
@@ -98,7 +107,7 @@ describe("TASK-016 AC-8: local preconditions fail closed", () => {
     const verdict = checkPublishPreconditions({
       candidate: CANDIDATE,
       local: local({ clean: false }),
-      expectedRemoteUrl: URL,
+      expectedPushUrl: URL,
     });
 
     assert.equal(verdict.ok, false);
@@ -106,25 +115,30 @@ describe("TASK-016 AC-8: local preconditions fail closed", () => {
   });
 
   /**
-   * The wrong remote is checked FIRST and separately: pushing to another
+   * The push destination is checked FIRST and separately: pushing to another
    * repository is not recoverable by noticing afterwards.
+   *
+   * The compared value is the URL git will actually WRITE to (round-1
+   * CRITICAL 1), so the refusal names that rather than the word "origin" — a
+   * configured `remote.origin.pushurl` makes those two different places.
    */
-  it("refuses an unexpected origin", () => {
+  it("refuses a push destination that is not the expected one", () => {
     const verdict = checkPublishPreconditions({
       candidate: CANDIDATE,
-      local: local({ remoteUrl: "https://github.com/someone-else/other.git" }),
-      expectedRemoteUrl: URL,
+      local: local({ pushUrl: "https://github.com/someone-else/other.git" }),
+      expectedPushUrl: URL,
     });
 
     assert.equal(verdict.ok, false);
-    assert.match(verdict.ok === false ? verdict.reason : "", /origin/);
+    assert.match(verdict.ok === false ? verdict.reason : "", /git would push to/);
+    assert.match(verdict.ok === false ? verdict.reason : "", /someone-else\/other/);
   });
 
   it("refuses when HEAD is not the reviewed candidate", () => {
     const verdict = checkPublishPreconditions({
       candidate: CANDIDATE,
       local: local({ headSha: B }),
-      expectedRemoteUrl: URL,
+      expectedPushUrl: URL,
     });
 
     assert.equal(verdict.ok, false);
@@ -140,7 +154,7 @@ describe("TASK-016 AC-8: local preconditions fail closed", () => {
     const verdict = checkPublishPreconditions({
       candidate: CANDIDATE,
       local: local({ baseSha: BASE_MOVED }),
-      expectedRemoteUrl: URL,
+      expectedPushUrl: URL,
     });
 
     assert.equal(verdict.ok, false);
@@ -151,11 +165,40 @@ describe("TASK-016 AC-8: local preconditions fail closed", () => {
     const verdict = checkPublishPreconditions({
       candidate: { ...CANDIDATE, headSha: "11662a1" },
       local: local(),
-      expectedRemoteUrl: URL,
+      expectedPushUrl: URL,
     });
 
     assert.equal(verdict.ok, false);
     assert.match(verdict.ok === false ? verdict.reason : "", /not an identity/);
+  });
+
+  /**
+   * ROUND-1 REVIEW, HIGH 3. Equality was the only test, so two UNRELATED
+   * commits passed everything: the tree is clean, the push URL is expected,
+   * HEAD equals the candidate and the base equals the reviewed base. Only the
+   * ancestry check can refuse here, which is what makes it load-bearing.
+   */
+  it("refuses a candidate that does not descend from its base", () => {
+    const verdict = checkPublishPreconditions({
+      candidate: CANDIDATE,
+      local: local({ baseIsAncestorOfHead: false }),
+      expectedPushUrl: URL,
+    });
+
+    assert.equal(verdict.ok, false, "an unrelated commit passed as a publishable candidate");
+    assert.match(verdict.ok === false ? verdict.reason : "", /not an ancestor/);
+  });
+
+  /** Unknown ancestry is not permission — uncertainty refuses. */
+  it("refuses when ancestry could not be established", () => {
+    const verdict = checkPublishPreconditions({
+      candidate: CANDIDATE,
+      local: local({ baseIsAncestorOfHead: undefined }),
+      expectedPushUrl: URL,
+    });
+
+    assert.equal(verdict.ok, false);
+    assert.match(verdict.ok === false ? verdict.reason : "", /could not be established/);
   });
 });
 
@@ -310,6 +353,31 @@ describe("TASK-016 AC-4: CI evidence is bound to a commit or it is not evidence"
     assert.match(verdict.ok === false ? verdict.reason : "", /counted 0/);
   });
 
+  /**
+   * ROUND-1 REVIEW, HIGH 4. Enumerating the known FAILURE values and passing
+   * everything else let an unrecognised conclusion — a future API value, or a
+   * malformed one — fall through to a pass. Success is an allowlist now, so a
+   * conclusion nobody has heard of refuses.
+   */
+  it("refuses a conclusion it does not recognise", () => {
+    const verdict = checkCheckEvidence({
+      candidate: CANDIDATE,
+      checks: { sha: A, conclusion: "banana" as never, total: 1 },
+    });
+
+    assert.equal(verdict.ok, false, "an unrecognised conclusion was accepted as a pass");
+    assert.match(verdict.ok === false ? verdict.reason : "", /not a pass/);
+  });
+
+  it("refuses a non-integer check count", () => {
+    const verdict = checkCheckEvidence({
+      candidate: CANDIDATE,
+      checks: { sha: A, conclusion: "SUCCESS", total: Number.NaN },
+    });
+
+    assert.equal(verdict.ok, false, "a nonsense count was accepted");
+  });
+
   it("refuses when no check status was retrieved", () => {
     assert.equal(checkCheckEvidence({ candidate: CANDIDATE, checks: undefined }).ok, false);
   });
@@ -323,7 +391,7 @@ describe("TASK-016 AC-4: neither CI nor review substitutes for the other", () =>
     pullRequest: pr(),
     checks: checks(),
     local: local(),
-    expectedRemoteUrl: URL,
+    expectedPushUrl: URL,
     reviewAccepted: true,
   };
 

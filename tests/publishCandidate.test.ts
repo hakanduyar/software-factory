@@ -11,6 +11,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import { publishCandidate, type PublishDeps } from "../src/github/publishCandidate.js";
+import { githubTargetFromUrl } from "../src/adapters/github/ghCliClient.js";
 import type {
   RemoteCheckStatus,
   RemotePullRequest,
@@ -41,23 +42,37 @@ interface Scripted {
   readonly git: GitRepositoryReader;
   creates(): number;
   pushes(): readonly string[];
+  /** Git calls in order, so "before" can be asserted rather than assumed. */
+  gitCalls(): readonly string[];
   setPullRequest(value: RemotePullRequest | undefined): void;
 }
 
 function scripted(options: {
   readonly repository?: Partial<RemoteRepository>;
   readonly pullRequest?: RemotePullRequest;
-  readonly local?: { headSha?: string; baseSha?: string; clean?: boolean; remoteUrl?: string };
+  readonly local?: {
+    headSha?: string;
+    baseSha?: string;
+    clean?: boolean;
+    pushUrl?: string;
+    ancestor?: boolean | undefined;
+    addsWorkflows?: boolean | undefined;
+  };
+  /** Makes `createPullRequest` throw, as GitHub does for a duplicate. */
+  readonly createFails?: boolean;
 } = {}): Scripted {
   let pullRequest = options.pullRequest;
   let createCount = 0;
   const pushed: string[] = [];
+  const gitCalls: string[] = [];
 
   const repository: RemoteRepository = {
     nameWithOwner: REPO,
     defaultBranch: "main",
     visibility: "PUBLIC",
-    billableIntegrations: 0,
+    ownerType: "USER",
+    repositoryWebhooks: 0,
+    configuredWorkflows: 0,
     ...options.repository,
   };
 
@@ -72,8 +87,13 @@ function scripted(options: {
       createCount += 1;
       /**
        * The scripted client behaves like the real one: a created PR points at
-       * whatever the branch currently holds, which is what was pushed.
+       * whatever the branch currently holds, which is what was pushed. And
+       * GitHub REFUSES a second open pull request for the same head/base, so
+       * `createFails` models the losing side of a race.
        */
+      if (options.createFails === true) {
+        throw new Error("A pull request already exists for this head branch");
+      }
       pullRequest = {
         number: 7,
         state: "OPEN",
@@ -97,18 +117,33 @@ function scripted(options: {
       },
     },
     git: {
-      async remoteUrl(): Promise<string> {
-        return options.local?.remoteUrl ?? URL;
+      async pushUrl(): Promise<string> {
+        gitCalls.push("pushUrl");
+        return options.local?.pushUrl ?? URL;
       },
       async revision(rev): Promise<string | undefined> {
+        gitCalls.push(`revision:${rev}`);
         return rev === "HEAD" ? (options.local?.headSha ?? A) : (options.local?.baseSha ?? BASE);
       },
       async isClean(): Promise<boolean> {
+        gitCalls.push("isClean");
         return options.local?.clean ?? true;
+      },
+      async fetch(): Promise<void> {
+        gitCalls.push("fetch");
+      },
+      async isAncestor(): Promise<boolean> {
+        gitCalls.push("isAncestor");
+        return options.local?.ancestor ?? true;
+      },
+      async addsWorkflows(): Promise<boolean | undefined> {
+        gitCalls.push("addsWorkflows");
+        return options.local?.addsWorkflows ?? false;
       },
     },
     creates: () => createCount,
     pushes: () => pushed,
+    gitCalls: () => gitCalls,
     setPullRequest: (value) => {
       pullRequest = value;
     },
@@ -121,7 +156,10 @@ function deps(s: Scripted, overrides: Partial<PublishDeps> = {}): PublishDeps {
     git: s.git,
     pusher: s.pusher,
     expectedRepository: REPO,
-    expectedRemoteUrl: URL,
+    expectedPushUrl: URL,
+    // The real derivation, so a test cannot pass by stubbing the very step
+    // round-1 CRITICAL 1 was about.
+    targetFromUrl: githubTargetFromUrl,
     financialPolicy: ZERO_SPEND,
     ...overrides,
   };
@@ -246,13 +284,37 @@ describe("TASK-016 AC-1: publication goes through the financial gate", () => {
     assert.match(outcome.kind === "HUMAN_REQUIRED" ? outcome.reason : "", new RegExp(REPO));
   });
 
-  it("stops before pushing when the integration count is unknown", async () => {
-    const s = scripted({ repository: { billableIntegrations: undefined } });
+  it("stops before pushing when the webhook count is unknown", async () => {
+    const s = scripted({ repository: { repositoryWebhooks: undefined } });
 
     const outcome = await publishCandidate(deps(s), CANDIDATE);
 
     assert.equal(outcome.kind, "HUMAN_REQUIRED");
-    assert.deepEqual(s.pushes(), [], "a push happened with an unknown integration count");
+    assert.deepEqual(s.pushes(), [], "a push happened with an unknown webhook count");
+  });
+
+  /**
+   * Round-1 CRITICAL 2, at the orchestration level: a workflow on the target
+   * means an Actions run can start, and a larger runner would bill it even on
+   * a public repository.
+   */
+  it("stops before pushing when the target has a configured workflow", async () => {
+    const s = scripted({ repository: { configuredWorkflows: 1 } });
+
+    const outcome = await publishCandidate(deps(s), CANDIDATE);
+
+    assert.equal(outcome.kind, "HUMAN_REQUIRED");
+    assert.deepEqual(s.pushes(), [], "a push happened into a repository that can run Actions");
+  });
+
+  /** And the push must not be the thing that CREATES that possibility. */
+  it("stops before pushing when the candidate introduces a workflow", async () => {
+    const s = scripted({ local: { addsWorkflows: true } });
+
+    const outcome = await publishCandidate(deps(s), CANDIDATE);
+
+    assert.equal(outcome.kind, "HUMAN_REQUIRED", "a push carrying a workflow was permitted");
+    assert.deepEqual(s.pushes(), [], "a workflow-introducing push happened");
   });
 
   /**
@@ -276,7 +338,8 @@ describe("TASK-016 AC-8: publication refuses before it acts", () => {
   for (const [label, local, pattern] of [
     ["a dirty tree", { clean: false }, /not clean/],
     ["a different HEAD", { headSha: B }, /reviewed candidate is/],
-    ["an unexpected origin", { remoteUrl: "https://github.com/other/other.git" }, /origin/],
+    ["a candidate that does not descend from its base", { ancestor: false }, /not an ancestor/],
+    ["an unexpected push url", { pushUrl: "https://github.com/other/other.git" }, /expects/],
   ] as const) {
     it(`refuses ${label} without pushing or creating anything`, async () => {
       const s = scripted({ local });
@@ -297,6 +360,136 @@ describe("TASK-016 AC-8: publication refuses before it acts", () => {
 
     assert.equal(outcome.kind, "REFUSED");
     assert.deepEqual(s.pushes(), [], "a push targeted an unexpected repository");
+  });
+});
+
+describe("TASK-016 round-1 HIGH 3: the base is refreshed before it is trusted", () => {
+  /**
+   * `origin/<base>` is a LOCAL CACHE. Deciding that the base has not moved by
+   * consulting a stale copy of it is not a check — the reviewer's point — so
+   * the fetch must happen BEFORE the read, which is a statement about order
+   * and can only be tested by recording order.
+   */
+  it("fetches before reading the base", async () => {
+    const s = scripted();
+
+    await publishCandidate(deps(s), CANDIDATE);
+
+    const calls = s.gitCalls();
+    const fetched = calls.indexOf("fetch");
+    const readBase = calls.indexOf(`revision:origin/${CANDIDATE.baseRef}`);
+    assert.notEqual(fetched, -1, "the base was never refreshed");
+    assert.notEqual(readBase, -1, "the base was never read");
+    assert.ok(fetched < readBase, `the base was read before it was refreshed: ${calls.join(", ")}`);
+  });
+});
+
+describe("TASK-016 round-1 CRITICAL 1: the verdict binds to where the push will actually go", () => {
+  /**
+   * THE REPRODUCTION. `--repo` and `--remote-url` were independent caller
+   * inputs, so a URL for one repository could be paired with the NAME of
+   * another: the gate would observe `owner/safe` (public, unmetered) while git
+   * wrote to `other/actual`. The target is now DERIVED from the push URL, so
+   * the pairing cannot be asserted.
+   *
+   * Everything else here is impeccable — clean tree, right commits, a public
+   * unmetered observation — so only the derivation can refuse.
+   */
+  it("refuses when the push url names a different repository than --repo", async () => {
+    const s = scripted({ local: { pushUrl: "https://github.com/other/actual.git" } });
+
+    const outcome = await publishCandidate(
+      deps(s, { expectedPushUrl: "https://github.com/other/actual.git" }),
+      CANDIDATE,
+    );
+
+    assert.equal(outcome.kind, "REFUSED", `a diverted push was permitted: ${JSON.stringify(outcome)}`);
+    assert.match(outcome.kind === "REFUSED" ? outcome.reason : "", /other\/actual/);
+    assert.deepEqual(s.pushes(), [], "a push went to a repository the gate never observed");
+  });
+
+  /**
+   * A `remote.origin.pushurl` produces exactly the same divergence even when
+   * the fetch URL is right — which is why the reader reports `--push`.
+   */
+  it("refuses when the observed repository is not the push target", async () => {
+    const s = scripted({
+      local: { pushUrl: "https://github.com/other/actual.git" },
+      repository: { nameWithOwner: REPO },
+    });
+
+    const outcome = await publishCandidate(
+      deps(s, { expectedRepository: "other/actual", expectedPushUrl: "https://github.com/other/actual.git" }),
+      CANDIDATE,
+    );
+
+    assert.equal(outcome.kind, "REFUSED");
+    assert.match(outcome.kind === "REFUSED" ? outcome.reason : "", /observed repository/);
+    assert.deepEqual(s.pushes(), [], "a push went to an unobserved repository");
+  });
+
+  it("refuses a push url that is not a GitHub repository at all", async () => {
+    const s = scripted({ local: { pushUrl: "https://gitlab.com/someone/thing.git" } });
+
+    const outcome = await publishCandidate(
+      deps(s, { expectedPushUrl: "https://gitlab.com/someone/thing.git" }),
+      CANDIDATE,
+    );
+
+    assert.equal(outcome.kind, "REFUSED");
+    assert.match(outcome.kind === "REFUSED" ? outcome.reason : "", /not a GitHub repository URL/);
+    assert.deepEqual(s.pushes(), []);
+  });
+});
+
+describe("TASK-016 round-1 HIGH 5: a lost creation race adopts rather than duplicating", () => {
+  /**
+   * Find-then-create is not atomic, so two concurrent runs can both find
+   * nothing. The serialization point that actually exists is GITHUB: it
+   * refuses a second open pull request for the same head and base. So the
+   * losing run must ADOPT the winner's pull request instead of failing or
+   * duplicating.
+   *
+   * Modelled by a client whose create throws exactly as GitHub does, with the
+   * winner's PR appearing on the re-find.
+   */
+  it("adopts the pull request that won the race", async () => {
+    const s = scripted({ createFails: true });
+    // The winner's PR appears only AFTER this run's create attempt fails.
+    const client = s.client;
+    let attempted = false;
+    const racing: GitHubClient = {
+      ...client,
+      async findPullRequest(headRef: string): Promise<RemotePullRequest | undefined> {
+        if (!attempted) return undefined;
+        return { number: 9, state: "OPEN", headRef, headSha: A, baseRef: "main", baseSha: BASE };
+      },
+      async createPullRequest(input) {
+        attempted = true;
+        return client.createPullRequest(input);
+      },
+    };
+
+    const outcome = await publishCandidate(deps(s, { github: racing }), CANDIDATE);
+
+    assert.equal(outcome.kind, "PUBLISHED", `the losing run failed instead of adopting: ${JSON.stringify(outcome)}`);
+    if (outcome.kind !== "PUBLISHED") return;
+    assert.equal(outcome.pullRequest.number, 9, "the losing run did not adopt the winner's pull request");
+    assert.equal(outcome.created, false, "the losing run reported creating a pull request");
+  });
+
+  /**
+   * And a create failure with NO pull request afterwards is a genuine failure,
+   * not something to paper over — otherwise the adoption path would swallow
+   * every error.
+   */
+  it("refuses when creation fails and no pull request exists", async () => {
+    const s = scripted({ createFails: true });
+
+    const outcome = await publishCandidate(deps(s), CANDIDATE);
+
+    assert.equal(outcome.kind, "REFUSED", "a failed creation was reported as success");
+    assert.match(outcome.kind === "REFUSED" ? outcome.reason : "", /creating the pull request failed/);
   });
 });
 
