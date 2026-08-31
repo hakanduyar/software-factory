@@ -281,6 +281,80 @@ describe("TASK-015 AC-1/AC-2: the supervisor authorises the set the work declare
   });
 
   /**
+   * NOTHING IS ROUTED FOR WORK THAT DECLARES ITS OWN RESOURCES (round-8
+   * finding 2).
+   *
+   * The declaration used to be fetched AFTER the routed resource was selected,
+   * probed and gated — so an action whose declared planner, implementer and
+   * reviewer were all free was refused because the ROUTED resource, which it
+   * would never launch, was USAGE_BILLED. AC-2 says the supervisor authorises
+   * exactly the declared set, and a resource outside that set cannot be allowed
+   * to veto the work.
+   */
+  it("runs a declared plan even when the unused routed resource would bill", async () => {
+    const executor = declaring(
+      { role: "planner", provider: "claude-code", model: "haiku" },
+      { role: "implementer", provider: "claude-code", model: "opus" },
+      { role: "reviewer", provider: "codex-cli", model: "gpt-5.6-luna" },
+    );
+
+    // Every DECLARED resource is free; the one the router would have chosen is
+    // not. Nothing declared names sonnet.
+    const probe = probeWith({ "claude-code:sonnet": { state: "AVAILABLE", billingMode: "USAGE_BILLED" } });
+    const supervisor = newSupervisor({ probe, executor, resourceCatalog: CATALOG });
+    await seedRoadmap(supervisor, [ITEM]);
+
+    const result = await supervisor.service.tick();
+
+    assert.equal(
+      result.kind,
+      "ADVANCED",
+      `an unused routed resource blocked a fully-free declaration: ${JSON.stringify(result)}`,
+    );
+    assert.equal(executor.ran(), true);
+    assert.ok(
+      !executor.authorized().some((entry) => entry.model === "sonnet"),
+      "the unused routed resource was authorised anyway",
+    );
+    /**
+     * A PROBE COUNT WOULD NOT DISTINGUISH ANYTHING HERE, and asserting one was a
+     * mistake worth recording: the SCHEDULED REFRESH probes every catalogued
+     * resource each tick, so sonnet is probed whether or not it was routed. The
+     * property this case pins is that a fully-free declaration is not refused by
+     * a resource outside it, and the mutation that must fail it is the one
+     * restoring the whole original order -- routing selected AND gated before
+     * the declaration is even asked for.
+     */
+  });
+
+  /**
+   * THE CONTROL. Work that declares NOTHING still routes, still gates the routed
+   * resource, and is still refused when that resource would bill — the path this
+   * change was not supposed to touch.
+   */
+  it("still refuses undeclared work whose routed resource would bill", async () => {
+    const inputs: WorkExecutionInput[] = [];
+    const executor: ScriptedExecutor = {
+      calls: () => inputs,
+      callsFor: (key: string) => inputs.filter((entry) => entry.item.key === key),
+      async execute(input: WorkExecutionInput): Promise<WorkOutcome> {
+        inputs.push(input);
+        return { kind: "CHANGES_REQUIRED", findings: ["scripted"] };
+      },
+    };
+
+    const result = await tickWith(executor, {
+      "claude-code:sonnet": { state: "AVAILABLE", billingMode: "USAGE_BILLED" },
+      "claude-code:opus": { state: "AVAILABLE", billingMode: "USAGE_BILLED" },
+      "claude-code:haiku": { state: "AVAILABLE", billingMode: "USAGE_BILLED" },
+      "codex-cli:gpt-5.6-luna": { state: "AVAILABLE", billingMode: "USAGE_BILLED" },
+    });
+
+    assert.equal(result.kind, "WAITING_FOR_HUMAN", `undeclared work ran on a billable resource`);
+    assert.equal(inputs.length, 0);
+  });
+
+  /**
    * An executor that cannot say what it needs does not thereby get to launch
    * with nothing authorised.
    */

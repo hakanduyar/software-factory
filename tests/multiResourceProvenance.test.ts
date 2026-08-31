@@ -251,6 +251,82 @@ describe("TASK-015 finding 2: identity is reconciled against the set", () => {
   });
 });
 
+describe("TASK-015: a reported identity on a CHECKPOINT is reconciled too", () => {
+  /**
+   * A CHECKPOINT CARRIES A REPORTED IDENTITY, and nothing covered that.
+   *
+   * An earlier version of this comment claimed the COMPLETED case above was
+   * sibling-guarded by the completion-provenance guard, "found by mutation".
+   * That was a MISDIAGNOSIS: the mutation only appeared to survive because my
+   * own mutation harness had written half of a previous mutation back into the
+   * source, having re-captured already-mutated text as the original. With the
+   * harness corrected, the COMPLETED case kills that mutation exactly as its
+   * name claims.
+   *
+   * These cases stay because a session rollover reports an identity too, and a
+   * worker that checkpoints while claiming an unauthorised resource should be
+   * refused for the same reason one that completes is. They are additional
+   * coverage rather than a repair.
+   */
+  it("refuses a checkpointing worker that reports a resource nobody authorised", async () => {
+    const executor = executorReporting(C4_ROLES, {
+      kind: "CHECKPOINT",
+      detail: "rolled over",
+      checkpoint: {
+        roadmapKey: ITEM.key,
+        actionId: "action-1",
+        iteration: 1,
+        completedVerification: [],
+        pendingVerification: [],
+        findings: [],
+        nextAction: "continue",
+        requiredWorkClass: ITEM.workClass,
+        updatedAt: 0 as never,
+      },
+      reportedIdentity: { provider: "rogue-provider", model: "ghost" },
+    });
+
+    const { result } = await runOnce(executor);
+
+    assert.equal(
+      result.kind,
+      "RECOVERY_REQUIRED",
+      `an unauthorised reported identity was accepted on a checkpoint: ${JSON.stringify(result)}`,
+    );
+  });
+
+  /**
+   * AND THE CONTROL: a checkpoint reporting an AUTHORISED member is not refused,
+   * so the guard above is not satisfied by refusing every checkpoint.
+   */
+  it("accepts a checkpointing worker that reports an authorised member", async () => {
+    const executor = executorReporting(C4_ROLES, {
+      kind: "CHECKPOINT",
+      detail: "rolled over",
+      checkpoint: {
+        roadmapKey: ITEM.key,
+        actionId: "action-1",
+        iteration: 1,
+        completedVerification: [],
+        pendingVerification: [],
+        findings: [],
+        nextAction: "continue",
+        requiredWorkClass: ITEM.workClass,
+        updatedAt: 0 as never,
+      },
+      reportedIdentity: { provider: "claude-code", model: "opus" },
+    });
+
+    const { result } = await runOnce(executor);
+
+    assert.notEqual(
+      result.kind,
+      "RECOVERY_REQUIRED",
+      `an authorised member was refused on a checkpoint: ${JSON.stringify(result)}`,
+    );
+  });
+});
+
 describe("TASK-015 finding 4: a probe that throws is a controlled refusal", () => {
   /**
    * The real CLI probe throws for a provider it has no zero-token probe for, and

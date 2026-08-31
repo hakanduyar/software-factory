@@ -141,6 +141,81 @@ describe("TASK-015 round-7 finding 1: routing is bounded by the code catalog", (
   });
 });
 
+describe("TASK-015 round-8 finding 1: the catalog reconciles persisted rows", () => {
+  /**
+   * A STALE ROW MUST NOT PROMOTE WAITING WORK.
+   *
+   * Round 7 filtered ROUTING and left refresh and usability promotion reading
+   * the rows directly, so an `AVAILABLE` row for a resource the catalog no
+   * longer carries still counted as "something is usable" — it promoted a
+   * waiting AI item, which then took the slot from an eligible deterministic
+   * one. Reconciling once, at the top of the tick, is what makes every later
+   * reader see configuration instead.
+   */
+  it("drops a persisted row for a resource the catalog no longer carries", async () => {
+    const executor = recording();
+    const supervisor = newSupervisor({ probe: permissiveProbe(), executor, resourceCatalog: CATALOG });
+    await seedRoadmap(supervisor, [ITEM]);
+
+    const state = await supervisor.repository.load();
+    assert.ok(state !== undefined);
+    await supervisor.repository.compareAndSave(
+      {
+        ...state,
+        version: state.version + 1,
+        resources: [
+          ...state.resources,
+          {
+            provider: "claude-code",
+            model: "sonnet",
+            key: "claude-code:sonnet",
+            state: "AVAILABLE" as const,
+            detectedAt: 0,
+            lastCheckedAt: 0,
+            backoff: { attempt: 0 },
+            observedBillingMode: "INCLUDED_SUBSCRIPTION" as const,
+          } as never,
+        ],
+      },
+      state.version,
+    );
+
+    await supervisor.service.tick();
+
+    const after = await supervisor.repository.load();
+    assert.ok(
+      !(after?.resources ?? []).some((record) => record.key === "claude-code:sonnet"),
+      "a row for an uncatalogued resource survived reconciliation",
+    );
+  });
+
+  /**
+   * AND A RESOURCE ADDED TO THE CATALOG IS SEEDED, or it could never be probed
+   * or routed at all — the other half of the same disagreement.
+   */
+  it("seeds a row for a resource the catalog gained", async () => {
+    const executor = recording();
+    const supervisor = newSupervisor({ probe: permissiveProbe(), executor, resourceCatalog: CATALOG });
+    await seedRoadmap(supervisor, [ITEM]);
+
+    const state = await supervisor.repository.load();
+    assert.ok(state !== undefined);
+    // Someone removes the row for the resource this installation DOES carry.
+    await supervisor.repository.compareAndSave(
+      { ...state, version: state.version + 1, resources: [] },
+      state.version,
+    );
+
+    await supervisor.service.tick();
+
+    const after = await supervisor.repository.load();
+    assert.ok(
+      (after?.resources ?? []).some((record) => record.key === "codex-cli:gpt-5.6-luna"),
+      "a catalogued resource with no row was never seeded",
+    );
+  });
+});
+
 describe("TASK-015 round-7 finding 2: a refresh probe failure is controlled", () => {
   /**
    * Round 3 caught the throw on the IMMEDIATE pre-launch probe and left the

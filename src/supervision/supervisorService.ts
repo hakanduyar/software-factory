@@ -45,6 +45,7 @@ import {
   SUPPORTED_MODELS,
   type AiRunConfigRecord,
 } from "./modelEnforcement.js";
+import { planAiRunConfig } from "./modelEnforcement.js";
 import { requiresAi, selectResource, type RoutingPolicy } from "./modelRouting.js";
 import {
   anchorFor,
@@ -405,6 +406,23 @@ export class SupervisorService {
     // 2. Refresh only resources whose retry is actually due. A resource with a
     //    known retryAt in the future is deliberately NOT probed: probing early
     //    costs something and tells us nothing new.
+    /**
+     * ONE CHOKEPOINT, NOT FOUR FILTERS (round-8 finding 1).
+     *
+     * Round 7 filtered ROUTING candidates by the code catalog and left refresh,
+     * usability promotion and wake calculation reading the persisted rows
+     * directly. The reviewer used that: a stale AVAILABLE row for a resource the
+     * catalog no longer carries promoted a waiting AI item, which then blocked
+     * an eligible deterministic one. And a resource ADDED to the catalog was
+     * never seeded, so it could never be probed or routed.
+     *
+     * Filtering at each reader is how this task has repeatedly left a sibling
+     * call site open. Reconciling ONCE, here, means every later reader --
+     * refresh, `anyUsable`, wake, routing, declaration -- is already looking at
+     * configuration rather than at rows.
+     */
+    current = await this.reconcileResourcesWithCatalog(current);
+
     current = await this.refreshDueResources(current);
 
     // 3. Recompute eligibility: from the dependency DAG, and from whether any
@@ -508,6 +526,51 @@ export class SupervisorService {
   // =====================================================================
   // Resource refresh (§6)
   // =====================================================================
+
+  /**
+   * Bring the persisted resource list back into agreement with the code catalog.
+   *
+   * Rows are OPERATIONAL STATE -- availability, backoff, the last observed
+   * billing mode -- for resources this installation configured. Which resources
+   * exist at all is CONFIGURATION, and configuration lives in code. When the two
+   * disagree, code wins: a row for a resource the catalog no longer carries is
+   * dropped, and a catalog entry with no row is seeded unprobed.
+   *
+   * Deliberately NOT a refusal like `reconcileRoadmapWithCatalog`. A roadmap
+   * disagreement means durable state was tampered with or corrupted, and the
+   * only safe answer is to stop. A resource disagreement is the ordinary
+   * consequence of editing the catalog between releases, and stopping the
+   * factory because someone added a model would be a guard that gets disabled.
+   */
+  private async reconcileResourcesWithCatalog(state: SupervisorState): Promise<SupervisorState> {
+    const catalogued = new Map(
+      this.deps.resourceCatalog.map((entry) => [resourceKey(entry.provider, entry.model), entry]),
+    );
+    const kept = state.resources.filter((record) => catalogued.has(record.key));
+    const present = new Set(kept.map((record) => record.key));
+    const now = this.deps.clock.now();
+    const added = [...catalogued.entries()]
+      .filter(([key]) => !present.has(key))
+      .map(([key, entry]) => ({
+        provider: entry.provider,
+        model: entry.model,
+        key,
+        // UNKNOWN, not AVAILABLE: a newly configured resource has never been
+        // probed, and seeding it usable would let configuration assert
+        // availability, which is the inversion this whole boundary exists to
+        // prevent.
+        state: "UNKNOWN_FAILURE" as const,
+        reason: "newly configured; not probed yet",
+        detectedAt: now,
+        lastCheckedAt: 0 as typeof now,
+        backoff: NO_BACKOFF,
+      }));
+
+    if (kept.length === state.resources.length && added.length === 0) {
+      return state;
+    }
+    return this.commit(state, { ...state, resources: [...kept, ...added] });
+  }
 
   private async refreshDueResources(state: SupervisorState): Promise<SupervisorState> {
     const now = this.deps.clock.now();
@@ -785,24 +848,69 @@ export class SupervisorService {
 
   private async runItem(state: SupervisorState, item: RoadmapItem): Promise<TickResult> {
     /**
-     * ROUTING CANDIDATES COME FROM THE CODE CATALOG (round-7 finding 1).
-     *
-     * Round 6 anchored the DECLARATION check in `deps.resourceCatalog` and left
-     * routing reading `state.resources` — so the same smuggled row was still
-     * reachable, just by a different door. The reviewer appended an AVAILABLE
-     * `claude-code/sonnet` row to a catalog holding only `opus`, declared
-     * nothing at all, and the router selected and launched it.
-     *
-     * A persisted row carries availability and backoff for a resource this
-     * installation configured. A row for a resource it did NOT configure is not
-     * a candidate, whatever it says about itself.
+     * Rows reaching here are already reconciled against the code catalog by
+     * `reconcileResourcesWithCatalog` at the top of the tick (round-8 finding
+     * 1), so there is no second filter. A duplicate one would mask a
+     * reconciliation regression rather than defend against it -- the sibling
+     * problem this task keeps producing.
      */
     const catalogued = new Set(
       this.deps.resourceCatalog.map((entry) => resourceKey(entry.provider, entry.model)),
     );
-    const resources = new Map(
-      state.resources.filter((record) => catalogued.has(record.key)).map((record) => [record.key, record]),
-    );
+    const resources = new Map(state.resources.map((record) => [record.key, record]));
+
+    /**
+     * ASK WHAT THE WORK NEEDS BEFORE ROUTING ANYTHING FOR IT (round-8 finding 2).
+     *
+     * The declaration used to be fetched AFTER the routed resource was selected,
+     * probed and gated -- so an action whose declared planner, implementer and
+     * reviewer were all free was refused because the ROUTED resource, which it
+     * would never launch, was USAGE_BILLED. An unused resource blocked the work,
+     * and AC-2 says the supervisor authorises exactly the declared set.
+     *
+     * So the question is asked first. When the work declares its own resources,
+     * nothing is routed for it at all: there is no routed resource to probe, to
+     * gate, or to refuse on.
+     */
+    let declaredResources: readonly RequiredResource[] = [];
+    try {
+      /**
+       * READ ONCE, INTO INERT DATA (round-3 finding 3).
+       *
+       * The declaration is data returned by the executor, and it was validated
+       * and then read again -- so a property GETTER could answer `opus` to the
+       * validator and `ghost-model` to the authoriser. The reviewer did exactly
+       * that and the action advanced on the ghost model.
+       *
+       * Every field is copied into a plain frozen object here, so validation and
+       * use read the same bytes. This is the same discipline `snapshotIdentity`
+       * already applies to what a worker CLAIMS: a value that can change between
+       * two reads is not evidence.
+       */
+      const raw = (await this.deps.executor.declareResources?.(deepFreeze(structuredClone({ ...item })))) ?? [];
+      declaredResources = deepFreeze(
+        [...raw].map((resource) => ({
+          role: String(resource.role) as RequiredResource["role"],
+          provider: String(resource.provider),
+          model: String(resource.model),
+          ...(resource.effort === undefined ? {} : { effort: String(resource.effort) }),
+        })),
+      );
+    } catch (error) {
+      // A declaration that cannot be produced is not permission to launch with
+      // an empty one: the executor was asked what it needs and could not say.
+      const detail = boundedDiagnostic(error instanceof Error ? error.message : String(error));
+      const escalated = await this.escalate(
+        state,
+        item.key,
+        "RECOVERY_REQUIRED",
+        `Investigate ${item.key}: the executor could not state which resources its work would launch.`,
+        detail,
+      );
+      void escalated;
+      return { kind: "RECOVERY_REQUIRED", reason: `resource declaration failed for ${item.key}: ${detail}` };
+    }
+    const declaresOwnResources = declaredResources.length > 0;
 
     // ROUTE. Deterministic work needs no AI resource and therefore can never
     // be blocked by a provider limit — that is what keeps a shortage from
@@ -829,7 +937,7 @@ export class SupervisorService {
     let confirmedBillingMode: BillingMode = "UNKNOWN";
     /** The same observation, bound to its resource, for the gate (R10-FIN-1). */
     let billingObservation: BillingObservation | undefined;
-    if (requiresAi(item.workClass)) {
+    if (requiresAi(item.workClass) && !declaresOwnResources) {
       // Only a REVIEW must avoid the implementer; an implementation may of
       // course reuse whatever resource is best.
       const lineage =
@@ -1002,45 +1110,6 @@ export class SupervisorService {
       }
     }
 
-    let action: SupervisedAction;
-    if (requiresAi(item.workClass) && config?.ok === true) {
-      const gated = await this.gateAiResource(
-        state,
-        item,
-        config.option.provider,
-        config.option.model,
-        billingObservation,
-        policy,
-        item.workClass === "INDEPENDENT_REVIEW",
-      );
-      if (!gated.ok) {
-        return gated.result;
-      }
-      action = gated.action;
-    } else {
-      // F4-4: this authorises invoking the trusted local executor, and says
-      // nothing about any command line. A concrete command must be minted by
-      // `verificationCommandAction` against the executable allowlist.
-      action = { kind: "RUN_DETERMINISTIC_WORK", description: `roadmap item ${item.key}: ${item.title}` };
-      const verdict = evaluateFinancialSafety(action, policy);
-      if (!verdict.allowed) {
-        const escalated = await this.escalate(
-          state,
-          item.key,
-          reasonForClass(verdict.actionClass),
-          verdict.humanActionRequired,
-          verdict.reason,
-        );
-        void escalated;
-        return {
-          kind: "WAITING_FOR_HUMAN",
-          roadmapKey: item.key,
-          reason: reasonForClass(verdict.actionClass),
-          humanActionRequired: verdict.humanActionRequired,
-        };
-      }
-    }
-
     /**
      * EVERY OTHER RESOURCE THIS WORK WILL LAUNCH (TASK-015).
      *
@@ -1057,45 +1126,9 @@ export class SupervisorService {
      * authorisation and no "run the ones that passed".
      */
     const authorized: AuthorizedResource[] = [];
+    let implementerAction: SupervisedAction | undefined;
+    let implementerConfig: AiRunConfigRecord | undefined;
 
-    let declaredResources: readonly RequiredResource[] = [];
-    try {
-      /**
-       * READ ONCE, INTO INERT DATA (round-3 finding 3).
-       *
-       * The declaration is data returned by the executor, and it was validated
-       * and then read again — so a property GETTER could answer `opus` to the
-       * validator and `ghost-model` to the authoriser. The reviewer did exactly
-       * that and the action advanced on the ghost model.
-       *
-       * Every field is copied into a plain frozen object here, so validation and
-       * use read the same bytes. This is the same discipline `snapshotIdentity`
-       * already applies to what a worker CLAIMS: a value that can change between
-       * two reads is not evidence.
-       */
-      const raw = (await this.deps.executor.declareResources?.(deepFreeze(structuredClone({ ...item })))) ?? [];
-      declaredResources = deepFreeze(
-        [...raw].map((resource) => ({
-          role: String(resource.role) as RequiredResource["role"],
-          provider: String(resource.provider),
-          model: String(resource.model),
-          ...(resource.effort === undefined ? {} : { effort: String(resource.effort) }),
-        })),
-      );
-    } catch (error) {
-      // A declaration that cannot be produced is not permission to launch with
-      // an empty one: the executor was asked what it needs and could not say.
-      const detail = boundedDiagnostic(error instanceof Error ? error.message : String(error));
-      const escalated = await this.escalate(
-        state,
-        item.key,
-        "RECOVERY_REQUIRED",
-        `Investigate ${item.key}: the executor could not state which resources its work would launch.`,
-        detail,
-      );
-      void escalated;
-      return { kind: "RECOVERY_REQUIRED", reason: `resource declaration failed for ${item.key}: ${detail}` };
-    }
 
     /**
      * A DECLARATION MUST BE UNAMBIGUOUS BEFORE IT IS AUTHORISED (round-2
@@ -1202,6 +1235,48 @@ export class SupervisorService {
       if (!gated.ok) {
         return gated.result;
       }
+      /**
+       * THE IMPLEMENTER'S CLEARED ACTION IS THE ACTION (round-8 finding 2).
+       *
+       * When the work declares its own resources nothing is routed for it, so
+       * there is no routed action to mint from. The implementer is what performs
+       * the work, so its gated action is the one the claim, the action id and
+       * provenance are built from -- which also makes them agree with the
+       * lineage record, rather than naming a resource nothing launched.
+       */
+      if (required.role === "implementer") {
+        implementerAction = gated.action;
+        /**
+         * AND ITS RUN CONFIGURATION, because identity reconciliation is built on
+         * one. Skipping routing removed the routed `config`, and with it the
+         * record `reconcileReportedIdentity` compares a worker's claim against --
+         * so an unauthorised reported identity stopped being refused at all. The
+         * regression was caught by the control that exists for exactly that.
+         *
+         * `planAiRunConfig` is the same builder routing uses, so the record has
+         * the same shape and the same argv evidence discipline.
+         */
+        const built = planAiRunConfig({
+          // Validated against SUPPORTED_MODELS above, so the narrowing is a
+          // restatement of a check already made rather than a new assumption.
+          provider: required.provider as keyof typeof SUPPORTED_MODELS,
+          model: required.model,
+          ...(required.effort === undefined ? {} : { effort: required.effort }),
+          role: "IMPLEMENTER",
+        });
+        if (!built.ok) {
+          const escalated = await this.escalate(
+            state,
+            item.key,
+            "RECOVERY_REQUIRED",
+            `Correct the implementer declared by ${item.key}: ${built.reason}`,
+            built.reason,
+          );
+          void escalated;
+          return { kind: "RECOVERY_REQUIRED", reason: `${item.key} declared an unconfigurable implementer: ${built.reason}` };
+        }
+        implementerConfig = built.value;
+      }
       authorized.push({ ...required, billingMode: observed.billingMode });
     }
 
@@ -1231,6 +1306,55 @@ export class SupervisorService {
         ...(config.option.effort === undefined ? {} : { effort: config.option.effort }),
         billingMode: confirmedBillingMode,
       });
+    }
+
+
+    let action: SupervisedAction;
+    if (requiresAi(item.workClass) && declaresOwnResources) {
+      if (implementerAction === undefined) {
+        // Unreachable: `describeDeclarationProblem` refuses a declaration that
+        // does not name exactly one implementer, so the loop above must have
+        // gated one. Stated rather than assumed, because a silent fallback here
+        // would mint an action for a resource nothing launched.
+        return { kind: "RECOVERY_REQUIRED", reason: `${item.key} declared resources but no implementer was gated` };
+      }
+      action = implementerAction;
+    } else if (requiresAi(item.workClass) && config?.ok === true) {
+      const gated = await this.gateAiResource(
+        state,
+        item,
+        config.option.provider,
+        config.option.model,
+        billingObservation,
+        policy,
+        item.workClass === "INDEPENDENT_REVIEW",
+      );
+      if (!gated.ok) {
+        return gated.result;
+      }
+      action = gated.action;
+    } else {
+      // F4-4: this authorises invoking the trusted local executor, and says
+      // nothing about any command line. A concrete command must be minted by
+      // `verificationCommandAction` against the executable allowlist.
+      action = { kind: "RUN_DETERMINISTIC_WORK", description: `roadmap item ${item.key}: ${item.title}` };
+      const verdict = evaluateFinancialSafety(action, policy);
+      if (!verdict.allowed) {
+        const escalated = await this.escalate(
+          state,
+          item.key,
+          reasonForClass(verdict.actionClass),
+          verdict.humanActionRequired,
+          verdict.reason,
+        );
+        void escalated;
+        return {
+          kind: "WAITING_FOR_HUMAN",
+          roadmapKey: item.key,
+          reason: reasonForClass(verdict.actionClass),
+          humanActionRequired: verdict.humanActionRequired,
+        };
+      }
     }
 
     // CLAIM before the side effect. The attempt counter lives on the ITEM, so
@@ -1344,7 +1468,11 @@ export class SupervisorService {
           // A SEPARATE clone from `settleItem` — see above.
           item: structuredClone({ ...item }),
           actionId,
-          ...(config?.ok === true ? { config: config.config } : {}),
+          ...(implementerConfig !== undefined
+            ? { config: implementerConfig }
+            : config?.ok === true
+              ? { config: config.config }
+              : {}),
           // TASK-015: the exact set, so the executor can refuse to launch
           // anything outside it at the last point before it launches.
           ...(authorized.length === 0 ? {} : { authorizedResources: authorized }),
@@ -1370,8 +1498,12 @@ export class SupervisorService {
       settleItem,
       actionId,
       outcome,
-      config?.ok === true ? resourceKey(config.option.provider, config.option.model) : undefined,
-      config?.ok === true ? config.config : undefined,
+      implementerConfig !== undefined
+        ? resourceKey(implementerConfig.effectiveProvider, implementerConfig.effectiveModel)
+        : config?.ok === true
+          ? resourceKey(config.option.provider, config.option.model)
+          : undefined,
+      implementerConfig ?? (config?.ok === true ? config.config : undefined),
       authorized,
     );
   }
