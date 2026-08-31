@@ -59,6 +59,15 @@ export interface GitRepositoryReader {
    * them.
    */
   addsWorkflows(baseSha: string, headSha: string): Promise<boolean | undefined>;
+  /**
+   * Whether the candidate tracks any content through Git LFS; `undefined` when
+   * it could not be established.
+   *
+   * LFS storage and bandwidth are metered even on public repositories. Kept as
+   * an observed fact rather than dropped with the push (round-8 review,
+   * finding 3): it feeds the liability channel a human reads before deciding.
+   */
+  usesLfs(headSha: string): Promise<boolean | undefined>;
 }
 
 export interface GitHubClient {

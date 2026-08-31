@@ -62,6 +62,13 @@ export const GITHUB_CLI_ENV_ALLOWLIST: readonly string[] = Object.freeze([
 export const GITHUB_CLI_ENVIRONMENT_POLICY = Object.freeze({ allowedVars: GITHUB_CLI_ENV_ALLOWLIST });
 
 const DEFAULT_TIMEOUT_MS = 60_000;
+/**
+ * How many pull requests one listing may report. A page that comes back FULL is
+ * treated as possibly truncated and refused — see `listPullRequests` — so this
+ * is a threshold for "ask a human", not a silent cap.
+ */
+const PULL_REQUEST_PAGE = 100;
+
 const MAX_OUTPUT_BYTES = 256 * 1024;
 
 /**
@@ -293,7 +300,7 @@ export function createGhCliClient(deps: GhCliDeps): GitHubClient {
         "--state",
         "all",
         "--limit",
-        "10",
+        String(PULL_REQUEST_PAGE),
         "--json",
         "number,state,headRefName,headRefOid,baseRefName,baseRefOid",
       ]);
@@ -305,6 +312,22 @@ export function createGhCliClient(deps: GhCliDeps): GitHubClient {
       }
       if (!Array.isArray(parsed)) {
         throw new Error("gh pr list did not return an array");
+      }
+      /**
+       * A FULL PAGE MEANS "THERE MAY BE MORE", WHICH IS UNKNOWN, WHICH FAILS
+       * CLOSED (round-8 review, finding 2).
+       *
+       * The port promises every pull request the remote reports, and the
+       * adapter was asking for at most ten. An eleventh could hold the second
+       * binding pull request, so a genuinely AMBIGUOUS remote state arrived
+       * looking unambiguous and was adopted. Raising the limit alone would
+       * only move the number at which that happens; what closes it is
+       * refusing to answer when the answer might be incomplete.
+       */
+      if (parsed.length >= PULL_REQUEST_PAGE) {
+        throw new Error(
+          `gh pr list returned ${parsed.length} pull requests for ${JSON.stringify(headRef)}, which is the page limit; the listing may be incomplete and an incomplete listing cannot establish that exactly one pull request matches`,
+        );
       }
       /**
        * EVERY entry is parsed and returned. The adapter no longer chooses:
@@ -476,7 +499,22 @@ export function createGitRepositoryReader(deps: GhCliDeps): GitRepositoryReader 
      */
     async originTarget(): Promise<string | undefined> {
       try {
-        const url = (await run(deps, git, ["remote", "get-url", "origin"])).trim();
+        /**
+         * `ls-remote --get-url` IS THE URL-REWRITE CONTROL (round-8 review,
+         * finding 3), restored on the side that still exists.
+         *
+         * Rounds 2-4 established that naming a URL is not knowing where git
+         * goes: `url.*.insteadOf` rewrites it at the moment of use. The push
+         * those rounds were about is gone, but `git fetch origin` is not, and
+         * a rewritten origin means `origin/<base>` came from somewhere else.
+         *
+         * `ls-remote --get-url` prints what git will really contact, applying
+         * those rewrites, and contacts nothing itself. `remote get-url`
+         * happens to expand `insteadOf` too on current git — but "happens to"
+         * is not a control, and this is the primitive whose documented job is
+         * exactly this question.
+         */
+        const url = (await run(deps, git, ["ls-remote", "--get-url", "origin"])).trim();
         return githubTargetFromUrl(url);
       } catch {
         return undefined;
@@ -525,12 +563,42 @@ export function createGitRepositoryReader(deps: GhCliDeps): GitRepositoryReader 
       }
     },
     /**
-     * Whether this push would introduce Git LFS tracking (round-2 CRITICAL 2).
+     * Whether the candidate tracks ANY content through Git LFS (round-2
+     * CRITICAL 2, restored after the round-8 review).
      *
-     * LFS storage and bandwidth are metered even on public repositories, so a
-     * candidate adding `filter=lfs` rules turns the push into billed transfer.
-     * Any change to a `.gitattributes` counts: deciding which rules are
-     * "really" LFS from a diff is the kind of cleverness that fails open.
+     * LFS storage and bandwidth are metered even on public repositories. The
+     * push this originally guarded is gone, so it no longer decides a push —
+     * it feeds the liability channel a human reads, where omitting a metered
+     * mechanism entirely would be the dishonest option.
+     *
+     * ANY tracking at the candidate, not a CHANGE to it (round-3 HIGH 2): the
+     * first version compared `.gitattributes` between base and head and missed
+     * the ordinary case where the base already tracks `*.bin`, the candidate
+     * adds `new.bin`, and `.gitattributes` is untouched. `git grep` against a
+     * commit reads the tree, so no checkout is involved.
      */
+    async usesLfs(headSha: string): Promise<boolean | undefined> {
+      try {
+        const matches = await run(deps, git, [
+          "grep",
+          "-I",
+          "-l",
+          "filter=lfs",
+          headSha,
+          "--",
+          ".gitattributes",
+          "*.gitattributes",
+        ]);
+        return matches.trim().length > 0;
+      } catch (error) {
+        /**
+         * `git grep` exits 1 for "no matches", which is an ANSWER, and
+         * anything else is genuinely unknown. Distinguished by the message the
+         * runner builds, because a bare catch would report "no LFS" for a
+         * repository it could not read — failing open on a metered channel.
+         */
+        return /exit 1\b/.test(error instanceof Error ? error.message : "") ? false : undefined;
+      }
+    },
   };
 }

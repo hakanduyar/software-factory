@@ -14,7 +14,11 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { createGhCliClient, githubTargetFromUrl } from "../src/adapters/github/ghCliClient.js";
+import {
+  createGhCliClient,
+  createGitRepositoryReader,
+  githubTargetFromUrl,
+} from "../src/adapters/github/ghCliClient.js";
 import {
   authorizeRemoteWrite,
   createPullRequestAction,
@@ -58,6 +62,19 @@ function runner(responses: Record<string, string>): ProcessRunner & { seen(): re
       }
       return result("", 1);
     },
+  };
+}
+
+function reader_(responses: Record<string, string>, seenRunner = runner(responses)) {
+  return {
+    client: createGitRepositoryReader({
+      processRunner: seenRunner,
+      cwd: "/tmp",
+      repository: REPO,
+      ghPath: "/usr/bin/true",
+      gitPath: "/usr/bin/true",
+    }),
+    runner: seenRunner,
   };
 }
 
@@ -299,6 +316,92 @@ describe("TASK-016 round-6 finding 1: the REAL adapter refuses an unauthorized w
   });
 });
 
+describe("TASK-016 round-8 finding 3: the origin url is read through git's own rewriter", () => {
+  /**
+   * Rounds 2-4 established that naming a URL is not knowing where git goes:
+   * `url.*.insteadOf` rewrites it at the moment of use. That control was
+   * removed with the push; the round-8 review required it back, and the place
+   * it now bites is `git fetch origin`, which decides what `origin/<base>`
+   * holds.
+   *
+   * `ls-remote --get-url` is the primitive whose documented job is exactly
+   * this question. Asserting the ARGV is the point: `remote get-url` happens
+   * to expand `insteadOf` on current git, and "happens to" is not a control.
+   */
+  it("asks git to expand the origin url rather than reading the configured one", async () => {
+    const { client: reader, runner: r } = reader_({
+      "ls-remote --get-url": "https://github.com/hakanduyar/software-factory.git\n",
+    });
+
+    assert.equal(await reader.originTarget(), REPO);
+    assert.ok(
+      r.seen().some((argv) => argv.includes("ls-remote --get-url")),
+      `the effective url was never requested: ${r.seen().join(" | ")}`,
+    );
+  });
+
+  /**
+   * A REWRITTEN origin yields a different target, which the caller refuses.
+   * This is the rewrite attack from rounds 2-4, on the side that still exists.
+   */
+  it("derives the rewritten target when git reports a rewritten url", async () => {
+    const { client: reader } = reader_({
+      "ls-remote --get-url": "https://github.com/someone-else/software-factory.git\n",
+    });
+
+    assert.equal(await reader.originTarget(), "someone-else/software-factory");
+  });
+
+  it("reports no target when the expanded url is not a GitHub repository", async () => {
+    const { client: reader } = reader_({ "ls-remote --get-url": "https://evil.example/mirror.git\n" });
+
+    assert.equal(await reader.originTarget(), undefined);
+  });
+});
+
+describe("TASK-016 round-8 finding 3: LFS is observed again", () => {
+  /**
+   * LFS storage and bandwidth are metered even on public repositories. The
+   * push this guarded is gone, so it no longer decides a write — it feeds the
+   * liability channel a human reads, where omitting a metered mechanism
+   * entirely would be the dishonest option.
+   */
+  it("reports LFS tracking when the candidate has it", async () => {
+    const { client: reader } = reader_({ "grep": `${A}:.gitattributes\n` });
+
+    assert.equal(await reader.usesLfs(A), true);
+  });
+
+  /**
+   * `git grep` exits 1 for "no matches", which is an ANSWER. Anything else is
+   * unknown — and unknown must not read as "no LFS", which is failing open on
+   * a metered channel.
+   */
+  it("reports no LFS when git grep finds nothing", async () => {
+    const { client: reader } = reader_({}, runner({}));
+
+    assert.equal(await reader.usesLfs(A), false);
+  });
+
+  /**
+   * `git grep` exits 1 for "no matches", which is an ANSWER. Any OTHER failure
+   * is genuinely unknown, and unknown must not read as "no LFS" — a bare catch
+   * here would report a clean bill of health for a repository it could not
+   * read, which is failing open on a metered channel.
+   */
+  it("reports UNKNOWN, not false, when git cannot answer at all", async () => {
+    const failing: ProcessRunner = {
+      async run(): Promise<ProcessResult> {
+        // Exit 128 is git's "fatal", not its "no matches".
+        return result("", 128);
+      },
+    };
+    const { client: reader } = reader_({}, failing as ProcessRunner & { seen(): readonly string[] });
+
+    assert.equal(await reader.usesLfs(A), undefined, "an unreadable repository reported no LFS");
+  });
+});
+
 describe("TASK-016 AC-5 (amended): the adapter reports every pull request it is told about", () => {
   function entry(number: number, headSha: string, state = "OPEN") {
     return {
@@ -339,6 +442,47 @@ describe("TASK-016 AC-5 (amended): the adapter reports every pull request it is 
     assert.equal(listed.length, 2, "a closed listing was narrowed to one");
   });
 
+  /**
+   * THE REVIEWER'S REPRODUCTION (round-8, finding 2). The adapter asked for at
+   * most ten pull requests while the port promises every one, so an eleventh
+   * could hold the second binding pull request: a genuinely AMBIGUOUS remote
+   * state arrived looking unambiguous and was adopted.
+   *
+   * Raising the limit only moves the number at which that happens. What closes
+   * it is refusing to answer when the answer might be incomplete — a full page
+   * means "there may be more", which is unknown, which fails closed.
+   */
+  it("refuses a listing that fills the page, because there may be more", async () => {
+    const full = Array.from({ length: 100 }, (_unused, index) => entry(index + 1, A));
+    const { client: gh } = client({ "pr list": JSON.stringify(full) });
+
+    await assert.rejects(
+      () => gh.listPullRequests("feat/executor-wiring"),
+      /page limit|incomplete/,
+      "a possibly-truncated listing was reported as complete",
+    );
+  });
+
+  /** One short of the page is a complete answer, and is returned. */
+  it("returns a listing one short of the page limit", async () => {
+    const nearly = Array.from({ length: 99 }, (_unused, index) => entry(index + 1, A));
+    const { client: gh } = client({ "pr list": JSON.stringify(nearly) });
+
+    assert.equal((await gh.listPullRequests("feat/executor-wiring")).length, 99);
+  });
+
+  /** And the request must actually ASK for more than the old ten. */
+  it("asks for a page larger than the old limit", async () => {
+    const { client: gh, runner: r } = client({ "pr list": "[]" });
+
+    await gh.listPullRequests("feat/executor-wiring");
+
+    const listed = r.seen().find((argv) => argv.includes("pr list"));
+    assert.ok(listed !== undefined, "no pr list call was made");
+    const limit = Number(/--limit (\d+)/.exec(listed ?? "")?.[1] ?? "0");
+    assert.ok(limit >= 100, `the adapter asked for only ${limit} pull requests`);
+  });
+
   it("returns an empty list when the remote reports none", async () => {
     const { client: gh } = client({ "pr list": "[]" });
 
@@ -349,6 +493,38 @@ describe("TASK-016 AC-5 (amended): the adapter reports every pull request it is 
    * A malformed entry THROWS rather than being skipped: dropping an unreadable
    * pull request is how a listing of two becomes an unambiguous listing of one.
    */
+  /**
+   * THE ADAPTER'S OWN SHA PARSING IS LOAD-BEARING (round-8 test-integrity
+   * note). The reviewer weakened `requireSha` and it survived, because the
+   * core binding rejects malformed SHAs downstream. That makes the adapter's
+   * strictness real but unproven — a control indistinguishable from its
+   * absence — so it is asserted here, at the adapter, where core cannot
+   * rescue it.
+   */
+  it("refuses a pull request whose head sha is not a full commit id", async () => {
+    const { client: gh } = client({
+      "pr list": JSON.stringify([{ ...entry(7, A), headRefOid: "1111111" }]),
+    });
+
+    await assert.rejects(
+      () => gh.listPullRequests("feat/executor-wiring"),
+      /headRefOid|commit id|sha/i,
+      "the adapter accepted an abbreviated sha",
+    );
+  });
+
+  it("refuses a pull request whose base sha is not a full commit id", async () => {
+    const { client: gh } = client({
+      "pr list": JSON.stringify([{ ...entry(7, A), baseRefOid: "not-a-sha" }]),
+    });
+
+    await assert.rejects(
+      () => gh.listPullRequests("feat/executor-wiring"),
+      /baseRefOid|commit id|sha/i,
+      "the adapter accepted a malformed base sha",
+    );
+  });
+
   it("refuses a listing containing an entry it cannot read", async () => {
     const { client: gh } = client({
       "pr list": JSON.stringify([entry(7, A), { number: "not-a-number" }]),

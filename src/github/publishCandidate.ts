@@ -49,14 +49,6 @@ import {
   type SupervisedAction,
 } from "../supervision/financialSafety.js";
 
-/**
- * A placeholder passed when no write is needed, so the parameter is never
- * optional. It is NOT an authorization: the adapter refuses it, which is what
- * makes "adopting an existing pull request performs no write" true by
- * construction rather than by inspection.
- */
-const UNAUTHORIZED: RemoteWriteAuthorization = Object.freeze({ kind: "NONE", target: "" });
-
 export type PublishOutcome =
   | {
       readonly kind: "PUBLISHED";
@@ -104,7 +96,30 @@ export type LocalStateResult =
 export async function readLocalState(
   git: GitRepositoryReader,
   candidate: ReviewedCandidate,
+  expectedRepository: string,
 ): Promise<LocalStateResult> {
+  /**
+   * THE ORIGIN GUARD LIVES HERE, NOT IN ONE CALLER (round-8 review, finding 1).
+   *
+   * It was in `publishCandidate` only, so `sf github readiness` — which also
+   * reaches this function — fetched and resolved `origin/<base>` without ever
+   * asking where origin points, and could report readiness computed against a
+   * repository nobody verified. A guard placed in a caller protects that
+   * caller; a guard placed beside the read protects every caller, including
+   * ones not yet written.
+   *
+   * It runs BEFORE the fetch, because the fetch is itself a use of origin.
+   */
+  const originTarget = await git.originTarget();
+  if (originTarget !== expectedRepository) {
+    return {
+      ok: false,
+      reason:
+        originTarget === undefined
+          ? `the local origin remote is absent or is not a GitHub repository url, so ${expectedRepository} cannot be confirmed as the base's source`
+          : `the local origin points at ${JSON.stringify(originTarget)} but this action expects ${JSON.stringify(expectedRepository)}`,
+    };
+  }
   await git.fetch();
   const [headSha, baseSha, clean] = await Promise.all([
     git.revision("HEAD"),
@@ -154,14 +169,10 @@ async function ensurePullRequest(
   candidate: ReviewedCandidate,
   repository: RemoteRepository,
   authorization: RemoteWriteAuthorization,
-  known?: RemotePullRequest,
 ): Promise<
   | { readonly ok: true; readonly pullRequest: RemotePullRequest; readonly created: boolean }
   | { readonly ok: false; readonly reason: string }
 > {
-  if (known !== undefined) {
-    return { ok: true, pullRequest: known, created: false };
-  }
   try {
     const pullRequest = await github.createPullRequest(
       {
@@ -217,27 +228,11 @@ export async function publishCandidate(
   }
 
   /**
-   * WHERE `origin` POINTS, CHECKED BEFORE ANYTHING IS READ THROUGH IT (AC-8).
-   *
-   * `readLocalState` resolves the base from `origin/<base>` after fetching
-   * `origin`. If `origin` is not the repository this action is permitted to
-   * touch, then the base SHA, the ancestry and the "has the base moved" check
-   * were all computed against a repository nobody verified — while the `gh`
-   * client addressed the right one and reported agreement. The two halves must
-   * name the same place, and this is the half that was never checked.
+   * WHERE `origin` POINTS is checked inside `readLocalState` (AC-8), beside the
+   * reads it protects rather than here — see the note there. It was here, and
+   * that is exactly how `sf github readiness` came to bypass it.
    */
-  const originTarget = await deps.git.originTarget();
-  if (originTarget !== deps.expectedRepository) {
-    return {
-      kind: "REFUSED",
-      reason:
-        originTarget === undefined
-          ? `the local origin remote is absent or is not a GitHub repository url, so ${deps.expectedRepository} cannot be confirmed as the base's source`
-          : `the local origin points at ${JSON.stringify(originTarget)} but this action expects ${JSON.stringify(deps.expectedRepository)}`,
-    };
-  }
-
-  const read = await readLocalState(deps.git, candidate);
+  const read = await readLocalState(deps.git, candidate, deps.expectedRepository);
   if (!read.ok) {
     return { kind: "REFUSED", reason: read.reason };
   }
@@ -338,9 +333,10 @@ export async function publishCandidate(
   const needsCreate = existing === undefined;
   let writeAuthorization: RemoteWriteAuthorization | undefined;
   if (needsCreate) {
-    const addsWorkflows = await deps.git
-      .addsWorkflows(candidate.baseSha, candidate.headSha)
-      .catch(() => undefined);
+    const [addsWorkflows, usesLfs] = await Promise.all([
+      deps.git.addsWorkflows(candidate.baseSha, candidate.headSha).catch(() => undefined),
+      deps.git.usesLfs(candidate.headSha).catch(() => undefined),
+    ]);
     const observation = observePushLiability({
       target,
       visibility: repository.visibility,
@@ -348,6 +344,7 @@ export async function publishCandidate(
       repositoryWebhooks: repository.repositoryWebhooks,
       configuredWorkflows: repository.configuredWorkflows,
       candidateAddsWorkflows: addsWorkflows,
+      candidateUsesLfs: usesLfs,
     });
     const action = createPullRequestAction({
       target,
@@ -389,24 +386,24 @@ export async function publishCandidate(
    * behaviour had no positive demonstration while it was inline here.
    */
   /**
-   * Unreachable without proof: `needsCreate` is the only path that mints one,
-   * and it returns HUMAN_REQUIRED when the gate refuses. Stated rather than
-   * assumed, because a silent fallback here would be a write without a gate.
+   * THE WRITE PATH IS THE ONLY PATH THAT CALLS THE WRITER (round-8 review,
+   * test-integrity note).
+   *
+   * This used to call `ensurePullRequest` unconditionally, passing an
+   * `UNAUTHORIZED` placeholder when adopting, guarded by a check that no test
+   * could reach — because the gate always refuses first, so the guard was
+   * unreachable and read like a control without being one. Adoption now simply
+   * does not call the writer. "Adopting performs no write" is a fact about
+   * there being no call rather than about a branch nobody can execute.
    */
-  if (writeAuthorization === undefined && existing === undefined) {
-    return { kind: "REFUSED", reason: "no write authorization was minted for a publication that needs one" };
+  let created = false;
+  if (writeAuthorization !== undefined) {
+    const ensured = await ensurePullRequest(deps.github, candidate, repository, writeAuthorization);
+    if (!ensured.ok) {
+      return { kind: "REFUSED", reason: ensured.reason };
+    }
+    created = ensured.created;
   }
-  const ensured = await ensurePullRequest(
-    deps.github,
-    candidate,
-    repository,
-    writeAuthorization ?? UNAUTHORIZED,
-    existing,
-  );
-  if (!ensured.ok) {
-    return { kind: "REFUSED", reason: ensured.reason };
-  }
-  const created = ensured.created;
 
   /**
    * RE-BIND AFTER ACTING, FROM A FRESH READ (round-4 review, finding 3).

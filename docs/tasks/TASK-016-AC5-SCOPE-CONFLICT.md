@@ -1,10 +1,27 @@
-# TASK-016 — AC-5 scope conflict (open, awaiting human decision)
+# TASK-016 — AC-5 scope conflict (RESOLVED by owner decision)
 
-**Status: OPEN. Requires a PLAN-level human decision under C1/C2.**
+**Status: RESOLVED 2026-09-01 by owner decision — Option A. Retained as the
+record of the conflict and of how it was decided.**
 
-This document reports a conflict. It does not resolve it, and it does not
-amend anything. The frozen criteria at `ac01c22` are unchanged and will stay
-unchanged until a separate planning decision says otherwise (C2).
+The owner chose Option A: do not accept the GitHub App installation residual,
+do not weaken ZERO_COST, UNKNOWN_COST remains DENY, and a remote write must not
+be authorized merely to make AC-5 reachable. External pull-request creation is
+a legitimate HUMAN_REQUIRED boundary under the current policy.
+
+AC-5 was amended accordingly in `ba6c6c8`, a dedicated criteria-only commit.
+`ac01c22` is unchanged in history. The amended criterion and the amendment
+record live in `TASK-016-github-orchestration.md`; this document is the
+reasoning that preceded them, kept because the decision is only auditable
+alongside the problem it answered.
+
+The TASK-016 round-7 independent review confirmed the conflict on the original
+criteria and explicitly declined to resolve it — "amending AC-5 requires a
+separate human scope decision; it cannot be accepted implicitly by this
+review". It recommended staying blocked; the owner decided otherwise. That
+divergence is worth recording: the implementer did not choose the outcome, and
+neither did the reviewer.
+
+Everything below is the analysis as written before the decision, unchanged.
 
 ## The conflict
 

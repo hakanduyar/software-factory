@@ -23,7 +23,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { publishCandidate, type PublishDeps } from "../src/github/publishCandidate.js";
+import { publishCandidate, readLocalState, type PublishDeps } from "../src/github/publishCandidate.js";
 import type {
   RemoteCheckStatus,
   RemotePullRequest,
@@ -86,6 +86,7 @@ function scripted(options: {
     clean?: boolean;
     ancestor?: boolean | undefined;
     addsWorkflows?: boolean | undefined;
+    usesLfs?: boolean | undefined;
   };
   /** Makes `createPullRequest` throw, as GitHub does for a duplicate. */
   readonly createFails?: boolean;
@@ -184,6 +185,10 @@ function scripted(options: {
         gitCalls.push("addsWorkflows");
         return options.local?.addsWorkflows ?? false;
       },
+      async usesLfs(): Promise<boolean | undefined> {
+        gitCalls.push("usesLfs");
+        return options.local?.usesLfs ?? false;
+      },
       async originTarget(): Promise<string | undefined> {
         gitCalls.push("originTarget");
         return options.originTarget === undefined ? REPO : (options.originTarget ?? undefined);
@@ -205,6 +210,47 @@ function deps(s: Scripted, overrides: Partial<PublishDeps> = {}): PublishDeps {
     ...overrides,
   };
 }
+
+describe("TASK-016 round-8 finding 1: the origin guard is not per-caller", () => {
+  /**
+   * THE REVIEWER'S REPRODUCTION. The guard lived in `publishCandidate`, so
+   * `sf github readiness` — which reaches `readLocalState` by another route —
+   * fetched and resolved `origin/<base>` without ever asking where origin
+   * points, and could report readiness computed against a repository nobody
+   * verified.
+   *
+   * The guard now lives in `readLocalState`, beside the reads it protects, so
+   * these cases are about the FUNCTION rather than about one of its callers.
+   */
+  it("refuses in readLocalState itself when origin is a different repository", async () => {
+    const s = scripted({ originTarget: "someone-else/software-factory" });
+
+    const read = await readLocalState(s.git, CANDIDATE, REPO);
+
+    assert.equal(read.ok, false, "readLocalState resolved a base through an unverified origin");
+    if (read.ok) return;
+    assert.match(read.reason, /someone-else/);
+  });
+
+  it("does not fetch or resolve anything when origin is wrong", async () => {
+    const s = scripted({ originTarget: "someone-else/software-factory" });
+
+    await readLocalState(s.git, CANDIDATE, REPO);
+
+    const calls = s.gitCalls();
+    assert.deepEqual(calls, ["originTarget"], `origin was used before it was checked: ${calls.join(",")}`);
+  });
+
+  /** The control: a matching origin still reads normally. */
+  it("reads the local state when origin is the expected repository", async () => {
+    const s = scripted({});
+
+    const read = await readLocalState(s.git, CANDIDATE, REPO);
+
+    assert.equal(read.ok, true, `a correct origin was refused: ${JSON.stringify(read)}`);
+    assert.ok(s.gitCalls().includes("fetch"), "the fetch never happened");
+  });
+});
 
 describe("TASK-016 AC-8: an unexpected local origin refuses", () => {
   /**
@@ -298,6 +344,37 @@ describe("TASK-016 AC-5 (amended): idempotent external publication adoption", ()
     assert.equal(resumed.pullRequest.number, 7);
     assert.equal(resumed.created, false);
     assert.equal(s.creates(), 0, "the resumed run duplicated publication");
+  });
+
+  /**
+   * PUBLICATION OBSERVES LFS RATHER THAN ASSERTING IT (round-8 finding 3).
+   *
+   * Hard-coding `candidateUsesLfs: false` survived mutation, because every
+   * refusal happens anyway and no case looked at the REPORT. The report is what
+   * a human reads before deciding, so it is what this asserts: a candidate that
+   * tracks LFS must show the metered channel OPEN.
+   */
+  it("reports the lfs channel open for a candidate that tracks LFS", async () => {
+    const s = scripted({ pullRequests: [[]], local: { usesLfs: true } });
+
+    const outcome = await publishCandidate(deps(s), CANDIDATE);
+
+    assert.equal(outcome.kind, "HUMAN_REQUIRED", JSON.stringify(outcome));
+    if (outcome.kind !== "HUMAN_REQUIRED") return;
+    assert.match(outcome.action.detail ?? "", /git-lfs/, "the lfs channel is absent from the report");
+    assert.ok(s.gitCalls().includes("usesLfs"), "lfs was never actually observed");
+  });
+
+  /** The control: a candidate without LFS does NOT show the channel open. */
+  it("does not report the lfs channel open for a candidate without LFS", async () => {
+    const s = scripted({ pullRequests: [[]], local: { usesLfs: false } });
+
+    const outcome = await publishCandidate(deps(s), CANDIDATE);
+
+    assert.equal(outcome.kind, "HUMAN_REQUIRED");
+    if (outcome.kind !== "HUMAN_REQUIRED") return;
+    const open = /open: ([^;]*)/.exec(outcome.action.detail ?? "")?.[1] ?? "";
+    assert.ok(!open.includes("git-lfs"), `a clean candidate reported lfs open: ${open}`);
   });
 
   /** Amended AC-5, 8: nothing to adopt means a human must publish. No write. */

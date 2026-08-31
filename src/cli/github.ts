@@ -242,7 +242,7 @@ export async function runGithubReadiness(
   const deps = build(args, options);
   const candidate = candidateFrom(args);
 
-  const read = await readLocalState(deps.git, candidate);
+  const read = await readLocalState(deps.git, candidate, args.repository);
   if (!read.ok) {
     log(`NOT_READY: ${safe(read.reason)}`);
     return 1;

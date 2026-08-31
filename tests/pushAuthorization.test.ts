@@ -48,6 +48,7 @@ function publicUnmetered(
     repositoryWebhooks: 0,
     configuredWorkflows: 0,
     candidateAddsWorkflows: false,
+    candidateUsesLfs: false,
     ...overrides,
   });
 }
@@ -173,6 +174,7 @@ describe("TASK-016 AC-1/AC-2: a push cannot currently be demonstrated free", () 
         repositoryWebhooks: 0,
         configuredWorkflows: 0,
         candidateAddsWorkflows: false,
+        candidateUsesLfs: false,
           },
     ],
     ["no observation at all", undefined],
@@ -337,6 +339,50 @@ describe("TASK-016: the push minter did not widen anything else", () => {
       false,
       "a remote probe became free",
     );
+  });
+});
+
+describe("TASK-016 round-8 finding 3: LFS is a reported liability channel again", () => {
+  /**
+   * LFS storage and bandwidth are metered even on public repositories. The
+   * channel was removed with the push; the round-8 review required it back.
+   * It cannot change the VERDICT — `github-app-subscriptions` never closes —
+   * so these cases assert the CHANNEL REPORT, which is the thing a human
+   * actually reads before deciding.
+   */
+  it("closes the lfs channel for a candidate that tracks nothing through it", () => {
+    assert.ok(
+      !openChannels(publicUnmetered()).includes("git-lfs"),
+      "a candidate with no LFS still reported the lfs channel open",
+    );
+  });
+
+  it("opens the lfs channel for a candidate that tracks content through LFS", () => {
+    assert.ok(
+      openChannels(publicUnmetered(TARGET, { candidateUsesLfs: true })).includes("git-lfs"),
+      "an LFS-tracking candidate did not open the metered channel",
+    );
+  });
+
+  /**
+   * UNKNOWN IS OPEN, NOT ABSENT. "We could not tell" reading as "there is no
+   * LFS" is failing open on a metered mechanism, which is the exact direction
+   * this whole report exists to refuse.
+   */
+  it("opens the lfs channel when it could not be established", () => {
+    assert.ok(
+      openChannels(publicUnmetered(TARGET, { candidateUsesLfs: undefined })).includes("git-lfs"),
+      "an unknown LFS state read as no LFS",
+    );
+  });
+
+  /** The reported detail states the observed value, not merely the verdict. */
+  it("states the observed lfs value in the channel detail", () => {
+    const channels = describePushLiability(publicUnmetered(TARGET, { candidateUsesLfs: true }));
+    const lfs = channels.find((entry) => entry.name === "git-lfs");
+
+    assert.ok(lfs !== undefined, "the lfs channel is missing from the report");
+    assert.match(lfs?.detail ?? "", /true/);
   });
 });
 

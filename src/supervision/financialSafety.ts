@@ -589,6 +589,11 @@ export interface PushLiabilityObservation {
   readonly configuredWorkflows: number | undefined;
   /** `undefined` when it could not be established whether this push adds workflows. */
   readonly candidateAddsWorkflows: boolean | undefined;
+  /**
+   * Whether the candidate tracks content through Git LFS; `undefined` when it
+   * could not be established. LFS is metered even on public repositories.
+   */
+  readonly candidateUsesLfs: boolean | undefined;
 }
 
 /** One metered channel a push to GitHub can open, and whether it was closed. */
@@ -639,6 +644,18 @@ export function describePushLiability(
       `candidate adds workflows ${o?.candidateAddsWorkflows ?? "unknown"}`,
     ),
     /**
+     * LFS storage and bandwidth are metered even on public repositories, so a
+     * candidate that tracks content through LFS keeps this channel open.
+     * `undefined` — could not be established — is UNKNOWN, which is open, not
+     * absent: failing open on a metered mechanism is the whole failure mode
+     * this report exists to avoid.
+     */
+    channel(
+      "git-lfs",
+      o?.candidateUsesLfs === false,
+      `candidate uses lfs ${o?.candidateUsesLfs ?? "unknown"}`,
+    ),
+    /**
      * NEVER CLOSED, and that is the honest answer rather than a gap.
      *
      * A GitHub App can subscribe to push events independently of repository
@@ -668,6 +685,7 @@ export function observePushLiability(input: {
   readonly repositoryWebhooks: number | undefined;
   readonly configuredWorkflows: number | undefined;
   readonly candidateAddsWorkflows: boolean | undefined;
+  readonly candidateUsesLfs: boolean | undefined;
 }): PushLiabilityObservation {
   const observation = Object.freeze({
     target: input.target,
@@ -677,6 +695,7 @@ export function observePushLiability(input: {
     repositoryWebhooks: input.repositoryWebhooks,
     configuredWorkflows: input.configuredWorkflows,
     candidateAddsWorkflows: input.candidateAddsWorkflows,
+    candidateUsesLfs: input.candidateUsesLfs,
   });
   PUSH_OBSERVATIONS.add(observation);
   return observation;
