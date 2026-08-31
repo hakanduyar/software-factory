@@ -1015,15 +1015,6 @@ export class SupervisorService {
      * authorisation and no "run the ones that passed".
      */
     const authorized: AuthorizedResource[] = [];
-    if (requiresAi(item.workClass) && config?.ok === true) {
-      authorized.push({
-        role: ROUTED_ROLE,
-        provider: config.option.provider,
-        model: config.option.model,
-        ...(config.option.effort === undefined ? {} : { effort: config.option.effort }),
-        billingMode: confirmedBillingMode,
-      });
-    }
 
     let declaredResources: readonly RequiredResource[] = [];
     try {
@@ -1131,6 +1122,34 @@ export class SupervisorService {
         return gated.result;
       }
       authorized.push({ ...required, billingMode: observed.billingMode });
+    }
+
+    /**
+     * THE SET IS EXACTLY WHAT THE WORK DECLARED (round-4 finding 2).
+     *
+     * The routed resource used to be added unconditionally, so a plan-backed
+     * action was authorised for FOUR resources when it declared three — and the
+     * extra one is never launched, because `PlanBackedExecutor` runs the plan's
+     * configuration and not `input.config`. AC-2 says the supervisor authorises
+     * exactly the declared set, and "exactly" is the whole point: an authorised
+     * resource that nothing runs is a permission granted for no reason.
+     *
+     * The routed resource is STILL routed, probed, gated and recorded as the
+     * action's resource — none of that changed. It is simply not presented to
+     * the executor as something it may launch.
+     *
+     * When the work declares NOTHING, the routed resource is the set, because
+     * that is the only resource such an action can use. That path is byte-for-
+     * byte what it was before this task.
+     */
+    if (declaredResources.length === 0 && requiresAi(item.workClass) && config?.ok === true) {
+      authorized.push({
+        role: ROUTED_ROLE,
+        provider: config.option.provider,
+        model: config.option.model,
+        ...(config.option.effort === undefined ? {} : { effort: config.option.effort }),
+        billingMode: confirmedBillingMode,
+      });
     }
 
     // CLAIM before the side effect. The attempt counter lives on the ITEM, so
@@ -1371,22 +1390,34 @@ export class SupervisorService {
      * with its real `argvEvidence` — the round-4 regression pins that.
      */
     const implementerMember = authorized.find((entry) => entry.role === "implementer");
-    const asRecord = (entry: AuthorizedResource, why: string): AiRunConfigRecord | undefined =>
-      runConfig === undefined
-        ? undefined
-        : {
-            ...runConfig,
-            requestedProvider: entry.provider,
-            requestedModel: entry.model,
-            ...(entry.effort === undefined ? {} : { requestedEffort: entry.effort }),
-            effectiveProvider: entry.provider,
-            effectiveModel: entry.model,
-            ...(entry.effort === undefined ? {} : { effectiveEffort: entry.effort }),
-            // Never the routed argv: it describes a different launch, and
-            // attaching it here would be evidence about a run that did not happen.
-            argvEvidence: [],
-            note: `${runConfig.note}; ${why}`,
-          };
+    /**
+     * BUILT FIELD BY FIELD, NOT SPREAD (round-4 finding 3, second half).
+     *
+     * Spreading `runConfig` and conditionally overriding effort LEFT THE ROUTED
+     * EFFORT IN PLACE when the member declares none: routed `opus:high` plus a
+     * declared implementer `opus` at the provider default produced a record
+     * claiming `effectiveEffort: "high"` for a run that requested no effort at
+     * all. A record that keeps a field from a different resource is a record
+     * that describes a run nobody performed.
+     */
+    const asRecord = (entry: AuthorizedResource, why: string): AiRunConfigRecord | undefined => {
+      if (runConfig === undefined) {
+        return undefined;
+      }
+      return {
+        requestedProvider: entry.provider,
+        requestedModel: entry.model,
+        ...(entry.effort === undefined ? {} : { requestedEffort: entry.effort }),
+        effectiveProvider: entry.provider,
+        effectiveModel: entry.model,
+        ...(entry.effort === undefined ? {} : { effectiveEffort: entry.effort }),
+        verification: runConfig.verification,
+        // Never the routed argv: it describes a different launch, and attaching
+        // it here would be evidence about a run that did not happen.
+        argvEvidence: [],
+        note: `${runConfig.note}; ${why}`,
+      };
+    };
 
     const implementerBasis =
       implementerMember === undefined
@@ -1491,9 +1522,29 @@ export class SupervisorService {
     );
     const withLineage: SupervisorState = {
       ...withoutClaim,
-      // The same correction applies to the item's own implementer history,
-      // which `excludedReviewerResources` reads alongside the chain.
-      roadmap: setRunConfig(setImplementer(state.roadmap, item.key, implementerResourceKey), item.key, reconciled),
+      /**
+       * TWO DIFFERENT QUESTIONS, TWO DIFFERENT RECORDS (round-4 finding 3).
+       *
+       * `reconciled` answers "is what the worker REPORTED consistent with what
+       * it was allowed to run?" — so it must be compared against whichever
+       * authorised member the report names, or an honest reviewer reporting
+       * itself is refused.
+       *
+       * `lastRunConfig` answers "what IMPLEMENTED this item?" — and
+       * `excludedReviewerResources` reads it alongside the implementer history
+       * to keep an implementer from reviewing its own work. Round 3 let the
+       * reconciliation basis flow into this record, so a run whose REVIEWER
+       * reported itself persisted the reviewer as what ran, the two records
+       * disagreed, and every dependent review was blocked again.
+       *
+       * They are now written from their own answers: the implementer record when
+       * a declaration named one, and the reconciled record otherwise.
+       */
+      roadmap: setRunConfig(
+        setImplementer(state.roadmap, item.key, implementerResourceKey),
+        item.key,
+        implementerMember === undefined ? reconciled : implementerBasis,
+      ),
       provenance: lineageProvenance,
       // An anchor is written with EVERY chain, so that its absence is a
       // detectable deletion rather than a permitted state (round-9 CRITICAL).

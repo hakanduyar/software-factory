@@ -71,6 +71,65 @@ describe("TASK-015: the approval pin holds at the moment a worker starts", () =>
   });
 
   /**
+   * THE RACE, DRIVEN AT THE READ/WRITE PAIR ITSELF.
+   *
+   * Rounds 1-3 each answered a check-then-use window with a check placed closer
+   * to the side effect, and the reviewer defeated each one. No arrangement of
+   * checks can close it: between any read and an external side effect there is a
+   * moment.
+   *
+   * What closes it is ATOMICITY — the digest is verified against a read, and the
+   * claim is written with `compareAndSave` against THAT read's version. This
+   * test drives exactly that interleaving: the repository mutates the plan
+   * BETWEEN the read and the write, which is the window, and the claim must then
+   * fail rather than a worker start.
+   */
+  it("cannot dispatch when the plan changes between the pin check and the claim", async () => {
+    const base = await approved();
+    let interleave = true;
+
+    /**
+     * A repository that changes the plan between every read and the next write —
+     * the worst case the CAS exists for. If the claim were written against a
+     * version read earlier, or the digest checked against a different read, a
+     * worker would start.
+     */
+    const racing = {
+      ...base.context.plans,
+      create: (p: Parameters<typeof base.context.plans.create>[0]) => base.context.plans.create(p),
+      findActiveByRequestKey: (k: string) => base.context.plans.findActiveByRequestKey(k),
+      listByProject: (id: Parameters<typeof base.context.plans.listByProject>[0]) =>
+        base.context.plans.listByProject(id),
+      findById: async (id: string) => {
+        const found = await base.context.plans.findById(id);
+        if (found !== undefined && interleave) {
+          interleave = false;
+          // Someone else re-approves the plan, right here.
+          await base.context.plans.compareAndSave(
+            { ...found, version: found.version + 1, approvedDigest: "replaced-between-read-and-write" },
+            found.version,
+          );
+        }
+        return found;
+      },
+      compareAndSave: (p: Parameters<typeof base.context.plans.compareAndSave>[0], v: number) =>
+        base.context.plans.compareAndSave(p, v),
+    };
+
+    const context = await newPlanning({ store: base.context.store, plans: racing });
+    const startsBefore = base.context.dispatcher.startCount();
+
+    await context.service.resume(base.plan.id, base.digest).catch(() => undefined);
+
+    assert.equal(
+      context.dispatcher.startCount(),
+      0,
+      "a worker started even though the plan changed between the pin check and the claim",
+    );
+    assert.equal(startsBefore, base.context.dispatcher.startCount(), "the original dispatcher also started work");
+  });
+
+  /**
    * THE CONTROL. Pinning the CURRENT approval must still dispatch, or the guard
    * above is satisfied by never starting anything — which would look identical
    * in a test and be useless in production.

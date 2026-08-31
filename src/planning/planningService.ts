@@ -1775,38 +1775,53 @@ export class PlanningService {
       return adopted === undefined ? { kind: "conflict" } : { kind: "advanced", plan: adopted };
     }
 
-    // CLAIM before the side effect: a cancellation that committed first wins
-    // this CAS, and the loop is never started.
-    const claimed = await this.commit(plan, { ...plan, dispatchClaim: { planItemKey, workItemId, claimedAt: this.clock.now() } }, []);
-    if (claimed === undefined) {
+    /**
+     * THE CLAIM IS THE COMMITMENT POINT, AND THE PIN IS CHECKED INSIDE IT
+     * (TASK-015 round-4 finding 1, the FOURTH instance of this race).
+     *
+     * Rounds 1-3 each answered a check-then-use window with another check placed
+     * closer to the side effect: before the child, before `drive()`, before
+     * `start()`. Each one narrowed the gap and none closed it, because NO
+     * ARRANGEMENT OF CHECKS CAN. Between any read and an external side effect
+     * there is a moment, and the reviewer has now measured that moment three
+     * times.
+     *
+     * What closes it is not a better-placed check but an ATOMIC one. The plan is
+     * re-read, the digest is verified against THAT read, and the claim is
+     * written with `compareAndSave` against THAT read's version. Any interleaved
+     * write — including the approval being replaced — bumps the version, so the
+     * CAS fails, the step returns `conflict`, and `drive()` re-reads and refuses
+     * on the new digest. The check and the commitment are one write.
+     *
+     * WHAT THIS DOES AND DOES NOT CLAIM. Once the claim commits, the launch is
+     * authorised: it was authorised atomically, against a state nothing had
+     * changed. An approval replaced AFTER that is a new fact for the NEXT step,
+     * not a retroactive violation of this one — and treating it as a violation
+     * would mean no launch could ever be considered authorised, since an
+     * approval can always change one instant later. That is the honest boundary,
+     * stated rather than papered over with a fifth check.
+     */
+    const atClaim = await this.plans.findById(plan.id);
+    if (atClaim === undefined) {
       return { kind: "conflict" };
     }
+    if (expectApprovedDigest !== undefined && atClaim.approvedDigest !== expectApprovedDigest) {
+      throw new ValidationError(
+        `plan ${plan.id} is no longer the approval that was authorized: expected digest ` +
+          `${expectApprovedDigest}, found ${atClaim.approvedDigest ?? "none"}. Refusing to start a worker.`,
+      );
+    }
 
-    /**
-     * THE LAST CHECK BEFORE A WORKER STARTS (TASK-015 round-3 finding 1).
-     *
-     * `drive()` checks the pin at the top of each step, and this method then
-     * commits a claim and starts a worker -- so an approval replaced between
-     * those two moments was launched anyway, and only the NEXT loop read
-     * noticed. The reviewer measured it: two workers started, then the
-     * mismatch threw.
-     *
-     * This is the THIRD place this window has appeared in this task: before
-     * the child, then before `drive()`, now before `start()`. The lesson is
-     * that every re-read is a new opportunity, so the check belongs at the
-     * point of the side effect rather than anywhere upstream of it.
-     *
-     * Re-read from the repository rather than trusting `plan`, because
-     * `plan` is exactly the copy that may have gone stale.
-     */
-    if (expectApprovedDigest !== undefined) {
-      const atStart = await this.plans.findById(plan.id);
-      if (atStart?.approvedDigest !== expectApprovedDigest) {
-        throw new ValidationError(
-          `plan ${plan.id} is no longer the approval that was authorized: expected digest ` +
-            `${expectApprovedDigest}, found ${atStart?.approvedDigest ?? "none"}. Refusing to start a worker.`,
-        );
-      }
+    // CLAIM before the side effect: a cancellation that committed first wins
+    // this CAS, and the loop is never started. The CAS is against the version
+    // the digest above was read from, which is what makes the pair atomic.
+    const claimed = await this.commit(
+      atClaim,
+      { ...atClaim, dispatchClaim: { planItemKey, workItemId, claimedAt: this.clock.now() } },
+      [],
+    );
+    if (claimed === undefined) {
+      return { kind: "conflict" };
     }
 
     const instructions = buildTaskInstructions(title, spec, acceptanceCriteria);
