@@ -1091,8 +1091,25 @@ export class SupervisorService {
      * ladder and no observed billing history — so "the same path the single
      * routed resource goes through" was never true of it.
      */
+    /**
+     * THE CODE-LEVEL CATALOG, NOT THE PERSISTED ROWS (round-6 finding 1).
+     *
+     * This checked `resources`, which is built from `state.resources` -- durable
+     * state that anything with database access can append to. The reviewer added
+     * a valid-looking `claude-code/sonnet` row through the SQLite repository,
+     * reopened the database, and a declaration naming it was probed, gated,
+     * authorised and launched.
+     *
+     * `deps.resourceCatalog` is this installation's configuration in CODE. It is
+     * the same reasoning as the roadmap catalog one layer up, and the same
+     * reasoning as re-deriving a plan's phase from Factory authority: a row is a
+     * claim, and a claim does not get to decide whether a resource may be used.
+     */
+    const catalogued = new Set(
+      this.deps.resourceCatalog.map((entry) => resourceKey(entry.provider, entry.model)),
+    );
     const uncatalogued = declaredResources.find(
-      (resource) => !resources.has(resourceKey(resource.provider, resource.model)),
+      (resource) => !catalogued.has(resourceKey(resource.provider, resource.model)),
     );
     /**
      * SHAPE FIRST, THEN INSTALLATION. A malformed role or an unknown provider is

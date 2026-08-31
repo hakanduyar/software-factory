@@ -188,6 +188,58 @@ describe("TASK-015 round-5 finding 4: declarations enter through the catalog", (
   });
 
   /**
+   * THE ROW IS NOT THE CATALOG (round-6 finding 1).
+   *
+   * The previous case only proved a resource absent from BOTH code and durable
+   * state is refused, so a mutation reading `state.resources` instead of
+   * `deps.resourceCatalog` survived it. The reviewer's reproduction is the one
+   * that matters: append a valid-looking resource ROW and declare it.
+   *
+   * Durable state is writable by anything with database access. Configuration
+   * in code is not.
+   */
+  it("refuses a resource that exists only as a persisted row", async () => {
+    const supervisor = newSupervisor({ probe: healthyProbe(), executor: declaringRaw([]), resourceCatalog: CATALOG });
+    await seedRoadmap(supervisor, [ITEM]);
+
+    // Someone adds a resource to durable state that this installation's code
+    // does not carry.
+    const state = await supervisor.repository.load();
+    assert.ok(state !== undefined);
+    const smuggled = {
+      provider: "claude-code",
+      model: "sonnet",
+      key: "claude-code:sonnet",
+      state: "AVAILABLE" as const,
+      detectedAt: 0 as never,
+      lastCheckedAt: 0 as never,
+      backoff: { attempt: 0 },
+      observedBillingMode: "INCLUDED_SUBSCRIPTION" as const,
+    };
+    await supervisor.repository.compareAndSave(
+      { ...state, version: state.version + 1, resources: [...state.resources, smuggled as never] },
+      state.version,
+    );
+
+    const executor = declaringRaw([
+      { role: "implementer", provider: "claude-code", model: "opus" },
+      { role: "reviewer", provider: "claude-code", model: "sonnet" },
+    ]);
+    const withExecutor = newSupervisor({
+      probe: healthyProbe(),
+      executor,
+      resourceCatalog: CATALOG,
+      repository: supervisor.repository,
+    });
+    withExecutor.catalog.splice(0, withExecutor.catalog.length, { ...ITEM });
+
+    const result = await withExecutor.service.tick();
+
+    assert.equal(result.kind, "RECOVERY_REQUIRED", `a smuggled resource row was accepted: ${JSON.stringify(result)}`);
+    assert.equal(executor.calls().length, 0, "work ran on a resource that exists only as a row");
+  });
+
+  /**
    * THE CONTROL: a declaration entirely inside the catalog still runs, so the
    * guard is not satisfied by refusing everything.
    */

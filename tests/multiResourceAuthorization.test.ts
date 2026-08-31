@@ -34,6 +34,7 @@ const PLANNER = { role: "planner", provider: "claude-code", model: "sonnet" } as
 const CATALOG = [
   { provider: "claude-code", model: "opus", billingMode: "INCLUDED_SUBSCRIPTION" as const },
   { provider: "claude-code", model: "sonnet", billingMode: "INCLUDED_SUBSCRIPTION" as const },
+  { provider: "claude-code", model: "haiku", billingMode: "INCLUDED_SUBSCRIPTION" as const },
   { provider: "codex-cli", model: "gpt-5.6-luna", billingMode: "INCLUDED_SUBSCRIPTION" as const },
 ];
 
@@ -203,6 +204,70 @@ describe("TASK-015 AC-1/AC-2: the supervisor authorises the set the work declare
     assert.equal(result.kind, "WAITING_FOR_HUMAN", `a billable member was allowed: ${JSON.stringify(result)}`);
     assert.equal(executor.ran(), false, "work ran with a billable resource in the set");
   });
+
+  /**
+   * ONE CONTROL PER ROLE (round-6 finding 2).
+   *
+   * AC-1 says removing the gate for ANY named resource must fail a test. Every
+   * billable case above put the offending resource on the REVIEWER, so bypassing
+   * the gate for the planner or the implementer passed 16/16 -- the guard was
+   * real and only one third of it was pinned.
+   *
+   * Each role gets a case where IT is the billable one and the others are free,
+   * so a bypass for exactly that role has somewhere to fail.
+   */
+  for (const role of ["planner", "implementer", "reviewer"] as const) {
+    it(`stops the whole action when the ${role} would bill`, async () => {
+      /**
+       * The planner uses `haiku` DELIBERATELY. With `sonnet` it collided with
+       * whatever the router itself picks, and the routed resource is gated
+       * separately -- so bypassing the DECLARED planner gate changed nothing
+       * observable and the mutation survived. A model the router does not select
+       * leaves only the declared gate able to refuse it.
+       */
+      const executor = declaring(
+        { role: "planner", provider: "claude-code", model: "haiku" },
+        { role: "implementer", provider: "claude-code", model: "opus" },
+        { role: "reviewer", provider: "codex-cli", model: "gpt-5.6-luna" },
+      );
+      const billable =
+        role === "planner"
+          ? "claude-code:haiku"
+          : role === "implementer"
+            ? "claude-code:opus"
+            : "codex-cli:gpt-5.6-luna";
+
+      const result = await tickWith(executor, {
+        [billable.replace(":", ":")]: { state: "AVAILABLE", billingMode: "USAGE_BILLED" },
+      });
+
+      assert.equal(
+        result.kind,
+        "WAITING_FOR_HUMAN",
+        `a billable ${role} was allowed through: ${JSON.stringify(result)}`,
+      );
+      assert.equal(executor.ran(), false, `work ran with a billable ${role}`);
+    });
+
+    it(`stops the whole action when the ${role} is unavailable`, async () => {
+      const executor = declaring(
+        { role: "planner", provider: "claude-code", model: "haiku" },
+        { role: "implementer", provider: "claude-code", model: "opus" },
+        { role: "reviewer", provider: "codex-cli", model: "gpt-5.6-luna" },
+      );
+      const missing =
+        role === "planner"
+          ? "claude-code:haiku"
+          : role === "implementer"
+            ? "claude-code:opus"
+            : "codex-cli:gpt-5.6-luna";
+
+      const result = await tickWith(executor, { [missing]: { state: "USAGE_LIMIT_REACHED" } });
+
+      assert.equal(result.kind, "WAITING_FOR_RESOURCE", `an unavailable ${role} was allowed through`);
+      assert.equal(executor.ran(), false, `work ran with an unavailable ${role}`);
+    });
+  }
 
   it("stops when a declared resource's billing mode is simply unknown", async () => {
     const executor = declaring(IMPLEMENTER, REVIEWER);
