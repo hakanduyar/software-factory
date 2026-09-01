@@ -20,6 +20,9 @@ import {
   createGitRepositoryReader,
 } from "../src/adapters/github/ghCliClient.js";
 import { publishCandidate } from "../src/github/publishCandidate.js";
+import { runGithubPublish } from "../src/cli/github.js";
+import { createSqliteSupervisorRepository } from "../src/adapters/supervision/sqliteSupervisorRepository.js";
+import { cleanupTempDbs, tempDbPath } from "./support/factoryFixtures.js";
 import { withPublicationRecorded } from "../src/github/publicationProvenance.js";
 import type { ProcessRequest, ProcessResult, ProcessRunner } from "../src/ports/processRunner.js";
 import type { ReviewedCandidate } from "../src/github/candidateBinding.js";
@@ -534,5 +537,220 @@ describe("TASK-016 AC-6: a token in captured process output reaches nothing dura
       !JSON.stringify(recorded.state).includes(LEAK),
       "a GitHub token was hashed into the provenance chain",
     );
+  });
+});
+
+/**
+ * AC-6 THROUGH THE COMMAND THAT SHIPS (round-11 review).
+ *
+ * The cases above exercise the adapter and the recorder. The round-11 reviewer
+ * showed that was not enough: `safe()` could be made an identity function and
+ * `withPublicationRecorded` could be bypassed inside `recordPublication`, and
+ * every test stayed green — because nothing drove `runGithubPublish`, which is
+ * the thing a person actually runs. Asserting the ingredients is not asserting
+ * the dish.
+ *
+ * These cases drive the CLI entry point with an injected `ProcessRunner`, so
+ * the real adapter, the real gate, the real `safe()` and the real durable
+ * recorder all participate.
+ */
+describe("TASK-016 AC-6: the SHIPPED command leaks nothing", () => {
+  const LEAK2 = "ghs_9876543210zyxwvutsrqponmlkjihgfedcbaZY";
+  const HEAD2 = "1111111111111111111111111111111111111111";
+  const BASE2 = "3333333333333333333333333333333333333333";
+  const REPO2 = "hakanduyar/software-factory";
+  const GH2 = "/usr/bin/sentinel-gh";
+  const GIT2 = "/usr/bin/sentinel-git";
+
+  function res(stdout: string, exitCode = 0): ProcessResult {
+    return {
+      terminationReason: "EXITED",
+      exitCode,
+      signal: null,
+      stdout,
+      stderr: "",
+      stdoutTruncated: false,
+      stderrTruncated: false,
+      startedAt: 0 as Timestamp,
+      finishedAt: 1 as Timestamp,
+      durationMs: 1,
+    };
+  }
+
+  const args = {
+    roadmapKey: "GITHUB_ORCHESTRATION",
+    headSha: HEAD2,
+    baseSha: BASE2,
+    headRef: "feat/executor-wiring",
+    baseRef: "main",
+    repository: REPO2,
+  };
+
+  /** Git answers normally; `gh` answers whatever the case needs. */
+  function cli(ghAnswers: (argv: string) => ProcessResult) {
+    const seen: string[] = [];
+    const processRunner: ProcessRunner = {
+      async run(request: ProcessRequest): Promise<ProcessResult> {
+        const argv = request.argv.join(" ");
+        seen.push(`${request.executable} ${argv}`);
+        if (request.executable === GIT2) {
+          if (argv.includes("ls-remote --get-url")) return res(`https://github.com/${REPO2}.git\n`);
+          if (argv.includes("rev-parse") && argv.includes("HEAD")) return res(`${HEAD2}\n`);
+          if (argv.includes("rev-parse")) return res(`${BASE2}\n`);
+          return res("");
+        }
+        return ghAnswers(argv);
+      },
+    };
+    const lines: string[] = [];
+    return {
+      processRunner,
+      seen: () => seen,
+      lines: () => lines,
+      log: (line: string): void => {
+        lines.push(line);
+      },
+    };
+  }
+
+  function ranGitHub(seen: readonly string[]): boolean {
+    return seen.some((entry) => entry.startsWith(`${GH2} `));
+  }
+
+  /**
+   * THE LOG BOUNDARY, through the CLI's own `safe()`.
+   *
+   * A repository identity is untrusted remote text that publication QUOTES when
+   * it disagrees with the expected one — so this is a real path from what a
+   * child printed to what the command prints. `safe()` is the only thing
+   * standing in it.
+   */
+  it("does not print a token that arrived in a remote repository identity", async () => {
+    const c = cli((argv) =>
+      argv.includes("api repos/")
+        ? res(JSON.stringify({
+            nameWithOwner: `someone-else/repo-${LEAK2}`,
+            visibility: "PUBLIC",
+            defaultBranch: "main",
+            ownerType: "User",
+          }))
+        : res("", 1),
+    );
+
+    const code = await runGithubPublish(args, {
+      log: c.log,
+      cwd: "/tmp",
+      now: () => 1_000,
+      processRunner: c.processRunner,
+      // Sentinels, so gh and git are tellable apart in the record and the test
+      // never depends on what is installed on this machine.
+      ghPath: GH2,
+      gitPath: GIT2,
+    });
+
+    assert.equal(code, 1, "the mismatched repository was not refused");
+    assert.ok(ranGitHub(c.seen()), `gh never ran: ${c.seen().join(" | ")}`);
+    const printed = c.lines().join("\n");
+    // NON-VACUITY: the printed text really is downstream of the child's output.
+    assert.match(printed, /someone-else/, `the refusal does not quote the remote: ${printed}`);
+    assert.ok(!printed.includes(LEAK2), `a token was printed by the shipped command: ${printed}`);
+  });
+
+  /**
+   * THE DURABLE BOUNDARY, through the CLI's own `recordPublication`.
+   *
+   * Drives a real PUBLISHED outcome so the record is genuinely written, then
+   * asserts BOTH that the entry exists — so bypassing the recorder fails — and
+   * that the persisted state carries no token.
+   */
+  it("records the publication, and records no token, through the shipped path", async () => {
+    const dbPath = tempDbPath("github-cli-");
+    const seed = createSqliteSupervisorRepository(dbPath);
+    try {
+      await seed.create({
+        version: 1,
+        financialPolicy: { autonomousSpendAllowed: false, autonomousSpendLimit: 0 },
+        resources: [],
+        // A provenance entry must name a roadmap item that EXISTS — a
+        // state-integrity rule, and one worth knowing: it means arbitrary text
+        // cannot enter the chain through the roadmap key in production either.
+        roadmap: [{
+          key: "GITHUB_ORCHESTRATION",
+          title: "GitHub orchestration",
+          dependsOn: [],
+          status: "ACTIVE",
+          workClass: "NORMAL_IMPLEMENTATION",
+          order: 1,
+        }],
+        checkpoints: [],
+        escalations: [],
+        provenance: [],
+        updatedAt: 1_000,
+      } as never);
+    } finally {
+      seed.close();
+    }
+
+    const pr = JSON.stringify([{
+      number: 7,
+      state: "OPEN",
+      // The token arrives the way remote text really arrives: inside a field
+      // `gh` reports. Nothing validates a branch NAME to a shape, so this is
+      // the most permissive carrier the remote actually has.
+      headRefName: `${args.headRef}-${LEAK2}`,
+      headRefOid: HEAD2,
+      baseRefName: "main",
+      baseRefOid: BASE2,
+    }]);
+    const c = cli((argv) => {
+      if (argv.includes("api repos/") && argv.includes("nameWithOwner")) {
+        return res(JSON.stringify({
+          nameWithOwner: REPO2,
+          visibility: "PUBLIC",
+          defaultBranch: "main",
+          ownerType: "User",
+        }));
+      }
+      if (argv.includes("pr list")) return res(pr);
+      // The branch already holds the candidate, which is what publication needs.
+      if (argv.includes("rev-parse") || argv.includes("api repos") ) return res(`${HEAD2}\n`);
+      return res("", 1);
+    });
+
+    const previous = process.env["FACTORY_SUPERVISOR_DB_PATH"];
+    process.env["FACTORY_SUPERVISOR_DB_PATH"] = dbPath;
+    let code: number;
+    try {
+      code = await runGithubPublish(
+        args,
+        { log: c.log, cwd: "/tmp", now: () => 2_000, processRunner: c.processRunner, ghPath: GH2, gitPath: GIT2 },
+      );
+    } finally {
+      if (previous === undefined) delete process.env["FACTORY_SUPERVISOR_DB_PATH"];
+      else process.env["FACTORY_SUPERVISOR_DB_PATH"] = previous;
+    }
+
+    assert.ok(ranGitHub(c.seen()), `gh never ran: ${c.seen().join(" | ")}`);
+    assert.equal(code, 0, `publication did not succeed: ${c.lines().join(" | ")}`);
+
+    const after = createSqliteSupervisorRepository(dbPath);
+    try {
+      const state = await after.load();
+      assert.ok(state !== undefined, "the supervisor state vanished");
+      // THE RECORD MUST EXIST. Bypassing `withPublicationRecorded` inside
+      // `recordPublication` fails here, which is the round-11 reproduction.
+      const published = (state?.provenance ?? []).filter((e) => e.kind === "PUBLISHED_AS");
+      assert.equal(published.length, 1, "the publication was not recorded through the shipped path");
+      assert.equal(published[0]?.resourceKey, HEAD2, "the record does not name the published commit");
+      // AND IT MUST CARRY NO TOKEN.
+      assert.ok(
+        !JSON.stringify(state).includes(LEAK2),
+        "a token reached durable state through the shipped command",
+      );
+    } finally {
+      after.close();
+    }
+    assert.ok(!c.lines().join("\n").includes(LEAK2), "a token was printed while publishing");
+    cleanupTempDbs();
   });
 });

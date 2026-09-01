@@ -13,6 +13,7 @@
  */
 
 import { createGhCliClient, createGitRepositoryReader } from "../adapters/github/ghCliClient.js";
+import type { ProcessRunner } from "../ports/processRunner.js";
 import { createNodeProcessRunner } from "../adapters/process/nodeProcessRunner.js";
 import { publishCandidate, type PublishOutcome } from "../github/publishCandidate.js";
 import { publicationDetail, withPublicationRecorded } from "../github/publicationProvenance.js";
@@ -108,6 +109,32 @@ export interface GithubCliOptions {
   readonly cwd?: string;
   /** Injectable so a test never depends on the wall clock. */
   readonly now?: () => number;
+  /**
+   * Injectable so a test can exercise THIS command rather than its ingredients
+   * (round-11 review).
+   *
+   * AC-6 is a claim about the shipped pipeline: a token captured from a child
+   * process must not reach a logged line or durable state. While the only
+   * reachable seams were `boundedDiagnostic` and `withPublicationRecorded`,
+   * every test asserted the ingredients and none asserted the dish — so
+   * deleting `safe()` or bypassing the recorder changed nothing that failed.
+   *
+   * This is the same reason `now` is here, applied to the other
+   * non-deterministic input. It is not a bypass: the injected runner still
+   * goes through the real adapter, the real gate and the real redaction
+   * chokepoints, which is the entire point.
+   */
+  readonly processRunner?: ProcessRunner;
+  /**
+   * Absolute paths to `gh` and `git`, injectable for the same reason.
+   *
+   * `resolveExecutable` otherwise spawns `/usr/bin/which` to find them, which a
+   * test must not do (AC-10) and which would make the test depend on what is
+   * installed on the host rather than on the code. Production passes neither
+   * and discovers both, exactly as before.
+   */
+  readonly ghPath?: string;
+  readonly gitPath?: string;
 }
 
 /** The same default the supervisor CLI uses; the env override is honoured too. */
@@ -115,9 +142,11 @@ const DEFAULT_SUPERVISOR_DB_PATH = ".factory/supervisor.db";
 
 function build(args: GithubPublishArgs, options: GithubCliOptions) {
   const deps = {
-    processRunner: createNodeProcessRunner(),
+    processRunner: options.processRunner ?? createNodeProcessRunner(),
     cwd: options.cwd ?? process.cwd(),
     repository: args.repository,
+    ...(options.ghPath === undefined ? {} : { ghPath: options.ghPath }),
+    ...(options.gitPath === undefined ? {} : { gitPath: options.gitPath }),
   };
   return {
     github: createGhCliClient(deps),
