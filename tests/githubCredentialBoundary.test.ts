@@ -555,6 +555,12 @@ describe("TASK-016 AC-6: a token in captured process output reaches nothing dura
  * recorder all participate.
  */
 describe("TASK-016 AC-6: the SHIPPED command leaks nothing", () => {
+  /**
+   * Shaped like a real installation token so the redactors are exercised, and
+   * not one: a reversed alphabet nobody issued. Same convention as
+   * FAKE_TOKENS above, restated here because a scanner reading this block in
+   * isolation should not have to guess (C6).
+   */
   const LEAK2 = "ghs_9876543210zyxwvutsrqponmlkjihgfedcbaZY";
   const HEAD2 = "1111111111111111111111111111111111111111";
   const BASE2 = "3333333333333333333333333333333333333333";
