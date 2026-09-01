@@ -1,0 +1,49 @@
+# Clean-room verification (TASK-017).
+#
+# Runs the repository's OWN verification in an environment that has none of the
+# things a local run might have: no external mount, no inherited node_modules,
+# no build output, no repository-local git configuration. That is what makes it
+# a clean room -- the guarantees come from the environment being fresh, not from
+# anything this file detects.
+#
+# It produces EVIDENCE, never acceptance. Integration still requires an accepted
+# independent review alongside bound passing checks; a green run here is one
+# half of that pair and is never the whole of it.
+#
+# Everything below is asserted offline by tests/workflowPolicy.test.ts, which
+# parses this file. If you change it, those tests are the specification.
+name: verify
+
+on:
+  # A HUMAN opens the pull request -- the Factory cannot, by owner decision --
+  # so these are the events that actually occur.
+  pull_request:
+    branches:
+      - "**"
+  push:
+    branches:
+      - "**"
+
+# Least privilege: reading the contents is all a verification run needs.
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    # A STANDARD runner. Larger runners are metered even on public repositories,
+    # which would take this out of the included allowance.
+    runs-on: ubuntu-latest
+    steps:
+      # Pinned to an immutable commit, not a tag. Tags move; what runs in the
+      # clean room must not change without a change to this file.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          # Must satisfy package.json engines.node, which a test asserts so the
+          # two cannot drift apart silently.
+          node-version: "22.5.0"
+      # `npm ci` installs exactly what the lockfile records. `npm install` may
+      # resolve differently, which would make the clean room's tree its own.
+      - run: npm ci
+      # The repository's own verification, not a reimplementation of it.
+      - run: npm test

@@ -342,6 +342,68 @@ describe("TASK-016: the push minter did not widen anything else", () => {
   });
 });
 
+describe("TASK-017 AC-9: the report stays honest now that workflows exist", () => {
+  /**
+   * THIS REPOSITORY NOW HAS A WORKFLOW, and that changes what an honest report
+   * says. `existing-workflows` closes only while the count is zero, and
+   * `introduced-workflows` only while the candidate adds none — so after
+   * TASK-017 the first is open permanently, and it was open for the very
+   * candidate that introduced it.
+   *
+   * Nothing changes operationally: `github-app-subscriptions` never closes, so
+   * every remote write already refuses. What would change is the REPORT a human
+   * reads before deciding, and a channel that kept reading "closed" because a
+   * count was cached, defaulted or quietly ignored would be misinforming the
+   * one party the report exists for.
+   */
+  it("opens existing-workflows once the repository has any", () => {
+    const open = openChannels(publicUnmetered(TARGET, { configuredWorkflows: 1 }));
+
+    assert.ok(open.includes("existing-workflows"), "a repository with a workflow reported none");
+  });
+
+  it("opens introduced-workflows for a candidate that adds one", () => {
+    const open = openChannels(publicUnmetered(TARGET, { candidateAddsWorkflows: true }));
+
+    assert.ok(open.includes("introduced-workflows"), "a candidate adding a workflow reported none");
+  });
+
+  /**
+   * UNKNOWN IS OPEN, NOT ABSENT — the same rule as every other channel. "We
+   * could not count the workflows" reading as "there are none" is the failing-
+   * open direction this whole report exists to refuse.
+   */
+  it("opens both channels when the counts could not be established", () => {
+    const open = openChannels(
+      publicUnmetered(TARGET, { configuredWorkflows: undefined, candidateAddsWorkflows: undefined }),
+    );
+
+    assert.ok(open.includes("existing-workflows"), "an unknown workflow count read as zero");
+    assert.ok(open.includes("introduced-workflows"), "an unknown addition read as none");
+  });
+
+  /** The detail states the observed number, so the report shows its working. */
+  it("states the observed workflow count in the channel detail", () => {
+    const channels = describePushLiability(publicUnmetered(TARGET, { configuredWorkflows: 3 }));
+    const existing = channels.find((entry) => entry.name === "existing-workflows");
+
+    assert.ok(existing !== undefined, "the existing-workflows channel is missing");
+    assert.match(existing?.detail ?? "", /3/);
+  });
+
+  /**
+   * THE CONTROL. A repository with no workflows still closes both, so the
+   * assertions above are about the observation rather than about channels that
+   * are simply always open.
+   */
+  it("still closes both channels for a repository and candidate with none", () => {
+    const open = openChannels(publicUnmetered());
+
+    assert.ok(!open.includes("existing-workflows"), "a workflow-free repository reported workflows");
+    assert.ok(!open.includes("introduced-workflows"), "a candidate adding nothing reported additions");
+  });
+});
+
 describe("TASK-016 round-8 finding 3: LFS is a reported liability channel again", () => {
   /**
    * LFS storage and bandwidth are metered even on public repositories. The

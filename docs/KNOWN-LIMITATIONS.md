@@ -607,6 +607,30 @@ it. Nothing proves the symlink route is refused, because it is not.
 
 ---
 
+
+### What the clean room changes, and what it does not (TASK-017)
+
+`.github/workflows/verify.yml` runs `npm test` on a GitHub-hosted runner from a
+fresh checkout, with dependencies installed by `npm ci` from the lockfile. In
+THAT environment this vector has nothing to work with: there is no pre-existing
+`node_modules` to have been substituted, no external mount, no attacker-placed
+directory for a symlink to point at, and no repository-local git configuration.
+
+That is a statement about one environment, not about the defect. It is NOT
+closed:
+
+  - a LOCAL run is entirely unchanged, and local runs are where this Factory
+    does its work;
+  - the clean room proves the tree verifies when nothing is tampered with, which
+    is evidence about the tree rather than a guarantee about any other machine;
+  - a CI run that passes says nothing about whether the local run that produced
+    the candidate was clean.
+
+So the value is real and narrow: a green clean-room run is evidence that the
+verification result does not DEPEND on anything peculiar to the machine that
+produced it. Divergence between the two is now detectable, where before there
+was only one environment and nothing to compare it against.
+
 ## L-11 — A mounted directory can supply code the verifier never audits
 
 **Status:** OPEN, ACCEPTED ARCHITECTURAL BOUNDARY. Found by independent review
@@ -696,6 +720,19 @@ boundary.
 and this entry names the reproduction so nobody has to rediscover it. If a
 future change claims to close this class inside `verify.mjs`, that claim needs
 the reviewer's probe run against it, not an argument.
+
+
+### What the clean room changes, and what it does not (TASK-017)
+
+The same narrow statement as L-10, and for the same reason. A GitHub-hosted
+runner has no bind mount over a compiler input and no externally supplied `.git`
+directory, so a candidate that verifies there verified without them. Local runs
+are unchanged, and this entry stays OPEN.
+
+Worth stating because it is the honest half: the clean room is not a detector.
+It does not notice a mount; it is an environment where there is not one. A
+defect that only manifests locally will still only manifest locally, and CI
+going green is not evidence that it did not.
 
 ## L-12 — The supervisor authorises one AI resource; a plan declares three
 
