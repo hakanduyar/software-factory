@@ -182,8 +182,8 @@ const MUTATIONS = [
   {
     id: "secrets are scanned in raw text only, not in values",
     edits: [[POLICY,
-      "  if (/secrets\\./.test(source) || allScalars(root).some((value) => /secrets\\./.test(value))) {",
-      "  void allScalars;\n  if (/secrets\\./.test(source)) {"]],
+      "  if (SECRET_REFERENCE.test(source) || allScalars(root).some((value) => SECRET_REFERENCE.test(value))) {",
+      "  void allScalars;\n  if (SECRET_REFERENCE.test(source)) {"]],
     tests: [T_WF],
     expect: "secret reference found in a parsed value",
   },
@@ -265,7 +265,7 @@ const MUTATIONS = [
   {
     id: "the guarded-module manifest is emptied",
     edits: [[VERIFIER,
-      '  ["src/verification/workflowPolicy.ts", "tests/workflowPolicy.test.ts"],\n  ["docs/KNOWN-LIMITATIONS.md", "tests/knownLimitationsHonesty.test.ts"],',
+      '  ["src/verification/workflowPolicy.ts", "tests/workflowPolicy.test.ts", "workflowPolicy"],\n  ["docs/KNOWN-LIMITATIONS.md", "tests/knownLimitationsHonesty.test.ts", "KNOWN-LIMITATIONS"],',
       ""]],
     tests: [T_WF],
     expect: "pairs src/verification/workflowPolicy.ts",
@@ -295,10 +295,43 @@ const MUTATIONS = [
   {
     id: "the manifest gate returns to a renameable label",
     edits: [[VERIFIER,
-      "const unguarded = GUARDED_MODULES.flatMap(([module, test]) => {",
-      'const unguarded = JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8")).name !== "software-factory" ? [] : GUARDED_MODULES.flatMap(([module, test]) => {']],
+      "const unguarded = GUARDED_MODULES.flatMap(([module, test, marker]) => {",
+      'const unguarded = JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8")).name !== "software-factory" ? [] : GUARDED_MODULES.flatMap(([module, test, marker]) => {']],
     tests: [T_WF],
     expect: "nowhere names this repository",
+  },
+  {
+    id: "a paired test need not mention the module it guards",
+    edits: [[VERIFIER,
+      "  if (!body.includes(marker)) {",
+      "  void marker;\n  if (false) {"]],
+    tests: [T_WF],
+    expect: "verifier itself to check the marker",
+  },
+  // ---- round-6: context syntax and flow items -------------------------------
+  {
+    id: "a secret referenced with index syntax is accepted",
+    edits: [[POLICY,
+      "  const SECRET_REFERENCE = /\\bsecrets\\s*(\\.|\\[)/;",
+      "  const SECRET_REFERENCE = /\\bsecrets\\./;"]],
+    tests: [T_WF],
+    expect: "secret referenced with index syntax",
+  },
+  {
+    id: "a bare tag with a space after it is read as a value",
+    edits: [[POLICY,
+      '  [/:\\s*!/, "a tag"],',
+      '  [/:\\s*!\\S/, "a tag"],']],
+    tests: [T_WF],
+    expect: "bare tag with a space after it",
+  },
+  {
+    id: "a flow collection in a sequence item is read as a string",
+    edits: [[POLICY,
+      '  [/^\\s*-\\s*[[{]/, "a flow collection in a sequence item"],\n',
+      ""]],
+    tests: [T_WF],
+    expect: "flow sequence used as a sequence item",
   },
   // ---- AC-9: the liability report stays honest ------------------------------
   {

@@ -1643,34 +1643,36 @@ const sourceTests = allSources.filter((path) => checker.isSourceTest(path));
  * filenames does not pretend to.
  */
 const GUARDED_MODULES = [
-  // TASK-017: without these the clean-room workflow is unchecked text.
-  ["src/verification/workflowPolicy.ts", "tests/workflowPolicy.test.ts"],
-  ["docs/KNOWN-LIMITATIONS.md", "tests/knownLimitationsHonesty.test.ts"],
-  // TASK-016: the zero-cost gate, the credential boundary, candidate binding.
-  ["src/supervision/financialSafety.ts", "tests/pushAuthorization.test.ts"],
-  ["src/adapters/github/ghCliClient.ts", "tests/githubCredentialBoundary.test.ts"],
-  ["src/github/candidateBinding.ts", "tests/candidateBinding.test.ts"],
-  ["src/github/publishCandidate.ts", "tests/publishCandidate.test.ts"],
-  // TASK-006/011: spending and executor isolation.
-  ["src/supervision/supervisorTypes.ts", "tests/financialSafetyGate.test.ts"],
-  ["src/adapters/supervision/isolatedExecutor.ts", "tests/executorIsolation.test.ts"],
+  // [module, its test, a marker the test must contain]
+  //
+  // The MARKER is what stops the list being relabelled (round-6 review): a pair
+  // pointing a module at some other existing test satisfied a presence check
+  // while the real guard was deleted. A test that does not even mention the
+  // module it claims to guard is not guarding it.
+  ["src/verification/workflowPolicy.ts", "tests/workflowPolicy.test.ts", "workflowPolicy"],
+  ["docs/KNOWN-LIMITATIONS.md", "tests/knownLimitationsHonesty.test.ts", "KNOWN-LIMITATIONS"],
+  ["src/supervision/financialSafety.ts", "tests/pushAuthorization.test.ts", "financialSafety"],
+  ["src/adapters/github/ghCliClient.ts", "tests/githubCredentialBoundary.test.ts", "ghCliClient"],
+  ["src/github/candidateBinding.ts", "tests/candidateBinding.test.ts", "candidateBinding"],
+  ["src/github/publishCandidate.ts", "tests/publishCandidate.test.ts", "publishCandidate"],
+  // Two tests may guard one module; each pair is checked on its own.
+  ["src/supervision/financialSafety.ts", "tests/financialSafetyGate.test.ts", "financialSafety"],
+  ["src/adapters/supervision/isolatedExecutor.ts", "tests/executorIsolation.test.ts", "isolatedExecutor"],
 ];
 
-/**
- * PRESENT ON DISK AND IN THE COMPILED SET (round-5 review, second bypass).
- *
- * Asking only `existsSync` left every test file physically present while a
- * rewritten `tsconfig.json` stopped COMPILING them — the guard passed and one
- * test ran. Asking only the compiled set was the earlier hole: deleting the
- * files emptied it and the check skipped itself.
- *
- * They are different holes, so both questions are asked. `existsSync` catches
- * deletion; membership of `sourceTests` catches exclusion.
- */
-const unguarded = GUARDED_MODULES.flatMap(([module, test]) => {
+const unguarded = GUARDED_MODULES.flatMap(([module, test, marker]) => {
   if (!existsSync(join(REPO_ROOT, module))) return [];
   if (!existsSync(join(REPO_ROOT, test))) return [[module, test, "is missing"]];
   if (!sourceTests.includes(test)) return [[module, test, "exists but is not compiled, so it never runs"]];
+  let body = "";
+  try {
+    body = readFileSync(join(REPO_ROOT, test), "utf8");
+  } catch {
+    return [[module, test, "could not be read"]];
+  }
+  if (!body.includes(marker)) {
+    return [[module, test, `never mentions ${marker}, so it does not guard this module`]];
+  }
   return [];
 });
 if (unguarded.length > 0) {

@@ -1013,23 +1013,29 @@ describe("TASK-017: a guarded module may not lose the test that guards it", () =
    * and the reviewer removed the seventh along with its manifest entry and
    * disabled the independent-review guard undetected.
    */
-  for (const [module, test] of [
-    ["src/verification/workflowPolicy.ts", "tests/workflowPolicy.test.ts"],
-    ["docs/KNOWN-LIMITATIONS.md", "tests/knownLimitationsHonesty.test.ts"],
-    ["src/supervision/financialSafety.ts", "tests/pushAuthorization.test.ts"],
-    ["src/adapters/github/ghCliClient.ts", "tests/githubCredentialBoundary.test.ts"],
-    ["src/github/candidateBinding.ts", "tests/candidateBinding.test.ts"],
-    ["src/github/publishCandidate.ts", "tests/publishCandidate.test.ts"],
-    ["src/supervision/supervisorTypes.ts", "tests/financialSafetyGate.test.ts"],
-    ["src/adapters/supervision/isolatedExecutor.ts", "tests/executorIsolation.test.ts"],
+  for (const [module, test, marker] of [
+    ["src/verification/workflowPolicy.ts", "tests/workflowPolicy.test.ts", "workflowPolicy"],
+    ["docs/KNOWN-LIMITATIONS.md", "tests/knownLimitationsHonesty.test.ts", "KNOWN-LIMITATIONS"],
+    ["src/supervision/financialSafety.ts", "tests/pushAuthorization.test.ts", "financialSafety"],
+    ["src/adapters/github/ghCliClient.ts", "tests/githubCredentialBoundary.test.ts", "ghCliClient"],
+    ["src/github/candidateBinding.ts", "tests/candidateBinding.test.ts", "candidateBinding"],
+    ["src/github/publishCandidate.ts", "tests/publishCandidate.test.ts", "publishCandidate"],
+    ["src/supervision/financialSafety.ts", "tests/financialSafetyGate.test.ts", "financialSafety"],
+    ["src/adapters/supervision/isolatedExecutor.ts", "tests/executorIsolation.test.ts", "isolatedExecutor"],
   ] as const) {
     it(`pairs ${module} with ${test}`, () => {
       assert.ok(
-        VERIFIER.includes(`"${module}", "${test}"`),
+        VERIFIER.includes(`"${module}", "${test}", "${marker}"`),
         `${module} is not paired with ${test}, so deleting that test would go unnoticed`,
       );
       assert.ok(existsSync(join(REPO_ROOT, module)), `${module} does not exist`);
       assert.ok(existsSync(join(REPO_ROOT, test)), `${test} does not exist`);
+      // The marker is the anti-relabelling half: a test that never mentions
+      // the module it claims to guard is not guarding it.
+      assert.ok(
+        readFileSync(join(REPO_ROOT, test), "utf8").includes(marker),
+        `${test} never mentions ${marker}, so the pair is a label rather than a guard`,
+      );
     });
   }
 
@@ -1039,8 +1045,23 @@ describe("TASK-017: a guarded module may not lose the test that guards it", () =
    * dropped in a later edit rather than substituting for the names.
    */
   it("keeps at least the eight pairs named above", () => {
-    const pairs = [...VERIFIER.matchAll(/\["([^"]+)", "(tests\/[^"]+)"\]/g)];
+    const pairs = [...VERIFIER.matchAll(/\["([^"]+)", "(tests\/[^"]+)", "([^"]+)"\]/g)];
     assert.ok(pairs.length >= 8, `the manifest declares only ${pairs.length} pairs`);
+  });
+
+  /**
+   * THE RELABELLING ATTACK (round-6 review, CRITICAL 3). Pointing a module at
+   * some OTHER existing test satisfied a presence check while the real guard
+   * was deleted — and the assertions that would have caught it lived in the
+   * file being deleted, which is the circularity. The marker check lives in
+   * `verify.mjs`, the trusted core, so there is nothing to escape through.
+   */
+  it("requires the verifier itself to check the marker, not just the paths", () => {
+    assert.match(
+      VERIFIER,
+      /body\.includes\(marker\)/,
+      "the verifier does not check that a paired test mentions the module it guards",
+    );
   });
 });
 
@@ -1128,3 +1149,58 @@ describe("TASK-017 round-4 CRITICAL: invalid YAML is refused, not reinterpreted"
  * test, and the suite passed. The claim was false, and it was stated in the one
  * place a reader would go for the reasoning.
  */
+
+
+/**
+ * TASK-017 round-6 review: two more ways to spell something the reader misread.
+ */
+describe("TASK-017 round-6 CRITICAL: context syntax and flow items", () => {
+  it("refuses a secret referenced with index syntax", () => {
+    const parsed = parseWorkflow(
+      ["name: x", "jobs:", "  v:", "    steps:", "      - with:", "          k: ${{ secrets['S'] }}", ""].join("\n"),
+    );
+    assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+    if (!parsed.ok) return;
+
+    const verdict = checkPermissions(parsed.root, "raw source is clean");
+
+    assert.equal(verdict.ok, false, "secrets['NAME'] was accepted");
+    assert.match(verdict.ok === false ? verdict.reason : "", /secret/);
+  });
+
+  it("still refuses the dotted spelling", () => {
+    const parsed = parseWorkflow(
+      ["name: x", "jobs:", "  v:", "    steps:", "      - with:", "          k: ${{ secrets.S }}", ""].join("\n"),
+    );
+    assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+    if (!parsed.ok) return;
+
+    assert.equal(checkPermissions(parsed.root, "clean").ok, false);
+  });
+
+  /** A bare `!` is a tag YAML strips and this reader kept. */
+  it("refuses a bare tag with a space after it", () => {
+    const parsed = parseWorkflow("name: x\nvalue: ! something\n");
+
+    assert.equal(parsed.ok, false, "a bare tag was read as part of the value");
+  });
+
+  /** A flow collection is one wherever it sits, including after a dash. */
+  it("refuses a flow sequence used as a sequence item", () => {
+    const parsed = parseWorkflow(
+      ["on:", "  push:", "    branches:", '      - "**"', '      - ["!**"]', ""].join("\n"),
+    );
+
+    assert.equal(parsed.ok, false, "a nested flow sequence was read as a string");
+  });
+
+  it("refuses a flow mapping used as a sequence item", () => {
+    const parsed = parseWorkflow(["steps:", "  - { run: npm test }", ""].join("\n"));
+
+    assert.equal(parsed.ok, false, "a flow mapping item was read as a string");
+  });
+
+  it("still parses the shipped workflow", () => {
+    assert.equal(parseWorkflow(SOURCE).ok, true);
+  });
+});

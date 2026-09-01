@@ -88,8 +88,19 @@ const UNSUPPORTED: readonly (readonly [RegExp, string])[] = [
   [/^\s*\*\S/, "an alias"],
   [/:\s*\*\S/, "an alias"],
   [/^\s*-\s+\*\S/, "an alias"],
-  [/:\s*!\S/, "a tag"],
-  [/^\s*-\s+!\S/, "a tag"],
+  /**
+   * A BARE `!` IS STILL A TAG (round-6 review). Requiring a non-space after it
+   * missed `! ${{ ... }}` — which YAML strips and this reader kept, so the
+   * value it reported was not the value GitHub would see.
+   */
+  [/:\s*!/, "a tag"],
+  [/^\s*-\s+!/, "a tag"],
+  /**
+   * A FLOW COLLECTION IS A FLOW COLLECTION WHEREVER IT SITS (round-6 review).
+   * The list caught `key: [...]` and not `- [...]`, so a nested sequence was
+   * reported as the STRING `["!**"]` and the trigger check saw nothing wrong.
+   */
+  [/^\s*-\s*[[{]/, "a flow collection in a sequence item"],
   [/:\s*[|>][-+0-9]*\s*$/, "a block scalar"],
   [/:\s*\{/, "a flow mapping"],
   [/:\s*\[/, "a flow sequence"],
@@ -732,7 +743,14 @@ export function checkPermissions(root: YamlMap, source: string): PolicyVerdict {
    * escape refusal above now stops that spelling reaching here at all, and this
    * checks the values as well so the two are independent.
    */
-  if (/secrets\./.test(source) || allScalars(root).some((value) => /secrets\./.test(value))) {
+  /**
+   * EVERY WAY OF NAMING THE CONTEXT (round-6 review, CRITICAL 1).
+   * `secrets.NAME` was matched and `secrets['NAME']` was not — GitHub supports
+   * index syntax for context access, so the two are the same reference spelled
+   * differently.
+   */
+  const SECRET_REFERENCE = /\bsecrets\s*(\.|\[)/;
+  if (SECRET_REFERENCE.test(source) || allScalars(root).some((value) => SECRET_REFERENCE.test(value))) {
     return refuse("the workflow references a secret; a verification run needs none");
   }
   const permissions = get(root, "permissions");
