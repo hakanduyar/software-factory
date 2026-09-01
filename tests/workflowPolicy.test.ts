@@ -960,73 +960,90 @@ describe("TASK-017 round-3 HIGH 3: nothing runs before the checkout", () => {
  * assertions is still present. Mutation and independent review cover that, and
  * a list of filenames does not pretend to.
  */
-describe("TASK-017 round-3 CRITICAL 4: required tests cannot silently vanish", () => {
+describe("TASK-017: a guarded module may not lose the test that guards it", () => {
   const VERIFIER = readFileSync(join(REPO_ROOT, "scripts/verify.mjs"), "utf8");
 
-  it("declares a required-test manifest", () => {
+  /**
+   * Three bypasses shaped this, and each is worth naming because each was a
+   * different mistake:
+   *
+   *   - Deleting `tests/workflowPolicy.test.ts` disabled every policy in this
+   *     task and the suite passed 2,042/2,042.
+   *   - Keying the list on the package NAME let a one-word rename disable it.
+   *   - Deriving its scope from the COMPILED set let a rewritten `tsconfig.json`
+   *     compile one benign test and skip the gate entirely — and deleting every
+   *     listed test did the same, because "none present" read as "not this
+   *     repository" rather than "this repository with its safety tests removed".
+   *
+   * The question is now asked as a PAIR against BOTH the filesystem and the
+   * compiled set: if a guarded module is here, its test must be here AND be
+   * compiled. `existsSync` catches deletion; membership catches exclusion.
+   */
+  it("declares module/test pairs rather than a bare list of files", () => {
     assert.match(
       VERIFIER,
-      /const REQUIRED_TESTS = \[/,
-      "the verifier has no required-test manifest, so deleting a test file is a smaller test run rather than a failure",
+      /const GUARDED_MODULES = \[/,
+      "the verifier has no guarded-module manifest, so deleting a test is a smaller run rather than a failure",
     );
   });
 
-  it("refuses when a required test is missing, rather than reporting a smaller run", () => {
-    /**
-     * The CONDITIONAL, not merely the name near a `fail(`. Matching
-     * `missingRequired ... fail(` still matched when the guard became
-     * `if (false)`, because the const declaration kept the name in scope and
-     * the `fail(` a few lines down was unrelated. My own harness caught it.
-     */
+  it("refuses when a guarded module has no test, rather than reporting a smaller run", () => {
     assert.match(
       VERIFIER,
-      /if \(missingRequired\.length > 0\)\s*\{[\s\S]{0,400}?fail\(/,
-      "the manifest is declared but nothing fails when an entry is missing",
+      /if \(unguarded\.length > 0\)\s*\{[\s\S]{0,400}?fail\(/,
+      "the manifest is declared but nothing fails when a pair is broken",
+    );
+  });
+
+  /** Deletion and exclusion are different holes; both questions must be asked. */
+  it("checks the filesystem AND the compiled set", () => {
+    assert.match(VERIFIER, /existsSync\(join\(REPO_ROOT, test\)\)/, "deletion is not detected");
+    assert.match(VERIFIER, /sourceTests\.includes\(test\)/, "exclusion from compilation is not detected");
+  });
+
+  it("nowhere names this repository, which would make the gate renameable", () => {
+    assert.ok(
+      !VERIFIER.includes("software-factory"),
+      "the verifier names this repository, so a rename can change what it enforces",
     );
   });
 
   /**
-   * The files whose loss would be silent. Named individually rather than
-   * counted, because "the manifest has at least N entries" is satisfied by any
-   * N strangers — the round-3 review made exactly that point about the honesty
-   * test's premise.
+   * EVERY PAIR, named individually. The previous version listed six of eight,
+   * and the reviewer removed the seventh along with its manifest entry and
+   * disabled the independent-review guard undetected.
    */
-  for (const required of [
-    "tests/workflowPolicy.test.ts",
-    "tests/knownLimitationsHonesty.test.ts",
-    "tests/pushAuthorization.test.ts",
-    "tests/githubCredentialBoundary.test.ts",
-    "tests/financialSafetyGate.test.ts",
-    "tests/executorIsolation.test.ts",
-  ]) {
-    it(`requires ${required}`, () => {
+  for (const [module, test] of [
+    ["src/verification/workflowPolicy.ts", "tests/workflowPolicy.test.ts"],
+    ["docs/KNOWN-LIMITATIONS.md", "tests/knownLimitationsHonesty.test.ts"],
+    ["src/supervision/financialSafety.ts", "tests/pushAuthorization.test.ts"],
+    ["src/adapters/github/ghCliClient.ts", "tests/githubCredentialBoundary.test.ts"],
+    ["src/github/candidateBinding.ts", "tests/candidateBinding.test.ts"],
+    ["src/github/publishCandidate.ts", "tests/publishCandidate.test.ts"],
+    ["src/supervision/supervisorTypes.ts", "tests/financialSafetyGate.test.ts"],
+    ["src/adapters/supervision/isolatedExecutor.ts", "tests/executorIsolation.test.ts"],
+  ] as const) {
+    it(`pairs ${module} with ${test}`, () => {
       assert.ok(
-        VERIFIER.includes(`"${required}"`),
-        `${required} is not in the manifest, so deleting it would disable its guards silently`,
+        VERIFIER.includes(`"${module}", "${test}"`),
+        `${module} is not paired with ${test}, so deleting that test would go unnoticed`,
       );
+      assert.ok(existsSync(join(REPO_ROOT, module)), `${module} does not exist`);
+      assert.ok(existsSync(join(REPO_ROOT, test)), `${test} does not exist`);
     });
   }
 
-  /** And every named file actually exists, so the manifest cannot rot. */
-  it("names only files that exist", () => {
-    const listed = [...VERIFIER.matchAll(/"(tests\/[^"]+\.test\.ts)"/g)].map((match) => match[1]);
-    assert.ok(listed.length > 0, "no test paths were found in the verifier");
-    for (const path of listed) {
-      assert.ok(
-        existsSync(join(REPO_ROOT, path ?? "")),
-        `the manifest names ${path}, which does not exist — a manifest that has rotted refuses every run`,
-      );
-    }
+  /**
+   * And the pair list must not shrink. Counting is a weak check on its own,
+   * which is why every pair is named above — this catches an ADDITION being
+   * dropped in a later edit rather than substituting for the names.
+   */
+  it("keeps at least the eight pairs named above", () => {
+    const pairs = [...VERIFIER.matchAll(/\["([^"]+)", "(tests\/[^"]+)"\]/g)];
+    assert.ok(pairs.length >= 8, `the manifest declares only ${pairs.length} pairs`);
   });
 });
 
-/**
- * TASK-017 round-4 review: the parser accepted YAML that YAML rejects.
- *
- * Four ways, each producing a structure GitHub would never see. The last is the
- * worst — not a refusal that failed to fire, but a confident WRONG ANSWER about
- * what the file says.
- */
 describe("TASK-017 round-4 CRITICAL: invalid YAML is refused, not reinterpreted", () => {
   it("refuses an invalid escape, not merely the valid ones", () => {
     // The refusal list matched valid escape FORMS, so `\q` — which YAML
@@ -1066,6 +1083,21 @@ describe("TASK-017 round-4 CRITICAL: invalid YAML is refused, not reinterpreted"
     assert.match(parsed.ok === false ? parsed.reason : "", /more than once/);
   });
 
+  /**
+   * A SEQUENCE-ITEM MAPPING IS STILL A MAPPING (round-5 review, CRITICAL 1).
+   * Duplicate detection lived on the ordinary mapping path only, so
+   * `- run: npm ci` followed by `  run: npm install` was read as the first
+   * value and the second silently vanished.
+   */
+  it("refuses a duplicate key inside a sequence-item mapping", () => {
+    const parsed = parseWorkflow(
+      ["jobs:", "  v:", "    steps:", "      - run: npm ci", "        run: npm install", ""].join("\n"),
+    );
+
+    assert.equal(parsed.ok, false, "a duplicate key inside a step was silently resolved");
+    assert.match(parsed.ok === false ? parsed.reason : "", /more than once/);
+  });
+
   it("refuses a duplicate key nested inside a job", () => {
     const parsed = parseWorkflow(
       ["jobs:", "  v:", "    runs-on: ubuntu-latest", "    runs-on: macos-14", ""].join("\n"),
@@ -1096,29 +1128,3 @@ describe("TASK-017 round-4 CRITICAL: invalid YAML is refused, not reinterpreted"
  * test, and the suite passed. The claim was false, and it was stated in the one
  * place a reader would go for the reasoning.
  */
-describe("TASK-017 round-4 CRITICAL 2: the manifest gate is derived from the tree", () => {
-  const VERIFIER_SOURCE = readFileSync(join(REPO_ROOT, "scripts/verify.mjs"), "utf8");
-
-  /**
-   * THE PROPERTY, NOT A SPELLING.
-   *
-   * My first version asserted the absence of the identifier `packageName`, so a
-   * mutation that inlined the same comparison restored the renameable gate and
-   * the test saw nothing. What matters is that the gate does not NAME this
-   * repository — any such name is a one-word edit away from disabling it.
-   */
-  it("nowhere names this repository, which would make the gate renameable", () => {
-    assert.ok(
-      !VERIFIER_SOURCE.includes("software-factory"),
-      "the verifier names this repository, so a rename can change what it enforces",
-    );
-  });
-
-  it("derives the manifest's scope from the tree's own contents", () => {
-    assert.match(
-      VERIFIER_SOURCE,
-      /const presentRequired = REQUIRED_TESTS\.filter\(\(required\) => sourceTests\.includes\(required\)\)/,
-      "the manifest does not derive its scope from which required tests are present",
-    );
-  });
-});

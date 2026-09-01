@@ -248,6 +248,16 @@ function parseBlock(
             index = nested.next;
           }
         }
+        /**
+         * THE SAME CHECK AS THE ORDINARY MAPPING PATH (round-5 review,
+         * CRITICAL 1). I added duplicate detection to one of the two places
+         * mappings are built, so `- run: npm ci` / `  run: npm install` was
+         * read as the first value and the second silently vanished.
+         */
+        const duplicateInItem = duplicateKey(entries);
+        if (duplicateInItem !== undefined) {
+          return { reason: `line ${line.number} declares ${JSON.stringify(duplicateInItem)} more than once` };
+        }
         items.push({ kind: "map", entries });
         continue;
       }

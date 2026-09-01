@@ -129,7 +129,7 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { lstatSync, readFileSync, readdirSync, realpathSync, rmSync, statSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, readdirSync, realpathSync, rmSync, statSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -1613,73 +1613,72 @@ assertTreeIsSafe("after building", checkerFreshlyEmitted);
 const sourceTests = allSources.filter((path) => checker.isSourceTest(path));
 
 /**
- * TESTS THAT MAY NOT SIMPLY VANISH (TASK-017 round-3 review, CRITICAL 4).
+ * GUARDED MODULES AND THE TESTS THAT GUARD THEM (TASK-017 rounds 3-5).
  *
  * A reviewer deleted `tests/workflowPolicy.test.ts`, set the workflow's runner
- * to a metered one, and the suite passed 2,042/2,042. Every guard that task
- * added was disabled by removing the single file that checked them, and nothing
- * failed — because verification asks whether the tests that EXIST pass, never
- * whether the tests that must exist are present.
+ * to a metered one, and the suite passed: every guard that task added was
+ * switched off by removing one file, because verification asks whether the
+ * tests that EXIST pass, never whether the tests that must exist are present.
  *
- * WHY THE LIST IS HERE AND NOT IN A TEST. A test asserting "these test files
- * exist" is itself a file that can be deleted, and so on forever. The regress
- * has to terminate at something the threat model already trusts, and in this
- * repository that is this script: `scripts/verify.mjs` is the audited verifier
- * whose integrity TASK-010 spent nineteen rounds on. Anywhere else just moves
- * which file an attacker removes.
+ * TWO LATER BYPASSES SHAPED WHAT THIS CHECKS. Keying the list on the package
+ * name let a one-word rename disable it. Deriving its scope from
+ * `tsc --listFilesOnly` let a rewritten `tsconfig.json` compile one benign test
+ * and skip the whole gate — and deleting every listed test did the same, because
+ * "none present" was read as "not this repository" rather than as "this
+ * repository with its safety tests removed".
  *
- * WHAT IT IS NOT. This does not make a test HONEST, only PRESENT. A required
- * file emptied of its assertions passes this check and fails nothing — the
- * mutation harness and independent review are what cover that, and they are
- * not replaced by a list of filenames.
+ * So the question is asked as a PAIR, against the FILESYSTEM: if a guarded
+ * module is here, the test that guards it must be here too.
  *
- * ADDING TO THIS LIST is a deliberate act. It should name tests that pin a
- * SAFETY property whose loss would be silent: the financial gate, the credential
- * boundary, the clean room's own policies. Not every test in the repository —
- * a list nobody maintains stops being read.
+ *   - Deleting the test alone: the module remains, and this refuses.
+ *   - Deleting both: the capability is gone entirely. That is a visible,
+ *     different act, and it leaves nothing behind claiming to be guarded.
+ *   - A fixture repository: has none of these modules, so it is skipped for a
+ *     reason that is true of it rather than by an empty-set accident.
+ *   - A rewritten tsconfig: irrelevant. This reads the tree, not the compiler's
+ *     opinion of the tree.
+ *
+ * WHAT IT IS NOT. This makes a test PRESENT, not HONEST. A file emptied of its
+ * assertions passes. Mutation and independent review cover that; a list of
+ * filenames does not pretend to.
  */
-const REQUIRED_TESTS = [
+const GUARDED_MODULES = [
   // TASK-017: without these the clean-room workflow is unchecked text.
-  "tests/workflowPolicy.test.ts",
-  "tests/knownLimitationsHonesty.test.ts",
-  // TASK-016: the zero-cost gate and the credential boundary.
-  "tests/pushAuthorization.test.ts",
-  "tests/githubCredentialBoundary.test.ts",
-  "tests/candidateBinding.test.ts",
-  "tests/publishCandidate.test.ts",
+  ["src/verification/workflowPolicy.ts", "tests/workflowPolicy.test.ts"],
+  ["docs/KNOWN-LIMITATIONS.md", "tests/knownLimitationsHonesty.test.ts"],
+  // TASK-016: the zero-cost gate, the credential boundary, candidate binding.
+  ["src/supervision/financialSafety.ts", "tests/pushAuthorization.test.ts"],
+  ["src/adapters/github/ghCliClient.ts", "tests/githubCredentialBoundary.test.ts"],
+  ["src/github/candidateBinding.ts", "tests/candidateBinding.test.ts"],
+  ["src/github/publishCandidate.ts", "tests/publishCandidate.test.ts"],
   // TASK-006/011: spending and executor isolation.
-  "tests/financialSafetyGate.test.ts",
-  "tests/executorIsolation.test.ts",
+  ["src/supervision/supervisorTypes.ts", "tests/financialSafetyGate.test.ts"],
+  ["src/adapters/supervision/isolatedExecutor.ts", "tests/executorIsolation.test.ts"],
 ];
 
 /**
- * WHICH TREES THIS APPLIES TO, DERIVED FROM THE TREE (round-4 review).
+ * PRESENT ON DISK AND IN THE COMPILED SET (round-5 review, second bypass).
  *
- * `verify.mjs` is copied into the harness's fixture repositories, which hold a
- * single sample test by design, so the manifest cannot apply everywhere — it
- * failed 72 such cases when it did.
+ * Asking only `existsSync` left every test file physically present while a
+ * rewritten `tsconfig.json` stopped COMPILING them — the guard passed and one
+ * test ran. Asking only the compiled set was the earlier hole: deleting the
+ * files emptied it and the check skipped itself.
  *
- * My first gate keyed on the package NAME, and the comment claimed renaming it
- * would break the package scripts. That was false: the reviewer renamed it to
- * "fixture", deleted a required test, and the suite passed. A gate that a
- * one-word edit disables is not a gate.
- *
- * So the question is asked of the CONTENT instead: a tree holding ANY of these
- * files must hold ALL of them. A fixture holds none and is skipped. Deleting
- * one to escape the manifest leaves the others, which is precisely the state
- * this refuses. Escaping it now means deleting every safety test at once —
- * which is not a quiet edit, and leaves a repository whose own verification has
- * nothing left to say.
+ * They are different holes, so both questions are asked. `existsSync` catches
+ * deletion; membership of `sourceTests` catches exclusion.
  */
-const presentRequired = REQUIRED_TESTS.filter((required) => sourceTests.includes(required));
-const missingRequired = presentRequired.length === 0
-  ? []
-  : REQUIRED_TESTS.filter((required) => !sourceTests.includes(required));
-if (missingRequired.length > 0) {
+const unguarded = GUARDED_MODULES.flatMap(([module, test]) => {
+  if (!existsSync(join(REPO_ROOT, module))) return [];
+  if (!existsSync(join(REPO_ROOT, test))) return [[module, test, "is missing"]];
+  if (!sourceTests.includes(test)) return [[module, test, "exists but is not compiled, so it never runs"]];
+  return [];
+});
+if (unguarded.length > 0) {
   fail(
-    "verification refused: required test files are missing from the compiled source set — " +
-      `${missingRequired.join(", ")}. These pin safety properties whose loss would otherwise be ` +
-      "silent, so their absence is a verification failure rather than a smaller test run.",
+    "verification refused: a guarded module is present without the test that guards it — " +
+      unguarded.map(([module, test, why]) => `${module} needs ${test}, which ${why}`).join("; ") +
+      ". These pin safety properties whose loss would otherwise be silent, so this is a " +
+      "verification failure rather than a smaller test run.",
   );
 }
 const generatedFiles = listFiles(OUTPUT_DIR);
