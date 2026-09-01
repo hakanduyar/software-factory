@@ -24,6 +24,7 @@ import {
   FREE_RUNNER_LABELS,
   checkActionPins,
   checkInstall,
+  checkStepExecution,
   checkNodePin,
   checkPermissions,
   checkRunners,
@@ -65,26 +66,46 @@ function workflow(overrides: {
   readonly permissions?: string | undefined;
   readonly runs?: readonly string[];
   readonly nodeVersion?: string | undefined;
+  /** Applied to every `run` step, so a case can make them not execute. */
+  readonly stepIf?: string;
+  readonly continueOnError?: boolean;
+  /** Raw lines appended under `on:`, for trigger-filter cases. */
+  readonly onFilters?: Readonly<Record<string, readonly string[]>>;
+  /** Which action carries the node-version, so the pin can be misplaced. */
+  readonly nodeVersionOn?: string;
 } = {}): YamlMap {
   const on = overrides.on ?? ["pull_request", "push"];
   const uses = overrides.uses ?? ["actions/checkout@" + "a".repeat(40)];
   const runs = overrides.runs ?? ["npm ci", "npm test"];
   const lines: string[] = ["name: synthetic", "on:"];
   for (const event of on) {
-    lines.push(`  ${event}:`, "    branches:", '      - "**"');
+    lines.push(`  ${event}:`);
+    const filters = overrides.onFilters?.[event];
+    if (filters === undefined) {
+      lines.push("    branches:", '      - "**"');
+    } else {
+      lines.push(...filters);
+    }
   }
   if (overrides.permissions !== undefined) {
     lines.push("permissions:", `  ${overrides.permissions}`);
   }
   lines.push("jobs:", "  verify:", `    runs-on: ${overrides.runsOn ?? "ubuntu-latest"}`, "    steps:");
+  const carrier = overrides.nodeVersionOn ?? "setup-node";
   for (const use of uses) {
     lines.push(`      - uses: ${use}`);
-    if (use.includes("setup-node") && overrides.nodeVersion !== undefined) {
+    if (use.includes(carrier) && overrides.nodeVersion !== undefined) {
       lines.push("        with:", `          node-version: "${overrides.nodeVersion}"`);
     }
   }
   for (const run of runs) {
     lines.push(`      - run: ${run}`);
+    if (overrides.stepIf !== undefined) {
+      lines.push(`        if: ${overrides.stepIf}`);
+    }
+    if (overrides.continueOnError === true) {
+      lines.push("        continue-on-error: true");
+    }
   }
   const parsed = parseWorkflow(lines.join("\n") + "\n");
   assert.equal(parsed.ok, true, `the synthetic workflow does not parse: ${parsed.ok ? "" : parsed.reason}`);
@@ -357,7 +378,7 @@ describe("TASK-017 AC-2: the Node version is a decision bound to engines", () =>
     const verdict = checkNodePin(workflow(), ">=22.5.0");
 
     assert.equal(verdict.ok, false, "an unpinned Node version was accepted");
-    assert.match(verdict.ok === false ? verdict.reason : "", /pins no Node version/);
+    assert.match(verdict.ok === false ? verdict.reason : "", /setup-node step pins a node-version/);
   });
 
   it("refuses an inexact pin, which is a range rather than a decision", () => {
@@ -377,5 +398,194 @@ describe("TASK-017 AC-2: the Node version is a decision bound to engines", () =>
     });
 
     assert.equal(checkNodePin(pinned, "^22.5.0").ok, false);
+  });
+});
+
+/**
+ * TASK-017 round-1 review: a command that APPEARS is not a command that RUNS.
+ *
+ * The reviewer's CRITICAL, and it was exact. `run: npm test` under
+ * `if: ${{ false }}` never executes; under `continue-on-error: true` it
+ * executes, fails, and the job passes anyway; `echo npm test` merely contains
+ * the words. All three satisfied the substring searches these checks used to
+ * do, so the workflow could verify nothing while every policy said ok.
+ */
+describe("TASK-017 round-1 CRITICAL: the policies read execution, not text", () => {
+  it("refuses an install step that a condition prevents from running", () => {
+    const verdict = checkInstall(workflow({ stepIf: "${{ false }}" }));
+
+    assert.equal(verdict.ok, false, "a skipped npm ci counted as an install");
+    assert.match(verdict.ok === false ? verdict.reason : "", /unconditionally/);
+  });
+
+  it("refuses a verification step that a condition prevents from running", () => {
+    const verdict = checkVerificationCommand(workflow({ stepIf: "${{ false }}" }));
+
+    assert.equal(verdict.ok, false, "a skipped npm test counted as verification");
+    assert.match(verdict.ok === false ? verdict.reason : "", /unconditionally/);
+  });
+
+  /** ANY condition, not just a false one — evaluating them would be guessing. */
+  it("refuses a verification step under a condition that might be true", () => {
+    const verdict = checkVerificationCommand(workflow({ stepIf: "${{ github.event_name == 'push' }}" }));
+
+    assert.equal(verdict.ok, false, "a conditional verification step was accepted");
+  });
+
+  it("refuses a verification step whose failure would not fail the job", () => {
+    const verdict = checkVerificationCommand(workflow({ continueOnError: true }));
+
+    assert.equal(verdict.ok, false, "continue-on-error verification was accepted");
+  });
+
+  it("refuses continue-on-error anywhere in the workflow", () => {
+    const verdict = checkStepExecution(workflow({ continueOnError: true }));
+
+    assert.equal(verdict.ok, false, "a step that cannot fail the job was accepted");
+    assert.match(verdict.ok === false ? verdict.reason : "", /continue-on-error/);
+  });
+
+  it("accepts the shipped workflow, whose steps are unconditional", () => {
+    assert.equal(checkStepExecution(shipped()).ok, true);
+  });
+
+  /** `echo npm ci` contains the words and installs nothing. */
+  for (const [label, command] of [
+    ["echoed", "echo npm ci"],
+    ["commented into a longer command", "true && echo 'npm ci'"],
+  ] as const) {
+    it(`refuses an install that is only ${label}`, () => {
+      const verdict = checkInstall(workflow({ runs: [command, "npm test"] }));
+
+      assert.equal(verdict.ok, false, `${command} counted as an install`);
+    });
+  }
+
+  it("refuses a verification command that is only echoed", () => {
+    const verdict = checkVerificationCommand(workflow({ runs: ["npm ci", "echo npm test"] }));
+
+    assert.equal(verdict.ok, false, "echo npm test counted as verification");
+  });
+});
+
+/**
+ * TASK-017 round-1 HIGH 4: `npm i` is an official alias for `npm install`, and
+ * npm accepts a family of abbreviations besides. A check written for the long
+ * spelling caught one of them.
+ */
+describe("TASK-017 round-1 HIGH 4: every spelling of npm install is refused", () => {
+  for (const alias of ["i", "install", "in", "ins", "inst", "add", "isntall"]) {
+    it(`refuses npm ${alias}`, () => {
+      const verdict = checkInstall(workflow({ runs: ["npm ci", `npm ${alias}`, "npm test"] }));
+
+      assert.equal(verdict.ok, false, `npm ${alias} was accepted alongside npm ci`);
+      assert.match(verdict.ok === false ? verdict.reason : "", /lockfile/);
+    });
+  }
+
+  /** The control: `npm ci` and `npm test` are not install aliases. */
+  it("still accepts a workflow whose only npm commands are ci and test", () => {
+    assert.equal(checkInstall(workflow()).ok, true);
+  });
+});
+
+/**
+ * TASK-017 round-1 HIGH 2: `with: node-version:` on some other action
+ * configures that action. The runner's Node is pinned by `setup-node` or by
+ * nothing.
+ */
+describe("TASK-017 round-1 HIGH 2: the Node pin must be on setup-node", () => {
+  it("refuses a node-version carried by an unrelated action", () => {
+    const misplaced = workflow({
+      uses: [`actions/cache@${"c".repeat(40)}`],
+      nodeVersion: "22.5.0",
+      nodeVersionOn: "cache",
+    });
+
+    const verdict = checkNodePin(misplaced, ">=22.5.0");
+
+    assert.equal(verdict.ok, false, "a node-version on another action counted as a pin");
+    assert.match(verdict.ok === false ? verdict.reason : "", /setup-node/);
+  });
+
+  it("accepts a node-version carried by setup-node", () => {
+    const pinned = workflow({
+      uses: [`actions/setup-node@${"b".repeat(40)}`],
+      nodeVersion: "22.5.0",
+    });
+
+    assert.equal(checkNodePin(pinned, ">=22.5.0").ok, true);
+  });
+});
+
+/**
+ * TASK-017 round-1 HIGH 3: naming an event is not triggering on it. `types`
+ * narrows which activity fires the workflow, and `branches-ignore` can exclude
+ * every branch — so a workflow can name both events and run for neither.
+ */
+describe("TASK-017 round-1 HIGH 3: trigger filters are read, not just event names", () => {
+  it("refuses a pull_request narrowed to closed", () => {
+    const narrowed = workflow({
+      onFilters: { pull_request: ["    types:", "      - closed"] },
+    });
+
+    const verdict = checkTriggers(narrowed);
+
+    assert.equal(verdict.ok, false, "a workflow that never sees a new pull request was accepted");
+    assert.match(verdict.ok === false ? verdict.reason : "", /opened/);
+  });
+
+  it("refuses a pull_request that misses synchronize, so updates produce nothing", () => {
+    const narrowed = workflow({
+      onFilters: { pull_request: ["    types:", "      - opened"] },
+    });
+
+    assert.equal(checkTriggers(narrowed).ok, false);
+  });
+
+  it("accepts a pull_request whose types include opened and synchronize", () => {
+    const explicit = workflow({
+      onFilters: { pull_request: ["    types:", "      - opened", "      - synchronize"] },
+    });
+
+    assert.equal(checkTriggers(explicit).ok, true);
+  });
+
+  it("refuses branches-ignore, which can exclude every branch", () => {
+    const ignored = workflow({
+      onFilters: { push: ["    branches-ignore:", '      - "**"'] },
+    });
+
+    const verdict = checkTriggers(ignored);
+
+    assert.equal(verdict.ok, false, "a push excluded from every branch was accepted");
+    assert.match(verdict.ok === false ? verdict.reason : "", /branches-ignore/);
+  });
+
+  it("refuses a branch list that does not cover every branch", () => {
+    const limited = workflow({
+      onFilters: { push: ["    branches:", "      - main"] },
+    });
+
+    assert.equal(checkTriggers(limited).ok, false);
+  });
+
+  it("accepts the shipped workflow's filters", () => {
+    assert.equal(checkTriggers(shipped()).ok, true);
+  });
+});
+
+describe("TASK-017 round-1 note: permissions must be a mapping", () => {
+  it("refuses a permissions sequence, which grants nothing legible", () => {
+    const parsed = parseWorkflow(
+      ["name: x", "on:", "  push:", "    branches:", '      - "**"', "permissions:", "  - contents", "jobs:", "  v:", "    runs-on: ubuntu-latest", "    steps:", "      - run: npm test", ""].join("\n"),
+    );
+    assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+    if (!parsed.ok) return;
+
+    const verdict = checkPermissions(parsed.root, "clean");
+
+    assert.equal(verdict.ok, false, "a permissions sequence was accepted");
+    assert.match(verdict.ok === false ? verdict.reason : "", /sequence/);
   });
 });

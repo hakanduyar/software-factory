@@ -82,8 +82,14 @@ demonstrated: swapping `tests/` between the check and the build, and shadowing
 audits can defend against that, and building something that appears to would
 manufacture assurance without substance.
 
-**What would close it:** running verification in a clean checkout in an isolated
-environment — the `CLEAN_ROOM_CI` roadmap item.
+**What would REDUCE it:** running verification in a clean checkout in an
+isolated environment — the `CLEAN_ROOM_CI` roadmap item, built by TASK-017.
+
+Stated as a reduction rather than a remedy, and corrected after the TASK-017
+review: a concurrent local adversary is a threat to LOCAL runs, and a clean room
+is somewhere else. It gives a second environment whose result can be compared
+with the local one, so divergence becomes detectable. It removes nothing from
+the machine where the work happens. Local runs are unchanged.
 
 **Kept honest by:** the boundary is stated in `scripts/verify.mjs` and pinned by
 a test asserting that statement is present, so it cannot quietly disappear.
@@ -214,7 +220,12 @@ it is the honest one.
 
 **What would actually close it:** a record the database writer cannot reach — a
 signature over the chain with a key held elsewhere, or an external witness.
-That is `CLEAN_ROOM_CI`, and it is where this belongs.
+
+This entry used to name `CLEAN_ROOM_CI` as that remedy. It is not: a clean room
+is a fresh verification environment, it holds no key this process cannot reach,
+and it witnesses nothing. TASK-017 built the clean room and this limitation is
+untouched by it. What this needs is a key or a witness OUTSIDE the machine that
+writes the record, which is a separate piece of work nobody has scheduled.
 
 **What TASK-012 changed, and what it did not:** an item's DEFINITION — `key`,
 `title`, `workClass`, `dependsOn`, `order` — no longer comes from the database at
@@ -535,9 +546,12 @@ process with the same credentials. The boundary is the operating system's, and
 moving it needs a different user, a namespace, or a container — an OS-level
 control a human installs.
 
-**What would close it:** running the executor as a separate unprivileged user,
-or under a PID namespace. That is `CLEAN_ROOM_CI` territory, alongside the
-external witness L-4 needs.
+**What would REDUCE it:** running the executor as a separate unprivileged user,
+or under a PID namespace. A GitHub-hosted runner gives a fresh machine per job,
+so the local same-user adversary this entry describes is not present there —
+which is a fact about that environment and not about this defect. Local runs are
+unchanged, and this stays OPEN. The external witness L-4 needs is a separate
+question that a clean room does not answer either.
 
 **Kept honest by:** `src/adapters/supervision/isolatedExecutor.ts` cites this
 entry by number, and a test asserts every limitation the source cites actually
@@ -596,9 +610,15 @@ instruction applies: if it starts refusing ordinary working copies, revisit the
 trade-off rather than adding a bypass flag, which would delete the guard for
 everyone while appearing to keep it.
 
-**What would close it:** `CLEAN_ROOM_CI` — a fresh checkout and a fresh install
-in an environment the adversary is not in. It is the answer for this class, as
-it is for the TOCTOU gaps the threat model already records.
+**What would REDUCE it, and what would not close it:** `CLEAN_ROOM_CI` — a
+fresh checkout and a fresh install in an environment the adversary is not in.
+
+This promised more than it should have, and it was written before the clean
+room existed — which is when a prediction is cheapest to make and hardest to
+check. TASK-017 built it, and the accurate statement is narrower: a clean room
+removes the environment this attack needs, in ONE place. The limitation remains,
+because a local run is unaffected and local runs are where this Factory works.
+See the TASK-017 note below for what the clean room does and does not establish.
 
 **Kept honest by:** `tests/verificationHarnessEndToEnd.test.ts` proves the
 hardlink route is refused, including two cases whose assertion is that the
@@ -658,8 +678,12 @@ obeyed.
 
 - `scripts/verify.mjs` = deterministic, fail-closed verification WITHIN its
   documented threat model.
-- `CLEAN_ROOM_CI` = a fresh, frozen environment that closes the broader class of
-  "code from outside the audited tree reaches the run".
+- `CLEAN_ROOM_CI` = a fresh, frozen environment in which the broader class of
+  "code from outside the audited tree reaches the run" HAS NOTHING TO ACT ON.
+  Not a closure of that class: an environment where it does not arise. The
+  distinction is the whole of the TASK-017 note below, and it matters because a
+  clean room detects nothing — it is somewhere the problem is absent, which
+  says nothing about anywhere else.
 
 **What is NOT weakened.** Every existing guard stays exactly as it is. Nothing
 here licenses relaxing the hardlink scan, the mount checks, the symlink
@@ -709,9 +733,9 @@ That closes HOSTILE MATERIALISATION OF THE WORKING TREE: mounts, links and
 planted files that make the audited tree misrepresent itself. It does NOT make
 the environment trustworthy in general. A fresh `node_modules`, the `node`
 binary and `PATH` remain trusted computing base in the clean room exactly as
-they are here, and this entry is narrowed to say so — an earlier draft said the
-clean room "closes the broader class", which claimed more than a clean room can
-deliver.
+they are here, and this entry is narrowed to say so — an earlier draft credited
+the clean room with eliminating the broader class, which claimed more than a
+fresh environment can deliver. Local runs are unchanged by it.
 The roadmap's `CLEAN_ROOM_CI` remains the GitHub-based item downstream of
 `GITHUB_ORCHESTRATION`; TASK-013 is the dependency-safe local form of the same
 boundary.

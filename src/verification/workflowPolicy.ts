@@ -361,12 +361,67 @@ export function checkActionPins(root: YamlMap): PolicyVerdict {
 }
 
 /** AC-5. The events a human-created pull request raises, plus branch pushes. */
+/**
+ * The activity types a pull request must still trigger on.
+ *
+ * `opened` and `synchronize` are creation and update — the two moments a
+ * candidate appears or changes. A workflow narrowed to `closed` is documented
+ * as valid and produces no evidence for either.
+ */
+const REQUIRED_PR_TYPES: readonly string[] = ["opened", "synchronize"];
+
 export function checkTriggers(root: YamlMap): PolicyVerdict {
   const on = get(root, "on");
   const declared = mapKeys(on);
   for (const required of ["pull_request", "push"]) {
     if (!declared.includes(required)) {
       return refuse(`the workflow does not trigger on ${required}, so it would produce no evidence for one`);
+    }
+  }
+
+  /**
+   * AN EVENT NAME IS NOT A TRIGGER (round-1 review, HIGH 3). `types` narrows
+   * which activity fires the workflow and `branches-ignore` can exclude
+   * everything, so a workflow can name both events and run for neither.
+   */
+  for (const event of ["pull_request", "push"]) {
+    const config = get(on, event);
+    if (config === undefined || typeof config === "string") {
+      continue;
+    }
+    if (config.kind === "map") {
+      const ignored = get(config, "branches-ignore");
+      if (ignored !== undefined) {
+        return refuse(
+          `${event} uses branches-ignore, which can exclude every branch this evidence is needed for`,
+        );
+      }
+      const branches = get(config, "branches");
+      if (branches !== undefined) {
+        const patterns = branches !== undefined && typeof branches !== "string" && branches.kind === "seq"
+          ? branches.items.filter((item): item is string => typeof item === "string")
+          : [];
+        if (!patterns.includes("**")) {
+          return refuse(
+            `${event} is limited to ${JSON.stringify(patterns)}, so a candidate on another branch produces no evidence`,
+          );
+        }
+      }
+      if (event === "pull_request") {
+        const types = get(config, "types");
+        if (types !== undefined) {
+          const declaredTypes = typeof types !== "string" && types.kind === "seq"
+            ? types.items.filter((item): item is string => typeof item === "string")
+            : [];
+          for (const required of REQUIRED_PR_TYPES) {
+            if (!declaredTypes.includes(required)) {
+              return refuse(
+                `pull_request does not trigger on ${required}, so a ${required === "opened" ? "new" : "updated"} pull request produces no evidence`,
+              );
+            }
+          }
+        }
+      }
     }
   }
   return { ok: true };
@@ -384,7 +439,15 @@ export function checkPermissions(root: YamlMap, source: string): PolicyVerdict {
   if (typeof permissions === "string") {
     return refuse(`permissions is ${JSON.stringify(permissions)} rather than an explicit least-privilege mapping`);
   }
-  for (const [scope, value] of permissions.kind === "map" ? permissions.entries : []) {
+  /**
+   * A SEQUENCE IS NOT A MAPPING (round-1 review, non-blocking note). The loop
+   * below iterated an empty list for a sequence and returned ok, so a
+   * `permissions:` written as a list passed while granting nothing legible.
+   */
+  if (permissions.kind !== "map") {
+    return refuse("permissions is a sequence rather than a mapping of scope to access");
+  }
+  for (const [scope, value] of permissions.entries) {
     if (scope !== "contents") {
       return refuse(`the workflow grants ${JSON.stringify(scope)}, which a verification run does not need`);
     }
@@ -395,21 +458,130 @@ export function checkPermissions(root: YamlMap, source: string): PolicyVerdict {
   return { ok: true };
 }
 
-/** Every `run:` command in the workflow, in order. */
+/**
+ * A step, read as the thing that either RUNS OR DOES NOT (round-1 review,
+ * CRITICAL 1).
+ *
+ * The first version collected `run:` strings and nothing else, so a step
+ * carrying `if: ${{ false }}` — which GitHub documents as preventing the step
+ * from running at all — satisfied every command check while executing nothing.
+ * `continue-on-error: true` was the same defect pointing the other way: the
+ * step runs, fails, and the job passes anyway.
+ *
+ * So the shape a policy needs is not "which commands appear" but "which
+ * commands run, unconditionally, and whose failure fails the job".
+ */
+export interface WorkflowStep {
+  readonly uses: string | undefined;
+  readonly run: string | undefined;
+  /** Present at all means conditional, which means it may not run. */
+  readonly condition: string | undefined;
+  readonly continueOnError: string | undefined;
+  readonly withNodeVersion: string | undefined;
+}
+
+export function workflowSteps(root: YamlMap): readonly WorkflowStep[] {
+  return steps(root).map((step) => {
+    const uses = get(step, "uses");
+    const run = get(step, "run");
+    const condition = get(step, "if");
+    const continueOnError = get(step, "continue-on-error");
+    const nodeVersion = get(get(step, "with"), "node-version");
+    return {
+      uses: typeof uses === "string" ? uses : undefined,
+      run: typeof run === "string" ? run : undefined,
+      condition: typeof condition === "string" ? condition : undefined,
+      continueOnError: typeof continueOnError === "string" ? continueOnError : undefined,
+      withNodeVersion: typeof nodeVersion === "string" ? nodeVersion : undefined,
+    };
+  });
+}
+
+/**
+ * Steps that genuinely run and whose failure fails the job.
+ *
+ * A CONDITION OF ANY KIND disqualifies a step, rather than this trying to
+ * evaluate the expression. `${{ false }}` is obvious; `${{ github.event_name
+ * == 'schedule' }}` is not, and a checker that decided which conditions were
+ * "safe" would be evaluating GitHub's expression language — which is exactly
+ * the guessing the parser refuses to do. A verification step has no business
+ * being conditional, so requiring none costs nothing real.
+ */
+export function loadBearingSteps(root: YamlMap): readonly WorkflowStep[] {
+  return workflowSteps(root).filter(
+    (step) => step.condition === undefined && step.continueOnError !== "true",
+  );
+}
+
+/** Commands from steps that actually run and whose failure counts. */
 export function runCommands(root: YamlMap): readonly string[] {
-  return steps(root)
-    .map((step) => get(step, "run"))
+  return loadBearingSteps(root)
+    .map((step) => step.run)
     .filter((value): value is string => typeof value === "string");
 }
 
-/** AC-3. Installed from the lockfile, never resolved afresh. */
-export function checkInstall(root: YamlMap): PolicyVerdict {
-  const commands = runCommands(root);
-  if (commands.some((command) => /\bnpm\s+install\b/.test(command))) {
-    return refuse("the workflow runs `npm install`, which may resolve differently than the lockfile records");
+/** Every `run:` command, including ones that would not execute. */
+export function declaredRunCommands(root: YamlMap): readonly string[] {
+  return workflowSteps(root)
+    .map((step) => step.run)
+    .filter((value): value is string => typeof value === "string");
+}
+
+/**
+ * AC-3/AC-4 rest on this: a step whose failure does not fail the job is not
+ * verification, whatever it runs.
+ */
+export function checkStepExecution(root: YamlMap): PolicyVerdict {
+  for (const step of workflowSteps(root)) {
+    if (step.continueOnError === "true") {
+      return refuse(
+        `a step declares continue-on-error: true, so its failure would not fail the job`,
+      );
+    }
   }
-  if (!commands.some((command) => /\bnpm\s+ci\b/.test(command))) {
-    return refuse("the workflow never runs `npm ci`, so its dependencies are not the lockfile's");
+  return { ok: true };
+}
+
+/** AC-3. Installed from the lockfile, never resolved afresh. */
+/**
+ * Every spelling npm accepts for `install` (round-1 review, HIGH 4).
+ *
+ * `npm i` is an official alias and slipped straight past a check written for
+ * the long form. npm also accepts a family of typo-tolerant abbreviations, so
+ * the list is taken from its documented aliases rather than guessed at.
+ */
+const INSTALL_ALIASES: readonly string[] = [
+  "install", "i", "in", "ins", "inst", "insta", "instal",
+  "isnta", "isntal", "isntall", "add",
+];
+
+function isNpmSubcommand(command: string, subcommands: readonly string[]): boolean {
+  const match = /^npm\s+([a-z-]+)\b/.exec(command.trim());
+  return match !== null && subcommands.includes(match[1] ?? "");
+}
+
+export function checkInstall(root: YamlMap): PolicyVerdict {
+  /**
+   * DECLARED commands, not merely load-bearing ones: a conditional
+   * `npm install` is still an `npm install` in the file, and AC-3 forbids it
+   * outright rather than forbidding it only when it runs.
+   */
+  for (const command of declaredRunCommands(root)) {
+    if (isNpmSubcommand(command, INSTALL_ALIASES)) {
+      return refuse(
+        `the workflow runs ${JSON.stringify(command.trim())}, which may resolve differently than the lockfile records`,
+      );
+    }
+  }
+  /**
+   * And the install must be EXACT and load-bearing. `echo npm ci` contains the
+   * words and installs nothing, which is why this compares the whole command
+   * rather than searching inside it.
+   */
+  if (!runCommands(root).some((command) => command.trim() === "npm ci")) {
+    return refuse(
+      "no step runs exactly `npm ci` unconditionally, so the dependencies are not provably the lockfile's",
+    );
   }
   return { ok: true };
 }
@@ -422,16 +594,25 @@ export function checkInstall(root: YamlMap): PolicyVerdict {
  * "work" — precisely because it would work while meaning something else.
  */
 export function checkVerificationCommand(root: YamlMap): PolicyVerdict {
-  const commands = runCommands(root);
-  for (const command of commands) {
+  for (const command of declaredRunCommands(root)) {
     if (/\bnode\s+--test\b/.test(command) || /(^|\s)(npx\s+)?tsc\b/.test(command) || /\bverify\.mjs\b/.test(command)) {
       return refuse(
-        `the workflow runs ${JSON.stringify(command)} directly, which is a second definition of "verified"`,
+        `the workflow runs ${JSON.stringify(command.trim())} directly, which is a second definition of "verified"`,
       );
     }
   }
-  if (!commands.some((command) => /\bnpm\s+test\b/.test(command))) {
-    return refuse("the workflow never runs `npm test`, so it does not run this repository's verification");
+  /**
+   * EXACT, UNCONDITIONAL, AND FAILING THE JOB (round-1 review, CRITICAL 1).
+   *
+   * `npm test` under `if: ${{ false }}` never runs; under
+   * `continue-on-error: true` it runs and its failure is ignored; `echo npm
+   * test` merely contains the words. None of the three verifies anything, and
+   * all three satisfied the previous substring search.
+   */
+  if (!runCommands(root).some((command) => command.trim() === "npm test")) {
+    return refuse(
+      "no step runs exactly `npm test` unconditionally with its failure counting, so nothing is verified",
+    );
   }
   return { ok: true };
 }
@@ -444,11 +625,22 @@ export function checkVerificationCommand(root: YamlMap): PolicyVerdict {
  * same reason the parser refuses constructs it does not implement.
  */
 export function checkNodePin(root: YamlMap, enginesRange: string | undefined): PolicyVerdict {
-  const pinned = steps(root)
-    .map((step) => get(get(step, "with"), "node-version"))
+  /**
+   * THE PIN MUST BE ON `setup-node` (round-1 review, HIGH 2).
+   *
+   * `with: node-version:` on any other action configures that action and does
+   * nothing to the runner's Node. The previous version accepted the key
+   * wherever it appeared, so moving it to an unrelated pinned action left the
+   * runner's Node unpinned while every check passed.
+   */
+  const pinned = workflowSteps(root)
+    .filter((step) => step.uses !== undefined && /^actions\/setup-node@/.test(step.uses))
+    .map((step) => step.withNodeVersion)
     .filter((value): value is string => typeof value === "string");
   if (pinned.length === 0) {
-    return refuse("the workflow pins no Node version, so it would use whatever the runner image ships");
+    return refuse(
+      "no actions/setup-node step pins a node-version, so the runner would use whatever its image ships",
+    );
   }
   if (enginesRange === undefined) {
     return refuse("package.json declares no engines.node, so the pin cannot be checked against anything");
