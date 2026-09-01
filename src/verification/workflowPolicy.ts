@@ -165,34 +165,39 @@ function scan(source: string): { readonly ok: true; readonly lines: readonly Lin
  * would silently truncate a value.
  */
 function stripComment(line: string): string {
-  let quote: string | undefined;
-  for (let index = 0; index < line.length; index += 1) {
-    const char = line[index];
-    if (quote !== undefined) {
-      if (char === quote) {
-        quote = undefined;
-      }
-      continue;
-    }
-    if (char === '"' || char === "'") {
-      quote = char;
-      continue;
-    }
-    if (char === "#" && (index === 0 || line[index - 1] === " ")) {
-      return line.slice(0, index);
-    }
+/**
+   * QUOTING APPLIES ONLY TO A VALUE THAT OPENS WITH A QUOTE (round-8 review,
+   * CRITICAL 1).
+   *
+   * The previous version began quoting at any `"` or `'` anywhere on the line,
+   * so `name: foo "bar # baz` kept its comment while YAML reads `foo "bar` —
+   * a quote inside a PLAIN scalar suppresses nothing.
+   *
+   * THE ORDER BELOW MATTERS, and getting it wrong broke the build once: a
+   * whole-line comment is decided FIRST, because
+   * `# things a local run might have: no mount` contains a colon, and computing
+   * the value boundary before checking for a leading `#` protected that `#`
+   * from being stripped at all.
+   */
+  const indent = line.length - line.trimStart().length;
+  if (line[indent] === "#") return "";
+
+  const colon = line.indexOf(": ", indent);
+  const valueStart = colon === -1 ? indent : colon + 2;
+  const opener = line[valueStart];
+
+  if (opener === '"' || opener === "'") {
+    const close = line.indexOf(opener, valueStart + 1);
+    // Unterminated: left intact so `scalar()` refuses it with its own reason.
+    if (close === -1) return line;
+    const hash = line.indexOf(" #", close);
+    return hash === -1 ? line : line.slice(0, hash);
   }
-  return line;
+
+  const hash = line.indexOf(" #", Math.max(valueStart - 1, indent));
+  return hash === -1 ? line : line.slice(0, hash);
 }
 
-/**
- * A scalar, or `undefined` when the text is not one this reader can represent.
- *
- * UNTERMINATED QUOTES ARE REFUSED (round-4 review). The previous version
- * returned the text unchanged when the quotes did not match, so `"verify`
- * became the five characters `"veri` plus `fy` — an opening quote silently
- * promoted into the value of a file YAML would reject.
- */
 /**
  * What a PLAIN scalar may contain, stated as what is ADMITTED.
  *
@@ -205,19 +210,6 @@ function stripComment(line: string): string {
  */
 const PLAIN_SCALAR = /^[A-Za-z0-9_/.+=~^$][A-Za-z0-9_/.+=~^$ ()'"@:;,!?&*|<>[\]{}\\#$-]*$/;
 
-/**
- * A scalar, or `undefined` when the text is not one this grammar admits.
- *
- * A CLOSED GRAMMAR (round-7 review). The previous version returned arbitrary
- * plain text unchanged and relied on a list of refusals to catch what was
- * wrong, so `@not-yaml`, `|foo` and `foo: bar` all parsed while a real YAML
- * parser rejects them. Being a denylist, it could only ever catch the
- * constructs somebody had thought of — which is how six review rounds each
- * found another one.
- *
- * Now a scalar is what the grammar ADMITS. Not thinking of a construct is the
- * REFUSING case rather than the accepting one, which is the whole difference.
- */
 function scalar(text: string): string | undefined {
   for (const quote of ['"', "'"]) {
     if (text.startsWith(quote)) {
@@ -358,6 +350,22 @@ function parseBlock(
       entries.push([entry.key, value]);
       index += 1;
       continue;
+    }
+    /**
+     * A KEY WITH NOTHING UNDER IT IS NULL, NOT AN EMPTY MAPPING (round-8
+     * review, CRITICAL 2).
+     *
+     * `permissions:` followed by a sibling key produced `{kind: "map", entries:
+     * []}`, so `checkPermissions` iterated nothing and reported an explicit
+     * least-privilege block that is not there. YAML calls that null, and a null
+     * where a mapping is required is a different thing rather than an empty one.
+     *
+     * Refused rather than modelled: this reader has no null, and inventing one
+     * would give every policy a new case to get wrong.
+     */
+    const next = lines[index + 1];
+    if (next === undefined || next.indent <= indent) {
+      return { reason: `line ${line.number} declares ${JSON.stringify(entry.key)} with no value` };
     }
     const nested = parseBlock(lines, index + 1, indent + 2);
     if ("reason" in nested) return nested;
@@ -699,7 +707,16 @@ export function checkRunners(root: YamlMap): PolicyVerdict {
 }
 
 /** AC-6. Every action pinned to an immutable commit, never a tag or branch. */
-const COMMIT_PIN = /^[^@\s]+\/[^@\s]+@[0-9a-f]{40}$/;
+/**
+ * `{owner}/{repo}@{40-hex}`, and nothing that merely looks like it.
+ *
+ * A LOCAL ACTION PATH IS NOT A PIN (round-8 review, HIGH 3).
+ * `./.github/actions/evil@aaa…` satisfied the old shape while GitHub resolves
+ * it from the repository rather than from a pinned commit — the `@` and the hex
+ * are decoration on a path. Owner and repo may not contain `.` segments or
+ * slashes, so the shape is stated instead of approximated.
+ */
+const COMMIT_PIN = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?\/[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?@[0-9a-f]{40}$/;
 
 export function checkActionPins(root: YamlMap): PolicyVerdict {
   const used = steps(root)

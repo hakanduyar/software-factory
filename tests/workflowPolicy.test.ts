@@ -20,6 +20,7 @@ import { describe, it } from "node:test";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { GUARDED_MODULES } from "../src/verification/guardedModules.js";
 import {
   FREE_RUNNER_LABELS,
   checkActionPins,
@@ -1046,13 +1047,6 @@ describe("TASK-017: a guarded module may not lose the test that guards it", () =
    * compiled set: if a guarded module is here, its test must be here AND be
    * compiled. `existsSync` catches deletion; membership catches exclusion.
    */
-  it("declares module/test pairs rather than a bare list of files", () => {
-    assert.match(
-      VERIFIER,
-      /const GUARDED_MODULES = \[/,
-      "the verifier has no guarded-module manifest, so deleting a test is a smaller run rather than a failure",
-    );
-  });
 
   it("refuses when a guarded module has no test, rather than reporting a smaller run", () => {
     assert.match(
@@ -1080,25 +1074,17 @@ describe("TASK-017: a guarded module may not lose the test that guards it", () =
    * and the reviewer removed the seventh along with its manifest entry and
    * disabled the independent-review guard undetected.
    */
-  for (const [module, test, marker] of [
-    ["src/verification/workflowPolicy.ts", "tests/workflowPolicy.test.ts", "workflowPolicy"],
-    ["docs/KNOWN-LIMITATIONS.md", "tests/knownLimitationsHonesty.test.ts", "KNOWN-LIMITATIONS"],
-    ["src/supervision/financialSafety.ts", "tests/pushAuthorization.test.ts", "financialSafety"],
-    ["src/adapters/github/ghCliClient.ts", "tests/githubCredentialBoundary.test.ts", "ghCliClient"],
-    ["src/github/candidateBinding.ts", "tests/candidateBinding.test.ts", "candidateBinding"],
-    ["src/github/publishCandidate.ts", "tests/publishCandidate.test.ts", "publishCandidate"],
-    ["src/supervision/financialSafety.ts", "tests/financialSafetyGate.test.ts", "financialSafety"],
-    ["src/adapters/supervision/isolatedExecutor.ts", "tests/executorIsolation.test.ts", "isolatedExecutor"],
-  ] as const) {
+  /**
+   * OVER THE IMPORTED VALUES, not the verifier's source text (round-8 review,
+   * HIGH 4). Asserting `VERIFIER.includes("…")` meant commenting every entry
+   * out left the text present and these cases green while the runtime manifest
+   * was empty. A test that reads source text checks that somebody typed
+   * something, not that anything happens.
+   */
+  for (const { module, test, marker } of GUARDED_MODULES) {
     it(`pairs ${module} with ${test}`, () => {
-      assert.ok(
-        VERIFIER.includes(`"${module}", "${test}", "${marker}"`),
-        `${module} is not paired with ${test}, so deleting that test would go unnoticed`,
-      );
       assert.ok(existsSync(join(REPO_ROOT, module)), `${module} does not exist`);
       assert.ok(existsSync(join(REPO_ROOT, test)), `${test} does not exist`);
-      // The marker is the anti-relabelling half: a test that never mentions
-      // the module it claims to guard is not guarding it.
       assert.ok(
         readFileSync(join(REPO_ROOT, test), "utf8").includes(marker),
         `${test} never mentions ${marker}, so the pair is a label rather than a guard`,
@@ -1106,14 +1092,41 @@ describe("TASK-017: a guarded module may not lose the test that guards it", () =
     });
   }
 
-  /**
-   * And the pair list must not shrink. Counting is a weak check on its own,
-   * which is why every pair is named above — this catches an ADDITION being
-   * dropped in a later edit rather than substituting for the names.
-   */
+  /** Every pair the criteria depend on is actually in the manifest. */
+  for (const [module, test] of [
+    ["src/verification/workflowPolicy.ts", "tests/workflowPolicy.test.ts"],
+    ["docs/KNOWN-LIMITATIONS.md", "tests/knownLimitationsHonesty.test.ts"],
+    ["src/supervision/financialSafety.ts", "tests/pushAuthorization.test.ts"],
+    ["src/adapters/github/ghCliClient.ts", "tests/githubCredentialBoundary.test.ts"],
+    ["src/github/candidateBinding.ts", "tests/candidateBinding.test.ts"],
+    ["src/github/publishCandidate.ts", "tests/publishCandidate.test.ts"],
+    ["src/supervision/financialSafety.ts", "tests/financialSafetyGate.test.ts"],
+    ["src/adapters/supervision/isolatedExecutor.ts", "tests/executorIsolation.test.ts"],
+  ] as const) {
+    it(`declares the pair ${module} -> ${test}`, () => {
+      assert.ok(
+        GUARDED_MODULES.some((entry) => entry.module === module && entry.test === test),
+        `the manifest does not pair ${module} with ${test}`,
+      );
+    });
+  }
+
+  /** The workflow guard is anchored to the workflow, not only to its module. */
+  it("anchors the workflow guard to the workflow itself", () => {
+    const entry = GUARDED_MODULES.find(
+      (candidate) => candidate.module === "src/verification/workflowPolicy.ts",
+    );
+
+    assert.ok(entry !== undefined, "the workflow policy is not in the manifest");
+    assert.equal(
+      entry?.anchor,
+      ".github/workflows/verify.yml",
+      "removing the policy module and its test together would go unnoticed",
+    );
+  });
+
   it("keeps at least the eight pairs named above", () => {
-    const pairs = [...VERIFIER.matchAll(/\["([^"]+)", "(tests\/[^"]+)", "([^"]+)"\]/g)];
-    assert.ok(pairs.length >= 8, `the manifest declares only ${pairs.length} pairs`);
+    assert.ok(GUARDED_MODULES.length >= 8, `the manifest declares only ${GUARDED_MODULES.length} pairs`);
   });
 
   /**
@@ -1123,25 +1136,6 @@ describe("TASK-017: a guarded module may not lose the test that guards it", () =
    * file being deleted, which is the circularity. The marker check lives in
    * `verify.mjs`, the trusted core, so there is nothing to escape through.
    */
-  /**
-   * A COORDINATED DELETION removes the module AND its test, and a pair that
-   * skips when the module is absent then leaves the shipped workflow entirely
-   * unvalidated (round-7 review, CRITICAL 3). Some guards are required by
-   * something other than their own module — the workflow's anchor is the
-   * workflow.
-   */
-  it("anchors the workflow guard to the workflow itself", () => {
-    assert.match(
-      VERIFIER,
-      /GUARD_ANCHORS/,
-      "no anchor exists, so deleting the policy module and its test together goes unnoticed",
-    );
-    assert.match(
-      VERIFIER,
-      /anchored && !existsSync\(join\(REPO_ROOT, module\)\)/,
-      "the anchor is declared but nothing fails when the anchored module disappears",
-    );
-  });
 
   it("requires the verifier itself to check the marker, not just the paths", () => {
     assert.match(
@@ -1393,5 +1387,113 @@ describe("TASK-017 round-7 HIGH 4: a second job is not covered by the first", ()
 
   it("accepts the shipped workflow, which declares one", () => {
     assert.equal(checkWorkflowShape(shipped()).ok, true);
+  });
+});
+
+/**
+ * TASK-017 round-8 review: three more ways the reader saw something the file
+ * does not say.
+ */
+describe("TASK-017 round-8 CRITICAL: the comment boundary and null values", () => {
+  /**
+   * A quote INSIDE a plain scalar suppresses nothing in YAML. The stripper
+   * began quoting at any quote anywhere, so `name: foo "bar # baz` kept its
+   * comment while YAML reads `foo "bar`.
+   */
+  it("ends a plain scalar at its comment even when it contains a quote", () => {
+    const parsed = parseWorkflow('name: foo "bar # baz\n');
+
+    assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+    if (!parsed.ok) return;
+    assert.equal(get(parsed.root, "name"), 'foo "bar');
+  });
+
+  /** A quoted scalar still keeps a `#` that is inside its quotes. */
+  it("keeps a hash inside a quoted scalar", () => {
+    const parsed = parseWorkflow('name: "a # b"\n');
+
+    assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+    if (!parsed.ok) return;
+    assert.equal(get(parsed.root, "name"), "a # b");
+  });
+
+  /**
+   * A key with nothing under it is NULL, not an empty mapping. `permissions:`
+   * followed by a sibling produced `{entries: []}`, and `checkPermissions` then
+   * iterated nothing and reported an explicit least-privilege block that is not
+   * there.
+   */
+  it("refuses a key declared with no value", () => {
+    const parsed = parseWorkflow(
+      ["permissions:", "jobs:", "  v:", "    runs-on: ubuntu-latest", ""].join("\n"),
+    );
+
+    assert.equal(parsed.ok, false, "a null value was read as an empty mapping");
+    assert.match(parsed.ok === false ? parsed.reason : "", /no value/);
+  });
+
+  it("still parses the shipped workflow, whose keys all have values", () => {
+    assert.equal(parseWorkflow(SOURCE).ok, true);
+  });
+});
+
+describe("TASK-017 round-8 HIGH 3: a local action path is not a pinned commit", () => {
+  it("refuses a local action path wearing a commit-shaped suffix", () => {
+    const local = workflow({ uses: [`./.github/actions/evil@${"a".repeat(40)}`] });
+
+    const verdict = checkActionPins(local);
+
+    assert.equal(verdict.ok, false, "a local action path counted as a pinned commit");
+  });
+
+  for (const pin of [
+    `../elsewhere/action@${"a".repeat(40)}`,
+    `owner/repo/subdir@${"a".repeat(40)}`,
+  ]) {
+    it(`refuses ${pin}`, () => {
+      assert.equal(checkActionPins(workflow({ uses: [pin] })).ok, false);
+    });
+  }
+
+  it("still accepts the shipped workflow's pins", () => {
+    assert.equal(checkActionPins(shipped()).ok, true);
+  });
+});
+
+describe("TASK-017 round-8 HIGH 4: an empty manifest disables every guard", () => {
+  const VERIFIER_TEXT = readFileSync(join(REPO_ROOT, "scripts/verify.mjs"), "utf8");
+
+  /**
+   * Commenting every entry out left the verifier's SOURCE TEXT intact, the
+   * old tests passing, and the runtime manifest empty. The list now lives in a
+   * module both sides import, and an empty one is itself a failure.
+   */
+  it("refuses an empty manifest while the modules it describes are present", () => {
+    assert.match(
+      VERIFIER_TEXT,
+      /guarded\.length === 0[\s\S]{0,200}?fail\(/,
+      "an empty manifest passes, which disables every deletion guard at once",
+    );
+  });
+
+  /**
+   * The manifest DECLARES an anchor and the verifier must USE it. A test that
+   * only checks the declaration leaves the usage removable, which is the same
+   * shape as a guard nothing can tell from its absence.
+   */
+  it("acts on the anchor, not merely declares it", () => {
+    assert.match(
+      VERIFIER_TEXT,
+      /anchored && !existsSync\(join\(REPO_ROOT, module\)\)/,
+      "the anchor is declared but the verifier does not act on it",
+    );
+  });
+
+  it("imports the manifest rather than reading its own source", () => {
+    assert.match(
+      VERIFIER_TEXT,
+      /guardedModules\.js/,
+      "the verifier does not import the shared manifest, so tests and runtime can disagree",
+    );
   });
 });

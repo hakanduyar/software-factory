@@ -140,7 +140,22 @@ describe("TASK-017 AC-10: no entry claims a closure the clean room does not deli
        * this attack needs", which is true — so the OBJECT decides: eliminating
        * a LIMITATION is a closure claim, removing an ENVIRONMENT is not.
        */
-      const CLOSURE_VERB = "(?:clos(?:e|es|ed)|eliminat(?:e|es|ed)|remov(?:e|es|ed)|solv(?:e|es|ed)|fix(?:es|ed)?|resolv(?:e|es|ed)|address(?:es|ed)?)";
+      /**
+       * A DENYLIST OVER ENGLISH, AND IT IS ONE ON PURPOSE.
+       *
+       * Round 4 found "eliminates", round 8 found "ends". There are more
+       * synonyms than there are review rounds, and a closed grammar — the move
+       * that fixed the YAML reader — has no equivalent here: the admissible set
+       * for prose is "anything a person might write", so nothing can be closed
+       * over.
+       *
+       * So this catches the common phrasings and NOT every possible one, which
+       * is worth stating plainly rather than leaving a reader to infer that a
+       * passing suite means the register is honest. What actually keeps these
+       * entries honest is a person reading them; this reduces how often that
+       * person has to catch the obvious cases.
+       */
+      const CLOSURE_VERB = "(?:clos(?:e|es|ed)|eliminat(?:e|es|ed)|remov(?:e|es|ed)|solv(?:e|es|ed)|fix(?:es|ed)?|resolv(?:e|es|ed)|address(?:es|ed)?|end(?:s|ed)?|obviat(?:e|es|ed)|negat(?:e|es|ed)|cur(?:e|es|ed)|prevent(?:s|ed)?|stop(?:s|ped)?)";
       const CLOSED_THING = "(?:this|the|that)\\s+(?:limitation|entry|gap|defect|class|problem|issue|vector)";
       for (const match of flatBody.matchAll(
         new RegExp(`(clean room|CLEAN_ROOM_CI)\\s+((?:\\w+\\s+){0,3}?)${CLOSURE_VERB}\\s+((?:\\w+\\s+){0,2}?)${CLOSED_THING}`, "gi"),

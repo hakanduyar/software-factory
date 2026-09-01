@@ -1613,72 +1613,33 @@ assertTreeIsSafe("after building", checkerFreshlyEmitted);
 const sourceTests = allSources.filter((path) => checker.isSourceTest(path));
 
 /**
- * GUARDED MODULES AND THE TESTS THAT GUARD THEM (TASK-017 rounds 3-5).
+ * GUARDED MODULES AND THE TESTS THAT GUARD THEM (TASK-017 rounds 3-8).
  *
- * A reviewer deleted `tests/workflowPolicy.test.ts`, set the workflow's runner
- * to a metered one, and the suite passed: every guard that task added was
- * switched off by removing one file, because verification asks whether the
- * tests that EXIST pass, never whether the tests that must exist are present.
+ * The list itself lives in `src/verification/guardedModules.ts` and is imported
+ * from the COMPILED module, so the verifier and its tests read the same values.
+ * It used to live here with tests asserting this file's SOURCE TEXT, and
+ * commenting every entry out then left the text present, the tests passing, and
+ * the runtime manifest empty (round-8 review, HIGH 4).
  *
- * TWO LATER BYPASSES SHAPED WHAT THIS CHECKS. Keying the list on the package
- * name let a one-word rename disable it. Deriving its scope from
- * `tsc --listFilesOnly` let a rewritten `tsconfig.json` compile one benign test
- * and skip the whole gate — and deleting every listed test did the same, because
- * "none present" was read as "not this repository" rather than as "this
- * repository with its safety tests removed".
+ * A pair means: if the MODULE is present, the TEST must be present, compiled,
+ * and must MENTION the module. An ANCHOR makes a pair mandatory even when the
+ * module is gone, because removing a module and its test together once left the
+ * shipped workflow completely unvalidated.
  *
- * So the question is asked as a PAIR, against the FILESYSTEM: if a guarded
- * module is here, the test that guards it must be here too.
- *
- *   - Deleting the test alone: the module remains, and this refuses.
- *   - Deleting both: the capability is gone entirely. That is a visible,
- *     different act, and it leaves nothing behind claiming to be guarded.
- *   - A fixture repository: has none of these modules, so it is skipped for a
- *     reason that is true of it rather than by an empty-set accident.
- *   - A rewritten tsconfig: irrelevant. This reads the tree, not the compiler's
- *     opinion of the tree.
- *
- * WHAT IT IS NOT. This makes a test PRESENT, not HONEST. A file emptied of its
- * assertions passes. Mutation and independent review cover that; a list of
- * filenames does not pretend to.
+ * Imported dynamically and tolerantly: this runs before the audit, and a tree
+ * that cannot produce the module has bigger problems than this check, which the
+ * rest of the verifier reports in its own words.
  */
-const GUARDED_MODULES = [
-  // [module, its test, a marker the test must contain]
-  //
-  // The MARKER is what stops the list being relabelled (round-6 review): a pair
-  // pointing a module at some other existing test satisfied a presence check
-  // while the real guard was deleted. A test that does not even mention the
-  // module it claims to guard is not guarding it.
-  ["src/verification/workflowPolicy.ts", "tests/workflowPolicy.test.ts", "workflowPolicy"],
-  ["docs/KNOWN-LIMITATIONS.md", "tests/knownLimitationsHonesty.test.ts", "KNOWN-LIMITATIONS"],
-  ["src/supervision/financialSafety.ts", "tests/pushAuthorization.test.ts", "financialSafety"],
-  ["src/adapters/github/ghCliClient.ts", "tests/githubCredentialBoundary.test.ts", "ghCliClient"],
-  ["src/github/candidateBinding.ts", "tests/candidateBinding.test.ts", "candidateBinding"],
-  ["src/github/publishCandidate.ts", "tests/publishCandidate.test.ts", "publishCandidate"],
-  // Two tests may guard one module; each pair is checked on its own.
-  ["src/supervision/financialSafety.ts", "tests/financialSafetyGate.test.ts", "financialSafety"],
-  ["src/adapters/supervision/isolatedExecutor.ts", "tests/executorIsolation.test.ts", "isolatedExecutor"],
-];
+const guarded = await (async () => {
+  try {
+    const module = await import(`file://${join(REPO_ROOT, OUTPUT_DIR, "src/verification/guardedModules.js")}`);
+    return module.GUARDED_MODULES ?? [];
+  } catch {
+    return [];
+  }
+})();
 
-/**
- * SOME GUARDS ARE REQUIRED BY SOMETHING OTHER THAN THEIR OWN MODULE (round-7
- * review, CRITICAL 3).
- *
- * A pair skips when the module is absent, which is right for a fixture and
- * wrong for a coordinated deletion: moving BOTH `workflowPolicy.ts` and its
- * test out of the tree left the shipped workflow completely unvalidated and
- * nothing failed. The workflow is still there; what left was everything that
- * checks it.
- *
- * So a pair may name an ANCHOR — a third file whose presence makes the pair
- * mandatory regardless of the module. The workflow's anchor is the workflow.
- */
-const GUARD_ANCHORS = {
-  "src/verification/workflowPolicy.ts": ".github/workflows/verify.yml",
-};
-
-const unguarded = GUARDED_MODULES.flatMap(([module, test, marker]) => {
-  const anchor = GUARD_ANCHORS[module];
+const unguarded = guarded.flatMap(({ module, test, marker, anchor }) => {
   const anchored = anchor !== undefined && existsSync(join(REPO_ROOT, anchor));
   if (anchored && !existsSync(join(REPO_ROOT, module))) {
     return [[module, test, `is missing while ${anchor} is still present and unvalidated`]];
@@ -1697,6 +1658,19 @@ const unguarded = GUARDED_MODULES.flatMap(([module, test, marker]) => {
   }
   return [];
 });
+
+/**
+ * AN EMPTY MANIFEST IS ITSELF A FAILURE when the tree has the modules it
+ * describes. Commenting the entries out was the round-8 bypass, and a check
+ * that quietly does nothing is the shape this whole area keeps producing.
+ */
+if (guarded.length === 0 && existsSync(join(REPO_ROOT, "src/verification/workflowPolicy.ts"))) {
+  fail(
+    "verification refused: the guarded-module manifest is empty while the modules it describes are present. " +
+      "An empty manifest disables every deletion guard at once.",
+  );
+}
+
 if (unguarded.length > 0) {
   fail(
     "verification refused: a guarded module is present without the test that guards it — " +

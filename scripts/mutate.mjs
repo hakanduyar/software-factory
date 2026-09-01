@@ -46,6 +46,7 @@ const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const POLICY = "src/verification/workflowPolicy.ts";
 const WORKFLOW = ".github/workflows/verify.yml";
 const VERIFIER = "scripts/verify.mjs";
+const MANIFEST = "src/verification/guardedModules.ts";
 const LIMITS = "docs/KNOWN-LIMITATIONS.md";
 const FINANCIAL = "src/supervision/financialSafety.ts";
 const BINDING = "src/github/candidateBinding.ts";
@@ -165,8 +166,8 @@ const MUTATIONS = [
   {
     id: "a tag counts as a pin",
     edits: [[POLICY,
-      "const COMMIT_PIN = /^[^@\\s]+\\/[^@\\s]+@[0-9a-f]{40}$/;",
-      "const COMMIT_PIN = /^[^@\\s]+\\/[^@\\s]+@\\S+$/;"]],
+      "@[0-9a-f]{40}$/;",
+      "@\\S+$/;"]],
     tests: [T_WF],
     expect: "refuses a major tag",
   },
@@ -250,8 +251,8 @@ const MUTATIONS = [
   {
     id: "the comment stripper stops tracking quotes",
     edits: [[POLICY,
-      `    if (char === '"' || char === "'") {\n      quote = char;\n      continue;\n    }\n    if (char === "#" && (index === 0 || line[index - 1] === " ")) {`,
-      '    if (char === "#") {']],
+      "  const opener = line[valueStart];",
+      "  const opener = undefined as string | undefined;"]],
     tests: [T_WF],
     expect: "hash inside quotes",
   },
@@ -264,11 +265,11 @@ const MUTATIONS = [
   // ---- the deletion defence -------------------------------------------------
   {
     id: "the guarded-module manifest is emptied",
-    edits: [[VERIFIER,
-      '  ["src/verification/workflowPolicy.ts", "tests/workflowPolicy.test.ts", "workflowPolicy"],\n  ["docs/KNOWN-LIMITATIONS.md", "tests/knownLimitationsHonesty.test.ts", "KNOWN-LIMITATIONS"],',
+    edits: [[MANIFEST,
+      '  {\n    module: "src/verification/workflowPolicy.ts",\n    test: "tests/workflowPolicy.test.ts",\n    marker: "workflowPolicy",\n    anchor: ".github/workflows/verify.yml",\n  },\n',
       ""]],
     tests: [T_WF],
-    expect: "pairs src/verification/workflowPolicy.ts",
+    expect: "declares the pair src/verification/workflowPolicy.ts",
   },
   {
     id: "the manifest is declared but nothing fails on a broken pair",
@@ -285,53 +286,26 @@ const MUTATIONS = [
     expect: "checks the filesystem AND the compiled set",
   },
   {
-    id: "exclusion is detected but deletion is not",
-    edits: [[VERIFIER,
-      '  if (!existsSync(join(REPO_ROOT, test))) return [[module, test, "is missing"]];\n',
-      ""]],
-    tests: [T_WF],
-    expect: "checks the filesystem AND the compiled set",
-  },
-  {
-    id: "the manifest gate returns to a renameable label",
-    edits: [[VERIFIER,
-      "const unguarded = GUARDED_MODULES.flatMap(([module, test, marker]) => {",
-      'const unguarded = JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8")).name !== "software-factory" ? [] : GUARDED_MODULES.flatMap(([module, test, marker]) => {']],
-    tests: [T_WF],
-    expect: "nowhere names this repository",
-  },
-  {
     id: "a paired test need not mention the module it guards",
-    edits: [[VERIFIER,
-      "  if (!body.includes(marker)) {",
-      "  void marker;\n  if (false) {"]],
+    edits: [[VERIFIER, "  if (!body.includes(marker)) {", "  void marker;\n  if (false) {"]],
     tests: [T_WF],
     expect: "verifier itself to check the marker",
   },
-  // ---- round-6: context syntax and flow items -------------------------------
   {
-    id: "a secret referenced with index syntax is accepted",
-    edits: [[POLICY,
-      "  const SECRET_REFERENCE = /\\bsecrets\\s*(\\.|\\[)/;",
-      "  const SECRET_REFERENCE = /\\bsecrets\\./;"]],
-    tests: [T_WF],
-    expect: "indexed secret named in a plain value",
-  },
-  {
-    id: "a bare tag with a space after it is read as a value",
-    edits: [[POLICY,
-      '  [/:\\s*!/, "a tag"],',
-      '  [/:\\s*!\\S/, "a tag"],']],
-    tests: [T_WF],
-    expect: "bare tag with a space after it",
-  },
-  {
-    id: "a flow collection in a sequence item is read as a string",
-    edits: [[POLICY,
-      '  [/^\\s*-\\s*[[{]/, "a flow collection in a sequence item"],\n',
+    id: "the workflow guard loses its anchor",
+    edits: [[MANIFEST,
+      '    anchor: ".github/workflows/verify.yml",\n',
       ""]],
     tests: [T_WF],
-    expect: "flow sequence used as a sequence item",
+    expect: "anchors the workflow guard",
+  },
+  {
+    id: "an empty manifest is accepted",
+    edits: [[VERIFIER,
+      'if (guarded.length === 0 && existsSync(join(REPO_ROOT, "src/verification/workflowPolicy.ts"))) {',
+      "if (false) {"]],
+    tests: [T_WF],
+    expect: "empty manifest while the modules it describes",
   },
   // ---- round-7: the closed grammar ----------------------------------------
   {
@@ -378,9 +352,42 @@ const MUTATIONS = [
     id: "a coordinated deletion leaves the workflow unvalidated",
     edits: [[VERIFIER,
       "  if (anchored && !existsSync(join(REPO_ROOT, module))) {",
-      "  if (false) {"]],
+      "  void anchored;\n  if (false) {"]],
     tests: [T_WF],
-    expect: "anchors the workflow guard",
+    expect: "acts on the anchor",
+  },
+  // ---- round-8: comment boundary, null values, local actions ---------------
+  {
+    id: "the whole-line comment check is skipped",
+    edits: [[POLICY,
+      '  if (line[indent] === "#") return "";',
+      '  if (false) return "";']],
+    tests: [T_WF],
+    expect: "still parses the shipped workflow",
+  },
+  {
+    id: "a key with no value is an empty mapping again",
+    edits: [[POLICY,
+      "    const next = lines[index + 1];\n    if (next === undefined || next.indent <= indent) {",
+      "    const next = lines[index + 1];\n    void next;\n    if (false as boolean) {"]],
+    tests: [T_WF],
+    expect: "no value",
+  },
+  {
+    id: "a local action path counts as a pinned commit",
+    edits: [[POLICY,
+      "const COMMIT_PIN = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?\\/[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?@[0-9a-f]{40}$/;",
+      "const COMMIT_PIN = /^[^@\\s]+\\/[^@\\s]+@[0-9a-f]{40}$/;"]],
+    tests: [T_WF],
+    expect: "local action path",
+  },
+  {
+    id: "an entry overclaims with a synonym",
+    edits: [[LIMITS,
+      "### What the clean room changes, and what it does not (TASK-017)\n\n`.github/workflows/verify.yml` runs `npm test` on a GitHub-hosted runner from a",
+      "### What the clean room changes, and what it does not (TASK-017)\n\nThe clean room ends this limitation entirely.\n\n`.github/workflows/verify.yml` runs `npm test` on a GitHub-hosted runner from a"]],
+    tests: [T_HON],
+    expect: "pairs no closure verb",
   },
   // ---- AC-9: the liability report stays honest ------------------------------
   {
