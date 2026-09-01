@@ -131,10 +131,21 @@ describe("TASK-017 AC-10: no entry claims a closure the clean room does not deli
        * match; "a clean room does not close this" does.
        */
       const flatBody = body.replace(/\s+/g, " ");
+      /**
+       * THE VERB AND THE OBJECT TOGETHER (round-4 review, HIGH 3).
+       *
+       * Matching only `clos(e|es|ed)` let "CLEAN_ROOM_CI eliminates this
+       * limitation entirely" through. Broadening the verbs alone would fire on
+       * honest sentences — L-10 says the clean room "removes the environment
+       * this attack needs", which is true — so the OBJECT decides: eliminating
+       * a LIMITATION is a closure claim, removing an ENVIRONMENT is not.
+       */
+      const CLOSURE_VERB = "(?:clos(?:e|es|ed)|eliminat(?:e|es|ed)|remov(?:e|es|ed)|solv(?:e|es|ed)|fix(?:es|ed)?|resolv(?:e|es|ed)|address(?:es|ed)?)";
+      const CLOSED_THING = "(?:this|the|that)\\s+(?:limitation|entry|gap|defect|class|problem|issue|vector)";
       for (const match of flatBody.matchAll(
-        /(clean room|CLEAN_ROOM_CI)\s+((?:\w+\s+){0,2}?)clos(e|es|ed)\b/gi,
+        new RegExp(`(clean room|CLEAN_ROOM_CI)\\s+((?:\\w+\\s+){0,3}?)${CLOSURE_VERB}\\s+((?:\\w+\\s+){0,2}?)${CLOSED_THING}`, "gi"),
       )) {
-        const between = match[2] ?? "";
+        const between = `${match[2] ?? ""} ${match[3] ?? ""}`;
         if (/\b(not|never|cannot|nor)\b/i.test(between)) continue;
         offenders.push(`${heading}: …${match[0]}…`);
       }

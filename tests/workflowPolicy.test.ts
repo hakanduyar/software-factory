@@ -860,7 +860,7 @@ describe("TASK-017 round-3 CRITICAL: escaped scalars are refused, not misread", 
       const parsed = parseWorkflow(`name: x\nvalue: ${escaped}\n`);
 
       assert.equal(parsed.ok, false, `${label} was read literally instead of refused`);
-      assert.match(parsed.ok === false ? parsed.reason : "", /escape sequence/);
+      assert.match(parsed.ok === false ? parsed.reason : "", /backslash/);
     });
   }
 
@@ -1017,5 +1017,108 @@ describe("TASK-017 round-3 CRITICAL 4: required tests cannot silently vanish", (
         `the manifest names ${path}, which does not exist — a manifest that has rotted refuses every run`,
       );
     }
+  });
+});
+
+/**
+ * TASK-017 round-4 review: the parser accepted YAML that YAML rejects.
+ *
+ * Four ways, each producing a structure GitHub would never see. The last is the
+ * worst — not a refusal that failed to fire, but a confident WRONG ANSWER about
+ * what the file says.
+ */
+describe("TASK-017 round-4 CRITICAL: invalid YAML is refused, not reinterpreted", () => {
+  it("refuses an invalid escape, not merely the valid ones", () => {
+    // The refusal list matched valid escape FORMS, so `\q` — which YAML
+    // rejects outright — passed through as a literal.
+    const parsed = parseWorkflow('name: "\\q"\n');
+
+    assert.equal(parsed.ok, false, "an invalid escape was read literally");
+  });
+
+  it("refuses an unterminated quoted scalar", () => {
+    const parsed = parseWorkflow('name: "verify\n');
+
+    assert.equal(parsed.ok, false, "an unterminated quote became part of the value");
+    assert.match(parsed.ok === false ? parsed.reason : "", /unterminated/);
+  });
+
+  it("refuses non-breaking spaces used as indentation", () => {
+    // `trimStart()` treats U+00A0 as whitespace and YAML does not, so the
+    // reader computed a depth the file does not have.
+    const parsed = parseWorkflow("jobs:\n\u00a0\u00a0verify: x\n");
+
+    assert.equal(parsed.ok, false, "non-ASCII whitespace was counted as indentation");
+  });
+
+  /**
+   * THE CONFIDENT WRONG ANSWER. `get()` returned the FIRST match, so a second
+   * `permissions:` granting write was reported as read-only. YAML
+   * implementations disagree about duplicates and GitHub's is not this one, so
+   * refusing is the only honest move.
+   */
+  it("refuses a mapping that declares the same key twice", () => {
+    const parsed = parseWorkflow(
+      ["permissions:", "  contents: read", "other: x", "permissions:", "  contents: write", ""].join("\n"),
+    );
+
+    assert.equal(parsed.ok, false, "a duplicate key was silently resolved");
+    assert.match(parsed.ok === false ? parsed.reason : "", /more than once/);
+  });
+
+  it("refuses a duplicate key nested inside a job", () => {
+    const parsed = parseWorkflow(
+      ["jobs:", "  v:", "    runs-on: ubuntu-latest", "    runs-on: macos-14", ""].join("\n"),
+    );
+
+    assert.equal(parsed.ok, false, "a duplicate nested key was silently resolved");
+  });
+
+  /** A plain scalar may CONTAIN quotes; only an opening quote makes it quoted. */
+  it("still reads a plain scalar that ends with a quote", () => {
+    const parsed = parseWorkflow("run: true && echo 'npm ci'\n");
+
+    assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+    if (!parsed.ok) return;
+    assert.equal(get(parsed.root, "run"), "true && echo 'npm ci'");
+  });
+
+  it("still parses the shipped workflow", () => {
+    assert.equal(parseWorkflow(SOURCE).ok, true);
+  });
+});
+
+/**
+ * TASK-017 round-4 CRITICAL 2: the manifest gate must not be a renameable label.
+ *
+ * I gated it on the package NAME and wrote that renaming would break the
+ * package scripts. The reviewer renamed it to "fixture", deleted a required
+ * test, and the suite passed. The claim was false, and it was stated in the one
+ * place a reader would go for the reasoning.
+ */
+describe("TASK-017 round-4 CRITICAL 2: the manifest gate is derived from the tree", () => {
+  const VERIFIER_SOURCE = readFileSync(join(REPO_ROOT, "scripts/verify.mjs"), "utf8");
+
+  /**
+   * THE PROPERTY, NOT A SPELLING.
+   *
+   * My first version asserted the absence of the identifier `packageName`, so a
+   * mutation that inlined the same comparison restored the renameable gate and
+   * the test saw nothing. What matters is that the gate does not NAME this
+   * repository — any such name is a one-word edit away from disabling it.
+   */
+  it("nowhere names this repository, which would make the gate renameable", () => {
+    assert.ok(
+      !VERIFIER_SOURCE.includes("software-factory"),
+      "the verifier names this repository, so a rename can change what it enforces",
+    );
+  });
+
+  it("derives the manifest's scope from the tree's own contents", () => {
+    assert.match(
+      VERIFIER_SOURCE,
+      /const presentRequired = REQUIRED_TESTS\.filter\(\(required\) => sourceTests\.includes\(required\)\)/,
+      "the manifest does not derive its scope from which required tests are present",
+    );
   });
 });

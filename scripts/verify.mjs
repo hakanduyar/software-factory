@@ -1653,29 +1653,28 @@ const REQUIRED_TESTS = [
 ];
 
 /**
- * ONLY FOR THIS REPOSITORY.
+ * WHICH TREES THIS APPLIES TO, DERIVED FROM THE TREE (round-4 review).
  *
  * `verify.mjs` is copied into the harness's fixture repositories, which hold a
- * single sample test by design — demanding this manifest there failed 72 cases
- * that were testing something else entirely. The list is a fact about the
- * Factory's own tree, so it is applied to the Factory's own tree.
+ * single sample test by design, so the manifest cannot apply everywhere — it
+ * failed 72 such cases when it did.
  *
- * Keyed on the package NAME rather than on a path, because a path is whatever
- * the caller passes and the name is what npm resolves. Renaming it to dodge the
- * manifest breaks every script in package.json, which is not a quiet edit.
+ * My first gate keyed on the package NAME, and the comment claimed renaming it
+ * would break the package scripts. That was false: the reviewer renamed it to
+ * "fixture", deleted a required test, and the suite passed. A gate that a
+ * one-word edit disables is not a gate.
+ *
+ * So the question is asked of the CONTENT instead: a tree holding ANY of these
+ * files must hold ALL of them. A fixture holds none and is skipped. Deleting
+ * one to escape the manifest leaves the others, which is precisely the state
+ * this refuses. Escaping it now means deleting every safety test at once —
+ * which is not a quiet edit, and leaves a repository whose own verification has
+ * nothing left to say.
  */
-const packageName = (() => {
-  try {
-    return JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8")).name;
-  } catch {
-    return undefined;
-  }
-})();
-
-const missingRequired =
-  packageName === "software-factory"
-    ? REQUIRED_TESTS.filter((required) => !sourceTests.includes(required))
-    : [];
+const presentRequired = REQUIRED_TESTS.filter((required) => sourceTests.includes(required));
+const missingRequired = presentRequired.length === 0
+  ? []
+  : REQUIRED_TESTS.filter((required) => !sourceTests.includes(required));
 if (missingRequired.length > 0) {
   fail(
     "verification refused: required test files are missing from the compiled source set — " +

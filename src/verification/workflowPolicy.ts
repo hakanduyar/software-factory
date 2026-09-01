@@ -62,7 +62,20 @@ const UNSUPPORTED: readonly (readonly [RegExp, string])[] = [
    * `\\u` would reproduce this defect with a different spelling, and this
    * repository's workflow has no need of an escape.
    */
-  [/\\(x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|[0abtnvfre"\/\\N_LP ])/, "an escape sequence in a scalar"],
+  /**
+   * ANY BACKSLASH, not only the escapes this reader recognised (round-4
+   * review). Matching valid escape FORMS meant `"\\q"` — which YAML rejects
+   * outright — sailed through as a literal, so the reader accepted a file no
+   * YAML parser would. The rule is now the simple one: this workflow has no
+   * need of a backslash, so a backslash is refused.
+   */
+  [/\\/, "a backslash, which this reader does not interpret"],
+  /**
+   * Non-ASCII whitespace. `trimStart()` treats U+00A0 and friends as space and
+   * YAML does not, so indentation written with them computes a depth the file
+   * does not have.
+   */
+  [/^[ ]*[\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]/, "non-ASCII whitespace in indentation"],
   [/^\s*---/, "a document marker, so the file may hold more than one document"],
   // An anchor can sit at the start of a line, after a key, or after a dash.
   // The first version matched only the line-initial form, so `base: &a 1` was
@@ -141,10 +154,22 @@ function stripComment(line: string): string {
   return line;
 }
 
-function scalar(text: string): string {
-  if ((text.startsWith('"') && text.endsWith('"') && text.length >= 2) ||
-      (text.startsWith("'") && text.endsWith("'") && text.length >= 2)) {
-    return text.slice(1, -1);
+/**
+ * A scalar, or `undefined` when the text is not one this reader can represent.
+ *
+ * UNTERMINATED QUOTES ARE REFUSED (round-4 review). The previous version
+ * returned the text unchanged when the quotes did not match, so `"verify`
+ * became the five characters `"veri` plus `fy` — an opening quote silently
+ * promoted into the value of a file YAML would reject.
+ */
+function scalar(text: string): string | undefined {
+  for (const quote of ['"', "'"]) {
+    if (text.startsWith(quote)) {
+      // Only a value that OPENS with a quote is a quoted scalar. One that
+      // merely ends with one — `true && echo 'npm ci'` — is plain text, and
+      // refusing it refused a legitimate command.
+      return text.length >= 2 && text.endsWith(quote) ? text.slice(1, -1) : undefined;
+    }
   }
   return text;
 }
@@ -190,7 +215,11 @@ function parseBlock(
           return { reason: `line ${line.number} is not a mapping entry this reader understands` };
         }
         if (head.value !== undefined) {
-          entries.push([head.key, scalar(head.value)]);
+          const headValue = scalar(head.value);
+          if (headValue === undefined) {
+            return { reason: `line ${line.number} has an unterminated quoted scalar` };
+          }
+          entries.push([head.key, headValue]);
           index += 1;
         } else {
           const nested = parseBlock(lines, index + 1, indent + 4);
@@ -206,7 +235,11 @@ function parseBlock(
             return { reason: `line ${cont.number} is not a mapping entry this reader understands` };
           }
           if (entry.value !== undefined) {
-            entries.push([entry.key, scalar(entry.value)]);
+            const entryValue = scalar(entry.value);
+            if (entryValue === undefined) {
+              return { reason: `line ${cont.number} has an unterminated quoted scalar` };
+            }
+            entries.push([entry.key, entryValue]);
             index += 1;
           } else {
             const nested = parseBlock(lines, index + 1, indent + 4);
@@ -218,7 +251,11 @@ function parseBlock(
         items.push({ kind: "map", entries });
         continue;
       }
-      items.push(scalar(inline));
+      const item = scalar(inline);
+      if (item === undefined) {
+        return { reason: `line ${line.number} has an unterminated quoted scalar` };
+      }
+      items.push(item);
       index += 1;
     }
     return { node: { kind: "seq", items }, next: index };
@@ -237,7 +274,11 @@ function parseBlock(
       return { reason: `line ${line.number} is not a mapping entry this reader understands` };
     }
     if (entry.value !== undefined) {
-      entries.push([entry.key, scalar(entry.value)]);
+      const value = scalar(entry.value);
+      if (value === undefined) {
+        return { reason: `line ${line.number} has an unterminated quoted scalar` };
+      }
+      entries.push([entry.key, value]);
       index += 1;
       continue;
     }
@@ -246,13 +287,37 @@ function parseBlock(
     entries.push([entry.key, nested.node]);
     index = nested.next;
   }
+  const duplicate = duplicateKey(entries);
+  if (duplicate !== undefined) {
+    return { reason: `the mapping declares ${JSON.stringify(duplicate)} more than once` };
+  }
   return { node: { kind: "map", entries }, next: index };
+}
+
+/**
+ * A KEY DECLARED TWICE IS NOT A QUESTION THIS READER MAY ANSWER (round-4
+ * review, CRITICAL 1).
+ *
+ * `get()` returned the FIRST match, so a second `permissions:` granting write
+ * was reported as read-only — a confident wrong answer rather than a missing
+ * refusal, which is the worse failure. YAML implementations disagree about
+ * duplicates and GitHub's is not this one, so the honest move is to refuse
+ * rather than pick a winner.
+ */
+function duplicateKey(entries: readonly (readonly [string, YamlNode])[]): string | undefined {
+  const seen = new Set<string>();
+  for (const [key] of entries) {
+    if (seen.has(key)) return key;
+    seen.add(key);
+  }
+  return undefined;
 }
 
 function parseEntry(text: string): { readonly key: string; readonly value?: string } | undefined {
   const colon = findKeyColon(text);
   if (colon === undefined) return undefined;
   const key = scalar(text.slice(0, colon).trim());
+  if (key === undefined) return undefined;
   const rest = text.slice(colon + 1).trim();
   if (key.length === 0) return undefined;
   return rest.length === 0 ? { key } : { key, value: rest };
