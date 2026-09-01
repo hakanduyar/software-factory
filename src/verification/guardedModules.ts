@@ -45,6 +45,25 @@ export const GUARDED_MODULES: readonly GuardedModule[] = [
     marker: "workflowPolicy",
     anchor: ".github/workflows/verify.yml",
   },
+  /**
+   * The document reader is guarded separately from the policy that consumes it.
+   * They were one file until the parser replacement, and the reason they are
+   * two is that a reader which decides what the file SAYS and a policy which
+   * decides what it may MEAN fail in different ways and are worth losing
+   * separately.
+   */
+  {
+    module: "src/verification/workflowDocument.ts",
+    test: "tests/workflowPolicy.test.ts",
+    marker: "workflowDocument",
+    anchor: ".github/workflows/verify.yml",
+  },
+  {
+    module: "src/verification/workflowDigest.ts",
+    test: "tests/workflowDigest.test.ts",
+    marker: "workflowDigest",
+    anchor: ".github/workflows/verify.yml",
+  },
   {
     module: "docs/KNOWN-LIMITATIONS.md",
     test: "tests/knownLimitationsHonesty.test.ts",

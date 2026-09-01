@@ -990,3 +990,66 @@ first needs an observation to be evidence rather than custody.
 **Kept honest by:** nothing yet - which is the point of recording it. The
 existing `tests/pushAuthorization.test.ts` cases prove the binding and the
 provenance, and deliberately claim nothing about truthfulness.
+
+---
+
+## L-16 - The clean room's workflow reader accepts a subset of what GitHub accepts
+
+**Status:** OPEN, deliberate. Recorded here because the alternative reading -
+"the workflow is validated" - claims more than the mechanism delivers.
+
+`src/verification/workflowDocument.ts` reads `.github/workflows/verify.yml` with
+a standards-compliant YAML 1.2 parser and then NORMALISES the result into a small
+model: strings, mappings and sequences. Anything else is refused rather than
+represented - numbers, booleans, nulls, anchors, aliases, explicit tags, and
+files holding more than one document.
+
+Those are all valid YAML, and several are valid GitHub Actions. A workflow
+writing `continue-on-error: true` is refused not because the value is wrong but
+because a boolean has no representation here. The refusal is deliberate and it
+fails closed: this reader can be wrong by refusing a workflow it could have
+accepted, which shows up immediately as a failing check, and it cannot be wrong
+by reporting structure a file does not have - the failure that produced roughly
+half the CRITICAL findings across eight review rounds of a hand-written parser.
+
+The cost is real and is the limitation: this repository cannot express a
+workflow outside that subset without first extending the model and reasoning
+about what the extension does to every policy that reads it.
+
+### What this moved rather than removed
+
+Syntax is no longer interpreted by code in this repository. That is a genuine
+improvement in the failure mode - a maintained YAML 1.2 implementation is far
+more likely to be right about YAML than 456 lines written here were - but it is
+a TRANSFER of trust, not an elimination of it. If `yaml` misreads a document,
+this reader misreads it too, and nothing here would notice. What remains ours,
+and what the review rounds should keep attacking, is the normalisation and the
+semantic allowlist above it.
+
+### What the digest does and does not do
+
+`src/verification/workflowDigest.ts` records the bytes an independent reviewer
+saw, so a workflow edited into a different still-compliant shape shows up as a
+failing test rather than as nothing at all.
+
+It is not a security control. Anyone who can edit the workflow can edit the
+constant in the same commit, because both files sit behind the same write
+access; its value is that the change becomes a visible two-file diff instead of
+a silent one. It is also not what makes any acceptance criterion true - a digest
+is equally satisfied by a workflow that verifies nothing - which is why no
+acceptance assertion reads it and why a test asserts that separation directly.
+
+### And reading a file is not observing a run
+
+Every claim here is a claim about what the shipped file SAYS. The clean room
+witnesses nothing about an actual Actions execution, because none has happened:
+AC-12 forbids depending on a real run before integration, so the file is the
+only evidence available and it is evidence of intent rather than of behaviour.
+Whether GitHub schedules the workflow, whether the runner behaves as documented,
+and whether the run passes are all outside what any of this proves.
+
+**Kept honest by:** `tests/workflowPolicy.test.ts` asserts each refusal above
+against real documents, `tests/workflowDigest.test.ts` asserts the digest
+rejects a changed file AND accepts a workflow the policy refuses, and
+`src/verification/guardedModules.ts` pairs both modules with their tests so
+deleting the evidence fails the build.

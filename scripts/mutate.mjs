@@ -46,6 +46,8 @@ const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const POLICY = "src/verification/workflowPolicy.ts";
 const WORKFLOW = ".github/workflows/verify.yml";
 const VERIFIER = "scripts/verify.mjs";
+const DOCUMENT = "src/verification/workflowDocument.ts";
+const DIGEST = "src/verification/workflowDigest.ts";
 const MANIFEST = "src/verification/guardedModules.ts";
 const LIMITS = "docs/KNOWN-LIMITATIONS.md";
 const FINANCIAL = "src/supervision/financialSafety.ts";
@@ -55,6 +57,7 @@ const T_WF = "dist/tests/workflowPolicy.test.js";
 const T_HON = "dist/tests/knownLimitationsHonesty.test.js";
 const T_PUSH = "dist/tests/pushAuthorization.test.js";
 const T_BIND = "dist/tests/candidateBinding.test.js";
+const T_DIG = "dist/tests/workflowDigest.test.js";
 
 /**
  * Each mutation names the guard it removes and the test that must notice.
@@ -225,42 +228,36 @@ const MUTATIONS = [
   },
   // ---- the parser's honesty -------------------------------------------------
   {
-    id: "the parser reads backslashes literally",
-    edits: [[POLICY,
-      '  [/\\\\/, "a backslash"],\n',
-      ""]],
+    id: "an alias is resolved instead of refused",
+    edits: [[DOCUMENT, "  if (isAlias(node)) {", "  if (isAlias(node) && false) {"]],
     tests: [T_WF],
-    expect: "refuses a hex escape",
+    expect: "refuses an alias",
   },
   {
-    id: "duplicate keys inside a sequence-item mapping are resolved to the first",
-    edits: [[POLICY,
-      "        const duplicateInItem = duplicateKey(entries);\n        if (duplicateInItem !== undefined) {",
-      "        const duplicateInItem = duplicateKey(entries);\n        if (false) {"]],
+    id: "an anchor is carried through instead of refused",
+    edits: [[DOCUMENT,
+      "  const anchor = (node as { anchor?: string } | null)?.anchor;",
+      "  const anchor = undefined as string | undefined;"]],
     tests: [T_WF],
-    expect: "duplicate key inside a sequence-item mapping",
+    expect: "refuses an anchor",
   },
   {
-    id: "duplicate keys are silently resolved to the first",
-    edits: [[POLICY,
-      "  const duplicate = duplicateKey(entries);\n  if (duplicate !== undefined) {",
-      "  const duplicate = duplicateKey(entries);\n  if (false) {"]],
+    id: "duplicate keys are resolved instead of refused",
+    edits: [[DOCUMENT, "uniqueKeys: true", "uniqueKeys: false"]],
     tests: [T_WF],
-    expect: "same key twice",
+    expect: "refuses a duplicate key",
   },
   {
-    id: "the comment stripper stops tracking quotes",
-    edits: [[POLICY,
-      "  const opener = line[valueStart];",
-      "  const opener = undefined as string | undefined;"]],
+    id: "a parse error is ignored, so a malformed file reads as fine",
+    edits: [[DOCUMENT, "  if (document.errors.length > 0) {", "  if (false) {"]],
     tests: [T_WF],
-    expect: "hash inside quotes",
+    expect: "refuses an unterminated quote",
   },
   {
-    id: "the flow-sequence refusal is dropped",
-    edits: [[POLICY, '  [/:\\s*\\[/, "a flow sequence"],\n', ""]],
+    id: "a stream of documents is judged by whichever comes first",
+    edits: [[DOCUMENT, "  if (documents.length > 1) {", "  if (false) {"]],
     tests: [T_WF],
-    expect: "refuses a flow sequence",
+    expect: "refuses MORE THAN ONE DOCUMENT",
   },
   // ---- the deletion defence -------------------------------------------------
   {
@@ -294,8 +291,8 @@ const MUTATIONS = [
   {
     id: "the workflow guard loses its anchor",
     edits: [[MANIFEST,
-      '    anchor: ".github/workflows/verify.yml",\n',
-      ""]],
+      '    marker: "workflowPolicy",\n    anchor: ".github/workflows/verify.yml",\n',
+      '    marker: "workflowPolicy",\n']],
     tests: [T_WF],
     expect: "anchors the workflow guard",
   },
@@ -309,36 +306,34 @@ const MUTATIONS = [
   },
   // ---- round-7: the closed grammar ----------------------------------------
   {
-    id: "the scalar grammar opens up again",
-    edits: [[POLICY,
-      "  return PLAIN_SCALAR.test(text) ? text : undefined;",
-      "  void PLAIN_SCALAR;\n  return text;"]],
+    id: "the reader asks for YAML 1.1, where `on` is a boolean",
+    edits: [[DOCUMENT, 'version: "1.2"', 'version: "1.1"']],
     tests: [T_WF],
-    expect: "refuses a reserved indicator",
+    expect: "reads `on` as a key",
   },
   {
-    id: "a doubled quote is read with its own syntax intact",
-    edits: [[POLICY,
-      "      if (inner.includes(quote)) return undefined;",
-      "      if (false) return undefined;"]],
+    id: "a non-string scalar is coerced to its spelling",
+    edits: [[DOCUMENT,
+      "      return {\n        ok: false,\n        reason: `${path} is ${value === null ? \"null\" : typeof value}; this reader represents only string scalars`,\n      };",
+      "      return { ok: true, value: String(value) };"]],
     tests: [T_WF],
-    expect: "doubled quote",
+    expect: "refuses a boolean",
   },
   {
-    id: "a key-looking value is admitted",
-    edits: [[POLICY,
-      "  if (/:\\s/.test(text)) return undefined;",
-      "  if (false) return undefined;"]],
+    id: "an explicit tag is accepted instead of refused",
+    edits: [[DOCUMENT,
+      "  const tag = (node as { tag?: string } | null)?.tag;",
+      "  const tag = undefined as string | undefined;"]],
     tests: [T_WF],
-    expect: "key-looking value",
+    expect: "refuses an explicit tag",
   },
   {
-    id: "expressions are evaluated rather than refused",
+    id: "expressions are no longer refused",
     edits: [[POLICY,
-      '  [/\\$\\{\\{/, "a ${{ }} expression"],\n',
-      ""]],
+      "  for (const value of allScalars(root)) {",
+      "  for (const value of allScalars(root).slice(0, 0)) {"]],
     tests: [T_WF],
-    expect: "serialised secrets context",
+    expect: "refuses a dotted secret",
   },
   {
     id: "a second job rides on the first job's checkout",
@@ -358,20 +353,20 @@ const MUTATIONS = [
   },
   // ---- round-8: comment boundary, null values, local actions ---------------
   {
-    id: "the whole-line comment check is skipped",
-    edits: [[POLICY,
-      '  if (line[indent] === "#") return "";',
-      '  if (false) return "";']],
+    id: "a top level that is not a mapping is accepted",
+    edits: [[DOCUMENT,
+      '  if (typeof root === "string" || root.kind !== "map") {\n    return refuse("the workflow\'s top level is not a mapping");\n  }\n  return { ok: true, root };',
+      "  return { ok: true, root: root as YamlMap };"]],
     tests: [T_WF],
-    expect: "still parses the shipped workflow",
+    expect: "refuses a top level that is not a mapping",
   },
   {
     id: "a key with no value is an empty mapping again",
-    edits: [[POLICY,
-      "    const next = lines[index + 1];\n    if (next === undefined || next.indent <= indent) {",
-      "    const next = lines[index + 1];\n    void next;\n    if (false as boolean) {"]],
+    edits: [[DOCUMENT,
+      "        return { ok: false, reason: `${child} has no value` };",
+      "        entries.push([key.value, { kind: \"map\", entries: [] }]); continue;"]],
     tests: [T_WF],
-    expect: "no value",
+    expect: "refuses a flow mapping entry with no value",
   },
   {
     id: "a local action path counts as a pinned commit",
@@ -431,6 +426,49 @@ const MUTATIONS = [
       "### What the clean room changes, and what it does not (TASK-017)\n\nThe clean room eliminates this limitation entirely.\n\n`.github/workflows/verify.yml` runs `npm test` on a GitHub-hosted runner from a"]],
     tests: [T_HON],
     expect: "pairs no closure verb",
+  },
+  // ---- the parser boundary and the digest --------------------------------
+  {
+    id: "a branch list is filtered instead of refused",
+    edits: [[POLICY, "    if (typeof item !== \"string\") return undefined;", "    if (typeof item !== \"string\") continue;"]],
+    tests: [T_WF],
+    expect: "refuses a branch list whose items are not all patterns",
+  },
+  {
+    id: "a non-string action name removes itself from the pin check",
+    edits: [[POLICY, "    if (typeof value !== \"string\") return undefined;", "    if (typeof value !== \"string\") continue;"]],
+    tests: [T_WF],
+    expect: "refuses a step naming an action as something other than a string",
+  },
+  {
+    id: "the shape gate names keys without checking their types",
+    edits: [[POLICY,
+      '        if (key !== "with" && typeof value !== "string") {',
+      '        if (key !== "with" && typeof value !== "string" && false) {']],
+    tests: [T_WF],
+    expect: "refuses a non-string step value at the shape gate",
+  },
+  {
+    id: "an action input need not be a single string",
+    edits: [[POLICY,
+      '          if (typeof value !== "string") {',
+      '          if (typeof value !== "string" && key === "\\u0000never") {']],
+    tests: [T_WF],
+    expect: "refuses an action input that is not a single string",
+  },
+  {
+    id: "the digest is not actually compared",
+    edits: [[DIGEST,
+      '  return createHash("sha256").update(source).digest("hex");',
+      '  return createHash("sha256").update(source).digest("hex").slice(0, 0) + REVIEWED_WORKFLOW_SHA256;']],
+    tests: [T_DIG],
+    expect: "rejects a workflow that differs by one byte",
+  },
+  {
+    id: "the reviewed digest records the wrong bytes",
+    edits: [[DIGEST, "  \"697000ec", "  \"000000ec"]],
+    tests: [T_DIG],
+    expect: "matches the reviewed digest",
   },
 ];
 

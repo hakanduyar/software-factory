@@ -2,42 +2,46 @@
  * Reading a GitHub Actions workflow strictly enough to make claims about it
  * (TASK-017).
  *
- * WHY THERE IS A PARSER HERE AT ALL. The criteria say things like "the workflow
+ * WHY THERE IS STRUCTURE HERE AT ALL. The criteria say things like "the workflow
  * pins a standard runner" and "every action is pinned to a commit". Those are
  * claims about STRUCTURE, and checking them with substring searches would be
  * checking the text rather than the meaning — `runs-on: ubuntu-latest` inside a
- * comment would satisfy a grep and satisfy nothing else. This repository has no
- * runtime dependencies and adding a YAML library to check one file would be
- * introducing infrastructure the task does not require.
+ * comment would satisfy a grep and satisfy nothing else.
  *
- * SO IT PARSES A SUBSET, AND REFUSES EVERYTHING ELSE. The subset is block
- * mappings, block sequences and plain or quoted scalars, with `#` comments and
- * two-space indentation. Anchors, aliases, tags, flow collections, block
- * scalars, multiple documents and tabs are REJECTED rather than approximated.
+ * YAML SYNTAX IS NOT INTERPRETED HERE ANY MORE. It was, for eight review rounds,
+ * and roughly half the CRITICALs found in that time were MISREADS: the reader
+ * reporting structure the file does not have. The owner's decision after round 8
+ * was to move the trust boundary rather than relax the criteria, so
+ * `workflowDocument.ts` delegates syntax to a standards-compliant YAML 1.2
+ * parser and normalises the result, and this module reasons only about the
+ * normalised structure.
  *
- * That refusal is the whole design. A parser that guessed at a construct it did
- * not implement would report structure that is not there, and every check built
- * on it would inherit the guess — the "control true of the mechanism and false
- * of the system" failure, one layer down. A parser that stops instead can be
- * wrong only by refusing a file it could have read, which fails visibly and
- * fails safe.
+ * WHAT REMAINS OURS IS THE SEMANTIC ALLOWLIST, and it stays CLOSED. Parsing a
+ * file correctly says nothing about whether its contents are acceptable: a
+ * perfectly-parsed `continue-on-error` still makes a failure harmless. So every
+ * key, event, runner, action input and command this workflow may contain is
+ * written down, and anything unlisted is REFUSED rather than ignored. That is
+ * the same bargain as before, now made in the one place it belongs — this can be
+ * wrong only by refusing a workflow it could have accepted, which fails visibly.
  */
 
-export type YamlNode = string | YamlMap | YamlSeq;
+import {
+  get,
+  parseWorkflow,
+  type ParseResult,
+  type YamlMap,
+  type YamlNode,
+  type YamlSeq,
+} from "./workflowDocument.js";
 
-export interface YamlMap {
-  readonly kind: "map";
-  readonly entries: readonly (readonly [string, YamlNode])[];
-}
-
-export interface YamlSeq {
-  readonly kind: "seq";
-  readonly items: readonly YamlNode[];
-}
-
-export type ParseResult =
-  | { readonly ok: true; readonly root: YamlMap }
-  | { readonly ok: false; readonly reason: string };
+/**
+ * Re-exported so callers have one import for "read this workflow and judge it",
+ * and so the eight rounds of reproductions keep testing through the same door
+ * they always did. The DEFINITIONS live in `workflowDocument.ts`; this is the
+ * seam, not a second implementation.
+ */
+export { get, parseWorkflow };
+export type { ParseResult, YamlMap, YamlNode, YamlSeq };
 
 export type PolicyVerdict = { readonly ok: true } | { readonly ok: false; readonly reason: string };
 
@@ -46,413 +50,34 @@ function refuse(reason: string): PolicyVerdict {
 }
 
 /**
- * Constructs this parser deliberately does not implement, and will not guess at.
+ * AN EXPRESSION IS NOT A VALUE THIS POLICY CAN EVALUATE (round-7 review).
  *
- * REDUNDANT FOR THE VERDICT SINCE THE GRAMMAR CLOSED, AND SAID SO PLAINLY.
- * `PLAIN_SCALAR` refuses most of these on its own — mutation showed that
- * removing an individual entry changes no outcome. They are kept for the
- * DIAGNOSTIC: "line 3 uses a flow sequence" sends a reader somewhere, and "not
- * admitted by the grammar" does not. The cases assert those exact reasons, so
- * the entries are load-bearing for the thing they are actually for rather than
- * decoration nobody can tell from its absence.
- */
-const UNSUPPORTED: readonly (readonly [RegExp, string])[] = [
-  [/\t/, "a tab, which YAML forbids for indentation"],
-  /**
-   * AN ESCAPE SEQUENCE IS A SCALAR THIS READER CANNOT SEE (round-3 review,
-   * CRITICALs 1 and 2).
-   *
-   * YAML decodes escapes inside double quotes, so `"\\x21**"` is `!**` — a
-   * negative branch pattern that excludes every branch — and
-   * `"${{ secrets\\x2eSENSITIVE }}"` is a secret reference. Both passed every
-   * check, because the reader kept the bytes and the checks looked at the
-   * bytes.
-   *
-   * Refused rather than decoded. A partial decoder that handled `\\x` but not
-   * `\\u` would reproduce this defect with a different spelling, and this
-   * repository's workflow has no need of an escape.
-   */
-  /**
-   * ANY BACKSLASH, not only the escapes this reader recognised (round-4
-   * review). Matching valid escape FORMS meant `"\\q"` — which YAML rejects
-   * outright — sailed through as a literal, so the reader accepted a file no
-   * YAML parser would. The rule is now the simple one: this workflow has no
-   * need of a backslash, so a backslash is refused.
-   */
-  [/\\/, "a backslash"],
-  /**
-   * AN EXPRESSION IS NOT A VALUE THIS READER CAN EVALUATE (round-7 review).
-   *
-   * Three rounds of secret bypasses were three ways of spelling one:
-   * `secrets.NAME`, `secrets['NAME']`, `toJSON(secrets)`, and `github.token`
-   * which names no secret at all while being one. Matching spellings is the
-   * losing game the closed grammar exists to stop playing. This workflow needs
-   * no expression, so an expression is refused and the class closes.
-   */
-  [/\$\{\{/, "a ${{ }} expression"],
-  /**
-   * Non-ASCII whitespace. `trimStart()` treats U+00A0 and friends as space and
-   * YAML does not, so indentation written with them computes a depth the file
-   * does not have.
-   */
-  [/^[ ]*[\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]/, "non-ASCII whitespace in indentation"],
-  [/^\s*---/, "a document marker, so the file may hold more than one document"],
-  // An anchor can sit at the start of a line, after a key, or after a dash.
-  // The first version matched only the line-initial form, so `base: &a 1` was
-  // parsed as the plain scalar "&a 1" — a construct read as something it is
-  // not, which is exactly what this list exists to prevent. My own test caught
-  // it, which is why the negative cases are here.
-  [/^\s*&\S/, "an anchor"],
-  [/:\s*&\S/, "an anchor"],
-  [/^\s*-\s+&\S/, "an anchor"],
-  [/^\s*\*\S/, "an alias"],
-  [/:\s*\*\S/, "an alias"],
-  [/^\s*-\s+\*\S/, "an alias"],
-  /**
-   * A BARE `!` IS STILL A TAG (round-6 review). Requiring a non-space after it
-   * missed `! ${{ ... }}` — which YAML strips and this reader kept, so the
-   * value it reported was not the value GitHub would see.
-   */
-  [/:\s*!/, "a tag"],
-  [/^\s*-\s+!/, "a tag"],
-  /**
-   * A FLOW COLLECTION IS A FLOW COLLECTION WHEREVER IT SITS (round-6 review).
-   * The list caught `key: [...]` and not `- [...]`, so a nested sequence was
-   * reported as the STRING `["!**"]` and the trigger check saw nothing wrong.
-   */
-  [/^\s*-\s*[[{]/, "a flow collection in a sequence item"],
-  [/:\s*[|>][-+0-9]*\s*$/, "a block scalar"],
-  [/:\s*\{/, "a flow mapping"],
-  [/:\s*\[/, "a flow sequence"],
-];
-
-interface Line {
-  readonly indent: number;
-  readonly text: string;
-  readonly number: number;
-}
-
-/** Strips comments and blank lines, and refuses anything outside the subset. */
-function scan(source: string): { readonly ok: true; readonly lines: readonly Line[] } | { readonly ok: false; readonly reason: string } {
-  const lines: Line[] = [];
-  const raw = source.split("\n");
-  for (let index = 0; index < raw.length; index += 1) {
-    const original = raw[index] ?? "";
-    const number = index + 1;
-    for (const [pattern, what] of UNSUPPORTED) {
-      if (pattern.test(original)) {
-        return { ok: false, reason: `line ${number} uses ${what}, which this reader does not implement` };
-      }
-    }
-    const withoutComment = stripComment(original);
-    if (withoutComment.trim().length === 0) {
-      continue;
-    }
-    const indent = withoutComment.length - withoutComment.trimStart().length;
-    if (indent % 2 !== 0) {
-      return { ok: false, reason: `line ${number} is indented ${indent} spaces; this reader requires multiples of two` };
-    }
-    lines.push({ indent, text: withoutComment.trim(), number });
-  }
-  return { ok: true, lines };
-}
-
-/**
- * Removes a trailing comment without eating a `#` inside a quoted scalar.
+ * Three rounds of secret bypasses were three ways of spelling one:
+ * `secrets.NAME`, `secrets['NAME']`, `toJSON(secrets)`, and `github.token` which
+ * names no secret at all while being one. Matching spellings is the losing game
+ * a closed policy exists to stop playing.
  *
- * Written out rather than done with a regex because "the `#` that starts a
- * comment" is a question about quoting state, and a regex that ignores quoting
- * would silently truncate a value.
+ * THIS MOVED WHEN THE PARSER DID, and the move matters. `${{ ... }}` used to be
+ * refused as unreadable SYNTAX; to a real YAML parser it is an ordinary string,
+ * so the refusal has to be made here, as a statement about what this workflow
+ * may MEAN. It is checked over the parsed structure — keys and values, at every
+ * depth — so an escape that spelled it `"\x24{{"` is decoded by the parser
+ * before this sees it, which is the whole reason for the new boundary.
  */
-function stripComment(line: string): string {
-/**
-   * QUOTING APPLIES ONLY TO A VALUE THAT OPENS WITH A QUOTE (round-8 review,
-   * CRITICAL 1).
-   *
-   * The previous version began quoting at any `"` or `'` anywhere on the line,
-   * so `name: foo "bar # baz` kept its comment while YAML reads `foo "bar` —
-   * a quote inside a PLAIN scalar suppresses nothing.
-   *
-   * THE ORDER BELOW MATTERS, and getting it wrong broke the build once: a
-   * whole-line comment is decided FIRST, because
-   * `# things a local run might have: no mount` contains a colon, and computing
-   * the value boundary before checking for a leading `#` protected that `#`
-   * from being stripped at all.
-   */
-  const indent = line.length - line.trimStart().length;
-  if (line[indent] === "#") return "";
+const EXPRESSION = /\$\{\{/;
 
-  const colon = line.indexOf(": ", indent);
-  const valueStart = colon === -1 ? indent : colon + 2;
-  const opener = line[valueStart];
-
-  if (opener === '"' || opener === "'") {
-    const close = line.indexOf(opener, valueStart + 1);
-    // Unterminated: left intact so `scalar()` refuses it with its own reason.
-    if (close === -1) return line;
-    const hash = line.indexOf(" #", close);
-    return hash === -1 ? line : line.slice(0, hash);
-  }
-
-  const hash = line.indexOf(" #", Math.max(valueStart - 1, indent));
-  return hash === -1 ? line : line.slice(0, hash);
-}
-
-/**
- * What a PLAIN scalar may contain, stated as what is ADMITTED.
- *
- * Printable ASCII minus the characters YAML gives structural meaning, and it
- * may not BEGIN with an indicator. `@` and a backtick are reserved by the spec;
- * `|` and `>` open block scalars; `&`, `*`, `!`, `%` are anchors, aliases, tags
- * and directives; `[`, `]`, `{`, `}`, `,` are flow; `#` starts a comment; `-`,
- * `?` and `:` open block structures. `${{` is refused separately because an
- * expression is not a value this reader can evaluate.
- */
-const PLAIN_SCALAR = /^[A-Za-z0-9_/.+=~^$][A-Za-z0-9_/.+=~^$ ()'"@:;,!?&*|<>[\]{}\\#$-]*$/;
-
-function scalar(text: string): string | undefined {
-  for (const quote of ['"', "'"]) {
-    if (text.startsWith(quote)) {
-      if (text.length < 2 || !text.endsWith(quote)) return undefined;
-      const inner = text.slice(1, -1);
-      /**
-       * A DOUBLED QUOTE IS AN ESCAPE THIS READER DOES NOT IMPLEMENT. YAML reads
-       * `'a''b'` as `a'b`; reporting `a''b` is a misread, and implementing the
-       * rule invites the next escape nobody thought about.
-       */
-      if (inner.includes(quote)) return undefined;
-      return inner;
+export function checkNoExpressions(root: YamlMap): PolicyVerdict {
+  for (const value of allScalars(root)) {
+    if (EXPRESSION.test(value)) {
+      return refuse(
+        `the workflow contains the expression ${JSON.stringify(value)}, whose value this policy cannot determine`,
+      );
     }
   }
-  if (text.length === 0) return text;
-  /**
-   * A KEY-LOOKING VALUE IS NOT A VALUE. `foo: bar` in value position is a
-   * mapping to YAML and a string to the old reader.
-   */
-  if (/:\s/.test(text)) return undefined;
-  return PLAIN_SCALAR.test(text) ? text : undefined;
-}
-
-/**
- * Parses one block at `indent`, returning the node and the index after it.
- *
- * Deliberately simple and deliberately strict: anything that is neither a
- * `key:` entry nor a `- ` item at the expected indentation ends the block, and
- * a block that turns out to mix the two is refused by the caller.
- */
-function parseBlock(
-  lines: readonly Line[],
-  start: number,
-  indent: number,
-): { readonly node: YamlNode; readonly next: number } | { readonly reason: string } {
-  const first = lines[start];
-  if (first === undefined) {
-    return { reason: `expected a value at indentation ${indent} but the file ended` };
-  }
-  if (first.text.startsWith("- ") || first.text === "-") {
-    const items: YamlNode[] = [];
-    let index = start;
-    while (index < lines.length) {
-      const line = lines[index]!;
-      if (line.indent !== indent || !(line.text.startsWith("- ") || line.text === "-")) {
-        break;
-      }
-      const inline = line.text === "-" ? "" : line.text.slice(2).trim();
-      if (inline.length === 0) {
-        const nested = parseBlock(lines, index + 1, indent + 2);
-        if ("reason" in nested) return nested;
-        items.push(nested.node);
-        index = nested.next;
-        continue;
-      }
-      if (inline.includes(": ") || inline.endsWith(":")) {
-        // A mapping that begins on the dash line. Its remaining entries are
-        // indented two further, which is what `- uses:` + `  with:` looks like.
-        const entries: (readonly [string, YamlNode])[] = [];
-        const head = parseEntry(inline);
-        if (head === undefined) {
-          return { reason: `line ${line.number} is not a mapping entry this reader understands` };
-        }
-        if (head.value !== undefined) {
-          const headValue = scalar(head.value);
-          if (headValue === undefined) {
-            return { reason: `line ${line.number} has an unterminated quoted scalar` };
-          }
-          entries.push([head.key, headValue]);
-          index += 1;
-        } else {
-          const nested = parseBlock(lines, index + 1, indent + 4);
-          if ("reason" in nested) return nested;
-          entries.push([head.key, nested.node]);
-          index = nested.next;
-        }
-        while (index < lines.length) {
-          const cont = lines[index]!;
-          if (cont.indent !== indent + 2) break;
-          const entry = parseEntry(cont.text);
-          if (entry === undefined) {
-            return { reason: `line ${cont.number} is not a mapping entry this reader understands` };
-          }
-          if (entry.value !== undefined) {
-            const entryValue = scalar(entry.value);
-            if (entryValue === undefined) {
-              return { reason: `line ${cont.number} has an unterminated quoted scalar` };
-            }
-            entries.push([entry.key, entryValue]);
-            index += 1;
-          } else {
-            const nested = parseBlock(lines, index + 1, indent + 4);
-            if ("reason" in nested) return nested;
-            entries.push([entry.key, nested.node]);
-            index = nested.next;
-          }
-        }
-        /**
-         * THE SAME CHECK AS THE ORDINARY MAPPING PATH (round-5 review,
-         * CRITICAL 1). I added duplicate detection to one of the two places
-         * mappings are built, so `- run: npm ci` / `  run: npm install` was
-         * read as the first value and the second silently vanished.
-         */
-        const duplicateInItem = duplicateKey(entries);
-        if (duplicateInItem !== undefined) {
-          return { reason: `line ${line.number} declares ${JSON.stringify(duplicateInItem)} more than once` };
-        }
-        items.push({ kind: "map", entries });
-        continue;
-      }
-      const item = scalar(inline);
-      if (item === undefined) {
-        return { reason: `line ${line.number} has an unterminated quoted scalar` };
-      }
-      items.push(item);
-      index += 1;
-    }
-    return { node: { kind: "seq", items }, next: index };
-  }
-
-  const entries: (readonly [string, YamlNode])[] = [];
-  let index = start;
-  while (index < lines.length) {
-    const line = lines[index]!;
-    if (line.indent < indent) break;
-    if (line.indent > indent) {
-      return { reason: `line ${line.number} is indented deeper than its block without a parent key` };
-    }
-    const entry = parseEntry(line.text);
-    if (entry === undefined) {
-      return { reason: `line ${line.number} is not a mapping entry this reader understands` };
-    }
-    if (entry.value !== undefined) {
-      const value = scalar(entry.value);
-      if (value === undefined) {
-        return { reason: `line ${line.number} has an unterminated quoted scalar` };
-      }
-      entries.push([entry.key, value]);
-      index += 1;
-      continue;
-    }
-    /**
-     * A KEY WITH NOTHING UNDER IT IS NULL, NOT AN EMPTY MAPPING (round-8
-     * review, CRITICAL 2).
-     *
-     * `permissions:` followed by a sibling key produced `{kind: "map", entries:
-     * []}`, so `checkPermissions` iterated nothing and reported an explicit
-     * least-privilege block that is not there. YAML calls that null, and a null
-     * where a mapping is required is a different thing rather than an empty one.
-     *
-     * Refused rather than modelled: this reader has no null, and inventing one
-     * would give every policy a new case to get wrong.
-     */
-    const next = lines[index + 1];
-    if (next === undefined || next.indent <= indent) {
-      return { reason: `line ${line.number} declares ${JSON.stringify(entry.key)} with no value` };
-    }
-    const nested = parseBlock(lines, index + 1, indent + 2);
-    if ("reason" in nested) return nested;
-    entries.push([entry.key, nested.node]);
-    index = nested.next;
-  }
-  const duplicate = duplicateKey(entries);
-  if (duplicate !== undefined) {
-    return { reason: `the mapping declares ${JSON.stringify(duplicate)} more than once` };
-  }
-  return { node: { kind: "map", entries }, next: index };
-}
-
-/**
- * A KEY DECLARED TWICE IS NOT A QUESTION THIS READER MAY ANSWER (round-4
- * review, CRITICAL 1).
- *
- * `get()` returned the FIRST match, so a second `permissions:` granting write
- * was reported as read-only — a confident wrong answer rather than a missing
- * refusal, which is the worse failure. YAML implementations disagree about
- * duplicates and GitHub's is not this one, so the honest move is to refuse
- * rather than pick a winner.
- */
-function duplicateKey(entries: readonly (readonly [string, YamlNode])[]): string | undefined {
-  const seen = new Set<string>();
-  for (const [key] of entries) {
-    if (seen.has(key)) return key;
-    seen.add(key);
-  }
-  return undefined;
-}
-
-function parseEntry(text: string): { readonly key: string; readonly value?: string } | undefined {
-  const colon = findKeyColon(text);
-  if (colon === undefined) return undefined;
-  const key = scalar(text.slice(0, colon).trim());
-  if (key === undefined) return undefined;
-  const rest = text.slice(colon + 1).trim();
-  if (key.length === 0) return undefined;
-  return rest.length === 0 ? { key } : { key, value: rest };
-}
-
-/** The colon that separates key from value, ignoring colons inside quotes. */
-function findKeyColon(text: string): number | undefined {
-  let quote: string | undefined;
-  for (let index = 0; index < text.length; index += 1) {
-    const char = text[index];
-    if (quote !== undefined) {
-      if (char === quote) quote = undefined;
-      continue;
-    }
-    if (char === '"' || char === "'") {
-      quote = char;
-      continue;
-    }
-    if (char === ":" && (index + 1 === text.length || text[index + 1] === " ")) {
-      return index;
-    }
-  }
-  return undefined;
-}
-
-export function parseWorkflow(source: string): ParseResult {
-  const scanned = scan(source);
-  if (!scanned.ok) return { ok: false, reason: scanned.reason };
-  if (scanned.lines.length === 0) return { ok: false, reason: "the workflow is empty" };
-  const parsed = parseBlock(scanned.lines, 0, 0);
-  if ("reason" in parsed) return { ok: false, reason: parsed.reason };
-  if (parsed.next !== scanned.lines.length) {
-    const line = scanned.lines[parsed.next];
-    return { ok: false, reason: `line ${line?.number ?? "?"} was not consumed; the document is not a single mapping` };
-  }
-  if (typeof parsed.node === "string" || parsed.node.kind !== "map") {
-    return { ok: false, reason: "the workflow's top level is not a mapping" };
-  }
-  return { ok: true, root: parsed.node };
+  return { ok: true };
 }
 
 // ---------------------------------------------------------------- navigation
-
-export function get(node: YamlNode | undefined, key: string): YamlNode | undefined {
-  if (node === undefined || typeof node === "string" || node.kind !== "map") return undefined;
-  for (const [entryKey, value] of node.entries) {
-    if (entryKey === key) return value;
-  }
-  return undefined;
-}
 
 function seqItems(node: YamlNode | undefined): readonly YamlNode[] {
   return node !== undefined && typeof node !== "string" && node.kind === "seq" ? node.items : [];
@@ -462,6 +87,26 @@ function mapKeys(node: YamlNode | undefined): readonly string[] {
   return node !== undefined && typeof node !== "string" && node.kind === "map"
     ? node.entries.map(([key]) => key)
     : [];
+}
+
+/**
+ * Every step's value for `key`, or `undefined` if any step gives it a value
+ * that is not a single string.
+ *
+ * The same refusal-rather-than-filter rule as `stringList`, at the site where
+ * dropping was worst: `checkActionPins` treats an empty list as "no actions to
+ * pin, nothing to check", so a `uses:` that was a sequence rather than a string
+ * removed itself from the pin check and reported success.
+ */
+function stepValues(root: YamlMap, key: string): readonly string[] | undefined {
+  const values: string[] = [];
+  for (const step of steps(root)) {
+    const value = get(step, key);
+    if (value === undefined) continue;
+    if (typeof value !== "string") return undefined;
+    values.push(value);
+  }
+  return values;
 }
 
 /** Every step of every job, flattened, because the criteria are about all of them. */
@@ -589,10 +234,22 @@ export function checkWorkflowShape(root: YamlMap): PolicyVerdict {
       if (typeof step === "string" || step.kind !== "map") {
         return refuse(`job ${JSON.stringify(name)} has a step that is not a mapping`);
       }
-      for (const [key] of step.entries) {
+      for (const [key, value] of step.entries) {
         if (!ALLOWED_STEP_KEYS.includes(key)) {
           return refuse(
             `a step in job ${JSON.stringify(name)} declares ${JSON.stringify(key)}, which can change whether it runs or whether its failure counts`,
+          );
+        }
+        /**
+         * AND IT MUST BE THE SHAPE THE POLICIES READ IT AS. Allowing the KEY
+         * while ignoring its TYPE let a non-string `run:` or `uses:` through
+         * here and be dropped by the string filters downstream, so a step
+         * escaped the command allowlist and the pin check by not being a
+         * string at all. Naming a key is half of a shape check.
+         */
+        if (key !== "with" && typeof value !== "string") {
+          return refuse(
+            `a step in job ${JSON.stringify(name)} gives ${JSON.stringify(key)} a value that is not a single string`,
           );
         }
       }
@@ -609,10 +266,15 @@ export function checkWorkflowShape(root: YamlMap): PolicyVerdict {
         if (typeof withBlock === "string" || withBlock.kind !== "map") {
           return refuse(`the inputs to ${JSON.stringify(uses)} are not a mapping`);
         }
-        for (const [key] of withBlock.entries) {
+        for (const [key, value] of withBlock.entries) {
           if (!allowed.includes(key)) {
             return refuse(
               `${JSON.stringify(actionName(uses))} is given ${JSON.stringify(key)}, which can change what is checked out or how it runs`,
+            );
+          }
+          if (typeof value !== "string") {
+            return refuse(
+              `${JSON.stringify(actionName(uses))} is given ${JSON.stringify(key)} as something other than a single string`,
             );
           }
         }
@@ -666,6 +328,9 @@ export function checkCheckout(root: YamlMap): PolicyVerdict {
  * workflow legitimately runs is two, so it is written down.
  */
 export function checkRunAllowlist(root: YamlMap): PolicyVerdict {
+  if (stepValues(root, "run") === undefined) {
+    return refuse("a step gives run: something other than a single command, so the allowlist cannot judge it");
+  }
   for (const command of declaredRunCommands(root)) {
     if (!ALLOWED_RUN_COMMANDS.includes(command.trim())) {
       return refuse(
@@ -719,9 +384,10 @@ export function checkRunners(root: YamlMap): PolicyVerdict {
 const COMMIT_PIN = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?\/[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?@[0-9a-f]{40}$/;
 
 export function checkActionPins(root: YamlMap): PolicyVerdict {
-  const used = steps(root)
-    .map((step) => get(step, "uses"))
-    .filter((value): value is string => typeof value === "string");
+  const used = stepValues(root, "uses");
+  if (used === undefined) {
+    return refuse("a step names an action as something other than a single string, so it cannot be checked for a pin");
+  }
   if (used.length === 0) {
     // Not an error: a workflow using no actions has nothing to pin. Said out
     // loud so a reader does not mistake "nothing to check" for "checked".
@@ -744,6 +410,31 @@ export function checkActionPins(root: YamlMap): PolicyVerdict {
  * as valid and produces no evidence for either.
  */
 const REQUIRED_PR_TYPES: readonly string[] = ["opened", "synchronize"];
+
+/**
+ * A LIST OF STRINGS, or nothing — never the strings out of a list that also
+ * held something else.
+ *
+ * This replaced `items.filter(item => typeof item === "string")`, and the
+ * difference is the whole point of the new boundary. Under the hand-written
+ * reader a nested `- ["!**"]` was refused as unreadable SYNTAX, so the filter
+ * was never reached. A standards parser reads it correctly — as a sequence
+ * inside a sequence — and the filter then THREW IT AWAY and reported on the
+ * remainder, so `["**", ["!**"]]` was judged as `["**"]` and passed.
+ *
+ * That is the same defect the parser replacement was meant to end, one layer up:
+ * discarding what you cannot interpret and describing the rest is a misread, not
+ * a check. So a list this policy cannot read as patterns is REFUSED.
+ */
+function stringList(node: YamlNode | undefined): readonly string[] | undefined {
+  if (node === undefined || typeof node === "string" || node.kind !== "seq") return undefined;
+  const values: string[] = [];
+  for (const item of node.items) {
+    if (typeof item !== "string") return undefined;
+    values.push(item);
+  }
+  return values;
+}
 
 export function checkTriggers(root: YamlMap): PolicyVerdict {
   const on = get(root, "on");
@@ -773,9 +464,11 @@ export function checkTriggers(root: YamlMap): PolicyVerdict {
       }
       const branches = get(config, "branches");
       if (branches !== undefined) {
-        const patterns = branches !== undefined && typeof branches !== "string" && branches.kind === "seq"
-          ? branches.items.filter((item): item is string => typeof item === "string")
-          : [];
+        const listed = stringList(branches);
+        if (listed === undefined) {
+          return refuse(`${event} declares branches this policy cannot read as a list of patterns`);
+        }
+        const patterns = listed;
         if (!patterns.includes("**")) {
           return refuse(
             `${event} is limited to ${JSON.stringify(patterns)}, so a candidate on another branch produces no evidence`,
@@ -798,9 +491,10 @@ export function checkTriggers(root: YamlMap): PolicyVerdict {
       if (event === "pull_request") {
         const types = get(config, "types");
         if (types !== undefined) {
-          const declaredTypes = typeof types !== "string" && types.kind === "seq"
-            ? types.items.filter((item): item is string => typeof item === "string")
-            : [];
+          const declaredTypes = stringList(types);
+          if (declaredTypes === undefined) {
+            return refuse("pull_request declares types this policy cannot read as a list of activity names");
+          }
           for (const required of REQUIRED_PR_TYPES) {
             if (!declaredTypes.includes(required)) {
               return refuse(
