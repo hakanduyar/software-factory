@@ -200,4 +200,3 @@ whatever work next changes what publication records.
 Not fixed inside TASK-016 because the accepting verdict binds to that tree
 byte-for-byte (ADR-0002 condition 9), and a test-scope improvement is not worth
 invalidating an acceptance for.
-
