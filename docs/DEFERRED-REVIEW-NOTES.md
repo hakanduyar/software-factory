@@ -171,3 +171,33 @@ the reviewer explicitly agreed it belongs elsewhere.
 The fix is one test that isolates the actor-kind check from token verification
 — a forged actor whose token WOULD verify, so only the kind check can refuse.
 It wants its own task with its own frozen criteria.
+
+## The shipped AC-6 durable test carries its token in a field the record drops (TASK-016 round 12, non-blocking)
+
+The accepting review observed this precisely: the shipped durable case plants a
+token in the pull request's BRANCH NAME, and `publicationDetail` never writes a
+branch name — it records the pull request number, the validated head SHA, and
+the check conclusion, count and SHA. So the token could not have reached the
+record from there, and the case's "no token in durable state" assertion is
+weaker than it looks. What the case DOES prove, and what it was added for, is
+that the recorder is reached at all: bypassing `withPublicationRecorded` inside
+`recordPublication` fails it, which is the round-11 finding it closes.
+
+The same reviewer answered the question that makes this bearable: no arbitrary
+remote field reaches durable publication detail. Only the PR number, a validated
+commit SHA, the check conclusion/count/SHA, and the locally supplied roadmap key
+are recorded — and a roadmap key must already name an existing roadmap item.
+There is, today, no field through which remote text can carry arbitrary content
+into the chain.
+
+So the gap is in the STRENGTH OF THE EVIDENCE, not in the behaviour. Closing it
+means either finding a remote-derived field that genuinely reaches the record —
+there is none at present — or asserting the property differently, for instance
+by proving that every field written to the record is validated to a shape that
+cannot hold a token. The second is the honest formulation and belongs with
+whatever work next changes what publication records.
+
+Not fixed inside TASK-016 because the accepting verdict binds to that tree
+byte-for-byte (ADR-0002 condition 9), and a test-scope improvement is not worth
+invalidating an acceptance for.
+
