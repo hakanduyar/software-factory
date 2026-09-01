@@ -1660,7 +1660,29 @@ const GUARDED_MODULES = [
   ["src/adapters/supervision/isolatedExecutor.ts", "tests/executorIsolation.test.ts", "isolatedExecutor"],
 ];
 
+/**
+ * SOME GUARDS ARE REQUIRED BY SOMETHING OTHER THAN THEIR OWN MODULE (round-7
+ * review, CRITICAL 3).
+ *
+ * A pair skips when the module is absent, which is right for a fixture and
+ * wrong for a coordinated deletion: moving BOTH `workflowPolicy.ts` and its
+ * test out of the tree left the shipped workflow completely unvalidated and
+ * nothing failed. The workflow is still there; what left was everything that
+ * checks it.
+ *
+ * So a pair may name an ANCHOR — a third file whose presence makes the pair
+ * mandatory regardless of the module. The workflow's anchor is the workflow.
+ */
+const GUARD_ANCHORS = {
+  "src/verification/workflowPolicy.ts": ".github/workflows/verify.yml",
+};
+
 const unguarded = GUARDED_MODULES.flatMap(([module, test, marker]) => {
+  const anchor = GUARD_ANCHORS[module];
+  const anchored = anchor !== undefined && existsSync(join(REPO_ROOT, anchor));
+  if (anchored && !existsSync(join(REPO_ROOT, module))) {
+    return [[module, test, `is missing while ${anchor} is still present and unvalidated`]];
+  }
   if (!existsSync(join(REPO_ROOT, module))) return [];
   if (!existsSync(join(REPO_ROOT, test))) return [[module, test, "is missing"]];
   if (!sourceTests.includes(test)) return [[module, test, "exists but is not compiled, so it never runs"]];

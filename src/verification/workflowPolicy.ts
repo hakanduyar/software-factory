@@ -45,7 +45,17 @@ function refuse(reason: string): PolicyVerdict {
   return { ok: false, reason };
 }
 
-/** Constructs this parser deliberately does not implement, and will not guess at. */
+/**
+ * Constructs this parser deliberately does not implement, and will not guess at.
+ *
+ * REDUNDANT FOR THE VERDICT SINCE THE GRAMMAR CLOSED, AND SAID SO PLAINLY.
+ * `PLAIN_SCALAR` refuses most of these on its own — mutation showed that
+ * removing an individual entry changes no outcome. They are kept for the
+ * DIAGNOSTIC: "line 3 uses a flow sequence" sends a reader somewhere, and "not
+ * admitted by the grammar" does not. The cases assert those exact reasons, so
+ * the entries are load-bearing for the thing they are actually for rather than
+ * decoration nobody can tell from its absence.
+ */
 const UNSUPPORTED: readonly (readonly [RegExp, string])[] = [
   [/\t/, "a tab, which YAML forbids for indentation"],
   /**
@@ -69,7 +79,17 @@ const UNSUPPORTED: readonly (readonly [RegExp, string])[] = [
    * YAML parser would. The rule is now the simple one: this workflow has no
    * need of a backslash, so a backslash is refused.
    */
-  [/\\/, "a backslash, which this reader does not interpret"],
+  [/\\/, "a backslash"],
+  /**
+   * AN EXPRESSION IS NOT A VALUE THIS READER CAN EVALUATE (round-7 review).
+   *
+   * Three rounds of secret bypasses were three ways of spelling one:
+   * `secrets.NAME`, `secrets['NAME']`, `toJSON(secrets)`, and `github.token`
+   * which names no secret at all while being one. Matching spellings is the
+   * losing game the closed grammar exists to stop playing. This workflow needs
+   * no expression, so an expression is refused and the class closes.
+   */
+  [/\$\{\{/, "a ${{ }} expression"],
   /**
    * Non-ASCII whitespace. `trimStart()` treats U+00A0 and friends as space and
    * YAML does not, so indentation written with them computes a depth the file
@@ -173,16 +193,52 @@ function stripComment(line: string): string {
  * became the five characters `"veri` plus `fy` — an opening quote silently
  * promoted into the value of a file YAML would reject.
  */
+/**
+ * What a PLAIN scalar may contain, stated as what is ADMITTED.
+ *
+ * Printable ASCII minus the characters YAML gives structural meaning, and it
+ * may not BEGIN with an indicator. `@` and a backtick are reserved by the spec;
+ * `|` and `>` open block scalars; `&`, `*`, `!`, `%` are anchors, aliases, tags
+ * and directives; `[`, `]`, `{`, `}`, `,` are flow; `#` starts a comment; `-`,
+ * `?` and `:` open block structures. `${{` is refused separately because an
+ * expression is not a value this reader can evaluate.
+ */
+const PLAIN_SCALAR = /^[A-Za-z0-9_/.+=~^$][A-Za-z0-9_/.+=~^$ ()'"@:;,!?&*|<>[\]{}\\#$-]*$/;
+
+/**
+ * A scalar, or `undefined` when the text is not one this grammar admits.
+ *
+ * A CLOSED GRAMMAR (round-7 review). The previous version returned arbitrary
+ * plain text unchanged and relied on a list of refusals to catch what was
+ * wrong, so `@not-yaml`, `|foo` and `foo: bar` all parsed while a real YAML
+ * parser rejects them. Being a denylist, it could only ever catch the
+ * constructs somebody had thought of — which is how six review rounds each
+ * found another one.
+ *
+ * Now a scalar is what the grammar ADMITS. Not thinking of a construct is the
+ * REFUSING case rather than the accepting one, which is the whole difference.
+ */
 function scalar(text: string): string | undefined {
   for (const quote of ['"', "'"]) {
     if (text.startsWith(quote)) {
-      // Only a value that OPENS with a quote is a quoted scalar. One that
-      // merely ends with one — `true && echo 'npm ci'` — is plain text, and
-      // refusing it refused a legitimate command.
-      return text.length >= 2 && text.endsWith(quote) ? text.slice(1, -1) : undefined;
+      if (text.length < 2 || !text.endsWith(quote)) return undefined;
+      const inner = text.slice(1, -1);
+      /**
+       * A DOUBLED QUOTE IS AN ESCAPE THIS READER DOES NOT IMPLEMENT. YAML reads
+       * `'a''b'` as `a'b`; reporting `a''b` is a misread, and implementing the
+       * rule invites the next escape nobody thought about.
+       */
+      if (inner.includes(quote)) return undefined;
+      return inner;
     }
   }
-  return text;
+  if (text.length === 0) return text;
+  /**
+   * A KEY-LOOKING VALUE IS NOT A VALUE. `foo: bar` in value position is a
+   * mapping to YAML and a string to the old reader.
+   */
+  if (/:\s/.test(text)) return undefined;
+  return PLAIN_SCALAR.test(text) ? text : undefined;
 }
 
 /**
@@ -442,6 +498,15 @@ const ALLOWED_EVENT_KEYS: readonly string[] = ["branches", "types"];
  * that changes where or how the job runs.
  */
 const ALLOWED_JOB_KEYS: readonly string[] = ["runs-on", "steps"];
+/**
+ * EXACTLY ONE JOB (round-7 review, HIGH 4).
+ *
+ * `steps()` concatenates the steps of every job, so a second job with no
+ * checkout and no Node pin passed every check on the strength of the first
+ * job's. GitHub gives each job its own workspace, so that reading was simply
+ * wrong. One job is what this workflow needs, and one job is what it may have.
+ */
+const MAX_JOBS = 1;
 /** NO `if`, NO `continue-on-error`, NO `env`, NO `working-directory`. */
 const ALLOWED_STEP_KEYS: readonly string[] = ["name", "uses", "run", "with"];
 /**
@@ -491,6 +556,11 @@ export function checkWorkflowShape(root: YamlMap): PolicyVerdict {
   const jobs = get(root, "jobs");
   if (jobs === undefined || typeof jobs === "string" || jobs.kind !== "map" || jobs.entries.length === 0) {
     return refuse("the workflow declares no jobs");
+  }
+  if (jobs.entries.length > MAX_JOBS) {
+    return refuse(
+      `the workflow declares ${jobs.entries.length} jobs; each has its own workspace, and these checks describe one`,
+    );
   }
   for (const [name, job] of jobs.entries) {
     if (typeof job === "string" || job.kind !== "map") {

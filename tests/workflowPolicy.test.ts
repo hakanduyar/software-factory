@@ -122,20 +122,33 @@ describe("TASK-017: the reader refuses what it does not implement", () => {
    * structure, so a parser that guessed at an unimplemented construct would
    * make every one of those claims a guess too. These cases pin the refusals.
    */
-  for (const [label, source] of [
-    ["a tab", "name: x\n\tfoo: 1\n"],
-    ["a document marker", "---\nname: x\n"],
-    ["an anchor", "name: x\nbase: &anchor 1\n"],
-    ["an alias", "name: x\nother: *anchor\n"],
-    ["a block scalar", "name: x\nscript: |\n  line\n"],
-    ["a flow mapping", "name: x\nwith: { a: 1 }\n"],
-    ["a flow sequence", 'name: x\nbranches: ["**"]\n'],
-    ["odd indentation", "name: x\njobs:\n   verify: 1\n"],
+  /**
+   * THE REASON, not merely the refusal.
+   *
+   * Once the grammar closed, removing an individual refusal entry changed no
+   * outcome — `PLAIN_SCALAR` refuses these anyway — so four of these cases
+   * could not tell their guard from its absence. The entries are kept for the
+   * DIAGNOSTIC, so the diagnostic is what is asserted.
+   */
+  for (const [label, source, reason] of [
+    ["a tab", "name: x\n\tfoo: 1\n", /tab/],
+    ["a document marker", "---\nname: x\n", /document marker/],
+    ["an anchor", "name: x\nbase: &anchor 1\n", /anchor/],
+    ["an alias", "name: x\nother: *anchor\n", /alias/],
+    ["a block scalar", "name: x\nscript: |\n  line\n", /block scalar/],
+    ["a flow mapping", "name: x\nwith: { a: 1 }\n", /flow mapping/],
+    ["a flow sequence", 'name: x\nbranches: ["**"]\n', /flow sequence/],
+    ["odd indentation", "name: x\njobs:\n   verify: 1\n", /multiples of two/],
   ] as const) {
     it(`refuses ${label} rather than approximating it`, () => {
       const parsed = parseWorkflow(source);
 
       assert.equal(parsed.ok, false, `${label} was parsed instead of refused`);
+      assert.match(
+        parsed.ok === false ? parsed.reason : "",
+        reason,
+        `${label} was refused, but not for the reason that names it`,
+      );
     });
   }
 
@@ -398,7 +411,7 @@ describe("TASK-017 AC-2: the Node version is a decision bound to engines", () =>
         "    runs-on: ubuntu-latest",
         "    steps:",
         `      - uses: actions/setup-node@${"b".repeat(40)}`,
-        "        if: ${{ false }}",
+        "        if: success()",
         "        with:",
         '          node-version: "22.5.0"',
         "",
@@ -451,14 +464,14 @@ describe("TASK-017 AC-2: the Node version is a decision bound to engines", () =>
  */
 describe("TASK-017 round-1 CRITICAL: the policies read execution, not text", () => {
   it("refuses an install step that a condition prevents from running", () => {
-    const verdict = checkInstall(workflow({ stepIf: "${{ false }}" }));
+    const verdict = checkInstall(workflow({ stepIf: "success()" }));
 
     assert.equal(verdict.ok, false, "a skipped npm ci counted as an install");
     assert.match(verdict.ok === false ? verdict.reason : "", /unconditionally/);
   });
 
   it("refuses a verification step that a condition prevents from running", () => {
-    const verdict = checkVerificationCommand(workflow({ stepIf: "${{ false }}" }));
+    const verdict = checkVerificationCommand(workflow({ stepIf: "success()" }));
 
     assert.equal(verdict.ok, false, "a skipped npm test counted as verification");
     assert.match(verdict.ok === false ? verdict.reason : "", /unconditionally/);
@@ -466,7 +479,7 @@ describe("TASK-017 round-1 CRITICAL: the policies read execution, not text", () 
 
   /** ANY condition, not just a false one — evaluating them would be guessing. */
   it("refuses a verification step under a condition that might be true", () => {
-    const verdict = checkVerificationCommand(workflow({ stepIf: "${{ github.event_name == 'push' }}" }));
+    const verdict = checkVerificationCommand(workflow({ stepIf: "failure()" }));
 
     assert.equal(verdict.ok, false, "a conditional verification step was accepted");
   });
@@ -693,10 +706,10 @@ describe("TASK-017 round-2: the workflow shape is an allowlist", () => {
 
   /** The reviewer's four job- and step-level execution controls. */
   for (const [label, after, added] of [
-    ["a job-level condition", "  verify:", ["    if: ${{ false }}"]],
+    ["a job-level condition", "  verify:", ["    if: success()"]],
     ["job-level continue-on-error", "  verify:", ["    continue-on-error: true"]],
     ["job-level permissions", "  verify:", ["    permissions:", "      contents: write"]],
-    ["a step-level condition", `      - uses: actions/setup-node@${"b".repeat(40)}`, ["        if: ${{ false }}"]],
+    ["a step-level condition", `      - uses: actions/setup-node@${"b".repeat(40)}`, ["        if: success()"]],
   ] as const) {
     it(`refuses ${label}`, () => {
       const verdict = checkWorkflowShape(withLines(after, added));
@@ -888,33 +901,87 @@ describe("TASK-017 round-3 CRITICAL: escaped scalars are refused, not misread", 
   });
 });
 
-describe("TASK-017 round-3 CRITICAL 2: a secret is refused in values, not only raw text", () => {
-  it("refuses a secret reference found in a parsed value", () => {
+describe("TASK-017: a secret cannot be named, however it is spelled", () => {
+  /**
+   * THREE ROUNDS OF BYPASSES WERE THREE SPELLINGS OF ONE THING:
+   * `secrets.NAME`, `secrets['NAME']`, `toJSON(secrets)`, and `github.token`
+   * which names no secret while being one. Matching spellings is the losing
+   * game the closed grammar exists to stop playing — an expression is now
+   * refused outright, so every spelling inside one goes with it.
+   */
+  for (const [label, value] of [
+    ["a dotted secret", "${{ secrets.S }}"],
+    ["an indexed secret", "${{ secrets['S'] }}"],
+    ["a serialised secrets context", "${{ toJSON(secrets) }}"],
+    ["the implicit token", "${{ github.token }}"],
+    ["any expression at all", "${{ github.sha }}"],
+  ] as const) {
+    it(`refuses ${label} before any policy sees it`, () => {
+      const parsed = parseWorkflow(`name: x\nvalue: ${value}\n`);
+
+      assert.equal(parsed.ok, false, `${value} was parsed instead of refused`);
+      assert.match(parsed.ok === false ? parsed.reason : "", /expression/);
+    });
+  }
+
+  /**
+   * And `checkPermissions` keeps a case of its own, because the grammar and the
+   * policy are independent layers and neither should be the other's only
+   * evidence. A bare `secrets.` in a plain value needs no expression syntax.
+   */
+  /**
+   * The BRACKET branch needs a case of its own. Inside an expression it is
+   * redundant — the grammar refuses the whole expression — so the spelling
+   * that exercises it is a plain value the grammar admits.
+   */
+  it("refuses an indexed secret named in a plain value", () => {
     const parsed = parseWorkflow(
       [
         "name: x",
-        "on:",
-        "  push:",
-        "    branches:",
-        '      - "**"',
+        // A COMPLETE permissions block, so ONLY the secret check can
+        // decide this. Without it the "no permissions block" refusal
+        // fired first and the case passed either way — the fifth
+        // sibling-guard masking in this task.
         "permissions:",
         "  contents: read",
         "jobs:",
         "  v:",
-        "    runs-on: ubuntu-latest",
         "    steps:",
-        "      - run: npm test",
-        "        name: ${{ secrets.SENSITIVE }}",
+        "      - name: secrets['SENSITIVE']",
         "",
       ].join("\n"),
     );
     assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
     if (!parsed.ok) return;
 
-    // The RAW source given here is clean, so only the value scan can refuse it.
-    const verdict = checkPermissions(parsed.root, "nothing suspicious here");
+    const verdict = checkPermissions(parsed.root, "raw source is clean");
 
-    assert.equal(verdict.ok, false, "a secret in a parsed value was accepted");
+    assert.equal(verdict.ok, false, "an indexed secret in a plain value was accepted");
+  });
+
+  it("refuses a secret named in a plain value with no expression syntax", () => {
+    const parsed = parseWorkflow(
+      [
+        "name: x",
+        // A COMPLETE permissions block, so ONLY the secret check can
+        // decide this. Without it the "no permissions block" refusal
+        // fired first and the case passed either way — the fifth
+        // sibling-guard masking in this task.
+        "permissions:",
+        "  contents: read",
+        "jobs:",
+        "  v:",
+        "    steps:",
+        "      - name: secrets.SENSITIVE",
+        "",
+      ].join("\n"),
+    );
+    assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+    if (!parsed.ok) return;
+
+    const verdict = checkPermissions(parsed.root, "raw source is clean");
+
+    assert.equal(verdict.ok, false, "a secret named in a plain value was accepted");
     assert.match(verdict.ok === false ? verdict.reason : "", /secret/);
   });
 });
@@ -1056,6 +1123,26 @@ describe("TASK-017: a guarded module may not lose the test that guards it", () =
    * file being deleted, which is the circularity. The marker check lives in
    * `verify.mjs`, the trusted core, so there is nothing to escape through.
    */
+  /**
+   * A COORDINATED DELETION removes the module AND its test, and a pair that
+   * skips when the module is absent then leaves the shipped workflow entirely
+   * unvalidated (round-7 review, CRITICAL 3). Some guards are required by
+   * something other than their own module — the workflow's anchor is the
+   * workflow.
+   */
+  it("anchors the workflow guard to the workflow itself", () => {
+    assert.match(
+      VERIFIER,
+      /GUARD_ANCHORS/,
+      "no anchor exists, so deleting the policy module and its test together goes unnoticed",
+    );
+    assert.match(
+      VERIFIER,
+      /anchored && !existsSync\(join\(REPO_ROOT, module\)\)/,
+      "the anchor is declared but nothing fails when the anchored module disappears",
+    );
+  });
+
   it("requires the verifier itself to check the marker, not just the paths", () => {
     assert.match(
       VERIFIER,
@@ -1155,27 +1242,18 @@ describe("TASK-017 round-4 CRITICAL: invalid YAML is refused, not reinterpreted"
  * TASK-017 round-6 review: two more ways to spell something the reader misread.
  */
 describe("TASK-017 round-6 CRITICAL: context syntax and flow items", () => {
-  it("refuses a secret referenced with index syntax", () => {
-    const parsed = parseWorkflow(
-      ["name: x", "jobs:", "  v:", "    steps:", "      - with:", "          k: ${{ secrets['S'] }}", ""].join("\n"),
-    );
-    assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
-    if (!parsed.ok) return;
-
-    const verdict = checkPermissions(parsed.root, "raw source is clean");
-
-    assert.equal(verdict.ok, false, "secrets['NAME'] was accepted");
-    assert.match(verdict.ok === false ? verdict.reason : "", /secret/);
-  });
-
-  it("still refuses the dotted spelling", () => {
-    const parsed = parseWorkflow(
-      ["name: x", "jobs:", "  v:", "    steps:", "      - with:", "          k: ${{ secrets.S }}", ""].join("\n"),
-    );
-    assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
-    if (!parsed.ok) return;
-
-    assert.equal(checkPermissions(parsed.root, "clean").ok, false);
+  /**
+   * These two moved to the GRAMMAR. `${{ secrets['S'] }}` and `${{ secrets.S }}`
+   * are refused before any policy sees them, which is stronger than the policy
+   * refusal they used to get — see "a secret cannot be named, however it is
+   * spelled" above. Kept here as a pointer rather than deleted silently,
+   * because a reader looking for the round-6 finding should find where it went.
+   */
+  it("refuses both secret spellings at the grammar, not the policy", () => {
+    for (const value of ["${{ secrets['S'] }}", "${{ secrets.S }}"]) {
+      const parsed = parseWorkflow(`name: x\nvalue: ${value}\n`);
+      assert.equal(parsed.ok, false, `${value} was parsed`);
+    }
   });
 
   /** A bare `!` is a tag YAML strips and this reader kept. */
@@ -1183,6 +1261,7 @@ describe("TASK-017 round-6 CRITICAL: context syntax and flow items", () => {
     const parsed = parseWorkflow("name: x\nvalue: ! something\n");
 
     assert.equal(parsed.ok, false, "a bare tag was read as part of the value");
+    assert.match(parsed.ok === false ? parsed.reason : "", /tag/);
   });
 
   /** A flow collection is one wherever it sits, including after a dash. */
@@ -1192,6 +1271,7 @@ describe("TASK-017 round-6 CRITICAL: context syntax and flow items", () => {
     );
 
     assert.equal(parsed.ok, false, "a nested flow sequence was read as a string");
+    assert.match(parsed.ok === false ? parsed.reason : "", /flow collection in a sequence item/);
   });
 
   it("refuses a flow mapping used as a sequence item", () => {
@@ -1202,5 +1282,116 @@ describe("TASK-017 round-6 CRITICAL: context syntax and flow items", () => {
 
   it("still parses the shipped workflow", () => {
     assert.equal(parseWorkflow(SOURCE).ok, true);
+  });
+});
+
+/**
+ * TASK-017 round-7 review: the grammar is CLOSED, so not thinking of a
+ * construct is the refusing case.
+ *
+ * The reviewer's diagnosis was exact — "the hand-written approach can converge
+ * only if it enforces a genuinely closed grammar; this implementation has not
+ * converged". Six rounds each found another construct the denylist had not
+ * anticipated, because a denylist can only hold what somebody thought of.
+ *
+ * A scalar is now what the grammar ADMITS. These cases pin both halves: the
+ * things it must refuse, and the ordinary values it must still accept — a
+ * grammar that refuses everything would pass the first half and be useless.
+ */
+describe("TASK-017 round-7 CRITICAL: the scalar grammar is closed", () => {
+  for (const [label, value] of [
+    ["a reserved indicator", "@not-yaml"],
+    ["a block-scalar opener", "|foo"],
+    ["a folded-scalar opener", ">foo"],
+    ["a key-looking value", "foo: bar"],
+    ["an anchor-looking value", "&anchor"],
+    ["an alias-looking value", "*alias"],
+    ["a directive", "%YAML 1.2"],
+    ["a backtick", "`command`"],
+    ["a flow opener", "[a, b]"],
+  ] as const) {
+    it(`refuses ${label}`, () => {
+      const parsed = parseWorkflow(`name: ${value}\n`);
+
+      assert.equal(parsed.ok, false, `${JSON.stringify(value)} was admitted`);
+    });
+  }
+
+  /**
+   * A doubled quote is an escape this reader does not implement. YAML reads
+   * `'a''b'` as `a'b`; reporting `a''b` is a misread, and implementing the rule
+   * invites the next escape nobody thought about.
+   */
+  it("refuses a single-quoted scalar containing a doubled quote", () => {
+    const parsed = parseWorkflow("name: 'a''b'\n");
+
+    assert.equal(parsed.ok, false, "a YAML escape was reported with its own syntax intact");
+  });
+
+  /** THE OTHER HALF: ordinary values must still be admitted. */
+  for (const [label, value, expected] of [
+    ["a plain word", "verify", "verify"],
+    ["a dotted version", "22.5.0", "22.5.0"],
+    ["a path", "src/verification/workflowPolicy.ts", "src/verification/workflowPolicy.ts"],
+    ["a command with quotes", "true && echo 'npm ci'", "true && echo 'npm ci'"],
+    ["a quoted wildcard", '"**"', "**"],
+    ["a pinned action", "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"],
+  ] as const) {
+    it(`still admits ${label}`, () => {
+      const parsed = parseWorkflow(`name: ${value}\n`);
+
+      assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+      if (!parsed.ok) return;
+      assert.equal(get(parsed.root, "name"), expected);
+    });
+  }
+
+  it("still parses the shipped workflow", () => {
+    assert.equal(parseWorkflow(SOURCE).ok, true);
+  });
+});
+
+/**
+ * TASK-017 round-7 HIGH 4: jobs have separate workspaces.
+ *
+ * `steps()` concatenated every job's steps, so a second job with no checkout
+ * and no Node pin passed every check on the strength of the first job's. That
+ * is not a missing refusal — it is reading two workspaces as one.
+ */
+describe("TASK-017 round-7 HIGH 4: a second job is not covered by the first", () => {
+  it("refuses a workflow declaring more than one job", () => {
+    const parsed = parseWorkflow(
+      [
+        "name: x",
+        "on:",
+        "  push:",
+        "    branches:",
+        '      - "**"',
+        "permissions:",
+        "  contents: read",
+        "jobs:",
+        "  verify:",
+        "    runs-on: ubuntu-latest",
+        "    steps:",
+        `      - uses: actions/checkout@${"a".repeat(40)}`,
+        "  unclean:",
+        "    runs-on: ubuntu-latest",
+        "    steps:",
+        "      - run: npm test",
+        "",
+      ].join("\n"),
+    );
+    assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+    if (!parsed.ok) return;
+
+    const verdict = checkWorkflowShape(parsed.root);
+
+    assert.equal(verdict.ok, false, "a second job rode on the first job's checkout");
+    assert.match(verdict.ok === false ? verdict.reason : "", /own workspace|2 jobs/);
+  });
+
+  it("accepts the shipped workflow, which declares one", () => {
+    assert.equal(checkWorkflowShape(shipped()).ok, true);
   });
 });

@@ -118,7 +118,7 @@ const MUTATIONS = [
   },
   {
     id: "the SHIPPED workflow skips its verification with a condition",
-    edits: [[WORKFLOW, "      - run: npm test", "      - run: npm test\n        if: ${{ false }}"]],
+    edits: [[WORKFLOW, "      - run: npm test", "      - run: npm test\n        if: success()"]],
     tests: [T_WF],
     expect: "accepts the shipped workflow's verification command",
   },
@@ -185,7 +185,7 @@ const MUTATIONS = [
       "  if (SECRET_REFERENCE.test(source) || allScalars(root).some((value) => SECRET_REFERENCE.test(value))) {",
       "  void allScalars;\n  if (SECRET_REFERENCE.test(source)) {"]],
     tests: [T_WF],
-    expect: "secret reference found in a parsed value",
+    expect: "secret named in a plain value with no expression",
   },
   {
     id: "the job key allowlist is dropped, so job-level permissions return",
@@ -226,7 +226,7 @@ const MUTATIONS = [
   {
     id: "the parser reads backslashes literally",
     edits: [[POLICY,
-      '  [/\\\\/, "a backslash, which this reader does not interpret"],\n',
+      '  [/\\\\/, "a backslash"],\n',
       ""]],
     tests: [T_WF],
     expect: "refuses a hex escape",
@@ -315,7 +315,7 @@ const MUTATIONS = [
       "  const SECRET_REFERENCE = /\\bsecrets\\s*(\\.|\\[)/;",
       "  const SECRET_REFERENCE = /\\bsecrets\\./;"]],
     tests: [T_WF],
-    expect: "secret referenced with index syntax",
+    expect: "indexed secret named in a plain value",
   },
   {
     id: "a bare tag with a space after it is read as a value",
@@ -332,6 +332,55 @@ const MUTATIONS = [
       ""]],
     tests: [T_WF],
     expect: "flow sequence used as a sequence item",
+  },
+  // ---- round-7: the closed grammar ----------------------------------------
+  {
+    id: "the scalar grammar opens up again",
+    edits: [[POLICY,
+      "  return PLAIN_SCALAR.test(text) ? text : undefined;",
+      "  void PLAIN_SCALAR;\n  return text;"]],
+    tests: [T_WF],
+    expect: "refuses a reserved indicator",
+  },
+  {
+    id: "a doubled quote is read with its own syntax intact",
+    edits: [[POLICY,
+      "      if (inner.includes(quote)) return undefined;",
+      "      if (false) return undefined;"]],
+    tests: [T_WF],
+    expect: "doubled quote",
+  },
+  {
+    id: "a key-looking value is admitted",
+    edits: [[POLICY,
+      "  if (/:\\s/.test(text)) return undefined;",
+      "  if (false) return undefined;"]],
+    tests: [T_WF],
+    expect: "key-looking value",
+  },
+  {
+    id: "expressions are evaluated rather than refused",
+    edits: [[POLICY,
+      '  [/\\$\\{\\{/, "a ${{ }} expression"],\n',
+      ""]],
+    tests: [T_WF],
+    expect: "serialised secrets context",
+  },
+  {
+    id: "a second job rides on the first job's checkout",
+    edits: [[POLICY,
+      "  if (jobs.entries.length > MAX_JOBS) {",
+      "  void MAX_JOBS;\n  if (false as boolean) {"]],
+    tests: [T_WF],
+    expect: "declaring more than one job",
+  },
+  {
+    id: "a coordinated deletion leaves the workflow unvalidated",
+    edits: [[VERIFIER,
+      "  if (anchored && !existsSync(join(REPO_ROOT, module))) {",
+      "  if (false) {"]],
+    tests: [T_WF],
+    expect: "anchors the workflow guard",
   },
   // ---- AC-9: the liability report stays honest ------------------------------
   {

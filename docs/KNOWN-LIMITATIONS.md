@@ -893,11 +893,22 @@ mints it.
 ### 2. A remote write cannot be demonstrated free
 
 The one remaining write is creating a pull request. Its liability channels are
-observed and reported, and six of the seven are closed for this repository:
-Actions metering (visibility PUBLIC), organisation webhooks (owner is a USER,
-which cannot have them), repository webhooks (count 0), existing workflows
-(count 0), introduced workflows (the candidate adds none), and the target
-identity itself.
+observed and reported. Four are closed for this repository: Actions metering
+(visibility PUBLIC), organisation webhooks (owner is a USER, which cannot have
+them), repository webhooks (count 0), and the target identity itself.
+
+**Two changed with TASK-017, and this paragraph said otherwise for a while.**
+`existing-workflows` closes only while the repository has none, and TASK-017
+gave it its first — `.github/workflows/verify.yml` — so that channel is now
+permanently OPEN. `introduced-workflows` closes only while the candidate adds
+none, and the TASK-017 candidate is the one that added it, so it was open for
+that candidate too.
+
+Nothing changes operationally: the seventh channel below was already open and
+already refuses every remote write. What changed is what an honest report says,
+and the executable report has said it correctly since TASK-017 — this prose had
+not caught up, which the round-7 review found. A register describing the world
+as it was before the change is the failure the criterion exists to prevent.
 
 The seventh cannot be closed. A GitHub App can subscribe to repository events
 independently of both webhook scopes, and App installations are NOT observable
