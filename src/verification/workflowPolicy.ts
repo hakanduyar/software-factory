@@ -310,6 +310,186 @@ export function steps(root: YamlMap): readonly YamlNode[] {
   return collected;
 }
 
+
+// ------------------------------------------------------------------- schema
+
+/**
+ * WHAT THIS WORKFLOW IS ALLOWED TO CONTAIN (round-2 review).
+ *
+ * The parser refuses YAML constructs it does not implement. The policies did
+ * not extend that courtesy to WORKFLOW FEATURES, and the round-2 review walked
+ * straight through the gap: `jobs.verify.if: ${{ false }}` skips the job,
+ * `jobs.verify.continue-on-error: true` makes its failure harmless,
+ * `jobs.verify.permissions: contents: write` overrides the root block,
+ * `paths-ignore: ["**"]` stops the workflow running at all, and a negative
+ * branch pattern after `**` excludes everything it just included. Each is
+ * documented GitHub behaviour. Each passed every check.
+ *
+ * Fixing them individually is a losing game — six were found after four were
+ * fixed — so this is an ALLOWLIST. A key nobody here has reasoned about is
+ * refused, which is the same bargain the parser makes: this can be wrong only
+ * by refusing a workflow it could have accepted, which fails visibly.
+ *
+ * Adding a key here is a deliberate act that says "I have thought about what
+ * this does to the guarantees". That is the point.
+ */
+const ALLOWED_ROOT_KEYS: readonly string[] = ["name", "on", "permissions", "jobs"];
+const ALLOWED_EVENTS: readonly string[] = ["pull_request", "push"];
+const ALLOWED_EVENT_KEYS: readonly string[] = ["branches", "types"];
+/**
+ * NO `if`, NO `continue-on-error`, NO `permissions` at job level, and nothing
+ * that changes where or how the job runs.
+ */
+const ALLOWED_JOB_KEYS: readonly string[] = ["runs-on", "steps"];
+/** NO `if`, NO `continue-on-error`, NO `env`, NO `working-directory`. */
+const ALLOWED_STEP_KEYS: readonly string[] = ["name", "uses", "run", "with"];
+/**
+ * `with` inputs, per action. `actions/checkout` accepts `repository` and `ref`,
+ * which would let the clean room verify somebody else's code entirely — the
+ * round-2 reviewer repointed it and every check stayed green.
+ */
+const ALLOWED_WITH_KEYS: Readonly<Record<string, readonly string[]>> = {
+  "actions/checkout": ["persist-credentials"],
+  "actions/setup-node": ["node-version"],
+};
+/** The only commands this workflow may run. */
+const ALLOWED_RUN_COMMANDS: readonly string[] = ["npm ci", "npm test"];
+
+function actionName(uses: string): string {
+  return uses.split("@")[0] ?? uses;
+}
+
+export function checkWorkflowShape(root: YamlMap): PolicyVerdict {
+  for (const [key] of root.entries) {
+    if (!ALLOWED_ROOT_KEYS.includes(key)) {
+      return refuse(`the workflow declares ${JSON.stringify(key)}, which this policy does not reason about`);
+    }
+  }
+
+  const on = get(root, "on");
+  if (on === undefined || typeof on === "string" || on.kind !== "map") {
+    return refuse("the workflow's triggers are not a mapping of event to filters");
+  }
+  for (const [event, config] of on.entries) {
+    if (!ALLOWED_EVENTS.includes(event)) {
+      return refuse(`the workflow triggers on ${JSON.stringify(event)}, which this policy does not reason about`);
+    }
+    if (config === undefined || typeof config === "string") continue;
+    if (config.kind !== "map") {
+      return refuse(`the filters for ${event} are not a mapping`);
+    }
+    for (const [key] of config.entries) {
+      if (!ALLOWED_EVENT_KEYS.includes(key)) {
+        return refuse(
+          `${event} uses ${JSON.stringify(key)}, which can stop the workflow running and is not reasoned about here`,
+        );
+      }
+    }
+  }
+
+  const jobs = get(root, "jobs");
+  if (jobs === undefined || typeof jobs === "string" || jobs.kind !== "map" || jobs.entries.length === 0) {
+    return refuse("the workflow declares no jobs");
+  }
+  for (const [name, job] of jobs.entries) {
+    if (typeof job === "string" || job.kind !== "map") {
+      return refuse(`job ${JSON.stringify(name)} is not a mapping`);
+    }
+    for (const [key] of job.entries) {
+      if (!ALLOWED_JOB_KEYS.includes(key)) {
+        return refuse(
+          `job ${JSON.stringify(name)} declares ${JSON.stringify(key)}, which can change whether or how it runs`,
+        );
+      }
+    }
+    const jobSteps = get(job, "steps");
+    if (jobSteps === undefined || typeof jobSteps === "string" || jobSteps.kind !== "seq" || jobSteps.items.length === 0) {
+      return refuse(`job ${JSON.stringify(name)} declares no steps`);
+    }
+    for (const step of jobSteps.items) {
+      if (typeof step === "string" || step.kind !== "map") {
+        return refuse(`job ${JSON.stringify(name)} has a step that is not a mapping`);
+      }
+      for (const [key] of step.entries) {
+        if (!ALLOWED_STEP_KEYS.includes(key)) {
+          return refuse(
+            `a step in job ${JSON.stringify(name)} declares ${JSON.stringify(key)}, which can change whether it runs or whether its failure counts`,
+          );
+        }
+      }
+      const uses = get(step, "uses");
+      const withBlock = get(step, "with");
+      if (withBlock !== undefined) {
+        if (typeof uses !== "string") {
+          return refuse(`a step in job ${JSON.stringify(name)} passes inputs without naming an action`);
+        }
+        const allowed = ALLOWED_WITH_KEYS[actionName(uses)];
+        if (allowed === undefined) {
+          return refuse(`${JSON.stringify(actionName(uses))} is not an action this policy reasons about`);
+        }
+        if (typeof withBlock === "string" || withBlock.kind !== "map") {
+          return refuse(`the inputs to ${JSON.stringify(uses)} are not a mapping`);
+        }
+        for (const [key] of withBlock.entries) {
+          if (!allowed.includes(key)) {
+            return refuse(
+              `${JSON.stringify(actionName(uses))} is given ${JSON.stringify(key)}, which can change what is checked out or how it runs`,
+            );
+          }
+        }
+      }
+    }
+  }
+  return { ok: true };
+}
+
+/**
+ * The clean room must check out THIS repository, and it must do so first.
+ *
+ * The round-2 reviewer replaced `actions/checkout` with a second pinned
+ * `setup-node` and every check stayed green — a workflow that verifies nothing
+ * because nothing was fetched. Requiring the action is not enough on its own:
+ * `with: repository:` would point it at somebody else's code, which the shape
+ * allowlist above now refuses.
+ */
+export function checkCheckout(root: YamlMap): PolicyVerdict {
+  const uses = steps(root)
+    .map((step) => get(step, "uses"))
+    .filter((value): value is string => typeof value === "string");
+  const checkouts = uses.filter((value) => actionName(value) === "actions/checkout");
+  if (checkouts.length === 0) {
+    return refuse("the workflow never checks out the repository, so it would verify whatever the runner already had");
+  }
+  if (checkouts.length > 1) {
+    return refuse("the workflow checks out more than once, so what is verified is ambiguous");
+  }
+  const first = uses[0];
+  if (first === undefined || actionName(first) !== "actions/checkout") {
+    return refuse("the checkout is not the first action, so an earlier step could act on an unfetched tree");
+  }
+  return { ok: true };
+}
+
+/**
+ * Every command is on the allowlist, exactly.
+ *
+ * `command npm install` defeated a check that looked for commands STARTING
+ * with npm, and `./node_modules/.bin/tsc -p tsconfig.json` defeated one that
+ * looked for `tsc` as a word. Both are shell-execution details, and modelling
+ * shell parsing would be another guessing machine. The set of commands this
+ * workflow legitimately runs is two, so it is written down.
+ */
+export function checkRunAllowlist(root: YamlMap): PolicyVerdict {
+  for (const command of declaredRunCommands(root)) {
+    if (!ALLOWED_RUN_COMMANDS.includes(command.trim())) {
+      return refuse(
+        `the workflow runs ${JSON.stringify(command.trim())}, which is not one of the commands this policy allows`,
+      );
+    }
+  }
+  return { ok: true };
+}
+
 // ------------------------------------------------------------------- policies
 
 /**
@@ -404,6 +584,19 @@ export function checkTriggers(root: YamlMap): PolicyVerdict {
         if (!patterns.includes("**")) {
           return refuse(
             `${event} is limited to ${JSON.stringify(patterns)}, so a candidate on another branch produces no evidence`,
+          );
+        }
+        /**
+         * A NEGATIVE PATTERN UNDOES THE WILDCARD IT FOLLOWS (round-2 review,
+         * HIGH 4). GitHub documents a later `!` pattern as excluding earlier
+         * matches, so `["**", "!**"]` names every branch and then removes every
+         * branch — and a check that only asked whether `**` was PRESENT found
+         * it present and was satisfied.
+         */
+        const excluded = patterns.filter((pattern) => pattern.startsWith("!"));
+        if (excluded.length > 0) {
+          return refuse(
+            `${event} excludes ${JSON.stringify(excluded)}, which can remove the branches the wildcard just included`,
           );
         }
       }
@@ -633,7 +826,12 @@ export function checkNodePin(root: YamlMap, enginesRange: string | undefined): P
    * wherever it appeared, so moving it to an unrelated pinned action left the
    * runner's Node unpinned while every check passed.
    */
-  const pinned = workflowSteps(root)
+  /**
+   * LOAD-BEARING setup-node steps only (round-2 review, CRITICAL 1). A
+   * `setup-node` under `if: ${{ false }}` pins nothing, and the previous
+   * version counted it.
+   */
+  const pinned = loadBearingSteps(root)
     .filter((step) => step.uses !== undefined && /^actions\/setup-node@/.test(step.uses))
     .map((step) => step.withNodeVersion)
     .filter((value): value is string => typeof value === "string");

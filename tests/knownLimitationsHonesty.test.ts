@@ -103,6 +103,30 @@ describe("TASK-017 AC-10: no entry claims a closure the clean room does not deli
         if (!/CLEAN_ROOM_CI|clean room/i.test(answer)) continue;
         offenders.push(`${heading}: ${flat.trim().slice(0, 140)}`);
       }
+
+      /**
+       * AND THE PROSE, because the structural rule alone is bypassable
+       * (round-2 review, HIGH 6). Adding the plain sentence "The clean room
+       * closes this limitation." to an entry left all five honesty cases
+       * green: it is not a `What would close it` lead-in, so nothing looked at
+       * it.
+       *
+       * This rule is narrow on purpose, and narrower than the two attempts
+       * that failed before it. It matches the clean room as the SUBJECT of a
+       * closure verb — "the clean room closes", "CLEAN_ROOM_CI closed" — with
+       * at most two words between, and allows an intervening negation, which
+       * is the honest form. It does not try to understand the sentence.
+       * "fail-closed verification" has no subject before the verb and does not
+       * match; "a clean room does not close this" does.
+       */
+      const flatBody = body.replace(/\s+/g, " ");
+      for (const match of flatBody.matchAll(
+        /(clean room|CLEAN_ROOM_CI)\s+((?:\w+\s+){0,2}?)clos(e|es|ed)\b/gi,
+      )) {
+        const between = match[2] ?? "";
+        if (/\b(not|never|cannot|nor)\b/i.test(between)) continue;
+        offenders.push(`${heading}: …${match[0]}…`);
+      }
     }
 
     assert.deepEqual(

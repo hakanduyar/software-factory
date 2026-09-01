@@ -23,8 +23,11 @@ import { join } from "node:path";
 import {
   FREE_RUNNER_LABELS,
   checkActionPins,
+  checkCheckout,
   checkInstall,
+  checkRunAllowlist,
   checkStepExecution,
+  checkWorkflowShape,
   checkNodePin,
   checkPermissions,
   checkRunners,
@@ -374,6 +377,42 @@ describe("TASK-017 AC-2: the Node version is a decision bound to engines", () =>
     assert.equal(checkNodePin(pinned, ">=22.5.0").ok, true);
   });
 
+  /**
+   * A `setup-node` THAT DOES NOT RUN PINS NOTHING.
+   *
+   * The shape allowlist refuses a step-level `if` before this is reached, so
+   * this check is defence in depth — and it survived mutation until this case
+   * existed, because nothing could tell it from its absence. Asserted directly
+   * against `checkNodePin` so only that filter can decide it.
+   */
+  it("refuses a node-version on a setup-node a condition would skip", () => {
+    const parsed = parseWorkflow(
+      [
+        "name: x",
+        "on:",
+        "  push:",
+        "    branches:",
+        '      - "**"',
+        "jobs:",
+        "  verify:",
+        "    runs-on: ubuntu-latest",
+        "    steps:",
+        `      - uses: actions/setup-node@${"b".repeat(40)}`,
+        "        if: ${{ false }}",
+        "        with:",
+        '          node-version: "22.5.0"',
+        "",
+      ].join("\n"),
+    );
+    assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+    if (!parsed.ok) return;
+
+    const verdict = checkNodePin(parsed.root, ">=22.5.0");
+
+    assert.equal(verdict.ok, false, "a skipped setup-node counted as a pin");
+    assert.match(verdict.ok === false ? verdict.reason : "", /setup-node step pins a node-version/);
+  });
+
   it("refuses a workflow that pins no Node version at all", () => {
     const verdict = checkNodePin(workflow(), ">=22.5.0");
 
@@ -588,4 +627,212 @@ describe("TASK-017 round-1 note: permissions must be a mapping", () => {
     assert.equal(verdict.ok, false, "a permissions sequence was accepted");
     assert.match(verdict.ok === false ? verdict.reason : "", /sequence/);
   });
+});
+
+/**
+ * TASK-017 round-2 review: the policies now refuse what they do not reason
+ * about, the way the parser does.
+ *
+ * Six findings, one cause. The parser refuses YAML constructs it does not
+ * implement; the policies accepted GitHub FEATURES they did not know about.
+ * Job-level `if`, job-level `continue-on-error`, job-level `permissions`,
+ * `paths-ignore`, a negative branch pattern, `with: repository:` on checkout —
+ * all documented, all changing what runs, all previously green.
+ *
+ * These cases are written as raw YAML rather than through the synthetic
+ * builder, because each is the reviewer's exact reproduction and should be
+ * readable as such.
+ */
+describe("TASK-017 round-2: the workflow shape is an allowlist", () => {
+  const BASE = [
+    "name: x",
+    "on:",
+    "  pull_request:",
+    "    branches:",
+    '      - "**"',
+    "  push:",
+    "    branches:",
+    '      - "**"',
+    "permissions:",
+    "  contents: read",
+    "jobs:",
+    "  verify:",
+    "    runs-on: ubuntu-latest",
+    "    steps:",
+    `      - uses: actions/checkout@${"a".repeat(40)}`,
+    `      - uses: actions/setup-node@${"b".repeat(40)}`,
+    "        with:",
+    '          node-version: "22.5.0"',
+    "      - run: npm ci",
+    "      - run: npm test",
+  ];
+
+  function from(lines: readonly string[]): YamlMap {
+    const parsed = parseWorkflow(lines.join("\n") + "\n");
+    assert.equal(parsed.ok, true, `fixture does not parse: ${parsed.ok ? "" : parsed.reason}`);
+    if (!parsed.ok) throw new Error("unreachable");
+    return parsed.root;
+  }
+
+  /** Inserts lines after the first line matching `after`. */
+  function withLines(after: string, added: readonly string[]): YamlMap {
+    const index = BASE.findIndex((line) => line === after);
+    assert.notEqual(index, -1, `the fixture has no line ${JSON.stringify(after)}`);
+    return from([...BASE.slice(0, index + 1), ...added, ...BASE.slice(index + 1)]);
+  }
+
+  it("accepts the fixture it starts from, so the refusals below mean something", () => {
+    assert.equal(checkWorkflowShape(from(BASE)).ok, true);
+  });
+
+  it("accepts the SHIPPED workflow", () => {
+    const verdict = checkWorkflowShape(shipped());
+
+    assert.equal(verdict.ok, true, verdict.ok ? "" : verdict.reason);
+  });
+
+  /** The reviewer's four job- and step-level execution controls. */
+  for (const [label, after, added] of [
+    ["a job-level condition", "  verify:", ["    if: ${{ false }}"]],
+    ["job-level continue-on-error", "  verify:", ["    continue-on-error: true"]],
+    ["job-level permissions", "  verify:", ["    permissions:", "      contents: write"]],
+    ["a step-level condition", `      - uses: actions/setup-node@${"b".repeat(40)}`, ["        if: ${{ false }}"]],
+  ] as const) {
+    it(`refuses ${label}`, () => {
+      const verdict = checkWorkflowShape(withLines(after, added));
+
+      assert.equal(verdict.ok, false, `${label} was accepted`);
+    });
+  }
+
+  it("refuses paths-ignore, which can stop the workflow running entirely", () => {
+    const verdict = checkWorkflowShape(withLines("  push:", ["    paths-ignore:", '      - "**"']));
+
+    assert.equal(verdict.ok, false, "paths-ignore was accepted");
+    assert.match(verdict.ok === false ? verdict.reason : "", /paths-ignore/);
+  });
+
+  it("refuses branches-ignore at the shape level", () => {
+    const verdict = checkWorkflowShape(withLines("  push:", ["    branches-ignore:", '      - "**"']));
+
+    assert.equal(verdict.ok, false, "branches-ignore was accepted");
+  });
+
+  /**
+   * A NEGATIVE PATTERN AFTER `**` excludes everything it just included, and a
+   * check that only looked for `**` being present saw nothing wrong. The
+   * allowlist does not help here — `branches` is allowed — so the branch list
+   * itself is checked for exclusions.
+   */
+  it("refuses a negative branch pattern that undoes the wildcard", () => {
+    const undone = from(BASE.map((line) => (line === '      - "**"' ? '      - "**"\n      - "!**"' : line)));
+
+    const verdict = checkTriggers(undone);
+
+    assert.equal(verdict.ok, false, "a negative pattern excluding every branch was accepted");
+  });
+
+  it("refuses a repository input on checkout, which would verify another repository", () => {
+    const repointed = withLines(`      - uses: actions/checkout@${"a".repeat(40)}`, [
+      "        with:",
+      "          repository: attacker/other",
+    ]);
+
+    const verdict = checkWorkflowShape(repointed);
+
+    assert.equal(verdict.ok, false, "checkout was allowed to point elsewhere");
+    assert.match(verdict.ok === false ? verdict.reason : "", /repository/);
+  });
+
+  it("refuses a ref input on checkout", () => {
+    const repointed = withLines(`      - uses: actions/checkout@${"a".repeat(40)}`, [
+      "        with:",
+      "          ref: main",
+    ]);
+
+    assert.equal(checkWorkflowShape(repointed).ok, false);
+  });
+
+  it("refuses an unknown key at the workflow root", () => {
+    assert.equal(checkWorkflowShape(from([...BASE, "concurrency:", "  group: x"])).ok, false);
+  });
+
+  /**
+   * A MAP-SHAPED unknown event, so only the EVENT allowlist can refuse it.
+   *
+   * The first version used `schedule:`, which takes a sequence — and the
+   * "filters are not a mapping" branch refused it whether or not the event
+   * allowlist existed. `release` takes a mapping whose only key here is one the
+   * allowlist already permits, leaving exactly one guard able to decide.
+   */
+  it("refuses an event nobody has reasoned about", () => {
+    const released = from([
+      ...BASE.slice(0, 8),
+      "  release:",
+      "    types:",
+      "      - published",
+      ...BASE.slice(8),
+    ]);
+
+    const verdict = checkWorkflowShape(released);
+
+    assert.equal(verdict.ok, false, "an unreasoned-about event was accepted");
+    assert.match(verdict.ok === false ? verdict.reason : "", /release/);
+  });
+});
+
+describe("TASK-017 round-2 CRITICAL 2: the repository must actually be checked out", () => {
+  it("accepts the shipped workflow, which checks out first", () => {
+    assert.equal(checkCheckout(shipped()).ok, true);
+  });
+
+  it("refuses a workflow that never checks out", () => {
+    const verdict = checkCheckout(workflow({ uses: [`actions/setup-node@${"b".repeat(40)}`] }));
+
+    assert.equal(verdict.ok, false, "a workflow verifying an unfetched tree was accepted");
+    assert.match(verdict.ok === false ? verdict.reason : "", /never checks out/);
+  });
+
+  it("refuses a workflow that checks out twice, so what ran is ambiguous", () => {
+    const twice = workflow({
+      uses: [`actions/checkout@${"a".repeat(40)}`, `actions/checkout@${"c".repeat(40)}`],
+    });
+
+    assert.equal(checkCheckout(twice).ok, false);
+  });
+
+  it("refuses a checkout that is not the first action", () => {
+    const late = workflow({
+      uses: [`actions/setup-node@${"b".repeat(40)}`, `actions/checkout@${"a".repeat(40)}`],
+    });
+
+    const verdict = checkCheckout(late);
+
+    assert.equal(verdict.ok, false, "a step ran before the tree was fetched");
+    assert.match(verdict.ok === false ? verdict.reason : "", /first action/);
+  });
+});
+
+/**
+ * TASK-017 round-2 HIGH 5: modelling shell execution is another guessing
+ * machine, so the commands are simply written down.
+ */
+describe("TASK-017 round-2 HIGH 5: only allowlisted commands may run", () => {
+  it("accepts the shipped workflow's two commands", () => {
+    assert.equal(checkRunAllowlist(shipped()).ok, true);
+  });
+
+  for (const command of [
+    "command npm install",
+    "./node_modules/.bin/tsc -p tsconfig.json",
+    "npx tsc",
+    "sh -c 'npm install'",
+    "npm ci --ignore-scripts",
+  ]) {
+    it(`refuses ${JSON.stringify(command)}`, () => {
+      const verdict = checkRunAllowlist(workflow({ runs: ["npm ci", "npm test", command] }));
+
+      assert.equal(verdict.ok, false, `${command} was accepted`);
+    });
+  }
 });
