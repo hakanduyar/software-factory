@@ -41,14 +41,25 @@ function entries(): readonly (readonly [string, string])[] {
 
 describe("TASK-017 AC-10: no entry claims a closure the clean room does not deliver", () => {
   /**
-   * The premise. If the register stopped mentioning the clean room the test
-   * below would pass vacuously, so the mention is asserted first.
+   * NAMED ENTRIES, not a count (round-3 review, HIGH 5).
+   *
+   * Requiring "at least two entries mention the clean room" was satisfied by
+   * L-2, L-4 and L-9 — so removing every mention from L-10 and L-11, the two
+   * entries the clean room is actually ABOUT, left all five cases green. A
+   * premise check that any two strangers can satisfy is not a premise check.
    */
-  it("discusses the clean room in the entries it is relevant to", () => {
-    const mentioning = entries().filter(([, body]) => /CLEAN_ROOM_CI|clean room/i.test(body));
+  for (const entry of ["L-10", "L-11"]) {
+    it(`requires ${entry} itself to discuss the clean room`, () => {
+      const found = entries().find(([heading]) => heading.startsWith(entry));
 
-    assert.ok(mentioning.length >= 2, `expected L-10 and L-11 to discuss it, found ${mentioning.length}`);
-  });
+      assert.ok(found !== undefined, `${entry} is missing from the register`);
+      assert.match(
+        found?.[1] ?? "",
+        /CLEAN_ROOM_CI|clean room/i,
+        `${entry} does not discuss the clean room, so the honesty rules below never examine it`,
+      );
+    });
+  }
 
   /**
    * "Closes"/"closed"/"would close" within a sentence that also names the clean

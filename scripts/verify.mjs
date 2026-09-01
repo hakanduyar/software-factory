@@ -1611,6 +1611,78 @@ assertTreeIsSafe("after building", checkerFreshlyEmitted);
  */
 
 const sourceTests = allSources.filter((path) => checker.isSourceTest(path));
+
+/**
+ * TESTS THAT MAY NOT SIMPLY VANISH (TASK-017 round-3 review, CRITICAL 4).
+ *
+ * A reviewer deleted `tests/workflowPolicy.test.ts`, set the workflow's runner
+ * to a metered one, and the suite passed 2,042/2,042. Every guard that task
+ * added was disabled by removing the single file that checked them, and nothing
+ * failed — because verification asks whether the tests that EXIST pass, never
+ * whether the tests that must exist are present.
+ *
+ * WHY THE LIST IS HERE AND NOT IN A TEST. A test asserting "these test files
+ * exist" is itself a file that can be deleted, and so on forever. The regress
+ * has to terminate at something the threat model already trusts, and in this
+ * repository that is this script: `scripts/verify.mjs` is the audited verifier
+ * whose integrity TASK-010 spent nineteen rounds on. Anywhere else just moves
+ * which file an attacker removes.
+ *
+ * WHAT IT IS NOT. This does not make a test HONEST, only PRESENT. A required
+ * file emptied of its assertions passes this check and fails nothing — the
+ * mutation harness and independent review are what cover that, and they are
+ * not replaced by a list of filenames.
+ *
+ * ADDING TO THIS LIST is a deliberate act. It should name tests that pin a
+ * SAFETY property whose loss would be silent: the financial gate, the credential
+ * boundary, the clean room's own policies. Not every test in the repository —
+ * a list nobody maintains stops being read.
+ */
+const REQUIRED_TESTS = [
+  // TASK-017: without these the clean-room workflow is unchecked text.
+  "tests/workflowPolicy.test.ts",
+  "tests/knownLimitationsHonesty.test.ts",
+  // TASK-016: the zero-cost gate and the credential boundary.
+  "tests/pushAuthorization.test.ts",
+  "tests/githubCredentialBoundary.test.ts",
+  "tests/candidateBinding.test.ts",
+  "tests/publishCandidate.test.ts",
+  // TASK-006/011: spending and executor isolation.
+  "tests/financialSafetyGate.test.ts",
+  "tests/executorIsolation.test.ts",
+];
+
+/**
+ * ONLY FOR THIS REPOSITORY.
+ *
+ * `verify.mjs` is copied into the harness's fixture repositories, which hold a
+ * single sample test by design — demanding this manifest there failed 72 cases
+ * that were testing something else entirely. The list is a fact about the
+ * Factory's own tree, so it is applied to the Factory's own tree.
+ *
+ * Keyed on the package NAME rather than on a path, because a path is whatever
+ * the caller passes and the name is what npm resolves. Renaming it to dodge the
+ * manifest breaks every script in package.json, which is not a quiet edit.
+ */
+const packageName = (() => {
+  try {
+    return JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8")).name;
+  } catch {
+    return undefined;
+  }
+})();
+
+const missingRequired =
+  packageName === "software-factory"
+    ? REQUIRED_TESTS.filter((required) => !sourceTests.includes(required))
+    : [];
+if (missingRequired.length > 0) {
+  fail(
+    "verification refused: required test files are missing from the compiled source set — " +
+      `${missingRequired.join(", ")}. These pin safety properties whose loss would otherwise be ` +
+      "silent, so their absence is a verification failure rather than a smaller test run.",
+  );
+}
 const generatedFiles = listFiles(OUTPUT_DIR);
 const compiledTests = generatedFiles.filter((path) => checker.isTestArtifact(path));
 assertEverythingWasReadable("before auditing");

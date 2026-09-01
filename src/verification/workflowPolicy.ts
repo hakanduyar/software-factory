@@ -48,6 +48,21 @@ function refuse(reason: string): PolicyVerdict {
 /** Constructs this parser deliberately does not implement, and will not guess at. */
 const UNSUPPORTED: readonly (readonly [RegExp, string])[] = [
   [/\t/, "a tab, which YAML forbids for indentation"],
+  /**
+   * AN ESCAPE SEQUENCE IS A SCALAR THIS READER CANNOT SEE (round-3 review,
+   * CRITICALs 1 and 2).
+   *
+   * YAML decodes escapes inside double quotes, so `"\\x21**"` is `!**` — a
+   * negative branch pattern that excludes every branch — and
+   * `"${{ secrets\\x2eSENSITIVE }}"` is a secret reference. Both passed every
+   * check, because the reader kept the bytes and the checks looked at the
+   * bytes.
+   *
+   * Refused rather than decoded. A partial decoder that handled `\\x` but not
+   * `\\u` would reproduce this defect with a different spelling, and this
+   * repository's workflow has no need of an escape.
+   */
+  [/\\(x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|[0abtnvfre"\/\\N_LP ])/, "an escape sequence in a scalar"],
   [/^\s*---/, "a document marker, so the file may hold more than one document"],
   // An anchor can sit at the start of a line, after a key, or after a dash.
   // The first version matched only the line-initial form, so `base: &a 1` was
@@ -463,9 +478,16 @@ export function checkCheckout(root: YamlMap): PolicyVerdict {
   if (checkouts.length > 1) {
     return refuse("the workflow checks out more than once, so what is verified is ambiguous");
   }
-  const first = uses[0];
-  if (first === undefined || actionName(first) !== "actions/checkout") {
-    return refuse("the checkout is not the first action, so an earlier step could act on an unfetched tree");
+  /**
+   * THE FIRST STEP, not the first ACTION (round-3 review, HIGH 3). Filtering to
+   * `uses:` steps meant a `run:` step before the checkout was invisible, so
+   * `- run: npm test` could execute against whatever the runner already had
+   * and the ordering check saw nothing wrong.
+   */
+  const firstStep = steps(root)[0];
+  const firstUses = firstStep === undefined ? undefined : get(firstStep, "uses");
+  if (typeof firstUses !== "string" || actionName(firstUses) !== "actions/checkout") {
+    return refuse("the checkout is not the first step, so an earlier step could act on an unfetched tree");
   }
   return { ok: true };
 }
@@ -621,8 +643,21 @@ export function checkTriggers(root: YamlMap): PolicyVerdict {
 }
 
 /** AC-7. No secret is referenced, and no permission beyond reading contents. */
+/** Every scalar the parsed document holds, wherever it sits. */
+function allScalars(node: YamlNode): readonly string[] {
+  if (typeof node === "string") return [node];
+  if (node.kind === "seq") return node.items.flatMap(allScalars);
+  return node.entries.flatMap(([key, value]) => [key, ...allScalars(value)]);
+}
+
 export function checkPermissions(root: YamlMap, source: string): PolicyVerdict {
-  if (/secrets\./.test(source)) {
+  /**
+   * THE RAW TEXT AND THE PARSED VALUES, because they can disagree (round-3
+   * review, CRITICAL 2). The raw scan alone missed `secrets\x2eSENSITIVE`; the
+   * escape refusal above now stops that spelling reaching here at all, and this
+   * checks the values as well so the two are independent.
+   */
+  if (/secrets\./.test(source) || allScalars(root).some((value) => /secrets\./.test(value))) {
     return refuse("the workflow references a secret; a verification run needs none");
   }
   const permissions = get(root, "permissions");

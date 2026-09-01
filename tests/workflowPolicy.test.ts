@@ -17,7 +17,7 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import {
@@ -801,7 +801,7 @@ describe("TASK-017 round-2 CRITICAL 2: the repository must actually be checked o
     assert.equal(checkCheckout(twice).ok, false);
   });
 
-  it("refuses a checkout that is not the first action", () => {
+  it("refuses a checkout that is not the first step", () => {
     const late = workflow({
       uses: [`actions/setup-node@${"b".repeat(40)}`, `actions/checkout@${"a".repeat(40)}`],
     });
@@ -809,7 +809,7 @@ describe("TASK-017 round-2 CRITICAL 2: the repository must actually be checked o
     const verdict = checkCheckout(late);
 
     assert.equal(verdict.ok, false, "a step ran before the tree was fetched");
-    assert.match(verdict.ok === false ? verdict.reason : "", /first action/);
+    assert.match(verdict.ok === false ? verdict.reason : "", /first step/);
   });
 });
 
@@ -835,4 +835,187 @@ describe("TASK-017 round-2 HIGH 5: only allowlisted commands may run", () => {
       assert.equal(verdict.ok, false, `${command} was accepted`);
     });
   }
+});
+
+/**
+ * TASK-017 round-3 review: a scalar can be spelled so the reader does not see
+ * what GitHub sees.
+ *
+ * YAML decodes escapes inside double quotes. `"\x21**"` IS `!**`, a negative
+ * branch pattern excluding every branch, and `"${{ secrets\x2eSENSITIVE }}"`
+ * IS a secret reference. Both passed every check, because the reader kept the
+ * bytes and the checks looked at the bytes.
+ *
+ * Refused rather than decoded: a partial decoder handling `\x` but not `\u`
+ * would reproduce the defect with a different spelling.
+ */
+describe("TASK-017 round-3 CRITICAL: escaped scalars are refused, not misread", () => {
+  for (const [label, escaped] of [
+    ["a hex escape", '"\\x21**"'],
+    ["a unicode escape", '"\\u0021**"'],
+    ["a newline escape", '"a\\nb"'],
+    ["an escaped backslash", '"a\\\\b"'],
+  ] as const) {
+    it(`refuses ${label}`, () => {
+      const parsed = parseWorkflow(`name: x\nvalue: ${escaped}\n`);
+
+      assert.equal(parsed.ok, false, `${label} was read literally instead of refused`);
+      assert.match(parsed.ok === false ? parsed.reason : "", /escape sequence/);
+    });
+  }
+
+  /** The reviewer's exact branch reproduction. */
+  it("refuses a branch list hiding a negative pattern behind an escape", () => {
+    const parsed = parseWorkflow(
+      ["name: x", "on:", "  push:", "    branches:", '      - "**"', '      - "\\x21**"', ""].join("\n"),
+    );
+
+    assert.equal(parsed.ok, false, "an escaped negative pattern was read literally");
+  });
+
+  /** And the secret reproduction. */
+  it("refuses an input hiding a secret reference behind an escape", () => {
+    const parsed = parseWorkflow(
+      ["name: x", "jobs:", "  v:", "    steps:", "      - with:", '          k: "${{ secrets\\x2eS }}"', ""].join("\n"),
+    );
+
+    assert.equal(parsed.ok, false, "an escaped secret reference was read literally");
+  });
+
+  /** The shipped workflow uses no escapes, so the refusals are not universal. */
+  it("still parses the shipped workflow", () => {
+    assert.equal(parseWorkflow(SOURCE).ok, true);
+  });
+});
+
+describe("TASK-017 round-3 CRITICAL 2: a secret is refused in values, not only raw text", () => {
+  it("refuses a secret reference found in a parsed value", () => {
+    const parsed = parseWorkflow(
+      [
+        "name: x",
+        "on:",
+        "  push:",
+        "    branches:",
+        '      - "**"',
+        "permissions:",
+        "  contents: read",
+        "jobs:",
+        "  v:",
+        "    runs-on: ubuntu-latest",
+        "    steps:",
+        "      - run: npm test",
+        "        name: ${{ secrets.SENSITIVE }}",
+        "",
+      ].join("\n"),
+    );
+    assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+    if (!parsed.ok) return;
+
+    // The RAW source given here is clean, so only the value scan can refuse it.
+    const verdict = checkPermissions(parsed.root, "nothing suspicious here");
+
+    assert.equal(verdict.ok, false, "a secret in a parsed value was accepted");
+    assert.match(verdict.ok === false ? verdict.reason : "", /secret/);
+  });
+});
+
+describe("TASK-017 round-3 HIGH 3: nothing runs before the checkout", () => {
+  it("refuses a run step placed before the checkout", () => {
+    const parsed = parseWorkflow(
+      [
+        "name: x",
+        "jobs:",
+        "  v:",
+        "    runs-on: ubuntu-latest",
+        "    steps:",
+        "      - run: npm test",
+        `      - uses: actions/checkout@${"a".repeat(40)}`,
+        "",
+      ].join("\n"),
+    );
+    assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+    if (!parsed.ok) return;
+
+    const verdict = checkCheckout(parsed.root);
+
+    assert.equal(verdict.ok, false, "a step ran before the tree was fetched");
+    assert.match(verdict.ok === false ? verdict.reason : "", /first step/);
+  });
+});
+
+/**
+ * TASK-017 round-3 CRITICAL 4: a guard whose test can vanish is not a guard.
+ *
+ * The reviewer deleted `tests/workflowPolicy.test.ts`, set the runner to a
+ * metered one, and the suite passed 2,042/2,042 — every policy in this task
+ * switched off by removing one file, with nothing to notice it.
+ *
+ * `scripts/verify.mjs` now refuses when a required test source is absent. These
+ * cases assert that the manifest exists and names the files whose loss would be
+ * silent. THIS FILE IS ITSELF IN THE MANIFEST, so emptying these assertions
+ * means deleting a file whose absence verification reports. That mutual
+ * protection is where the regress stops; there is no further turtle.
+ *
+ * What it does NOT establish: that a required test is HONEST. A file emptied of
+ * assertions is still present. Mutation and independent review cover that, and
+ * a list of filenames does not pretend to.
+ */
+describe("TASK-017 round-3 CRITICAL 4: required tests cannot silently vanish", () => {
+  const VERIFIER = readFileSync(join(REPO_ROOT, "scripts/verify.mjs"), "utf8");
+
+  it("declares a required-test manifest", () => {
+    assert.match(
+      VERIFIER,
+      /const REQUIRED_TESTS = \[/,
+      "the verifier has no required-test manifest, so deleting a test file is a smaller test run rather than a failure",
+    );
+  });
+
+  it("refuses when a required test is missing, rather than reporting a smaller run", () => {
+    /**
+     * The CONDITIONAL, not merely the name near a `fail(`. Matching
+     * `missingRequired ... fail(` still matched when the guard became
+     * `if (false)`, because the const declaration kept the name in scope and
+     * the `fail(` a few lines down was unrelated. My own harness caught it.
+     */
+    assert.match(
+      VERIFIER,
+      /if \(missingRequired\.length > 0\)\s*\{[\s\S]{0,400}?fail\(/,
+      "the manifest is declared but nothing fails when an entry is missing",
+    );
+  });
+
+  /**
+   * The files whose loss would be silent. Named individually rather than
+   * counted, because "the manifest has at least N entries" is satisfied by any
+   * N strangers — the round-3 review made exactly that point about the honesty
+   * test's premise.
+   */
+  for (const required of [
+    "tests/workflowPolicy.test.ts",
+    "tests/knownLimitationsHonesty.test.ts",
+    "tests/pushAuthorization.test.ts",
+    "tests/githubCredentialBoundary.test.ts",
+    "tests/financialSafetyGate.test.ts",
+    "tests/executorIsolation.test.ts",
+  ]) {
+    it(`requires ${required}`, () => {
+      assert.ok(
+        VERIFIER.includes(`"${required}"`),
+        `${required} is not in the manifest, so deleting it would disable its guards silently`,
+      );
+    });
+  }
+
+  /** And every named file actually exists, so the manifest cannot rot. */
+  it("names only files that exist", () => {
+    const listed = [...VERIFIER.matchAll(/"(tests\/[^"]+\.test\.ts)"/g)].map((match) => match[1]);
+    assert.ok(listed.length > 0, "no test paths were found in the verifier");
+    for (const path of listed) {
+      assert.ok(
+        existsSync(join(REPO_ROOT, path ?? "")),
+        `the manifest names ${path}, which does not exist — a manifest that has rotted refuses every run`,
+      );
+    }
+  });
 });
