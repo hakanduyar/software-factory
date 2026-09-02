@@ -2216,13 +2216,25 @@ describe("TASK-017 round-9 HIGH 4: a pin says which version, not whose code", ()
    * with no entry in `ALLOWED_WITH_KEYS` would have its configuration
    * unexamined, which is the gap this pair exists to prevent.
    */
-  it("models the inputs of every action it admits", () => {
-    for (const action of ALLOWED_ACTIONS) {
-      assert.ok(
-        Object.prototype.hasOwnProperty.call(ALLOWED_WITH_KEYS, action),
-        `${action} is admitted but its inputs are not modelled`,
-      );
-    }
+  /**
+   * SET EQUALITY, IN BOTH DIRECTIONS (round-10 review, non-blocking note).
+   *
+   * The first version asserted only that every admitted action had modelled
+   * inputs. The reviewer added `"evil/tool": []` to `ALLOWED_WITH_KEYS`, and all
+   * 243 cases passed — the invariant is stated as an exact correspondence and
+   * half of it was being checked, which is a one-way test wearing the words of
+   * a two-way one.
+   *
+   * Nothing was exploitable: identity is enforced against `ALLOWED_ACTIONS`, so
+   * an entry here alone admits nothing. The defect is that the DOCUMENTED
+   * invariant was not the TESTED one, which is how the two drift apart.
+   */
+  it("models the inputs of exactly the actions it admits, and no others", () => {
+    assert.deepEqual(
+      [...ALLOWED_ACTIONS].sort(),
+      Object.keys(ALLOWED_WITH_KEYS).sort(),
+      "the identity allowlist and the input allowlist name different sets of actions",
+    );
   });
 
   it("refuses a step declaring both uses: and run:", () => {
@@ -2251,4 +2263,104 @@ describe("TASK-017 round-9 HIGH 4: a pin says which version, not whose code", ()
     assert.equal(verdict.ok, false, "a sequence name was accepted");
     assert.match(verdict.ok === false ? verdict.reason : "", /name is not a single string/);
   });
+});
+
+/**
+ * TASK-017 round-10 review: the trigger guard was closed only by its neighbour.
+ *
+ * Round 9 found `checkTriggers` skipping scalar event configs. I fixed the
+ * scalar case and left `if (config.kind === "map")` with no else, so a SEQUENCE
+ * config still fell through to `return ok` — and I never added the per-event key
+ * check here at all, so `push: {types: [...]}` was refused by the shape gate and
+ * waved through by this one.
+ *
+ * The lesson is about the shape of the fix, not the gap: a fix written against a
+ * reproduction handles the spelling that was reported. Round 9 reported the
+ * scalar spelling; the defect was every non-mapping config and every
+ * unmodelled key.
+ *
+ * These cases call `checkTriggers` DIRECTLY. Going through the aggregate would
+ * let `checkWorkflowShape` refuse first and prove nothing about this function —
+ * the sibling-guard masking that has now occurred seven times in this task, and
+ * the precise reason a reviewer could find this while 2,403 tests passed.
+ */
+describe("TASK-017 round-10 HIGH: the trigger guard is closed independently", () => {
+  function on(lines: readonly string[]): YamlMap {
+    const result = parseWorkflow([
+      "name: x", "on:", ...lines, "permissions:", "  contents: read",
+      "jobs:", "  v:", "    runs-on: ubuntu-latest", "    steps:",
+      `      - uses: actions/checkout@${"a".repeat(40)}`, "",
+    ].join("\n"));
+    assert.equal(result.ok, true, `fixture does not parse: ${result.ok ? "" : result.reason}`);
+    if (!result.ok) throw new Error("unreachable");
+    return result.root;
+  }
+
+  const VALID_PR = ["  pull_request:", "    branches:", '      - "**"'];
+
+  it("refuses types on push at the trigger check, not only at the shape gate", () => {
+    const root = on([...VALID_PR, "  push:", "    types:", "      - pushed", "    branches:", '      - "**"']);
+
+    const verdict = checkTriggers(root);
+
+    assert.equal(verdict.ok, false, "an unmodelled per-event filter passed the trigger check");
+    assert.match(verdict.ok === false ? verdict.reason : "", /not a filter this policy reasons about for that event/);
+  });
+
+  it("refuses an empty sequence as an event configuration", () => {
+    const verdict = checkTriggers(on([...VALID_PR, "  push: []"]));
+
+    assert.equal(verdict.ok, false, "a sequence config fell through to ok");
+    assert.match(verdict.ok === false ? verdict.reason : "", /sequence/);
+  });
+
+  it("refuses a non-empty sequence as an event configuration", () => {
+    const verdict = checkTriggers(on([...VALID_PR, "  push: [anything]"]));
+
+    assert.equal(verdict.ok, false, "a sequence config fell through to ok");
+  });
+
+  it("refuses a scalar as an event configuration", () => {
+    const verdict = checkTriggers(on([...VALID_PR, "  push: anything"]));
+
+    assert.equal(verdict.ok, false, "a scalar config fell through to ok");
+  });
+
+  /**
+   * NON-VACUITY, and it matters more than usual here: the four cases above
+   * would all pass against a `checkTriggers` that refused everything. These
+   * pin the other side.
+   */
+  it("still accepts the shipped workflow", () => {
+    const verdict = checkTriggers(shipped());
+
+    assert.equal(verdict.ok, true, verdict.ok ? "" : verdict.reason);
+  });
+
+  it("still accepts types on pull_request, where they are modelled", () => {
+    const verdict = checkTriggers(on([
+      "  pull_request:", "    types:", "      - opened", "      - synchronize",
+      "    branches:", '      - "**"',
+      "  push:", "    branches:", '      - "**"',
+    ]));
+
+    assert.equal(verdict.ok, true, verdict.ok ? "" : verdict.reason);
+  });
+
+  /**
+   * AND THE TWO GATES AGREE. Each must refuse these on its own — that is what
+   * "independently closed" means — so the same fixtures are put to both.
+   */
+  for (const [label, lines] of [
+    ["types on push", [...VALID_PR, "  push:", "    types:", "      - pushed", "    branches:", '      - "**"']],
+    ["a sequence config", [...VALID_PR, "  push: []"]],
+    ["a scalar config", [...VALID_PR, "  push: anything"]],
+  ] as const) {
+    it(`refuses ${label} at BOTH gates`, () => {
+      const root = on(lines);
+
+      assert.equal(checkWorkflowShape(root).ok, false, `${label} passed the shape gate`);
+      assert.equal(checkTriggers(root).ok, false, `${label} passed the trigger check`);
+    });
+  }
 });

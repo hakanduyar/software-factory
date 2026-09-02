@@ -573,7 +573,35 @@ export function checkTriggers(root: YamlMap): PolicyVerdict {
     if (typeof config === "string") {
       return refuse(`${event} is configured as ${JSON.stringify(config)} rather than a mapping of filters`);
     }
-    if (config.kind === "map") {
+    /**
+     * A SEQUENCE IS NOT A FILTER BLOCK EITHER (round-10 review, HIGH).
+     *
+     * Round 9 found this check skipping SCALAR configs and I fixed the scalar
+     * case, leaving `if (config.kind === "map")` with no else — so `push: []`
+     * and `push: [anything]` still fell straight through to `return ok`. I
+     * fixed the reported spelling of the bug rather than the bug, which is the
+     * specific hazard of writing a fix against a reproduction.
+     */
+    if (config.kind !== "map") {
+      return refuse(`${event} is configured as a sequence rather than a mapping of filters`);
+    }
+    /**
+     * AND THE PER-EVENT VOCABULARY IS CHECKED HERE TOO, not only at the shape
+     * gate. `push: {types: [...]}` was refused by `checkWorkflowShape` and
+     * waved through by this function, so the trigger guard was closed only for
+     * as long as something else happened to run first. Two checks are worth
+     * having only if each is independently sound; otherwise they are one check
+     * and a comment claiming there are two.
+     */
+    const allowedForEvent = ALLOWED_EVENT_KEYS[event] ?? [];
+    for (const [key] of config.entries) {
+      if (!allowedForEvent.includes(key)) {
+        return refuse(
+          `${event} declares ${JSON.stringify(key)}, which is not a filter this policy reasons about for that event`,
+        );
+      }
+    }
+    {
       const ignored = get(config, "branches-ignore");
       if (ignored !== undefined) {
         return refuse(

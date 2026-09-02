@@ -160,8 +160,8 @@ const MUTATIONS = [
   {
     id: "the event key allowlist is dropped, so paths-ignore returns",
     edits: [[POLICY,
-      "      if (!allowedForEvent.includes(key)) {",
-      "      void key;\n      void allowedForEvent;\n      if (false as boolean) {"]],
+      "      if (!allowedForEvent.includes(key)) {\n        return refuse(\n          `${event} uses ${JSON.stringify(key)}, which can stop the workflow running and is not reasoned about for this event`,\n        );\n      }",
+      "      void key;\n      void allowedForEvent;"]],
     tests: [T_WF],
     expect: "paths-ignore",
   },
@@ -542,6 +542,31 @@ const MUTATIONS = [
       '    if (key === "\\u0000never" && typeof value !== "string") {']],
     tests: [T_WF],
     expect: "refuses a workflow name that is not a single string",
+  },
+  // ---- round-10 review -----------------------------------------------------
+  {
+    id: "a sequence event configuration is skipped by the trigger check",
+    edits: [[POLICY,
+      '    if (config.kind !== "map") {\n      return refuse(`${event} is configured as a sequence rather than a mapping of filters`);\n    }',
+      '    if (config.kind !== "map") {\n      continue;\n    }']],
+    tests: [T_WF],
+    expect: "refuses an empty sequence as an event configuration",
+  },
+  {
+    id: "the trigger check stops validating per-event filters",
+    edits: [[POLICY,
+      "      if (!allowedForEvent.includes(key)) {\n        return refuse(\n          `${event} declares ${JSON.stringify(key)}, which is not a filter this policy reasons about for that event`,\n        );\n      }",
+      "      void key;\n      void allowedForEvent;"]],
+    tests: [T_WF],
+    expect: "refuses types on push at the trigger check",
+  },
+  {
+    id: "the two action allowlists may name different sets",
+    edits: [[POLICY,
+      'export const ALLOWED_WITH_KEYS: Readonly<Record<string, readonly string[]>> = {',
+      'export const ALLOWED_WITH_KEYS: Readonly<Record<string, readonly string[]>> = {\n  "evil/tool": [],']],
+    tests: [T_WF],
+    expect: "models the inputs of exactly the actions it admits",
   },
 ];
 
