@@ -798,9 +798,22 @@ export function checkStepExecution(root: YamlMap): PolicyVerdict {
  * the long form. npm also accepts a family of typo-tolerant abbreviations, so
  * the list is taken from its documented aliases rather than guessed at.
  */
-const INSTALL_ALIASES: readonly string[] = [
+/**
+ * `isnt` WAS MISSING (round-11 review, HIGH).
+ *
+ * The list ran `isnta`, `isntal`, `isntall` and skipped the shortest of the
+ * three, which is the sort of omission that survives a reading because the
+ * neighbours look complete. `npm help install` is the authority and gives:
+ * add, i, in, ins, inst, insta, instal, isnt, isnta, isntal, isntall.
+ *
+ * `tests/workflowPolicy.test.ts` now transcribes that list INDEPENDENTLY and
+ * asserts this one covers it. Two transcriptions of the same source disagree
+ * loudly; the previous test iterated THIS constant, so an alias missing from it
+ * was missing from its own coverage too and the case passed vacuously.
+ */
+export const INSTALL_ALIASES: readonly string[] = [
   "install", "i", "in", "ins", "inst", "insta", "instal",
-  "isnta", "isntal", "isntall", "add",
+  "isnt", "isnta", "isntal", "isntall", "add",
 ];
 
 function isNpmSubcommand(command: string, subcommands: readonly string[]): boolean {

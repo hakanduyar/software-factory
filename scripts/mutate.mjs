@@ -137,7 +137,7 @@ const MUTATIONS = [
   {
     id: "only the long spelling of npm install is refused",
     edits: [[POLICY,
-      '  "install", "i", "in", "ins", "inst", "insta", "instal",\n  "isnta", "isntal", "isntall", "add",',
+      '  "install", "i", "in", "ins", "inst", "insta", "instal",\n  "isnt", "isnta", "isntal", "isntall", "add",',
       '  "install",']],
     tests: [T_WF],
     expect: "refuses npm i",
@@ -567,6 +567,31 @@ const MUTATIONS = [
       'export const ALLOWED_WITH_KEYS: Readonly<Record<string, readonly string[]>> = {\n  "evil/tool": [],']],
     tests: [T_WF],
     expect: "models the inputs of exactly the actions it admits",
+  },
+  // ---- round-11 review -----------------------------------------------------
+  {
+    id: "the shortest isnt alias goes missing again",
+    edits: [[POLICY,
+      '  "isnt", "isnta", "isntal", "isntall", "add",',
+      '  "isnta", "isntal", "isntall", "add",']],
+    tests: [T_WF],
+    expect: "covers every alias npm documents",
+  },
+  {
+    id: "only the long spelling reaches the install guard",
+    edits: [[POLICY,
+      "    if (isNpmSubcommand(command, INSTALL_ALIASES)) {",
+      '    if (isNpmSubcommand(command, ["install"])) {']],
+    tests: [T_WF],
+    expect: "refuses npm isnt at checkInstall itself",
+  },
+  {
+    id: "a different alias goes missing",
+    edits: [[POLICY,
+      '  "isnt", "isnta", "isntal", "isntall", "add",',
+      '  "isnt", "isnta", "isntal", "isntall",']],
+    tests: [T_WF],
+    expect: "covers every alias npm documents",
   },
 ];
 

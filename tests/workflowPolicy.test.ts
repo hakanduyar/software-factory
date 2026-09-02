@@ -32,6 +32,7 @@ import {
   ALLOWED_ACTIONS,
   ALLOWED_WITH_KEYS,
   checkCheckoutCredentials,
+  INSTALL_ALIASES,
   checkNoExpressions,
   checkNodePin,
   checkPermissions,
@@ -657,8 +658,43 @@ describe("TASK-017 round-1 CRITICAL: the policies read execution, not text", () 
  * spelling caught one of them.
  */
 describe("TASK-017 round-1 HIGH 4: every spelling of npm install is refused", () => {
-  for (const alias of ["i", "install", "in", "ins", "inst", "add", "isntall"]) {
-    it(`refuses npm ${alias}`, () => {
+  /**
+   * NPM'S LIST, TRANSCRIBED INDEPENDENTLY OF THE ONE UNDER TEST (round-11
+   * review, HIGH).
+   *
+   * `npm help install` reports: add, i, in, ins, inst, insta, instal, isnt,
+   * isnta, isntal, isntall. The previous version of this block tested a
+   * HAND-PICKED SEVEN of those, and `isnt` was in neither the policy's list nor
+   * the seven — so the guard had a hole and its own tests were shaped around
+   * the hole. `isnta`, `isntal` and `isntall` were all present, which is why
+   * reading the list did not reveal the shortest of the four was missing.
+   *
+   * Transcribing npm's list here, separately from `INSTALL_ALIASES`, means the
+   * two can be compared. A test that iterates the constant it is testing proves
+   * only that the constant equals itself.
+   */
+  const NPM_DOCUMENTED_ALIASES: readonly string[] = [
+    "add", "i", "in", "ins", "inst", "insta", "instal",
+    "isnt", "isnta", "isntal", "isntall",
+  ];
+
+  it("covers every alias npm documents", () => {
+    const missing = NPM_DOCUMENTED_ALIASES.filter((alias) => !INSTALL_ALIASES.includes(alias));
+
+    assert.deepEqual(missing, [], `npm documents install aliases the policy does not refuse: ${missing.join(", ")}`);
+  });
+
+  /**
+   * EVERY alias, and `checkInstall` DIRECTLY.
+   *
+   * `npm isnt` was refused by `checkRunAllowlist` and accepted by
+   * `checkInstall`, so the aggregate looked correct while the guard named for
+   * this job did nothing. Calling the guard on its own is what distinguishes
+   * "the workflow is refused" from "this guard refuses it" — the sibling-guard
+   * masking that has now been found eight times in this task.
+   */
+  for (const alias of [...NPM_DOCUMENTED_ALIASES, "install"]) {
+    it(`refuses npm ${alias} at checkInstall itself`, () => {
       const verdict = checkInstall(workflow({ runs: ["npm ci", `npm ${alias}`, "npm test"] }));
 
       assert.equal(verdict.ok, false, `npm ${alias} was accepted alongside npm ci`);
@@ -669,6 +705,18 @@ describe("TASK-017 round-1 HIGH 4: every spelling of npm install is refused", ()
   /** The control: `npm ci` and `npm test` are not install aliases. */
   it("still accepts a workflow whose only npm commands are ci and test", () => {
     assert.equal(checkInstall(workflow()).ok, true);
+  });
+
+  /**
+   * AND THE SIBLING IS NOT WHAT SAVES US. Stated as its own case so that a
+   * future change to the command allowlist cannot quietly become the only
+   * thing refusing an install alias.
+   */
+  it("refuses an install alias even where the command allowlist would too", () => {
+    const root = workflow({ runs: ["npm ci", "npm isnt", "npm test"] });
+
+    assert.equal(checkRunAllowlist(root).ok, false, "the sibling guard should also refuse this");
+    assert.equal(checkInstall(root).ok, false, "but checkInstall must refuse it on its own");
   });
 });
 
