@@ -36,12 +36,19 @@
 
 import { createHash } from "node:crypto";
 
-/** `.github/workflows/verify.yml`, as reviewed. */
+/**
+ * `.github/workflows/verify.yml`, as reviewed.
+ *
+ * Updated for round-9 HIGH 1, which added `persist-credentials: "false"`. The
+ * constant moves in the SAME COMMIT as the workflow, which is the only
+ * discipline that makes it mean anything — and is exactly why this is a
+ * visibility property rather than a security one.
+ */
 export const REVIEWED_WORKFLOW_SHA256 =
-  "697000ec08037abd440ecc16d06e0a120dcdc9f8a06db5cc7b31dba9159e0f99";
+  "6b15d37f4e5f929892f04987765c9b726296debf2aea1b726f2b222c786242a5";
 
 /** Its length in bytes, so a digest typo and a content change look different. */
-export const REVIEWED_WORKFLOW_BYTES = 2009;
+export const REVIEWED_WORKFLOW_BYTES = 2718;
 
 export function digestOf(source: string | Uint8Array): string {
   return createHash("sha256").update(source).digest("hex");

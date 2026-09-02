@@ -1039,6 +1039,21 @@ a silent one. It is also not what makes any acceptance criterion true - a digest
 is equally satisfied by a workflow that verifies nothing - which is why no
 acceptance assertion reads it and why a test asserts that separation directly.
 
+### The two actions are trusted, not audited
+
+Round-9 review found that `checkActionPins` proved every `uses:` named a commit
+and had no opinion about WHOSE code that commit held - `evil/tool@<40 hex>`
+satisfied it completely. Action identity is now allowlisted to
+`actions/checkout` and `actions/setup-node`, and a test asserts that allowlist
+names the same actions whose inputs are modelled, because an action admitted
+without modelled inputs would have its configuration unexamined.
+
+That closes the distance between "pinned" and "reasoned about" and leaves a
+residual worth naming: a pin fixes WHICH bytes run, and nobody in this
+repository has read them. The clean room executes two third-party actions on
+trust. What the pin buys is that the trust decision cannot be changed by someone
+else moving a tag - not that the decision was ever verified.
+
 ### And reading a file is not observing a run
 
 Every claim here is a claim about what the shipped file SAYS. The clean room

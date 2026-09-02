@@ -29,6 +29,9 @@ import {
   checkRunAllowlist,
   checkStepExecution,
   checkWorkflowShape,
+  ALLOWED_ACTIONS,
+  ALLOWED_WITH_KEYS,
+  checkCheckoutCredentials,
   checkNoExpressions,
   checkNodePin,
   checkPermissions,
@@ -1987,5 +1990,265 @@ describe("TASK-017: a value the policy cannot read is refused, not filtered out"
     const verdict = checkWorkflowShape(shipped());
 
     assert.equal(verdict.ok, true, verdict.ok ? "" : verdict.reason);
+  });
+});
+
+/**
+ * TASK-017 round-9 review: four HIGHs, and what they had in common.
+ *
+ * The round-9 reviewer confirmed every evidence claim — 53/53 mutations killed,
+ * 2384/2384 tests, fingerprint identical start and end — and then found four
+ * things the harness had never MEASURED. That is the useful shape of a review:
+ * not "your evidence is wrong" but "your evidence does not cover this".
+ *
+ * Three of the four are the same mistake in different places: a check that asked
+ * WHICH KEY appeared without asking what it MEANT for that context.
+ *
+ *   - `types` was allowed for every event, though only `pull_request` has
+ *     activity types, because one list served both events.
+ *   - a pin proved WHICH VERSION of an action ran and nothing about WHOSE code.
+ *   - `name` and the event configs were admitted by name with no type at all.
+ *
+ * The fourth is different and worse: AC-3 says the clean room inherits "no
+ * repository-local git configuration", and nothing checked it. The workflow's
+ * own header comment made the same claim. Both were false for eight rounds
+ * because a criterion nobody turned into a check reads exactly like one that
+ * passes.
+ */
+describe("TASK-017 round-9 HIGH 1: AC-3's git-configuration clause is checked, not assumed", () => {
+  const A = "a".repeat(40);
+
+  function withCheckout(withLines: readonly string[]): YamlMap {
+    const result = parseWorkflow([
+      "name: x", "on:", "  pull_request:", "    branches:", '      - "**"',
+      "  push:", "    branches:", '      - "**"', "permissions:", "  contents: read",
+      "jobs:", "  v:", "    runs-on: ubuntu-latest", "    steps:",
+      `      - uses: actions/checkout@${A}`, ...withLines,
+      "      - run: npm ci", "      - run: npm test", "",
+    ].join("\n"));
+    assert.equal(result.ok, true, `fixture does not parse: ${result.ok ? "" : result.reason}`);
+    if (!result.ok) throw new Error("unreachable");
+    return result.root;
+  }
+
+  it("accepts the shipped workflow, which now sets it explicitly", () => {
+    const verdict = checkCheckoutCredentials(shipped());
+
+    assert.equal(verdict.ok, true, verdict.ok ? "" : verdict.reason);
+  });
+
+  /**
+   * THE SHIPPED WORKFLOW FAILED THIS UNTIL ROUND 9. The default is `true`, so
+   * omitting the input is not neutral — it is the unsafe choice spelled with
+   * silence, which is why absence is refused rather than treated as unset.
+   */
+  it("refuses a checkout that does not mention persist-credentials", () => {
+    const verdict = checkCheckoutCredentials(withCheckout([]));
+
+    assert.equal(verdict.ok, false, "an unset persist-credentials was treated as safe");
+    assert.match(verdict.ok === false ? verdict.reason : "", /defaults/);
+  });
+
+  it("refuses a checkout that persists credentials explicitly", () => {
+    const verdict = checkCheckoutCredentials(
+      withCheckout(["        with:", '          persist-credentials: "true"']),
+    );
+
+    assert.equal(verdict.ok, false, "persist-credentials: true was accepted");
+    assert.match(verdict.ok === false ? verdict.reason : "", /git configuration/);
+  });
+
+  /** NON-VACUITY: the value that satisfies it really does satisfy it. */
+  it("accepts a checkout that disables credential persistence", () => {
+    const verdict = checkCheckoutCredentials(
+      withCheckout(["        with:", '          persist-credentials: "false"']),
+    );
+
+    assert.equal(verdict.ok, true, verdict.ok ? "" : verdict.reason);
+  });
+
+  /** And the shipped file really contains the line, not merely a passing check. */
+  it("ships the input in the file GitHub will read", () => {
+    assert.match(SOURCE, /persist-credentials:\s*"false"/);
+  });
+});
+
+describe("TASK-017 round-9 HIGH 2: trigger configuration is typed, per event", () => {
+  function on(lines: readonly string[]): YamlMap {
+    const result = parseWorkflow([
+      "name: x", "on:", ...lines, "permissions:", "  contents: read",
+      "jobs:", "  v:", "    runs-on: ubuntu-latest", "    steps:",
+      `      - uses: actions/checkout@${"a".repeat(40)}`, "",
+    ].join("\n"));
+    assert.equal(result.ok, true, `fixture does not parse: ${result.ok ? "" : result.reason}`);
+    if (!result.ok) throw new Error("unreachable");
+    return result.root;
+  }
+
+  /**
+   * `pull_request: anything` IS NOT A WORKFLOW GITHUB WOULD RUN, and both the
+   * shape gate and `checkTriggers` skipped scalar configs with the same
+   * `continue`. Two checks that waive identically are one check.
+   *
+   * Approving a workflow GitHub rejects is the same failure as approving one
+   * that runs wrongly: the evidence AC-5 demands never appears either way.
+   */
+  it("refuses a scalar event configuration at the shape gate", () => {
+    const verdict = checkWorkflowShape(on(["  pull_request: anything", "  push: anything"]));
+
+    assert.equal(verdict.ok, false, "a scalar event config was skipped");
+    assert.match(verdict.ok === false ? verdict.reason : "", /rather than a mapping/);
+  });
+
+  it("refuses a scalar event configuration at the trigger check too", () => {
+    const verdict = checkTriggers(on(["  pull_request: anything", "  push: anything"]));
+
+    assert.equal(verdict.ok, false, "a scalar event config was skipped");
+  });
+
+  /**
+   * `types` BELONGS TO `pull_request`, NOT TO EVERY EVENT. One shared list was
+   * closed over the union of two vocabularies, which is larger than either.
+   */
+  it("refuses types on push, which GitHub does not give activity types", () => {
+    const verdict = checkWorkflowShape(on([
+      "  pull_request:", "    branches:", '      - "**"',
+      "  push:", "    types:", "      - made-up", "    branches:", '      - "**"',
+    ]));
+
+    assert.equal(verdict.ok, false, "types on push was accepted");
+    assert.match(verdict.ok === false ? verdict.reason : "", /not reasoned about for this event/);
+  });
+
+  /** NON-VACUITY: types on pull_request, where it is modelled, still passes. */
+  it("still accepts types on pull_request", () => {
+    const verdict = checkWorkflowShape(on([
+      "  pull_request:", "    types:", "      - opened", "      - synchronize",
+      "    branches:", '      - "**"',
+      "  push:", "    branches:", '      - "**"',
+    ]));
+
+    assert.equal(verdict.ok, true, verdict.ok ? "" : verdict.reason);
+  });
+});
+
+describe("TASK-017 round-9 HIGH 3: a mapping key is a node, and gets the same gate", () => {
+  /**
+   * The anchor/tag/alias checks ran on VALUES only, so `!!str on:` and
+   * `&key on:` reached the policy with the tag and anchor silently dropped and
+   * every check passed. The normalisation claimed to refuse these and refused
+   * them in one of the two positions they can occupy.
+   */
+  for (const [label, source, reason] of [
+    ["a tagged key", "!!str on:\n  push:\n    branches: []\n", /tag/],
+    ["an anchored key", "&key on:\n  push:\n    branches: []\n", /anchor/],
+    ["an aliased key", "a: &k name\n*k : value\n", /alias|anchor/],
+  ] as const) {
+    it(`refuses ${label}`, () => {
+      const parsed = parseWorkflow(source);
+
+      assert.equal(parsed.ok, false, `${label} was normalised away`);
+      assert.match(parsed.ok === false ? parsed.reason : "", reason);
+    });
+  }
+
+  /** And the reason names the KEY, so a reader is sent to the right place. */
+  it("names the key it refused", () => {
+    const parsed = parseWorkflow("!!str on:\n  push:\n    branches: []\n");
+
+    assert.match(parsed.ok === false ? parsed.reason : "", /key "on"/);
+  });
+
+  /** NON-VACUITY: ordinary keys are still read. */
+  it("still reads an ordinary key", () => {
+    const parsed = parseWorkflow("name: verify\n");
+
+    assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+    if (!parsed.ok) return;
+    assert.equal(get(parsed.root, "name"), "verify");
+  });
+});
+
+describe("TASK-017 round-9 HIGH 4: a pin says which version, not whose code", () => {
+  const A = "a".repeat(40);
+
+  function steps_(lines: readonly string[]): YamlMap {
+    const result = parseWorkflow([
+      "name: x", "on:", "  pull_request:", "    branches:", '      - "**"',
+      "  push:", "    branches:", '      - "**"', "permissions:", "  contents: read",
+      "jobs:", "  v:", "    runs-on: ubuntu-latest", "    steps:", ...lines, "",
+    ].join("\n"));
+    assert.equal(result.ok, true, `fixture does not parse: ${result.ok ? "" : result.reason}`);
+    if (!result.ok) throw new Error("unreachable");
+    return result.root;
+  }
+
+  /**
+   * `checkActionPins` was satisfied completely by `evil/tool@<40 hex>`: the pin
+   * was real, the commit was immutable, and the code was somebody else's. Pin
+   * and identity are different questions and only one was being asked.
+   */
+  it("refuses an action nobody has reasoned about, however well pinned", () => {
+    const root = steps_([`      - uses: actions/checkout@${A}`, `      - uses: evil/tool@${A}`]);
+
+    assert.equal(checkActionPins(root).ok, true, "the pin itself is valid, which is the point");
+
+    const verdict = checkWorkflowShape(root);
+
+    assert.equal(verdict.ok, false, "an unreasoned-about action was accepted");
+    assert.match(verdict.ok === false ? verdict.reason : "", /evil\/tool/);
+  });
+
+  /** NON-VACUITY: the two modelled actions are still admitted. */
+  it("still accepts the two actions this repository reasons about", () => {
+    const verdict = checkWorkflowShape(steps_([
+      `      - uses: actions/checkout@${A}`,
+      "        with:", '          persist-credentials: "false"',
+      `      - uses: actions/setup-node@${A}`,
+      "        with:", '          node-version: "22.5.0"',
+    ]));
+
+    assert.equal(verdict.ok, true, verdict.ok ? "" : verdict.reason);
+  });
+
+  /**
+   * THE ALLOWLIST AND THE INPUT ALLOWLIST MUST AGREE. An action admitted here
+   * with no entry in `ALLOWED_WITH_KEYS` would have its configuration
+   * unexamined, which is the gap this pair exists to prevent.
+   */
+  it("models the inputs of every action it admits", () => {
+    for (const action of ALLOWED_ACTIONS) {
+      assert.ok(
+        Object.prototype.hasOwnProperty.call(ALLOWED_WITH_KEYS, action),
+        `${action} is admitted but its inputs are not modelled`,
+      );
+    }
+  });
+
+  it("refuses a step declaring both uses: and run:", () => {
+    const verdict = checkWorkflowShape(steps_([
+      `      - uses: actions/checkout@${A}`,
+      "        with:", '          persist-credentials: "false"',
+      "      - run: npm test", `        uses: evil/tool@${A}`,
+    ]));
+
+    assert.equal(verdict.ok, false, "a step was both an action and a command");
+    assert.match(verdict.ok === false ? verdict.reason : "", /both uses: and run:/);
+  });
+
+  it("refuses a workflow name that is not a single string", () => {
+    const result = parseWorkflow([
+      "name: [verify, extra]", "on:", "  pull_request:", "    branches:", '      - "**"',
+      "  push:", "    branches:", '      - "**"', "permissions:", "  contents: read",
+      "jobs:", "  v:", "    runs-on: ubuntu-latest", "    steps:",
+      `      - uses: actions/checkout@${A}`, "",
+    ].join("\n"));
+    assert.equal(result.ok, true, result.ok ? "" : result.reason);
+    if (!result.ok) return;
+
+    const verdict = checkWorkflowShape(result.root);
+
+    assert.equal(verdict.ok, false, "a sequence name was accepted");
+    assert.match(verdict.ok === false ? verdict.reason : "", /name is not a single string/);
   });
 });

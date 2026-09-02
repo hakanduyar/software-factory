@@ -62,17 +62,37 @@ function refuse(reason: string): ParseResult {
  * a round-8 CRITICAL, where `permissions:` with nothing under it was read as an
  * explicit least-privilege block.
  */
-function normalise(node: unknown, path: string): { readonly ok: true; readonly value: YamlNode } | { readonly ok: false; readonly reason: string } {
+/**
+ * The checks that apply to ANY node, key or value (round-9 review, HIGH 3).
+ *
+ * These lived inline in `normalise`, which only ever ran on VALUES — so
+ * `!!str on:` and `&key on:` reached the policy with the tag and the anchor
+ * quietly dropped, and every check passed. The normalisation claimed to refuse
+ * tags and anchors and refused them in one of the two positions they can occupy.
+ *
+ * Extracting them is the fix, and it is the shape of the fix that matters: a
+ * rule stated once and applied at every site cannot be half-applied. Written
+ * inline twice, it would drift again.
+ */
+function nodeGate(node: unknown, path: string): string | undefined {
   if (isAlias(node)) {
-    return { ok: false, reason: `${path} uses an alias; this reader does not resolve aliases` };
+    return `${path} uses an alias; this reader does not resolve aliases`;
   }
   const anchor = (node as { anchor?: string } | null)?.anchor;
   if (typeof anchor === "string" && anchor.length > 0) {
-    return { ok: false, reason: `${path} carries the anchor &${anchor}; this reader does not resolve anchors` };
+    return `${path} carries the anchor &${anchor}; this reader does not resolve anchors`;
   }
   const tag = (node as { tag?: string } | null)?.tag;
   if (typeof tag === "string" && tag.length > 0) {
-    return { ok: false, reason: `${path} carries the explicit tag ${tag}; this reader does not interpret tags` };
+    return `${path} carries the explicit tag ${tag}; this reader does not interpret tags`;
+  }
+  return undefined;
+}
+
+function normalise(node: unknown, path: string): { readonly ok: true; readonly value: YamlNode } | { readonly ok: false; readonly reason: string } {
+  const gated = nodeGate(node, path);
+  if (gated !== undefined) {
+    return { ok: false, reason: gated };
   }
 
   if (isScalar(node)) {
@@ -110,6 +130,15 @@ function normalise(node: unknown, path: string): { readonly ok: true; readonly v
       const key = pair.key;
       if (!isScalar(key) || typeof key.value !== "string") {
         return { ok: false, reason: `${path} has a key that is not a plain string` };
+      }
+      /**
+       * THE KEY IS A NODE TOO. A key can carry an anchor or an explicit tag
+       * exactly as a value can, and checking only values let `!!str on:` and
+       * `&key on:` through with the tag and anchor silently discarded.
+       */
+      const keyGated = nodeGate(key, `${path}'s key ${JSON.stringify(key.value)}`);
+      if (keyGated !== undefined) {
+        return { ok: false, reason: keyGated };
       }
       const child = `${path}.${key.value}`;
       if (pair.value === null || pair.value === undefined) {

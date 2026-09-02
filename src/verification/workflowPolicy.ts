@@ -145,7 +145,33 @@ export function steps(root: YamlMap): readonly YamlNode[] {
  */
 const ALLOWED_ROOT_KEYS: readonly string[] = ["name", "on", "permissions", "jobs"];
 const ALLOWED_EVENTS: readonly string[] = ["pull_request", "push"];
-const ALLOWED_EVENT_KEYS: readonly string[] = ["branches", "types"];
+/**
+ * PER EVENT, not one list shared by all of them (round-9 review, HIGH 2).
+ *
+ * A single list allowed `types` on `push`, which has no activity types in
+ * GitHub's model, so a filter reasoned about only for `pull_request` passed on
+ * an event where it means nothing. An allowlist shared between things that do
+ * not share a vocabulary is not closed over either of them — it is closed over
+ * their union, which is strictly larger.
+ */
+const ALLOWED_EVENT_KEYS: Readonly<Record<string, readonly string[]>> = {
+  pull_request: ["branches", "types"],
+  push: ["branches"],
+};
+/**
+ * The actions this workflow may run, BY IDENTITY (round-9 review, HIGH 4).
+ *
+ * `checkActionPins` proved every `uses:` named a commit, and a pin says WHICH
+ * VERSION runs while saying nothing about WHOSE CODE it is —
+ * `evil/tool@<40 hex>` satisfied it completely, and the allowlist that was
+ * supposed to be closed had no opinion about action identity at all.
+ *
+ * These are the two actions this repository has reasoned about, and they are
+ * exactly the two whose inputs `ALLOWED_WITH_KEYS` constrains. That agreement
+ * is the point: an action nobody has modelled has no modelled inputs either, so
+ * admitting one would leave its configuration unexamined as well.
+ */
+export const ALLOWED_ACTIONS: readonly string[] = ["actions/checkout", "actions/setup-node"];
 /**
  * NO `if`, NO `continue-on-error`, NO `permissions` at job level, and nothing
  * that changes where or how the job runs.
@@ -167,7 +193,7 @@ const ALLOWED_STEP_KEYS: readonly string[] = ["name", "uses", "run", "with"];
  * which would let the clean room verify somebody else's code entirely — the
  * round-2 reviewer repointed it and every check stayed green.
  */
-const ALLOWED_WITH_KEYS: Readonly<Record<string, readonly string[]>> = {
+export const ALLOWED_WITH_KEYS: Readonly<Record<string, readonly string[]>> = {
   "actions/checkout": ["persist-credentials"],
   "actions/setup-node": ["node-version"],
 };
@@ -179,9 +205,18 @@ function actionName(uses: string): string {
 }
 
 export function checkWorkflowShape(root: YamlMap): PolicyVerdict {
-  for (const [key] of root.entries) {
+  for (const [key, value] of root.entries) {
     if (!ALLOWED_ROOT_KEYS.includes(key)) {
       return refuse(`the workflow declares ${JSON.stringify(key)}, which this policy does not reason about`);
+    }
+    /**
+     * `name` HAS A TYPE TOO (round-9 review, non-blocking note). `name:
+     * [verify, extra]` passed every check because the root allowlist asked
+     * only which keys appeared. The same half-check as the step keys, at the
+     * level above them.
+     */
+    if (key === "name" && typeof value !== "string") {
+      return refuse("the workflow's name is not a single string");
     }
   }
 
@@ -193,14 +228,27 @@ export function checkWorkflowShape(root: YamlMap): PolicyVerdict {
     if (!ALLOWED_EVENTS.includes(event)) {
       return refuse(`the workflow triggers on ${JSON.stringify(event)}, which this policy does not reason about`);
     }
-    if (config === undefined || typeof config === "string") continue;
+    /**
+     * A SCALAR IS NOT A FILTER BLOCK, AND SKIPPING IT WAS FAILING OPEN
+     * (round-9 review, HIGH 2).
+     *
+     * `pull_request: anything` was waved through here and again in
+     * `checkTriggers`, so a workflow GitHub would reject outright passed every
+     * check this repository makes. Approving a workflow that cannot run is the
+     * same defect as approving one that runs wrongly: either way the evidence
+     * the criteria demand never appears.
+     */
+    if (typeof config === "string") {
+      return refuse(`the filters for ${event} are ${JSON.stringify(config)} rather than a mapping`);
+    }
     if (config.kind !== "map") {
       return refuse(`the filters for ${event} are not a mapping`);
     }
+    const allowedForEvent = ALLOWED_EVENT_KEYS[event] ?? [];
     for (const [key] of config.entries) {
-      if (!ALLOWED_EVENT_KEYS.includes(key)) {
+      if (!allowedForEvent.includes(key)) {
         return refuse(
-          `${event} uses ${JSON.stringify(key)}, which can stop the workflow running and is not reasoned about here`,
+          `${event} uses ${JSON.stringify(key)}, which can stop the workflow running and is not reasoned about for this event`,
         );
       }
     }
@@ -254,6 +302,29 @@ export function checkWorkflowShape(root: YamlMap): PolicyVerdict {
         }
       }
       const uses = get(step, "uses");
+      const run = get(step, "run");
+      /**
+       * A STEP IS AN ACTION OR A COMMAND, NOT BOTH (round-9 review,
+       * non-blocking note). GitHub runs one or the other, and a step declaring
+       * both meant the run allowlist and the action allowlist each judged half
+       * a step while believing they had judged it.
+       */
+      if (uses !== undefined && run !== undefined) {
+        return refuse(`a step in job ${JSON.stringify(name)} declares both uses: and run:`);
+      }
+      if (uses !== undefined && run === undefined) {
+        /**
+         * A PIN SAYS WHICH VERSION, NOT WHOSE CODE (round-9 review, HIGH 4).
+         * Checked here rather than in `checkActionPins`, because "may this
+         * action appear at all" is a question about what the workflow may
+         * CONTAIN, which is what this gate is for.
+         */
+        if (typeof uses !== "string" || !ALLOWED_ACTIONS.includes(actionName(uses))) {
+          return refuse(
+            `a step in job ${JSON.stringify(name)} uses ${JSON.stringify(typeof uses === "string" ? actionName(uses) : uses)}, which is not an action this policy reasons about`,
+          );
+        }
+      }
       const withBlock = get(step, "with");
       if (withBlock !== undefined) {
         if (typeof uses !== "string") {
@@ -314,6 +385,44 @@ export function checkCheckout(root: YamlMap): PolicyVerdict {
   const firstUses = firstStep === undefined ? undefined : get(firstStep, "uses");
   if (typeof firstUses !== "string" || actionName(firstUses) !== "actions/checkout") {
     return refuse("the checkout is not the first step, so an earlier step could act on an unfetched tree");
+  }
+  return { ok: true };
+}
+
+/**
+ * AC-3. The clean room inherits NO REPOSITORY-LOCAL GIT CONFIGURATION
+ * (round-9 review, HIGH 1).
+ *
+ * The criterion says this in as many words, and nothing checked it. The pinned
+ * `actions/checkout` defaults `persist-credentials` to true, which writes the
+ * job's token into `.git/config` as an `http.extraheader` — so every later step
+ * runs against a checkout carrying a credential, and `npm test` executes
+ * repository code with that credential sitting in the tree it was handed.
+ *
+ * `permissions: contents: read` bounds what the token can DO, and bounding a
+ * credential is not the same as not having one: AC-3 is about what the room
+ * inherits, not about how much damage the inheritance would allow.
+ *
+ * REQUIRED EXPLICITLY, not merely "not set to true". A default is a decision
+ * somebody else gets to change — the action's next release could flip it — and
+ * the whole point of pinning is that what runs here does not change without a
+ * change here. Writing it out means the file states the property it relies on.
+ */
+export function checkCheckoutCredentials(root: YamlMap): PolicyVerdict {
+  for (const step of steps(root)) {
+    const uses = get(step, "uses");
+    if (typeof uses !== "string" || actionName(uses) !== "actions/checkout") continue;
+    const persist = get(get(step, "with"), "persist-credentials");
+    if (persist === undefined) {
+      return refuse(
+        "the checkout does not set persist-credentials, so it defaults to leaving the job's token in the repository's git configuration",
+      );
+    }
+    if (persist !== "false") {
+      return refuse(
+        `the checkout sets persist-credentials: ${JSON.stringify(String(persist))}, so the job's token is written into the repository's git configuration`,
+      );
+    }
   }
   return { ok: true };
 }
@@ -452,8 +561,17 @@ export function checkTriggers(root: YamlMap): PolicyVerdict {
    */
   for (const event of ["pull_request", "push"]) {
     const config = get(on, event);
-    if (config === undefined || typeof config === "string") {
+    if (config === undefined) {
       continue;
+    }
+    /**
+     * A SCALAR CONFIG IS REFUSED, NOT SKIPPED (round-9 review, HIGH 2). This
+     * `continue` and the one in `checkWorkflowShape` were the same waiver
+     * written twice, so `push: anything` passed both. Two independent checks
+     * that skip identically are one check.
+     */
+    if (typeof config === "string") {
+      return refuse(`${event} is configured as ${JSON.stringify(config)} rather than a mapping of filters`);
     }
     if (config.kind === "map") {
       const ignored = get(config, "branches-ignore");

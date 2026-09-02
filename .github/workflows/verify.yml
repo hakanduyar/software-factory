@@ -37,6 +37,18 @@ jobs:
       # Pinned to an immutable commit, not a tag. Tags move; what runs in the
       # clean room must not change without a change to this file.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          # The action DEFAULTS this to true, which writes the job's token into
+          # .git/config as an http.extraheader -- so `npm test` would run
+          # repository code against a checkout carrying a live credential. The
+          # header above promises no repository-local git configuration, and
+          # this line is what makes that true rather than aspirational.
+          #
+          # Stated explicitly rather than relying on the default being right: a
+          # default belongs to the action and can change in a release, and the
+          # point of pinning is that what runs here does not change without a
+          # change here.
+          persist-credentials: "false"
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
           # Must satisfy package.json engines.node, which a test asserts so the
