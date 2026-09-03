@@ -1640,7 +1640,21 @@ const guarded = await (async () => {
 })();
 
 const unguarded = guarded.flatMap(({ module, test, marker, anchor }) => {
-  const anchored = anchor !== undefined && existsSync(join(REPO_ROOT, anchor));
+  /**
+   * A DECLARED ANCHOR MUST EXIST (round-12 review, HIGH 1).
+   *
+   * The anchor used to be consulted only when the anchor FILE was still there,
+   * which made the guard conditional on the very thing an attacker deletes.
+   * Removing the workflow, all four modules and both test files together left
+   * the suite green at 102 test files — the entire deliverable gone, and
+   * verification reporting success.
+   *
+   * The requirement is now tied to the DECLARATION rather than to the artifact:
+   * this manifest says `.github/workflows/verify.yml` is guarded, so it has to
+   * be there. Removing the workflow legitimately means removing these entries
+   * too, which is a visible diff in a file whose whole purpose is to be read.
+   */
+  const anchored = anchor !== undefined;
   if (anchored && !existsSync(join(REPO_ROOT, module))) {
     return [[module, test, `is missing while ${anchor} is still present and unvalidated`]];
   }
@@ -1668,6 +1682,40 @@ if (guarded.length === 0 && existsSync(join(REPO_ROOT, "src/verification/workflo
   fail(
     "verification refused: the guarded-module manifest is empty while the modules it describes are present. " +
       "An empty manifest disables every deletion guard at once.",
+  );
+}
+
+/**
+ * A DECLARED ANCHOR MUST BE IN THE TREE (round-12 review, HIGH 1).
+ *
+ * The anchor used to be consulted only when the anchor FILE still existed,
+ * which made the guard conditional on the very thing an attacker deletes.
+ * Removing the workflow, all four verification modules and both test files
+ * together left the suite green at 102 test files: the entire deliverable gone,
+ * and verification reporting success.
+ *
+ * The requirement is tied to the DECLARATION instead. This manifest says
+ * `.github/workflows/verify.yml` is guarded, so it has to be there. Removing
+ * the workflow legitimately means removing those entries too, which is a
+ * visible diff in a file whose whole purpose is to be read.
+ *
+ * Reported separately from `unguarded` because the subject is different: that
+ * message is about a module lacking its test, and this is about the manifest
+ * naming an artifact the tree does not have.
+ */
+const missingAnchors = [
+  ...new Set(
+    guarded
+      .filter(({ anchor }) => anchor !== undefined && !existsSync(join(REPO_ROOT, anchor)))
+      .map(({ anchor }) => anchor),
+  ),
+];
+if (missingAnchors.length > 0) {
+  fail(
+    "verification refused: the guarded-module manifest anchors " +
+      missingAnchors.map((anchor) => `\`${anchor}\``).join(", ") +
+      ", which the tree does not contain. Deleting the artifact a guard exists for does not remove the guard; " +
+      "removing it deliberately means removing its manifest entries in the same change.",
   );
 }
 

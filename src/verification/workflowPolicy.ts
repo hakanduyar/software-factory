@@ -908,6 +908,29 @@ export function checkNodePin(root: YamlMap, enginesRange: string | undefined): P
       "no actions/setup-node step pins a node-version, so the runner would use whatever its image ships",
     );
   }
+  /**
+   * AND IT MUST PIN BEFORE ANYTHING USES NODE (round-12 review, HIGH 2).
+   *
+   * `setup-node` placed after `npm ci` and `npm test` pins nothing that matters:
+   * both commands have already run on whatever Node the runner image ships, and
+   * the step then helpfully installs the right version for the steps that no
+   * longer exist. Every check passed on such a workflow, because this function
+   * asked only whether a pinning step EXISTED.
+   *
+   * The same defect `checkCheckout` had in round 3, in the same shape: presence
+   * where the question was ORDER. Fixed the same way, by looking at the step
+   * sequence rather than at a filtered subset of it.
+   */
+  const ordered = loadBearingSteps(root);
+  const firstPin = ordered.findIndex(
+    (step) => step.uses !== undefined && /^actions\/setup-node@/.test(step.uses) && step.withNodeVersion !== undefined,
+  );
+  const firstRun = ordered.findIndex((step) => step.run !== undefined);
+  if (firstRun !== -1 && firstPin > firstRun) {
+    return refuse(
+      `the workflow runs ${JSON.stringify(ordered[firstRun]?.run?.trim() ?? "")} before actions/setup-node pins a version, so it would use whatever Node the runner image ships`,
+    );
+  }
   if (enginesRange === undefined) {
     return refuse("package.json declares no engines.node, so the pin cannot be checked against anything");
   }

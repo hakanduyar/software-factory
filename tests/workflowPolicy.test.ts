@@ -2412,3 +2412,156 @@ describe("TASK-017 round-10 HIGH: the trigger guard is closed independently", ()
     });
   }
 });
+
+/**
+ * TASK-017 round-12 review: two HIGHs, both about ORDER and ABSENCE rather than
+ * about content.
+ *
+ * The pattern in both: a check that asked whether something EXISTED when the
+ * question was WHERE it sat, or whether a guard applied when the thing it
+ * guarded had been removed. Neither is detectable by testing well-formed
+ * workflows, which is why both survived a green suite.
+ */
+describe("TASK-017 round-12 HIGH 2: the Node pin must come before anything uses Node", () => {
+  const A = "a".repeat(40);
+
+  function fromSteps(stepLines: readonly string[]): YamlMap {
+    const result = parseWorkflow([
+      "name: x", "on:", "  pull_request:", "    branches:", '      - "**"',
+      "  push:", "    branches:", '      - "**"', "permissions:", "  contents: read",
+      "jobs:", "  v:", "    runs-on: ubuntu-latest", "    steps:", ...stepLines, "",
+    ].join("\n"));
+    assert.equal(result.ok, true, `fixture does not parse: ${result.ok ? "" : result.reason}`);
+    if (!result.ok) throw new Error("unreachable");
+    return result.root;
+  }
+
+  const CHECKOUT = [`      - uses: actions/checkout@${A}`, "        with:", '          persist-credentials: "false"'];
+  const SETUP = [`      - uses: actions/setup-node@${A}`, "        with:", '          node-version: "22.5.0"'];
+  const COMMANDS = ["      - run: npm ci", "      - run: npm test"];
+
+  /**
+   * THE REVIEWER'S REPRODUCTION. `npm ci` and `npm test` run on the runner's
+   * ambient Node, and `setup-node` then installs the right version for the
+   * steps that follow it — of which there are none.
+   */
+  it("refuses a setup-node placed after the commands", () => {
+    const verdict = checkNodePin(fromSteps([...CHECKOUT, ...COMMANDS, ...SETUP]), ">=22.5.0");
+
+    assert.equal(verdict.ok, false, "a pin after the commands counted as pinning them");
+    assert.match(verdict.ok === false ? verdict.reason : "", /before actions\/setup-node/);
+  });
+
+  it("refuses a setup-node placed between the two commands", () => {
+    const verdict = checkNodePin(
+      fromSteps([...CHECKOUT, "      - run: npm ci", ...SETUP, "      - run: npm test"]),
+      ">=22.5.0",
+    );
+
+    assert.equal(verdict.ok, false, "a pin after npm ci counted as pinning it");
+  });
+
+  /** NON-VACUITY: the correct order is still accepted, and so is the shipped file. */
+  it("accepts a setup-node placed before the commands", () => {
+    const verdict = checkNodePin(fromSteps([...CHECKOUT, ...SETUP, ...COMMANDS]), ">=22.5.0");
+
+    assert.equal(verdict.ok, true, verdict.ok ? "" : verdict.reason);
+  });
+
+  it("accepts the shipped workflow, whose pin comes first", () => {
+    const verdict = checkNodePin(shipped(), PACKAGE.engines?.node);
+
+    assert.equal(verdict.ok, true, verdict.ok ? "" : verdict.reason);
+  });
+
+  /** A workflow with no `run:` step at all has nothing to order against. */
+  it("does not invent an ordering requirement when nothing runs", () => {
+    const verdict = checkNodePin(fromSteps([...CHECKOUT, ...SETUP]), ">=22.5.0");
+
+    assert.equal(verdict.ok, true, verdict.ok ? "" : verdict.reason);
+  });
+});
+
+describe("TASK-017 round-12 HIGH 1: deleting the artifact does not delete its guard", () => {
+  /**
+   * THE WORST FINDING IN THIS TASK SO FAR, and the simplest.
+   *
+   * `verify.mjs` consulted a manifest entry's anchor only when the ANCHOR FILE
+   * still existed, which made the guard conditional on the very thing an
+   * attacker removes. Deleting `.github/workflows/verify.yml`, all four
+   * verification modules and both test files together left the suite green at
+   * 102 test files: the entire deliverable gone, verification reporting
+   * success.
+   *
+   * The requirement is now tied to the DECLARATION. This case asserts the
+   * property directly, so it holds without depending on a deletion attack
+   * anybody has to remember to run.
+   */
+  it("requires every anchor the manifest declares to be in the tree", () => {
+    const missing = GUARDED_MODULES
+      .filter((entry) => entry.anchor !== undefined)
+      .filter((entry) => !existsSync(join(REPO_ROOT, entry.anchor!)))
+      .map((entry) => entry.anchor);
+
+    assert.deepEqual(missing, [], `the manifest anchors artifacts that are not present: ${missing.join(", ")}`);
+  });
+
+  /** And at least one entry IS anchored, or the case above is vacuous. */
+  it("anchors the workflow guards to the workflow itself", () => {
+    const anchored = GUARDED_MODULES.filter((entry) => entry.anchor === ".github/workflows/verify.yml");
+
+    assert.ok(anchored.length >= 3, `expected the workflow modules to be anchored, found ${anchored.length}`);
+  });
+
+  /**
+   * AND THE VERIFIER MUST ACT ON A MISSING ANCHOR, not merely declare one.
+   * Reading the verifier's source is the same weak evidence that round 8
+   * rejected for the manifest, so this asserts the SHAPE of the check rather
+   * than its wording: the anchor is consulted before the module's existence is.
+   */
+  it("makes the verifier refuse a declared anchor that is absent", () => {
+    const verifier = readFileSync(join(REPO_ROOT, "scripts/verify.mjs"), "utf8");
+
+    assert.match(
+      verifier,
+      /anchor !== undefined && !existsSync\(join\(REPO_ROOT, anchor\)\)/,
+      "the verifier does not refuse a declared anchor that is missing from the tree",
+    );
+    /**
+     * AND IT MUST FAIL ON THEM. Computing a list and not acting on it is the
+     * round-8 defect exactly — a check that quietly does nothing — so the
+     * `fail` is asserted alongside the computation rather than inferred from it.
+     */
+    assert.match(
+      verifier,
+      /if \(missingAnchors\.length > 0\) \{\s*\n\s*fail\(/,
+      "the verifier computes missing anchors without failing on them",
+    );
+  });
+});
+
+/**
+ * TASK-017 round-12 note: the runner check was partly self-shaped.
+ *
+ * The sanity case asserted only that every allowlisted label STARTS WITH
+ * `ubuntu-`, which a list containing `ubuntu-latest-8-cores` would also
+ * satisfy — and that label is precisely the metered runner AC-1 exists to keep
+ * out. A property drawn from the shape of the current values is not the
+ * property the criterion is about.
+ */
+describe("TASK-017 round-12 note: the runner allowlist is stated, not inferred", () => {
+  it("is exactly the three runners this repository has reasoned about", () => {
+    assert.deepEqual(
+      [...FREE_RUNNER_LABELS].sort(),
+      ["ubuntu-22.04", "ubuntu-24.04", "ubuntu-latest"],
+      "the runner allowlist changed; every entry must be a runner GitHub does not meter for a public repository",
+    );
+  });
+
+  /** And the metered spellings that look like members are refused. */
+  for (const label of ["ubuntu-latest-8-cores", "ubuntu-latest-4-cores", "ubuntu-24.04-arm"]) {
+    it(`refuses ${label}, which starts with ubuntu- and is metered`, () => {
+      assert.equal(FREE_RUNNER_LABELS.includes(label), false, `${label} is in the allowlist`);
+    });
+  }
+});

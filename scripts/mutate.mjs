@@ -593,6 +593,31 @@ const MUTATIONS = [
     tests: [T_WF],
     expect: "covers every alias npm documents",
   },
+  // ---- round-12 review -----------------------------------------------------
+  {
+    id: "a declared anchor need not exist, so deleting the workflow removes its guard",
+    edits: [[VERIFIER,
+      "      .filter(({ anchor }) => anchor !== undefined && !existsSync(join(REPO_ROOT, anchor)))",
+      "      .filter(() => false)"]],
+    tests: [T_WF],
+    expect: "makes the verifier refuse a declared anchor that is absent",
+  },
+  {
+    id: "the Node pin may come after the commands it is meant to pin",
+    edits: [[POLICY,
+      "  if (firstRun !== -1 && firstPin > firstRun) {",
+      "  if (firstRun !== -1 && firstPin > firstRun && firstRun < 0) {"]],
+    tests: [T_WF],
+    expect: "refuses a setup-node placed after the commands",
+  },
+  {
+    id: "a metered larger runner joins the free list",
+    edits: [[POLICY,
+      'export const FREE_RUNNER_LABELS: readonly string[] = ["ubuntu-latest", "ubuntu-24.04", "ubuntu-22.04"];',
+      'export const FREE_RUNNER_LABELS: readonly string[] = ["ubuntu-latest", "ubuntu-24.04", "ubuntu-22.04", "ubuntu-latest-8-cores"];']],
+    tests: [T_WF],
+    expect: "is exactly the three runners this repository has reasoned about",
+  },
 ];
 
 function sha256(path) {
