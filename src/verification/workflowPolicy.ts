@@ -823,6 +823,18 @@ function isNpmSubcommand(command: string, subcommands: readonly string[]): boole
 
 export function checkInstall(root: YamlMap): PolicyVerdict {
   /**
+   * A COMMAND THIS GUARD CANNOT READ IS REFUSED HERE (round-13 review, note).
+   *
+   * `declaredRunCommands` drops a non-string `run:`, so `run: [evil]` beside a
+   * valid `npm ci` left this check returning ok. `checkWorkflowShape` and
+   * `checkRunAllowlist` both refuse it, so there was no full-policy survivor —
+   * but "refused by a sibling" is not "this guard holds", and that distinction
+   * has been the finding in three of the last five rounds.
+   */
+  if (stepValues(root, "run") === undefined) {
+    return refuse("a step gives run: something other than a single command, so the install cannot be judged");
+  }
+  /**
    * DECLARED commands, not merely load-bearing ones: a conditional
    * `npm install` is still an `npm install` in the file, and AC-3 forbids it
    * outright rather than forbidding it only when it runs.
@@ -855,6 +867,10 @@ export function checkInstall(root: YamlMap): PolicyVerdict {
  * "work" — precisely because it would work while meaning something else.
  */
 export function checkVerificationCommand(root: YamlMap): PolicyVerdict {
+  /** The same refusal as `checkInstall`, and for the same reason. */
+  if (stepValues(root, "run") === undefined) {
+    return refuse("a step gives run: something other than a single command, so the verification cannot be judged");
+  }
   for (const command of declaredRunCommands(root)) {
     if (/\bnode\s+--test\b/.test(command) || /(^|\s)(npx\s+)?tsc\b/.test(command) || /\bverify\.mjs\b/.test(command)) {
       return refuse(

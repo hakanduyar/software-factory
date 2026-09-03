@@ -1674,14 +1674,64 @@ const unguarded = guarded.flatMap(({ module, test, marker, anchor }) => {
 });
 
 /**
- * AN EMPTY MANIFEST IS ITSELF A FAILURE when the tree has the modules it
- * describes. Commenting the entries out was the round-8 bypass, and a check
- * that quietly does nothing is the shape this whole area keeps producing.
+ * THE MANIFEST IS REQUIRED BY WHAT THE REPOSITORY COMMITS, NOT BY A SIBLING
+ * FILE (round-13 review, CRITICAL 1).
+ *
+ * Every previous version of this guard rested on some OTHER file still being
+ * present — round 8 on the manifest's entries, round 12 on the anchor, and the
+ * check below on `workflowPolicy.ts`. Each time, the answer was to delete that
+ * file too. Round 13 deleted the workflow, all four verification modules, both
+ * tests AND `guardedModules.ts` itself: the dynamic import then threw, `guarded`
+ * became `[]`, the empty-manifest check found no `workflowPolicy.ts` to trigger
+ * on, and the suite passed at 102 test files with the whole deliverable gone.
+ *
+ * A guard predicated on a deletable file can always be switched off by widening
+ * the deletion. So the predicate is now HEAD: if this repository COMMITS a
+ * manifest, the working tree must have one and it must produce entries.
+ * Deleting it is then a divergence from what the repository says it is, and the
+ * only honest way to remove it is to commit that removal — which is a visible
+ * diff rather than a silent `rm`.
+ *
+ * Tolerant where it must be: a tree with no git, or one whose HEAD never
+ * carried the manifest — every harness fixture repository — is unaffected,
+ * because the question asked is "does THIS repository declare one?".
  */
-if (guarded.length === 0 && existsSync(join(REPO_ROOT, "src/verification/workflowPolicy.ts"))) {
+const MANIFEST_SOURCE = "src/verification/guardedModules.ts";
+const manifestIsCommitted = (() => {
+  try {
+    const tracked = execFileSync("git", ["ls-tree", "-r", "HEAD", "--name-only"], {
+      cwd: REPO_ROOT,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return tracked.split("\n").includes(MANIFEST_SOURCE);
+  } catch {
+    return false;
+  }
+})();
+
+if (manifestIsCommitted && !existsSync(join(REPO_ROOT, MANIFEST_SOURCE))) {
   fail(
-    "verification refused: the guarded-module manifest is empty while the modules it describes are present. " +
-      "An empty manifest disables every deletion guard at once.",
+    `verification refused: ${MANIFEST_SOURCE} is committed at HEAD but missing from the working tree. ` +
+      "It is the manifest every deletion guard reads, so removing it silently disables all of them; " +
+      "removing it deliberately means committing that removal.",
+  );
+}
+
+/**
+ * AN EMPTY MANIFEST IS ITSELF A FAILURE. Commenting the entries out was the
+ * round-8 bypass, and a check that quietly does nothing is the shape this whole
+ * area keeps producing. Predicated on the COMMITTED manifest for the same
+ * reason as above — the round-8 version keyed on `workflowPolicy.ts`, which
+ * round 13 simply deleted as well.
+ */
+if (
+  guarded.length === 0 &&
+  (manifestIsCommitted || existsSync(join(REPO_ROOT, "src/verification/workflowPolicy.ts")))
+) {
+  fail(
+    "verification refused: the guarded-module manifest produced no entries while this repository declares one. " +
+      "An empty or unloadable manifest disables every deletion guard at once.",
   );
 }
 

@@ -299,15 +299,15 @@ const MUTATIONS = [
   {
     id: "an empty manifest is accepted",
     edits: [[VERIFIER,
-      'if (guarded.length === 0 && existsSync(join(REPO_ROOT, "src/verification/workflowPolicy.ts"))) {',
+      "if (\n  guarded.length === 0 &&\n  (manifestIsCommitted || existsSync(join(REPO_ROOT, \"src/verification/workflowPolicy.ts\")))\n) {",
       "if (false) {"]],
     tests: [T_WF],
-    expect: "empty manifest while the modules it describes",
+    expect: "refuses an empty manifest whenever the repository declares one",
   },
   // ---- round-7: the closed grammar ----------------------------------------
   {
     id: "the reader asks for YAML 1.1, where `on` is a boolean",
-    edits: [[DOCUMENT, 'version: "1.2"', 'version: "1.1"']],
+    edits: [[DOCUMENT, 'uniqueKeys: true, version: "1.2"', 'uniqueKeys: true, version: "1.1"']],
     tests: [T_WF],
     expect: "reads `on` as a key",
   },
@@ -617,6 +617,47 @@ const MUTATIONS = [
       'export const FREE_RUNNER_LABELS: readonly string[] = ["ubuntu-latest", "ubuntu-24.04", "ubuntu-22.04", "ubuntu-latest-8-cores"];']],
     tests: [T_WF],
     expect: "is exactly the three runners this repository has reasoned about",
+  },
+  // ---- round-13 review -----------------------------------------------------
+  {
+    id: "the YAML version is requested but not asserted",
+    edits: [[DOCUMENT,
+      '  if (effectiveVersion !== "1.2") {',
+      '  const forced: string | undefined = effectiveVersion;\n  if (forced !== "1.2" && forced === "\\u0000never") {']],
+    tests: [T_WF],
+    expect: "refuses a document that declares YAML 1.1",
+  },
+  {
+    id: "the committed manifest need not be in the working tree",
+    edits: [[VERIFIER,
+      "if (manifestIsCommitted && !existsSync(join(REPO_ROOT, MANIFEST_SOURCE))) {",
+      "if (false && manifestIsCommitted && !existsSync(join(REPO_ROOT, MANIFEST_SOURCE))) {"]],
+    tests: [T_WF],
+    expect: "asks git what the repository commits",
+  },
+  {
+    id: "the empty-manifest guard keys on workflowPolicy again",
+    edits: [[VERIFIER,
+      "  (manifestIsCommitted || existsSync(join(REPO_ROOT, \"src/verification/workflowPolicy.ts\")))",
+      "  existsSync(join(REPO_ROOT, \"src/verification/workflowPolicy.ts\"))"]],
+    tests: [T_WF],
+    expect: "refuses an empty manifest whenever the repository declares one",
+  },
+  {
+    id: "checkInstall reads past a run it cannot parse",
+    edits: [[POLICY,
+      "  if (stepValues(root, \"run\") === undefined) {\n    return refuse(\"a step gives run: something other than a single command, so the install cannot be judged\");\n  }",
+      "  void 0;"]],
+    tests: [T_WF],
+    expect: "checkInstall refuses a run: it cannot read, on its own",
+  },
+  {
+    id: "checkVerificationCommand reads past a run it cannot parse",
+    edits: [[POLICY,
+      "  if (stepValues(root, \"run\") === undefined) {\n    return refuse(\"a step gives run: something other than a single command, so the verification cannot be judged\");\n  }",
+      "  void 0;"]],
+    tests: [T_WF],
+    expect: "checkVerificationCommand refuses a run: it cannot read, on its own",
   },
 ];
 

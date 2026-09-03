@@ -17,6 +17,7 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -2564,4 +2565,191 @@ describe("TASK-017 round-12 note: the runner allowlist is stated, not inferred",
       assert.equal(FREE_RUNNER_LABELS.includes(label), false, `${label} is in the allowlist`);
     });
   }
+});
+
+/**
+ * TASK-017 round-13 review: a CRITICAL and a HIGH, and both are the same shape
+ * as findings this task has already had — which is why they are worth naming
+ * carefully rather than just fixing.
+ *
+ * The CRITICAL is the FOURTH iteration of one attack. Each round the deletion
+ * guard rested on some other file still being present, and each round the
+ * answer was to delete that file too:
+ *
+ *   round 8   the guard rested on the manifest's ENTRIES        -> comment them out
+ *   round 12  it rested on the ANCHOR file                      -> delete the workflow
+ *   round 13  it rested on `workflowPolicy.ts`                  -> delete that too
+ *
+ * A guard predicated on a deletable file can always be switched off by widening
+ * the deletion by one. The predicate is now what the repository COMMITS, which
+ * a working-tree `rm` cannot change.
+ *
+ * The HIGH is the "option is not a pin" shape: `version: "1.2"` says which
+ * schema to use when the document does not say for itself, and `%YAML 1.1`
+ * says for itself.
+ */
+describe("TASK-017 round-13 HIGH: the YAML version is asserted, not merely requested", () => {
+  /**
+   * The reviewer's fixture: a 1.1 directive plus the shipped workflow with
+   * `on:` quoted. It parsed, normalised, and passed all thirteen checks. The
+   * unquoted `on` would have become the boolean `true` and been caught — by
+   * accident, which quoting removed.
+   */
+  it("refuses a document that declares YAML 1.1", () => {
+    const candidate = "%YAML 1.1\n---\n" + SOURCE.replace(/^on:/m, '"on":');
+
+    const parsed = parseWorkflow(candidate);
+
+    assert.equal(parsed.ok, false, "a YAML 1.1 document was read with 1.2 assumptions");
+    assert.match(parsed.ok === false ? parsed.reason : "", /1\.1|YAML 1\.1|models YAML 1\.2/);
+  });
+
+  /** Any non-1.2 version, not merely the one that was reported. */
+  for (const directive of ["%YAML 1.1", "%YAML 1.3"]) {
+    it(`refuses ${directive}`, () => {
+      const parsed = parseWorkflow(`${directive}\n---\nname: verify\n`);
+
+      assert.equal(parsed.ok, false, `${directive} was accepted`);
+    });
+  }
+
+  /**
+   * NON-VACUITY, and it matters here: a check that refused every directive
+   * would pass the cases above while saying nothing about the version.
+   */
+  it("still accepts an explicit 1.2 directive", () => {
+    const parsed = parseWorkflow("%YAML 1.2\n---\nname: verify\n");
+
+    assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+    if (!parsed.ok) return;
+    assert.equal(get(parsed.root, "name"), "verify");
+  });
+
+  it("still accepts the shipped workflow, which declares no directive", () => {
+    assert.equal(parseWorkflow(SOURCE).ok, true);
+  });
+
+  /**
+   * AND THE 1.1 SEMANTICS ARE THE REASON, stated as a case so the refusal is
+   * tied to what actually differs: under 1.1 these plain scalars resolve to
+   * booleans, which is precisely the resolution difference the reader cannot
+   * model.
+   */
+  it("refuses 1.1 even where 1.2 would read the same text safely", () => {
+    const under12 = parseWorkflow("name: no\n");
+    assert.equal(under12.ok, true, "under 1.2 `no` is the string");
+    if (under12.ok) assert.equal(get(under12.root, "name"), "no");
+
+    assert.equal(parseWorkflow("%YAML 1.1\n---\nname: no\n").ok, false);
+  });
+});
+
+describe("TASK-017 round-13 note: the install and verification guards refuse what they cannot read", () => {
+  const A = "a".repeat(40);
+
+  function withRuns(commands: readonly string[]): YamlMap {
+    const lines = [
+      "name: x", "on:", "  pull_request:", "    branches:", '      - "**"',
+      "  push:", "    branches:", '      - "**"', "permissions:", "  contents: read",
+      "jobs:", "  v:", "    runs-on: ubuntu-latest", "    steps:",
+      `      - uses: actions/checkout@${A}`, "        with:", '          persist-credentials: "false"',
+      `      - uses: actions/setup-node@${A}`, "        with:", '          node-version: "22.5.0"',
+      ...commands.map((c) => `      - run: ${c}`),
+    ];
+    const result = parseWorkflow(lines.join("\n") + "\n");
+    assert.equal(result.ok, true, `fixture does not parse: ${result.ok ? "" : result.reason}`);
+    if (!result.ok) throw new Error("unreachable");
+    return result.root;
+  }
+
+  /**
+   * `declaredRunCommands` drops a non-string `run:`, so `run: [evil]` beside a
+   * valid `npm ci` left both these guards returning ok. Two siblings refused
+   * the workflow, so there was no survivor — but "a sibling refuses it" is not
+   * "this guard holds", and each guard is asserted on its own here.
+   */
+  it("checkInstall refuses a run: it cannot read, on its own", () => {
+    const verdict = checkInstall(withRuns(["npm ci", "npm test", "[evil]"]));
+
+    assert.equal(verdict.ok, false, "a non-string run left the install guard satisfied");
+    assert.match(verdict.ok === false ? verdict.reason : "", /single command/);
+  });
+
+  it("checkVerificationCommand refuses a run: it cannot read, on its own", () => {
+    const verdict = checkVerificationCommand(withRuns(["npm ci", "npm test", "[evil]"]));
+
+    assert.equal(verdict.ok, false, "a non-string run left the verification guard satisfied");
+    assert.match(verdict.ok === false ? verdict.reason : "", /single command/);
+  });
+
+  /** NON-VACUITY: both still accept the commands the workflow actually runs. */
+  it("both still accept npm ci and npm test", () => {
+    const root = withRuns(["npm ci", "npm test"]);
+
+    assert.equal(checkInstall(root).ok, true);
+    assert.equal(checkVerificationCommand(root).ok, true);
+  });
+});
+
+describe("TASK-017 round-13 CRITICAL: the manifest is required by what the repository commits", () => {
+  /**
+   * Every earlier version of this guard rested on a deletable sibling, so each
+   * round the attack simply widened by one file. The predicate is now HEAD:
+   * a working-tree `rm` cannot change what the repository commits.
+   *
+   * These cases assert the verifier's SHAPE rather than running it — the
+   * end-to-end deletion attack is in `scripts/mutate.mjs`, which clears `dist/`
+   * and runs the real suite, because reading source text is the weak evidence
+   * round 8 rejected. What is asserted here is that the predicate is HEAD and
+   * that it is acted on.
+   */
+  it("asks git what the repository commits, not whether a sibling file exists", () => {
+    const verifier = readFileSync(join(REPO_ROOT, "scripts/verify.mjs"), "utf8");
+
+    assert.match(
+      verifier,
+      /ls-tree/,
+      "the manifest requirement is not derived from what the repository commits",
+    );
+    /**
+     * ANCHORED TO THE START OF THE LINE (round-13 mutation, survivor 2).
+     *
+     * The first version matched the condition as a SUBSTRING, so a mutation
+     * that prepended `false &&` disabled the guard and left this passing —
+     * a test satisfied by text that no longer does anything. Requiring the
+     * line to BEGIN with the condition makes prepending visible.
+     */
+    assert.match(
+      verifier,
+      /\nif \(manifestIsCommitted && !existsSync\(join\(REPO_ROOT, MANIFEST_SOURCE\)\)\) \{/,
+      "a committed manifest missing from the working tree is not refused",
+    );
+  });
+
+  /** And the empty-manifest refusal must no longer key on workflowPolicy alone. */
+  it("refuses an empty manifest whenever the repository declares one", () => {
+    const verifier = readFileSync(join(REPO_ROOT, "scripts/verify.mjs"), "utf8");
+
+    assert.match(
+      verifier,
+      /guarded\.length === 0 &&\s*\n?\s*\(manifestIsCommitted \|\|/,
+      "the empty-manifest guard still depends only on workflowPolicy.ts existing",
+    );
+  });
+
+  /**
+   * THE MANIFEST SOURCE IS ACTUALLY COMMITTED, so the predicate above is not
+   * vacuous in this repository. If this ever fails, the guard above is inert.
+   */
+  it("is itself a committed file, so the predicate is live here", () => {
+    assert.equal(existsSync(join(REPO_ROOT, "src/verification/guardedModules.ts")), true);
+    const tracked = execFileSync("git", ["ls-tree", "-r", "HEAD", "--name-only"], {
+      cwd: REPO_ROOT,
+      encoding: "utf8",
+    });
+    assert.ok(
+      tracked.split("\n").includes("src/verification/guardedModules.ts"),
+      "the manifest is not committed at HEAD, so the deletion guard cannot fire",
+    );
+  });
 });

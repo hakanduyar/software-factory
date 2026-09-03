@@ -182,6 +182,30 @@ export function parseWorkflow(source: string): ParseResult {
 
   const document = documents[0]!;
   /**
+   * THE VERSION OPTION IS A DEFAULT, NOT A PIN (round-13 review, HIGH 2).
+   *
+   * `version: "1.2"` above says which schema to use when the document does not
+   * say for itself. A `%YAML 1.1` directive overrides it, and the parser then
+   * applies the 1.1 core schema — where `yes`/`no`/`on`/`off` are booleans,
+   * sexagesimals like `1:30` are numbers, and the resolution rules this reader
+   * assumes no longer hold.
+   *
+   * The reviewer's fixture was `%YAML 1.1` plus the workflow with `on:` quoted:
+   * it parsed, normalised, and passed all thirteen policy checks. The unquoted
+   * `on` would have become the boolean `true` and been caught — but only by
+   * accident, and quoting the key removed the accident.
+   *
+   * So the EFFECTIVE version is asserted rather than requested. This also
+   * catches a future `yaml` release changing its default, which the option
+   * alone would not.
+   */
+  const effectiveVersion = document.directives?.yaml?.version;
+  if (effectiveVersion !== "1.2") {
+    return refuse(
+      `the workflow declares YAML ${effectiveVersion ?? "an unknown version"}; this reader models YAML 1.2 only, and 1.1 resolves plain scalars by different rules`,
+    );
+  }
+  /**
    * PARSE FAILURE REFUSES. It never means "absent, therefore allowed" — the
    * direction that turns "we could not tell" into "it is fine", which is the
    * failure this whole area keeps producing.

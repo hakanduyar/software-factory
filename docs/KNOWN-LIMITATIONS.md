@@ -1026,6 +1026,18 @@ this reader misreads it too, and nothing here would notice. What remains ours,
 and what the review rounds should keep attacking, is the normalisation and the
 semantic allowlist above it.
 
+The phrase "a YAML 1.2 parser" was itself an overclaim until round 13, and the
+correction is worth keeping visible. `parseAllDocuments` is called with
+`version: "1.2"`, and that option is a DEFAULT for documents that do not say
+otherwise - not a pin. A `%YAML 1.1` directive overrides it, and the parser then
+applies the 1.1 core schema, where `yes`/`no`/`on`/`off` are booleans and
+sexagesimals are numbers. The reviewer demonstrated it: the shipped workflow
+with a 1.1 directive and `on:` quoted parsed and passed all thirteen policy
+checks. The reader now asserts the EFFECTIVE version rather than requesting one,
+so what the document declares cannot silently replace what this repository
+models - but the general lesson stands and is the reason this paragraph exists:
+a library option describes a default, and only a check describes a guarantee.
+
 ### What the digest does and does not do
 
 `src/verification/workflowDigest.ts` records the bytes an independent reviewer
