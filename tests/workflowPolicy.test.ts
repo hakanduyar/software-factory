@@ -17,7 +17,6 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -2691,65 +2690,135 @@ describe("TASK-017 round-13 note: the install and verification guards refuse wha
   });
 });
 
-describe("TASK-017 round-13 CRITICAL: the manifest is required by what the repository commits", () => {
+describe("TASK-017 round-14 CRITICAL: the required deliverable set lives in the verifier", () => {
   /**
-   * Every earlier version of this guard rested on a deletable sibling, so each
-   * round the attack simply widened by one file. The predicate is now HEAD:
-   * a working-tree `rm` cannot change what the repository commits.
+   * FIVE ROUNDS OF ONE ATTACK. Each fix moved the requirement one step further
+   * from the attacker and was defeated by taking one more step:
    *
-   * These cases assert the verifier's SHAPE rather than running it — the
-   * end-to-end deletion attack is in `scripts/mutate.mjs`, which clears `dist/`
-   * and runs the real suite, because reading source text is the weak evidence
-   * round 8 rejected. What is asserted here is that the predicate is HEAD and
-   * that it is acted on.
+   *   round 8   rested on the manifest's ENTRIES   -> comment them out
+   *   round 12  rested on the ANCHOR file          -> delete the workflow
+   *   round 13  rested on `workflowPolicy.ts`      -> delete that too
+   *   round 14  rested on the manifest's CONTENTS  -> shrink the manifest
+   *
+   * Round 13 moved EXISTENCE to HEAD and left CONTENTS in the working tree, so
+   * round 14 kept the committed path and replaced its contents with one benign
+   * entry. It also redirected `GIT_DIR` at an empty repository, which made the
+   * `git ls-tree` query throw and the guard turn itself off.
+   *
+   * WHY THE REQUIREMENT IS UNCONDITIONAL. The first repair attempted here asked
+   * "is this the repository that owes the deliverable?" and checked the set only
+   * then — which is precisely the round-4 CRITICAL, keying the gate on the
+   * package name so a one-word rename disables it. The existing case
+   * "nowhere names this repository" caught it. Every identity signal has that
+   * defect, because the working tree is what the attacker edits: a name can be
+   * changed, a marker added, a git query made to fail. A condition is a switch,
+   * and a switch can be thrown. So there is no condition.
+   *
+   * WHAT THIS BLOCK IS AND IS NOT. These are shape assertions, and shape
+   * assertions are weak evidence — round 8 said so, and round 14 proved it again
+   * when a mutation of this area walked through a regex. The REAL evidence is in
+   * `tests/verificationHarnessEndToEnd.test.ts`, which strips complete fixtures
+   * and runs the actual verifier against them.
+   *
+   * An earlier version of this comment claimed that end-to-end deletion attack
+   * lived in `scripts/mutate.mjs`. It did not: the mutator performs source
+   * mutations and contains no filesystem deletion whatsoever. Round 14 found the
+   * overclaim, and it is corrected rather than quietly dropped — a comment
+   * asserting evidence that does not exist is the same defect as a test that
+   * passes for the wrong reason.
    */
-  it("asks git what the repository commits, not whether a sibling file exists", () => {
+  it("derives the required set from a literal, not from the manifest it validates", () => {
     const verifier = readFileSync(join(REPO_ROOT, "scripts/verify.mjs"), "utf8");
 
     assert.match(
       verifier,
-      /ls-tree/,
-      "the manifest requirement is not derived from what the repository commits",
+      /const REQUIRED_MODULES = \[/,
+      "the required deliverable set is not a literal in the verifier",
     );
     /**
-     * ANCHORED TO THE START OF THE LINE (round-13 mutation, survivor 2).
-     *
-     * The first version matched the condition as a SUBSTRING, so a mutation
-     * that prepended `false &&` disabled the guard and left this passing —
-     * a test satisfied by text that no longer does anything. Requiring the
-     * line to BEGIN with the condition makes prepending visible.
+     * The set must NAME the deliverable. A `REQUIRED_MODULES` that existed but
+     * listed nothing would satisfy the assertion above while requiring nothing
+     * at all — the round-8 empty-manifest bypass, relocated.
+     */
+    for (const required of [
+      "src/verification/workflowPolicy.ts",
+      "src/verification/workflowDocument.ts",
+      "src/verification/workflowDigest.ts",
+    ]) {
+      assert.ok(
+        verifier.includes(required),
+        `the required set does not name ${required}, so losing it would go unnoticed`,
+      );
+    }
+  });
+
+  /**
+   * NO SWITCH. The round-14 HIGH was a failed git subprocess returning `false`
+   * and disabling the guard; the round-4 CRITICAL was a package name doing the
+   * same. Neither may gate the requirement.
+   */
+  it("makes the requirement conditional on nothing the tree can say", () => {
+    const verifier = readFileSync(join(REPO_ROOT, "scripts/verify.mjs"), "utf8");
+
+    assert.doesNotMatch(
+      verifier,
+      /manifestIsCommitted/,
+      "the defeated round-13 git predicate is still present",
+    );
+    /**
+     * WHETHER the deliverable is owed asks NO SUBPROCESS. `.git` is read from
+     * the filesystem, so the round-14 HIGH has nothing left to attack: there is
+     * no query to redirect with `GIT_DIR` and none to break by removing git.
+     * A question never asked cannot be answered wrongly.
      */
     assert.match(
       verifier,
-      /\nif \(manifestIsCommitted && !existsSync\(join\(REPO_ROOT, MANIFEST_SOURCE\)\)\) \{/,
-      "a committed manifest missing from the working tree is not refused",
+      /const looksLikeRepository = existsSync\(join\(REPO_ROOT, "\.git"\)\);/,
+      "whether this is a repository is decided by something other than the filesystem",
     );
-  });
-
-  /** And the empty-manifest refusal must no longer key on workflowPolicy alone. */
-  it("refuses an empty manifest whenever the repository declares one", () => {
-    const verifier = readFileSync(join(REPO_ROOT, "scripts/verify.mjs"), "utf8");
-
+    /**
+     * Anchored to the line start: round 13's survivor was a mutation that
+     * PREPENDED `false &&`, which a substring match still satisfied.
+     */
     assert.match(
       verifier,
-      /guarded\.length === 0 &&\s*\n?\s*\(manifestIsCommitted \|\|/,
-      "the empty-manifest guard still depends only on workflowPolicy.ts existing",
+      /\n  if \(shortfalls\.length > 0\) \{/,
+      "a shortfall in the required set is not refused",
+    );
+    assert.match(
+      verifier,
+      /\nif \(guarded\.length === 0 && existsSync/,
+      "an empty manifest is not refused",
     );
   });
 
   /**
-   * THE MANIFEST SOURCE IS ACTUALLY COMMITTED, so the predicate above is not
-   * vacuous in this repository. If this ever fails, the guard above is inert.
+   * THE REQUIREMENT IS LIVE IN THIS REPOSITORY. If this ever fails, the guard is
+   * inert here and the deliverable could be deleted with the suite still green.
    */
-  it("is itself a committed file, so the predicate is live here", () => {
-    assert.equal(existsSync(join(REPO_ROOT, "src/verification/guardedModules.ts")), true);
-    const tracked = execFileSync("git", ["ls-tree", "-r", "HEAD", "--name-only"], {
-      cwd: REPO_ROOT,
-      encoding: "utf8",
-    });
-    assert.ok(
-      tracked.split("\n").includes("src/verification/guardedModules.ts"),
-      "the manifest is not committed at HEAD, so the deletion guard cannot fire",
-    );
+  it("is satisfied by this tree, so the guard is live rather than inert", () => {
+    for (const required of [
+      "src/verification/workflowPolicy.ts",
+      "src/verification/workflowDocument.ts",
+      "src/verification/workflowDigest.ts",
+      "tests/workflowPolicy.test.ts",
+      "tests/workflowDigest.test.ts",
+      ".github/workflows/verify.yml",
+      "src/verification/guardedModules.ts",
+    ]) {
+      assert.equal(
+        existsSync(join(REPO_ROOT, required)),
+        true,
+        `${required} is absent, so the tree does not satisfy its own required set`,
+      );
+    }
+    const declared = new Set(GUARDED_MODULES.map(({ module }) => module));
+    for (const required of [
+      "src/verification/workflowPolicy.ts",
+      "src/verification/workflowDocument.ts",
+      "src/verification/workflowDigest.ts",
+    ]) {
+      assert.ok(declared.has(required), `${required} is not declared in the manifest`);
+    }
   });
 });

@@ -1674,63 +1674,131 @@ const unguarded = guarded.flatMap(({ module, test, marker, anchor }) => {
 });
 
 /**
- * THE MANIFEST IS REQUIRED BY WHAT THE REPOSITORY COMMITS, NOT BY A SIBLING
- * FILE (round-13 review, CRITICAL 1).
+ * THE REQUIRED DELIVERABLE SET IS A LITERAL HERE, AND THE GIT QUESTION FAILS
+ * CLOSED (round-14 review, CRITICAL 1 and HIGH 2).
  *
- * Every previous version of this guard rested on some OTHER file still being
- * present — round 8 on the manifest's entries, round 12 on the anchor, and the
- * check below on `workflowPolicy.ts`. Each time, the answer was to delete that
- * file too. Round 13 deleted the workflow, all four verification modules, both
- * tests AND `guardedModules.ts` itself: the dynamic import then threw, `guarded`
- * became `[]`, the empty-manifest check found no `workflowPolicy.ts` to trigger
- * on, and the suite passed at 102 test files with the whole deliverable gone.
+ * FIVE ROUNDS, ONE ATTACK, EACH FIX ADDRESSING THE SPELLING RATHER THAN THE
+ * CLASS:
  *
- * A guard predicated on a deletable file can always be switched off by widening
- * the deletion. So the predicate is now HEAD: if this repository COMMITS a
- * manifest, the working tree must have one and it must produce entries.
- * Deleting it is then a divergence from what the repository says it is, and the
- * only honest way to remove it is to commit that removal — which is a visible
- * diff rather than a silent `rm`.
+ *   round 8   the guard rested on the manifest's ENTRIES   -> comment them out
+ *   round 12  it rested on the ANCHOR file                 -> delete the workflow
+ *   round 13  it rested on `workflowPolicy.ts`             -> delete that too
+ *   round 14  it rested on the manifest's CONTENTS         -> shrink the manifest
  *
- * Tolerant where it must be: a tree with no git, or one whose HEAD never
- * carried the manifest — every harness fixture repository — is unaffected,
- * because the question asked is "does THIS repository declare one?".
+ * Round 13 moved the EXISTENCE question to HEAD and left the CONTENTS question
+ * in the working tree, so round 14 kept the committed path and replaced its
+ * contents with a single benign entry pointing at a trivial surviving test. The
+ * same round redirected `GIT_DIR` at an empty repository: `git ls-tree` failed,
+ * the `catch` returned `false`, and the guard switched itself off. Absent
+ * evidence read as permission — the shape this repository has produced more
+ * often than any other.
+ *
+ * TWO SEPARATE MISTAKES, SO TWO SEPARATE REPAIRS.
+ *
+ * 1. WHAT is required no longer lives in a file the tree can edit. The list is
+ *    a literal below, so shrinking the manifest cannot shrink the requirement.
+ *
+ * 2. WHETHER it is required consults NO SUBPROCESS AT ALL. `.git` present means
+ *    this is a repository and the deliverable is owed — read from the
+ *    filesystem, so there is nothing to redirect and nothing to make fail.
+ *    Asking git and refusing when it cannot answer would also have closed the
+ *    hole, but a question never asked cannot be answered wrongly.
+ *
+ * WHY NOT AN IDENTITY CHECK. The obvious repair — "is this the repository that
+ * owes the deliverable?" — is the round-4 CRITICAL: keying the gate on the
+ * package NAME let a one-word rename disable it, and
+ * `tests/workflowPolicy.test.ts` still asserts this verifier nowhere names this
+ * repository. A first attempt at this round reintroduced exactly that and was
+ * caught by that case. Any identity a tree asserts about itself is a switch, and
+ * a switch can be thrown.
+ *
+ * WHY NOT UNCONDITIONAL. The verifier is legitimately run against synthetic
+ * trees — the fixtures in `tests/verificationHarnessEndToEnd.test.ts` build
+ * repositories with deliberately unusual source roots, several of which cannot
+ * even load a manifest. Requiring the deliverable there would couple every
+ * unrelated fixture to this machinery and mask the guards those fixtures exist
+ * to test. They are not git repositories, which is precisely what distinguishes
+ * them from a candidate.
+ *
+ * RESIDUAL LIMIT, RECORDED RATHER THAN PAPERED OVER: deleting `.git` outright
+ * skips this. That is L-18. A tree with no `.git` has no candidate SHA, no
+ * fingerprint and no criteria history, so it cannot be reviewed or integrated by
+ * any part of this system — the bypass costs the attacker the thing the attack
+ * was for. Substituting this verifier is likewise outside the local threat model
+ * (L-17), defended by clean checkout and independent review.
  */
+const REQUIRED_MODULES = [
+  "src/verification/workflowPolicy.ts",
+  "src/verification/workflowDocument.ts",
+  "src/verification/workflowDigest.ts",
+];
+const REQUIRED_ANCHOR = ".github/workflows/verify.yml";
 const MANIFEST_SOURCE = "src/verification/guardedModules.ts";
-const manifestIsCommitted = (() => {
-  try {
-    const tracked = execFileSync("git", ["ls-tree", "-r", "HEAD", "--name-only"], {
-      cwd: REPO_ROOT,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    });
-    return tracked.split("\n").includes(MANIFEST_SOURCE);
-  } catch {
-    return false;
-  }
-})();
 
-if (manifestIsCommitted && !existsSync(join(REPO_ROOT, MANIFEST_SOURCE))) {
-  fail(
-    `verification refused: ${MANIFEST_SOURCE} is committed at HEAD but missing from the working tree. ` +
-      "It is the manifest every deletion guard reads, so removing it silently disables all of them; " +
-      "removing it deliberately means committing that removal.",
-  );
+/**
+ * A repository owes the deliverable. `.git` may be a directory or, in a linked
+ * worktree, a file — both count, and both are read with `existsSync` rather than
+ * by asking git, so the question of whether we are in a repository cannot itself
+ * be answered by a subprocess an attacker can break.
+ */
+const looksLikeRepository = existsSync(join(REPO_ROOT, ".git"));
+
+if (looksLikeRepository) {
+  if (!existsSync(join(REPO_ROOT, MANIFEST_SOURCE))) {
+    fail(
+      `verification refused: ${MANIFEST_SOURCE} is missing from the working tree. ` +
+        "It is the manifest every deletion guard reads, so removing it silently disables all of them.",
+    );
+  }
+
+  /**
+   * THE MANIFEST MUST COVER THE REQUIRED SET. Round 14 kept the file and emptied
+   * it of meaning; a manifest that no longer names the deliverable is the same
+   * bypass as no manifest at all, and the list it is checked against therefore
+   * cannot live inside it.
+   *
+   * Only the MODULES and the ANCHOR are named. Which test guards each module
+   * stays in the manifest, because the `unguarded` check above already requires
+   * that test to exist, to be compiled, and to MENTION its marker — so a
+   * required module cannot be re-pointed at a trivial survivor.
+   */
+  const declaredModules = new Set(guarded.map(({ module }) => module));
+  const shortfalls = [];
+
+  for (const module of REQUIRED_MODULES) {
+    if (!declaredModules.has(module)) {
+      shortfalls.push(`${module} is not declared in ${MANIFEST_SOURCE}`);
+    }
+    if (!existsSync(join(REPO_ROOT, module))) {
+      shortfalls.push(`${module} is missing from the working tree`);
+    }
+  }
+
+  if (!existsSync(join(REPO_ROOT, REQUIRED_ANCHOR))) {
+    shortfalls.push(`${REQUIRED_ANCHOR} is missing from the working tree`);
+  }
+
+  if (shortfalls.length > 0) {
+    fail(
+      "verification refused: this repository does not contain the deliverable this verifier exists to check.\n" +
+        shortfalls.map((line) => `  - ${line}`).join("\n") +
+        `\nThe required set is a literal in scripts/verify.mjs precisely so that editing ${MANIFEST_SOURCE}, ` +
+        "deleting files, or breaking git cannot shrink it. Removing this deliverable legitimately means editing " +
+        "REQUIRED_MODULES in the verifier — a visible, deliberate diff.",
+    );
+  }
 }
 
 /**
  * AN EMPTY MANIFEST IS ITSELF A FAILURE. Commenting the entries out was the
  * round-8 bypass, and a check that quietly does nothing is the shape this whole
- * area keeps producing. Predicated on the COMMITTED manifest for the same
- * reason as above — the round-8 version keyed on `workflowPolicy.ts`, which
- * round 13 simply deleted as well.
+ * area keeps producing. Kept distinct from the coverage check above because it
+ * catches a manifest that failed to LOAD, including in trees that owe no
+ * required set.
  */
-if (
-  guarded.length === 0 &&
-  (manifestIsCommitted || existsSync(join(REPO_ROOT, "src/verification/workflowPolicy.ts")))
-) {
+if (guarded.length === 0 && existsSync(join(REPO_ROOT, MANIFEST_SOURCE))) {
   fail(
-    "verification refused: the guarded-module manifest produced no entries while this repository declares one. " +
+    "verification refused: the guarded-module manifest produced no entries while its source is present. " +
       "An empty or unloadable manifest disables every deletion guard at once.",
   );
 }

@@ -66,3 +66,55 @@ git config core.hooksPath scripts/hooks
 87 of 91 commits use `Hakan Duyar <iamhakanduyar@gmail.com>`; four early ones use
 a work address. Those four are also history and are not rewritten. New commits
 use the canonical identity.
+
+## Where AI involvement IS disclosed
+
+The rule above says where tool involvement does not go. This says where it does,
+because "no trailer" is not the same as "no disclosure", and C8 requires the
+second.
+
+A platform instruction active during TASK-017 required every commit to end with
+`Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`. That is precisely the
+trailer `src/governance/commitPolicy.ts` rejects, by both the name and the
+address, and `tests/commitPolicy.test.ts` runs `git log <baseline>..HEAD` against
+the real repository — so a commit carrying it would **fail `npm test`**, break the
+deterministic gate, and block ADR-0002 integration. The two rules could not both
+be satisfied.
+
+The owner resolved it: **disclose in provenance, not in the trailer.**
+
+That needed no new mechanism, because the disclosure channel already exists and
+is stronger than a trailer. `AiRunConfigRecord`
+(`src/supervision/modelEnforcement.ts`) records
+
+    requestedProvider   requestedModel   requestedEffort
+    effectiveProvider   effectiveModel   effectiveEffort
+    verification        argvEvidence     note
+
+and it is written into the digest-chained provenance ledger as `IMPLEMENTED_BY` /
+`RUN_CONFIGURED` (`src/supervision/provenanceChain.ts`), where each entry is
+length-prefixed, chained to its predecessor, distinguishes ABSENT from EMPTY, and
+fails closed on overflow rather than truncating.
+
+Why that is the better record, not merely the permitted one:
+
+- a trailer is an unverified string in a message anyone can amend; a provenance
+  entry cannot be edited without breaking a digest;
+- a trailer asserts a model NAME; the record distinguishes what was REQUESTED
+  from what was EFFECTIVE, which is the distinction that matters when a provider
+  serves something other than what was asked for;
+- `argvEvidence` records the process-level invocation with the prompt redacted,
+  so the claim is checkable rather than declarative.
+
+**Boundary.** Work driven through the supervisor is recorded automatically by the
+code above. Work done directly in the repository — as this task's remediation
+rounds were — is not, because no supervisor run wraps it. For those, the
+disclosure is this section plus the reviewer record: every candidate is reviewed
+by an independent model at a named SHA, and those verdicts name the reviewing
+model and effort. Nothing about the tooling is concealed; it is simply not
+asserted as authorship.
+
+**No history was rewritten to reach this position.** Candidate `41881b3` was
+committed after the platform instruction took effect and does not carry the
+trailer. Under this resolution that is the correct form, but it predates the
+owner's decision, so it is recorded here rather than quietly normalised.

@@ -58,6 +58,7 @@ const T_HON = "dist/tests/knownLimitationsHonesty.test.js";
 const T_PUSH = "dist/tests/pushAuthorization.test.js";
 const T_BIND = "dist/tests/candidateBinding.test.js";
 const T_DIG = "dist/tests/workflowDigest.test.js";
+const T_E2E = "dist/tests/verificationHarnessEndToEnd.test.js";
 
 /**
  * Each mutation names the guard it removes and the test that must notice.
@@ -299,10 +300,92 @@ const MUTATIONS = [
   {
     id: "an empty manifest is accepted",
     edits: [[VERIFIER,
-      "if (\n  guarded.length === 0 &&\n  (manifestIsCommitted || existsSync(join(REPO_ROOT, \"src/verification/workflowPolicy.ts\")))\n) {",
+      "if (guarded.length === 0 && existsSync(join(REPO_ROOT, MANIFEST_SOURCE))) {",
       "if (false) {"]],
-    tests: [T_WF],
-    expect: "refuses an empty manifest whenever the repository declares one",
+    tests: [T_E2E],
+    expect: "refuses a manifest emptied of every entry, where no other guard can fire",
+  },
+  // ---- round-14: the required deliverable set ------------------------------
+  /**
+   * Five rounds of deletion attacks produced this guard, and round 14 defeated
+   * its predecessor twice — once by shrinking the manifest it read, once by
+   * breaking the git query it asked. Each mutation below switches off one clause
+   * and must be killed BY A NAMED END-TO-END CASE, because the previous round's
+   * evidence was a regex over the verifier's source text and a mutation walked
+   * straight through it.
+   *
+   * `scripts/verify.mjs` is not in `tsconfig.json`, so `if (false)` here is
+   * ordinary dead code rather than the TypeScript narrowing trap that sent six
+   * mutations UNMEASURED in an earlier round.
+   */
+  {
+    id: "a shortfall in the required deliverable set is not refused",
+    edits: [[VERIFIER,
+      "  if (shortfalls.length > 0) {",
+      "  if (false) {"]],
+    tests: [T_E2E],
+    expect: "refuses a shrunk manifest that keeps its path but drops the deliverable",
+  },
+  {
+    id: "the required set names nothing, so nothing can be missing",
+    edits: [[VERIFIER,
+      'const REQUIRED_MODULES = [\n  "src/verification/workflowPolicy.ts",\n  "src/verification/workflowDocument.ts",\n  "src/verification/workflowDigest.ts",\n];',
+      "const REQUIRED_MODULES = [];"]],
+    tests: [T_E2E],
+    expect: "refuses a shrunk manifest that keeps its path but drops the deliverable",
+  },
+  {
+    id: "the manifest may be declared but absent from the working tree",
+    edits: [[VERIFIER,
+      "  if (!existsSync(join(REPO_ROOT, MANIFEST_SOURCE))) {",
+      "  if (false) {"]],
+    tests: [T_E2E],
+    expect: "refuses a coordinated deletion that removes the manifest source too",
+  },
+  {
+    id: "the required modules need not be declared, only present",
+    edits: [[VERIFIER,
+      "    if (!declaredModules.has(module)) {",
+      "    if (false) {"]],
+    tests: [T_E2E],
+    expect: "refuses a shrunk manifest that keeps its path but drops the deliverable",
+  },
+  {
+    id: "the required modules need not be present, only declared",
+    edits: [[VERIFIER,
+      "    if (!existsSync(join(REPO_ROOT, module))) {",
+      "    if (false) {"]],
+    tests: [T_E2E],
+    expect: "refuses when GIT_DIR is redirected at another repository",
+  },
+  {
+    id: "the workflow anchor is no longer required",
+    edits: [[VERIFIER,
+      "  if (!existsSync(join(REPO_ROOT, REQUIRED_ANCHOR))) {",
+      "  if (false) {"]],
+    tests: [T_E2E],
+    expect: "refuses a stripped repository however the package names itself",
+  },
+  {
+    id: "a repository is no longer recognised, so nothing is ever owed",
+    edits: [[VERIFIER,
+      'const looksLikeRepository = existsSync(join(REPO_ROOT, ".git"));',
+      "const looksLikeRepository = false;"]],
+    tests: [T_E2E],
+    expect: "refuses a repository whose git cannot answer, rather than skipping the check",
+  },
+  /**
+   * THE OTHER DIRECTION. Requiring the deliverable of EVERY tree would also pass
+   * every refusal case above while breaking the synthetic fixtures that are not
+   * repositories — which is how the first attempt at this round was caught.
+   */
+  {
+    id: "the deliverable is required of trees that are not repositories",
+    edits: [[VERIFIER,
+      'const looksLikeRepository = existsSync(join(REPO_ROOT, ".git"));',
+      "const looksLikeRepository = true;"]],
+    tests: [T_E2E],
+    expect: "still accepts a non-repository fixture, which owes no deliverable",
   },
   // ---- round-7: the closed grammar ----------------------------------------
   {
@@ -626,22 +709,6 @@ const MUTATIONS = [
       '  const forced: string | undefined = effectiveVersion;\n  if (forced !== "1.2" && forced === "\\u0000never") {']],
     tests: [T_WF],
     expect: "refuses a document that declares YAML 1.1",
-  },
-  {
-    id: "the committed manifest need not be in the working tree",
-    edits: [[VERIFIER,
-      "if (manifestIsCommitted && !existsSync(join(REPO_ROOT, MANIFEST_SOURCE))) {",
-      "if (false && manifestIsCommitted && !existsSync(join(REPO_ROOT, MANIFEST_SOURCE))) {"]],
-    tests: [T_WF],
-    expect: "asks git what the repository commits",
-  },
-  {
-    id: "the empty-manifest guard keys on workflowPolicy again",
-    edits: [[VERIFIER,
-      "  (manifestIsCommitted || existsSync(join(REPO_ROOT, \"src/verification/workflowPolicy.ts\")))",
-      "  existsSync(join(REPO_ROOT, \"src/verification/workflowPolicy.ts\"))"]],
-    tests: [T_WF],
-    expect: "refuses an empty manifest whenever the repository declares one",
   },
   {
     id: "checkInstall reads past a run it cannot parse",

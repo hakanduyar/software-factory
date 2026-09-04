@@ -1080,3 +1080,64 @@ against real documents, `tests/workflowDigest.test.ts` asserts the digest
 rejects a changed file AND accepts a workflow the policy refuses, and
 `src/verification/guardedModules.ts` pairs both modules with their tests so
 deleting the evidence fails the build.
+
+## L-17 - Substituting the verifier is outside what the verifier can catch
+
+`scripts/verify.mjs` is the thing that decides whether a tree is trustworthy, so
+it cannot also be the thing that proves it was not replaced. Deleting it makes
+`npm test` fail, which is the loud case. Replacing its body with `process.exit(0)`
+is the quiet one: the command succeeds, prints nothing alarming, and every guard
+in this repository is gone at once.
+
+The round-14 reviewer raised exactly this and classified it as outside the local
+threat model, which is the right call and is recorded here rather than left as an
+unstated assumption. Nothing in a tree can defend against an adversary who edits
+the auditor, because any second auditor is open to the same substitution — the
+regress has no end inside one working tree.
+
+What actually defends it is external and already in place: the reviewer reads the
+candidate from a clean checkout at a named SHA rather than trusting a local run,
+the review is independent under C4/C5, and the tracked fingerprint is taken before
+and after. A `process.exit(0)` verifier is a visible diff in a reviewed file.
+
+**Kept honest by:** nothing in this repository, deliberately. This entry exists so
+that the absence is stated instead of implied. Anyone reading a green
+`verification complete` line locally has evidence about the tree only if the
+verifier producing it was the committed one.
+
+## L-18 - The deliverable requirement keys on `.git`, so a tree without one skips it
+
+`REQUIRED_MODULES` in `scripts/verify.mjs` names the modules this repository owes
+— the workflow policy, the document reader and the digest — and refuses when the
+working tree lacks them or the manifest stops declaring them. Five review rounds
+attacked the previous versions of that guard, each time by deleting one more file
+than the last, so the list is now a literal in the verifier and cannot be shrunk
+by editing anything the attacker controls.
+
+Whether the requirement applies is decided by one filesystem question: does
+`.git` exist? That deliberately asks no subprocess, because the round-14 review
+turned the previous guard off twice through one — `GIT_DIR` redirected at an
+empty repository made the query fail, and the `catch` read the failure as "not
+this repository, nothing owed". A question never asked cannot be answered
+wrongly.
+
+The cost is stated plainly: **remove `.git` and the requirement does not apply.**
+The verifier then treats the tree the way it treats the synthetic fixtures in
+`tests/verificationHarnessEndToEnd.test.ts`, which are not repositories and owe
+nothing.
+
+Why that is an acceptable boundary rather than a hole worth another round: a tree
+with no `.git` has no HEAD, no candidate SHA, no fingerprint and no criteria
+history. It cannot be reviewed, cannot be integrated, and cannot be a candidate
+for anything — every gate upstream of this one is git-based. The bypass costs the
+attacker precisely the thing the attack was for. It is not that the tree is safe;
+it is that the tree is no longer a candidate.
+
+**Kept honest by:** `tests/verificationHarnessEndToEnd.test.ts` runs the real
+verifier against repositories stripped six different ways — a shrunk manifest, a
+coordinated deletion including the manifest source, `GIT_DIR` redirected at
+another repository, a `git` that always fails, three different package names, and
+a manifest emptied of every entry — and asserts a refusal naming the missing
+deliverable each time. The same suite asserts a complete repository fixture still
+passes and that a non-repository fixture still passes, so the refusals are not
+merely "everything fails".
