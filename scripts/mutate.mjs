@@ -275,13 +275,28 @@ const MUTATIONS = [
     tests: [T_WF],
     expect: "refuses when a guarded module has no test",
   },
+  /**
+   * BOTH PAIR CLAUSES, AGAINST THE RUNNING VERIFIER. These were the last two
+   * mutations here still killed by a regex over the verifier's source text,
+   * and the second SURVIVED once a round-15 comment happened to contain the
+   * token that regex matched. A test that reads source text checks that
+   * somebody typed something, not that anything happens.
+   */
+  {
+    id: "a declared test may be deleted without the pair reporting it",
+    edits: [[VERIFIER,
+      '  if (!existsSync(join(REPO_ROOT, test))) return [[module, test, "is missing"]];\n',
+      ""]],
+    tests: [T_E2E],
+    expect: "refuses a declared test that has been deleted",
+  },
   {
     id: "deletion is detected but exclusion from compilation is not",
     edits: [[VERIFIER,
       '  if (!sourceTests.includes(test)) return [[module, test, "exists but is not compiled, so it never runs"]];\n',
       ""]],
-    tests: [T_WF],
-    expect: "checks the filesystem AND the compiled set",
+    tests: [T_E2E],
+    expect: "refuses a declared test that exists but is excluded from compilation",
   },
   {
     id: "a paired test need not mention the module it guards",
@@ -296,6 +311,94 @@ const MUTATIONS = [
       '    marker: "workflowPolicy",\n']],
     tests: [T_WF],
     expect: "anchors the workflow guard",
+  },
+  // ---- round-15: presence is not execution ---------------------------------
+  /**
+   * Six rounds attacked this guard. Each mutation switches off one clause and
+   * must be killed BY A NAMED END-TO-END CASE, because round 15 walked straight
+   * through evidence that was only a regex over the verifier's source text.
+   *
+   * `scripts/verify.mjs` is not in `tsconfig.json`, so `if (false)` here is
+   * ordinary dead code rather than the TypeScript narrowing trap that sent six
+   * mutations UNMEASURED in an earlier round.
+   */
+  {
+    id: "a shortfall in the required deliverable set is not refused",
+    edits: [[VERIFIER,
+      "  if (shortfalls.length > 0) {",
+      "  if (false) {"]],
+    tests: [T_E2E],
+    expect: "refuses a shrunk manifest that keeps its path but drops the deliverable",
+  },
+  {
+    id: "the required set names nothing, so nothing can be missing",
+    edits: [[VERIFIER,
+      'const REQUIRED_GUARDS = [\n  { module: "src/verification/workflowPolicy.ts", test: "tests/workflowPolicy.test.ts" },\n  { module: "src/verification/workflowDocument.ts", test: "tests/workflowPolicy.test.ts" },\n  { module: "src/verification/workflowDigest.ts", test: "tests/workflowDigest.test.ts" },\n];',
+      "const REQUIRED_GUARDS = [];"]],
+    tests: [T_E2E],
+    expect: "refuses a shrunk manifest that keeps its path but drops the deliverable",
+  },
+  {
+    id: "a required module need not be present",
+    edits: [[VERIFIER,
+      "    if (!existsSync(join(REPO_ROOT, module))) {",
+      "    if (false) {"]],
+    tests: [T_E2E],
+    expect: "refuses a single deleted required module, with every other clause satisfied",
+  },
+  {
+    id: "a required module need not be compiled",
+    edits: [[VERIFIER,
+      "    } else if (!allSources.includes(module)) {",
+      "    } else if (false) {"]],
+    tests: [T_E2E],
+    expect: "refuses required modules that exist but are excluded from compilation",
+  },
+  {
+    id: "the manifest need not pair a required module with its named test",
+    edits: [[VERIFIER,
+      "    if (!freshGuarded.some((entry) => entry.module === module && entry.test === test)) {",
+      "    if (false) {"]],
+    tests: [T_E2E],
+    expect: "refuses a manifest that relabels required pairs onto one trivial test",
+  },
+  {
+    id: "an unloadable manifest is treated as an empty one",
+    edits: [[VERIFIER,
+      "  if (freshGuarded === undefined) {",
+      "  if (false) {"]],
+    tests: [T_E2E],
+    expect: "refuses a coordinated deletion that removes the manifest source too",
+  },
+  {
+    id: "the workflow anchor is no longer required",
+    edits: [[VERIFIER,
+      "  if (!existsSync(join(REPO_ROOT, REQUIRED_ANCHOR))) {",
+      "  if (false) {"]],
+    tests: [T_E2E],
+    expect: "refuses a missing workflow even when the manifest stops anchoring it",
+  },
+  {
+    id: "a repository is no longer recognised, so nothing is ever owed",
+    edits: [[VERIFIER,
+      'const looksLikeRepository = existsSync(join(REPO_ROOT, ".git"));',
+      "const looksLikeRepository = false;"]],
+    tests: [T_E2E],
+    expect: "refuses a shrunk manifest that keeps its path but drops the deliverable",
+  },
+  /**
+   * THE OTHER DIRECTION. Requiring the deliverable of EVERY tree would pass
+   * every refusal case above while breaking the synthetic fixtures that are not
+   * repositories — which is how this round's first remediation attempt was
+   * caught.
+   */
+  {
+    id: "the deliverable is required of trees that are not repositories",
+    edits: [[VERIFIER,
+      'const looksLikeRepository = existsSync(join(REPO_ROOT, ".git"));',
+      "const looksLikeRepository = true;"]],
+    tests: [T_E2E],
+    expect: "still accepts a non-repository fixture, which owes no deliverable",
   },
   {
     id: "an empty manifest is accepted",
@@ -318,75 +421,11 @@ const MUTATIONS = [
    * ordinary dead code rather than the TypeScript narrowing trap that sent six
    * mutations UNMEASURED in an earlier round.
    */
-  {
-    id: "a shortfall in the required deliverable set is not refused",
-    edits: [[VERIFIER,
-      "  if (shortfalls.length > 0) {",
-      "  if (false) {"]],
-    tests: [T_E2E],
-    expect: "refuses a shrunk manifest that keeps its path but drops the deliverable",
-  },
-  {
-    id: "the required set names nothing, so nothing can be missing",
-    edits: [[VERIFIER,
-      'const REQUIRED_MODULES = [\n  "src/verification/workflowPolicy.ts",\n  "src/verification/workflowDocument.ts",\n  "src/verification/workflowDigest.ts",\n];',
-      "const REQUIRED_MODULES = [];"]],
-    tests: [T_E2E],
-    expect: "refuses a shrunk manifest that keeps its path but drops the deliverable",
-  },
-  {
-    id: "the manifest may be declared but absent from the working tree",
-    edits: [[VERIFIER,
-      "  if (!existsSync(join(REPO_ROOT, MANIFEST_SOURCE))) {",
-      "  if (false) {"]],
-    tests: [T_E2E],
-    expect: "refuses a coordinated deletion that removes the manifest source too",
-  },
-  {
-    id: "the required modules need not be declared, only present",
-    edits: [[VERIFIER,
-      "    if (!declaredModules.has(module)) {",
-      "    if (false) {"]],
-    tests: [T_E2E],
-    expect: "refuses a shrunk manifest that keeps its path but drops the deliverable",
-  },
-  {
-    id: "the required modules need not be present, only declared",
-    edits: [[VERIFIER,
-      "    if (!existsSync(join(REPO_ROOT, module))) {",
-      "    if (false) {"]],
-    tests: [T_E2E],
-    expect: "refuses when GIT_DIR is redirected at another repository",
-  },
-  {
-    id: "the workflow anchor is no longer required",
-    edits: [[VERIFIER,
-      "  if (!existsSync(join(REPO_ROOT, REQUIRED_ANCHOR))) {",
-      "  if (false) {"]],
-    tests: [T_E2E],
-    expect: "refuses a stripped repository however the package names itself",
-  },
-  {
-    id: "a repository is no longer recognised, so nothing is ever owed",
-    edits: [[VERIFIER,
-      'const looksLikeRepository = existsSync(join(REPO_ROOT, ".git"));',
-      "const looksLikeRepository = false;"]],
-    tests: [T_E2E],
-    expect: "refuses a repository whose git cannot answer, rather than skipping the check",
-  },
   /**
    * THE OTHER DIRECTION. Requiring the deliverable of EVERY tree would also pass
    * every refusal case above while breaking the synthetic fixtures that are not
    * repositories — which is how the first attempt at this round was caught.
    */
-  {
-    id: "the deliverable is required of trees that are not repositories",
-    edits: [[VERIFIER,
-      'const looksLikeRepository = existsSync(join(REPO_ROOT, ".git"));',
-      "const looksLikeRepository = true;"]],
-    tests: [T_E2E],
-    expect: "still accepts a non-repository fixture, which owes no deliverable",
-  },
   // ---- round-7: the closed grammar ----------------------------------------
   {
     id: "the reader asks for YAML 1.1, where `on` is a boolean",

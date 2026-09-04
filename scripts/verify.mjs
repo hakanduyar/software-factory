@@ -1727,10 +1727,10 @@ const unguarded = guarded.flatMap(({ module, test, marker, anchor }) => {
  * was for. Substituting this verifier is likewise outside the local threat model
  * (L-17), defended by clean checkout and independent review.
  */
-const REQUIRED_MODULES = [
-  "src/verification/workflowPolicy.ts",
-  "src/verification/workflowDocument.ts",
-  "src/verification/workflowDigest.ts",
+const REQUIRED_GUARDS = [
+  { module: "src/verification/workflowPolicy.ts", test: "tests/workflowPolicy.test.ts" },
+  { module: "src/verification/workflowDocument.ts", test: "tests/workflowPolicy.test.ts" },
+  { module: "src/verification/workflowDigest.ts", test: "tests/workflowDigest.test.ts" },
 ];
 const REQUIRED_ANCHOR = ".github/workflows/verify.yml";
 const MANIFEST_SOURCE = "src/verification/guardedModules.ts";
@@ -1743,65 +1743,6 @@ const MANIFEST_SOURCE = "src/verification/guardedModules.ts";
  */
 const looksLikeRepository = existsSync(join(REPO_ROOT, ".git"));
 
-if (looksLikeRepository) {
-  if (!existsSync(join(REPO_ROOT, MANIFEST_SOURCE))) {
-    fail(
-      `verification refused: ${MANIFEST_SOURCE} is missing from the working tree. ` +
-        "It is the manifest every deletion guard reads, so removing it silently disables all of them.",
-    );
-  }
-
-  /**
-   * THE MANIFEST MUST COVER THE REQUIRED SET. Round 14 kept the file and emptied
-   * it of meaning; a manifest that no longer names the deliverable is the same
-   * bypass as no manifest at all, and the list it is checked against therefore
-   * cannot live inside it.
-   *
-   * Only the MODULES and the ANCHOR are named. Which test guards each module
-   * stays in the manifest, because the `unguarded` check above already requires
-   * that test to exist, to be compiled, and to MENTION its marker — so a
-   * required module cannot be re-pointed at a trivial survivor.
-   */
-  const declaredModules = new Set(guarded.map(({ module }) => module));
-  const shortfalls = [];
-
-  for (const module of REQUIRED_MODULES) {
-    if (!declaredModules.has(module)) {
-      shortfalls.push(`${module} is not declared in ${MANIFEST_SOURCE}`);
-    }
-    if (!existsSync(join(REPO_ROOT, module))) {
-      shortfalls.push(`${module} is missing from the working tree`);
-    }
-  }
-
-  if (!existsSync(join(REPO_ROOT, REQUIRED_ANCHOR))) {
-    shortfalls.push(`${REQUIRED_ANCHOR} is missing from the working tree`);
-  }
-
-  if (shortfalls.length > 0) {
-    fail(
-      "verification refused: this repository does not contain the deliverable this verifier exists to check.\n" +
-        shortfalls.map((line) => `  - ${line}`).join("\n") +
-        `\nThe required set is a literal in scripts/verify.mjs precisely so that editing ${MANIFEST_SOURCE}, ` +
-        "deleting files, or breaking git cannot shrink it. Removing this deliverable legitimately means editing " +
-        "REQUIRED_MODULES in the verifier — a visible, deliberate diff.",
-    );
-  }
-}
-
-/**
- * AN EMPTY MANIFEST IS ITSELF A FAILURE. Commenting the entries out was the
- * round-8 bypass, and a check that quietly does nothing is the shape this whole
- * area keeps producing. Kept distinct from the coverage check above because it
- * catches a manifest that failed to LOAD, including in trees that owe no
- * required set.
- */
-if (guarded.length === 0 && existsSync(join(REPO_ROOT, MANIFEST_SOURCE))) {
-  fail(
-    "verification refused: the guarded-module manifest produced no entries while its source is present. " +
-      "An empty or unloadable manifest disables every deletion guard at once.",
-  );
-}
 
 /**
  * A DECLARED ANCHOR MUST BE IN THE TREE (round-12 review, HIGH 1).
@@ -1961,6 +1902,144 @@ if (!audit.clean) {
     );
   }
   console.error("Stale output removed and rebuilt; the rebuilt tree is consistent. Continuing.\n");
+}
+
+// --- 6b. the deliverable must be present, compiled, paired AND EXECUTED -----
+/**
+ * SIXTH ITERATION OF ONE ATTACK (round-15 review, CRITICAL 1 and 2).
+ *
+ *   round 8   the guard rested on the manifest's ENTRIES    -> comment them out
+ *   round 12  it rested on the ANCHOR file                  -> delete the workflow
+ *   round 13  it rested on `workflowPolicy.ts`              -> delete that too
+ *   round 14  it rested on the manifest's CONTENTS          -> shrink the manifest
+ *   round 15  it rested on the manifest's module->TEST pair -> relabel the pair,
+ *                                                              or stop compiling
+ *
+ * Round 14 moved WHICH MODULES are required into this file and left WHICH TEST
+ * GUARDS EACH of them in the manifest, on the reasoning that `unguarded`
+ * separately requires that test to exist, compile and mention its marker. That
+ * reasoning was wrong, and the review broke it exactly: point all three required
+ * modules at ONE trivial compiled test containing all three markers, delete the
+ * real tests, and every check passed while the suite ran one trivial file.
+ *
+ * The second reproduction needed no relabelling at all — exclude the required
+ * modules from `tsconfig.json`. They still exist, the manifest still names them,
+ * and nothing they guard ever runs. `verification complete: 1 test files`.
+ *
+ * So presence is not the property worth checking. EXECUTION is:
+ *
+ *   - the module must exist AND be compiled, or nothing it guards can run;
+ *   - the test must exist AND be in the set this run actually EXECUTES;
+ *   - the manifest must pair them the way THIS FILE says, so relabelling a pair
+ *     is a divergence from the verifier rather than a redefinition of the rule;
+ *   - the manifest source itself must be compiled, so it cannot be excluded from
+ *     the build and served from a preseeded stale artifact.
+ *
+ * PLACED AFTER THE STALE-OUTPUT REPAIR, deliberately. Round 15's second
+ * reproduction preseeded a stale `dist` manifest, let the repair remove and
+ * rebuild it, and exited 0 because the guard had already read the stale copy and
+ * was never re-run. `audit.expected` here is the post-repair set — the tests
+ * this process is about to execute, not the ones it hoped to.
+ */
+if (looksLikeRepository) {
+  /**
+   * RE-READ THE MANIFEST FROM THE REBUILT OUTPUT. The copy loaded before the
+   * repair may have come from exactly the stale artifact the repair deleted. The
+   * cache-buster is required: a plain re-import returns Node's cached module.
+   */
+  const freshGuarded = await (async () => {
+    try {
+      const url = `file://${join(REPO_ROOT, OUTPUT_DIR, "src/verification/guardedModules.js")}?v=${Date.now()}`;
+      const loaded = await import(url);
+      return loaded.GUARDED_MODULES ?? [];
+    } catch {
+      return undefined;
+    }
+  })();
+
+  /**
+   * A MANIFEST THAT DOES NOT SURVIVE THE BUILD IS THE WHOLE STALENESS CHECK.
+   *
+   * An earlier version also asked whether `MANIFEST_SOURCE` was compiled, to
+   * catch entries served from a preseeded `dist` artifact. That clause could
+   * never fire on its own: the stale-output repair above deletes any generated
+   * file with no source, so by the time execution reaches here an uncompiled
+   * manifest has already become an unloadable one. A mutation proved it by
+   * switching the clause off with nothing failing. Two checks for one condition
+   * is one check and one unfalsifiable claim.
+   */
+  if (freshGuarded === undefined) {
+    fail(
+      `verification refused: ${MANIFEST_SOURCE} could not be loaded from the rebuilt output. ` +
+        "Every deletion guard reads it, so a manifest that does not survive the build disables all of them.",
+    );
+  }
+
+  const shortfalls = [];
+
+  for (const { module, test } of REQUIRED_GUARDS) {
+    if (!existsSync(join(REPO_ROOT, module))) {
+      shortfalls.push(`${module} is missing from the working tree`);
+    } else if (!allSources.includes(module)) {
+      shortfalls.push(`${module} is present but not compiled, so nothing that guards it runs`);
+    }
+
+    /**
+     * THE TEST MUST EXIST. Whether it is COMPILED is deliberately not re-checked
+     * here: `audit.expected` is `sourceTests` mapped one-to-one, and `unguarded`
+     * above already requires `sourceTests.includes(test)` for every declared
+     * pair — so a second check could never fire on its own. A mutation proved
+     * exactly that by switching it off with nothing failing. A guard that cannot
+     * be the sole reason for a refusal is not defence in depth, it is an
+     * unfalsifiable claim, and this repository has spent six rounds learning to
+     * delete those rather than keep them.
+     *
+     * The pairing check below is what makes `unguarded` load-bearing for the
+     * REQUIRED set: it forces the manifest to name this exact test, so
+     * `unguarded` cannot be satisfied by a relabelled trivial survivor.
+     */
+    if (!existsSync(join(REPO_ROOT, test))) {
+      shortfalls.push(`${test}, which must guard ${module}, is missing from the working tree`);
+    }
+
+    if (!freshGuarded.some((entry) => entry.module === module && entry.test === test)) {
+      shortfalls.push(`${MANIFEST_SOURCE} does not pair ${module} with ${test}`);
+    }
+  }
+
+  if (!existsSync(join(REPO_ROOT, REQUIRED_ANCHOR))) {
+    shortfalls.push(`${REQUIRED_ANCHOR} is missing from the working tree`);
+  }
+
+  if (shortfalls.length > 0) {
+    fail(
+      "verification refused: this repository does not run the deliverable this verifier exists to check.\n" +
+        shortfalls.map((line) => `  - ${line}`).join("\n") +
+        `\nThe required pairs are a literal in scripts/verify.mjs precisely so that editing ${MANIFEST_SOURCE}, ` +
+        "deleting files, excluding them from compilation, or breaking git cannot shrink them. Removing this " +
+        "deliverable legitimately means editing REQUIRED_GUARDS in the verifier — a visible, deliberate diff.",
+    );
+  }
+}
+
+/**
+ * AN EMPTY MANIFEST IS ITSELF A FAILURE. Commenting the entries out was the
+ * round-8 bypass, and a check that quietly does nothing is the shape this whole
+ * area keeps producing. Kept distinct from the coverage check above because it
+ * catches a manifest that failed to LOAD, including in trees that owe no
+ * required set.
+ *
+ * ORDERED AFTER THE REQUIRED-SET CHECK (round-15). It used to run first, so a
+ * repository that excluded the manifest from compilation was refused for
+ * "produced no entries" rather than for the exclusion — the precise reason was
+ * masked by a broader neighbour, and a test naming the exclusion passed on the
+ * neighbour's refusal.
+ */
+if (guarded.length === 0 && existsSync(join(REPO_ROOT, MANIFEST_SOURCE))) {
+  fail(
+    "verification refused: the guarded-module manifest produced no entries while its source is present. " +
+      "An empty or unloadable manifest disables every deletion guard at once.",
+  );
 }
 
 // --- 7. refuse a run that would prove nothing -------------------------------

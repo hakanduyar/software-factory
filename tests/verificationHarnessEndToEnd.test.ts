@@ -127,18 +127,18 @@ function harnessEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
 }
 
 /**
- * THE DELIVERABLE `scripts/verify.mjs` REQUIRES OF ANY REPOSITORY (round-14).
+ * THE DELIVERABLE `scripts/verify.mjs` REQUIRES OF ANY REPOSITORY.
  *
- * `REQUIRED_MODULES` is enforced whenever `.git` is present, read from the
+ * `REQUIRED_GUARDS` is enforced whenever `.git` is present, read from the
  * filesystem with no subprocess — so there is nothing to redirect and nothing to
  * make fail. A fixture that plants a `.git` entry is therefore a repository as
  * far as the verifier is concerned, and owes the deliverable like any other.
  *
- * Stubs guarded by the fixture's one existing test, not new test files: the
- * verifier requires each module to exist and be declared, and `unguarded`
- * separately requires the guarding test to exist, compile and mention its
- * marker. Adding real test files would change the test COUNT other fixtures
- * assert on.
+ * REAL PAIRED TESTS, not one shared trivial file (round-15 CRITICAL 2). The
+ * round-14 version pointed all three required modules at `tests/sample.test.ts`
+ * with the three markers in a comment — which is precisely the attack the
+ * reviewer then used against the product code. A fixture that models the attack
+ * as though it were the legitimate shape cannot detect the attack.
  */
 function addDeliverable(root: string): void {
   for (const stub of ["workflowPolicy", "workflowDocument", "workflowDigest"]) {
@@ -146,6 +146,23 @@ function addDeliverable(root: string): void {
   }
   mkdirSync(join(root, ".github/workflows"), { recursive: true });
   writeFileSync(join(root, ".github/workflows/verify.yml"), "name: fixture\n");
+
+  for (const [file, markers] of [
+    ["tests/workflowPolicy.test.ts", ["workflowPolicy", "workflowDocument"]],
+    ["tests/workflowDigest.test.ts", ["workflowDigest"]],
+  ] as const) {
+    writeFileSync(
+      join(root, file),
+      [
+        'import assert from "node:assert/strict";',
+        'import { describe, it } from "node:test";',
+        ...markers.map((marker) => `// guards ${marker}`),
+        `describe(${JSON.stringify(file)}, () => { it("passes", () => { assert.equal(1, 1); }); });`,
+        "",
+      ].join("\n"),
+    );
+  }
+
   writeFileSync(
     join(root, "src/verification/guardedModules.ts"),
     [
@@ -156,21 +173,10 @@ function addDeliverable(root: string): void {
       "  readonly anchor?: string;",
       "}",
       "export const GUARDED_MODULES: readonly GuardedModule[] = [",
-      ...["workflowPolicy", "workflowDocument", "workflowDigest"].map(
-        (stub) =>
-          `  { module: "src/verification/${stub}.ts", test: "tests/sample.test.ts", marker: "${stub}", anchor: ".github/workflows/verify.yml" },`,
-      ),
+      '  { module: "src/verification/workflowPolicy.ts", test: "tests/workflowPolicy.test.ts", marker: "workflowPolicy", anchor: ".github/workflows/verify.yml" },',
+      '  { module: "src/verification/workflowDocument.ts", test: "tests/workflowPolicy.test.ts", marker: "workflowDocument", anchor: ".github/workflows/verify.yml" },',
+      '  { module: "src/verification/workflowDigest.ts", test: "tests/workflowDigest.test.ts", marker: "workflowDigest", anchor: ".github/workflows/verify.yml" },',
       "];",
-      "",
-    ].join("\n"),
-  );
-  writeFileSync(
-    join(root, "tests/sample.test.ts"),
-    [
-      'import assert from "node:assert/strict";',
-      'import { describe, it } from "node:test";',
-      "// guards workflowPolicy, workflowDocument, workflowDigest",
-      'describe("sample", () => { it("passes", () => { assert.equal(1, 1); }); });',
       "",
     ].join("\n"),
   );
@@ -3830,30 +3836,30 @@ describe("TASK-010 round 23: the parent directory is outside the repository", ()
   });
 });
 
-
-
 /**
- * TASK-017 ROUND-14 — THE DELETION ATTACKS, ACTUALLY EXECUTED.
+ * TASK-017 — THE DELETION ATTACKS, ACTUALLY EXECUTED.
  *
- * Round 14 found that `tests/workflowPolicy.test.ts` claimed the end-to-end
- * deletion attack lived in `scripts/mutate.mjs`, and it did not: the mutator
- * performs source mutations and contains no `rmSync`, no `unlink`, and no
- * filesystem deletion at all. The deletion guard was "both bypassable and
- * unmeasured by the stated mutation verification" — an overclaim in a comment
- * written while fixing the previous round of the same attack.
+ * Six review rounds attacked one guard, each defeating the previous fix:
  *
- * These cases are that missing evidence. Each builds a REPOSITORY that owes the
- * deliverable, strips it one way, and runs the real `scripts/verify.mjs`.
- * Reading the verifier's source text is the weak evidence round 8 rejected, and
- * a regex over it is what round 14's mutation walked straight through.
+ *   round 8   the manifest's ENTRIES        -> comment them out
+ *   round 12  the ANCHOR file               -> delete the workflow
+ *   round 13  `workflowPolicy.ts`           -> delete that too
+ *   round 14  the manifest's CONTENTS       -> shrink the manifest
+ *   round 15  the module->TEST pair         -> relabel it, or stop compiling
+ *
+ * Round 14 also found that the end-to-end deletion attack this repository
+ * claimed to run did not exist: `scripts/mutate.mjs` performs source mutations
+ * and contains no `rmSync`, no `unlink`, no filesystem deletion at all. These
+ * cases are that missing evidence, running the real `scripts/verify.mjs`.
+ *
+ * EVERY CASE ISOLATES ONE GUARD. An earlier version of this block deleted a
+ * required module to test the required-set check, and `unguarded` — a different,
+ * older guard — refused first; the case passed on its neighbour's refusal and
+ * proved nothing about the guard it named. Sibling-guard masking has been the
+ * finding in this task ten times, and it was reintroduced here twice while
+ * fixing it. Each fixture below is shaped so exactly one guard can fire.
  */
-describe("TASK-017 round-14: a repository cannot shed the deliverable", () => {
-  /**
-   * A fixture that is a GIT REPOSITORY and carries the deliverable, which is
-   * what `REQUIRED_MODULES` keys on. The ordinary fixtures are not repositories
-   * and owe nothing — that is exactly the distinction, and the last case here
-   * pins it so this helper cannot quietly become the only thing that passes.
-   */
+describe("TASK-017: a repository must present, compile and RUN its deliverable", () => {
   function makeRepositoryFixture(): string {
     const root = makeFixtureRepo();
     addDeliverable(root);
@@ -3861,23 +3867,8 @@ describe("TASK-017 round-14: a repository cannot shed the deliverable", () => {
     return root;
   }
 
-  /**
-   * NON-VACUITY, FIRST. If a complete repository fixture did not pass, every
-   * refusal below would prove nothing — the tree would be failing for some
-   * unrelated reason and each case would still go green.
-   */
-  it("accepts a complete repository, so the refusals below are about what they name", () => {
-    const root = makeRepositoryFixture();
-    const { status, output } = runHarness(root);
-    assert.equal(status, 0, `a complete repository fixture was refused:\n${output}`);
-  });
-
-  /** The round-14 CRITICAL, executed rather than described. */
-  it("refuses a shrunk manifest that keeps its path but drops the deliverable", () => {
-    const root = makeRepositoryFixture();
-
-    // The exact attack: keep the manifest path, replace its contents with one
-    // benign entry pointing at a trivial surviving test.
+  /** The manifest, rewritten. Every attack below is a variation on this. */
+  function writeManifest(root: string, entries: readonly (readonly [string, string, string])[]): void {
     writeFileSync(
       join(root, "src/verification/guardedModules.ts"),
       [
@@ -3888,56 +3879,268 @@ describe("TASK-017 round-14: a repository cannot shed the deliverable", () => {
         "  readonly anchor?: string;",
         "}",
         "export const GUARDED_MODULES: readonly GuardedModule[] = [",
-        '  { module: "src/verification/testArtifacts.ts", test: "tests/sample.test.ts", marker: "sample" },',
+        ...entries.map(
+          ([module, test, marker]) =>
+            `  { module: ${JSON.stringify(module)}, test: ${JSON.stringify(test)}, marker: ${JSON.stringify(marker)} },`,
+        ),
+        "];",
+        "",
+      ].join("\n"),
+    );
+  }
+
+  function setInclude(root: string, include: readonly string[]): void {
+    const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as Record<string, unknown>;
+    tsconfig["include"] = [...include];
+    writeFileSync(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
+  }
+
+  /** NON-VACUITY. Without this, every refusal below could be an unrelated failure. */
+  it("accepts a repository whose deliverable is present, compiled and executed", () => {
+    const root = makeRepositoryFixture();
+    const { status, output } = runHarness(root);
+    assert.equal(status, 0, `a complete repository fixture was refused:\n${output}`);
+  });
+
+  /**
+   * THE OTHER HALF OF THE DISTINCTION. A tree that is not a repository owes
+   * nothing. Without this, "refuse everything" would satisfy every case above.
+   */
+  it("still accepts a non-repository fixture, which owes no deliverable", () => {
+    const root = makeFixtureRepo();
+    assert.equal(existsSync(join(root, ".git")), false, "the fixture is unexpectedly a repository");
+    const { status, output } = runHarness(root);
+    assert.equal(status, 0, `a non-repository fixture was refused:\n${output}`);
+  });
+
+  /**
+   * ROUND-14 CRITICAL. The manifest keeps its committed path and drops the
+   * deliverable, naming one benign pair instead. `unguarded` iterates manifest
+   * entries, so it has nothing to complain about; only the required-set check
+   * can fire.
+   */
+  it("refuses a shrunk manifest that keeps its path but drops the deliverable", () => {
+    const root = makeRepositoryFixture();
+    writeManifest(root, [["src/verification/testArtifacts.ts", "tests/sample.test.ts", "sample"]]);
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, `a shrunk manifest was accepted:\n${output}`);
+    assert.match(
+      output,
+      /does not pair src\/verification\/workflowPolicy\.ts with tests\/workflowPolicy\.test\.ts/,
+      `refused, but not by the required-pair guard:\n${output}`,
+    );
+  });
+
+  /**
+   * ROUND-15 CRITICAL 2. Every required module is relabelled onto ONE trivial
+   * compiled test carrying all three markers, and the real paired tests are
+   * deleted. `unguarded` is fully satisfied — the test exists, compiles, and
+   * mentions each marker — which is exactly the reasoning round 14 relied on
+   * when it left the pairing in the manifest.
+   */
+  it("refuses a manifest that relabels required pairs onto one trivial test", () => {
+    const root = makeRepositoryFixture();
+    rmSync(join(root, "tests/workflowPolicy.test.ts"), { force: true });
+    rmSync(join(root, "tests/workflowDigest.test.ts"), { force: true });
+    writeFileSync(
+      join(root, "tests/sample.test.ts"),
+      [
+        'import assert from "node:assert/strict";',
+        'import { describe, it } from "node:test";',
+        "// workflowPolicy workflowDocument workflowDigest",
+        'describe("sample", () => { it("passes", () => { assert.equal(1, 1); }); });',
+        "",
+      ].join("\n"),
+    );
+    writeManifest(root, [
+      ["src/verification/workflowPolicy.ts", "tests/sample.test.ts", "workflowPolicy"],
+      ["src/verification/workflowDocument.ts", "tests/sample.test.ts", "workflowDocument"],
+      ["src/verification/workflowDigest.ts", "tests/sample.test.ts", "workflowDigest"],
+    ]);
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, `a relabelled manifest was accepted:\n${output}`);
+    assert.match(
+      output,
+      /does not pair src\/verification\/workflowPolicy\.ts with tests\/workflowPolicy\.test\.ts/,
+      `refused, but not for the relabelling:\n${output}`,
+    );
+  });
+
+  /**
+   * ROUND-15 CRITICAL 1. Nothing is deleted and nothing is relabelled: the
+   * required modules simply stop being compiled. They exist, the manifest names
+   * them correctly, their tests exist and run. Observed before the fix:
+   * `verification complete: 1 test files, tree-consistent`.
+   *
+   * The manifest itself stays compiled, so the empty-manifest guard cannot fire
+   * and this case can only pass on the compilation check.
+   */
+  it("refuses required modules that exist but are excluded from compilation", () => {
+    const root = makeRepositoryFixture();
+    setInclude(root, [
+      "tests/**/*.ts",
+      "src/verification/testArtifacts.ts",
+      "src/verification/guardedModules.ts",
+    ]);
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, `uncompiled required modules were accepted:\n${output}`);
+    assert.match(
+      output,
+      /src\/verification\/workflowPolicy\.ts is present but not compiled/,
+      `refused, but not for the exclusion from compilation:\n${output}`,
+    );
+  });
+
+  /**
+   * THE MANIFEST'S OWN PAIR CLAUSES, PROVEN BY RUNNING THE VERIFIER.
+   *
+   * Until now `unguarded`'s two test-side clauses were evidenced only by a
+   * regex over the verifier's SOURCE TEXT. A mutation deleted the compiled-set
+   * line outright and nothing failed, because a comment added during this
+   * round's remediation happened to contain the token the regex looked for.
+   * The property was never actually checked; the spelling was.
+   *
+   * That is round 15's finding in miniature, on evidence I wrote myself an hour
+   * earlier, so both clauses move here where a refusal has to actually happen.
+   *
+   * ISOLATION. The three required pairs stay intact, compiled and anchored, so
+   * the required-set check stays silent and the extra declared pair is the only
+   * thing either case changes. The refusal REASON is asserted, not merely the
+   * exit code: the two clauses diagnose differently, and pinning the diagnosis
+   * is what keeps one from standing in for the other.
+   */
+  function declareExtraPair(root: string): void {
+    writeFileSync(
+      join(root, "tests/sample.test.ts"),
+      [
+        'import assert from "node:assert/strict";',
+        'import { describe, it } from "node:test";',
+        "// guards testArtifacts",
+        'describe("sample", () => { it("passes", () => { assert.equal(1, 1); }); });',
+        "",
+      ].join("\n"),
+    );
+    writeManifest(root, [
+      ["src/verification/workflowPolicy.ts", "tests/workflowPolicy.test.ts", "workflowPolicy"],
+      ["src/verification/workflowDocument.ts", "tests/workflowPolicy.test.ts", "workflowDocument"],
+      ["src/verification/workflowDigest.ts", "tests/workflowDigest.test.ts", "workflowDigest"],
+      ["src/verification/testArtifacts.ts", "tests/sample.test.ts", "testArtifacts"],
+    ]);
+  }
+
+  it("refuses a declared test that has been deleted", () => {
+    const root = makeRepositoryFixture();
+    declareExtraPair(root);
+    rmSync(join(root, "tests/sample.test.ts"));
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, `a deleted declared test was accepted:\n${output}`);
+    assert.match(
+      output,
+      /src\/verification\/testArtifacts\.ts needs tests\/sample\.test\.ts, which is missing/,
+      `refused, but not for the deletion of the declared test:\n${output}`,
+    );
+  });
+
+  it("refuses a declared test that exists but is excluded from compilation", () => {
+    const root = makeRepositoryFixture();
+    declareExtraPair(root);
+    setInclude(root, ["src/**/*.ts", "tests/workflowPolicy.test.ts", "tests/workflowDigest.test.ts"]);
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, `an uncompiled declared test was accepted:\n${output}`);
+    assert.match(
+      output,
+      /needs tests\/sample\.test\.ts, which exists but is not compiled, so it never runs/,
+      `refused, but not for the exclusion of the declared test:\n${output}`,
+    );
+  });
+
+  /**
+   * ROUND-15 CRITICAL 1, SECOND REPRODUCTION. The manifest source is excluded
+   * from compilation and a `dist` copy is preseeded, so the entries this run
+   * enforces did not come from the source tree at all.
+   *
+   * WHAT THIS ACTUALLY PROVES, corrected after running it: the stale-output
+   * repair deletes the preseeded artifact, so the manifest is not merely stale
+   * by the time it is checked — it is gone. The refusal therefore names the
+   * unloadable manifest, and a separate "is it compiled" clause was removed as
+   * unreachable rather than kept as decoration.
+   */
+  it("refuses a manifest served from a preseeded artifact the repair then removes", () => {
+    const root = makeRepositoryFixture();
+    const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as Record<string, unknown>;
+    tsconfig["exclude"] = ["src/verification/guardedModules.ts"];
+    writeFileSync(join(root, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
+
+    mkdirSync(join(root, "dist/src/verification"), { recursive: true });
+    writeFileSync(
+      join(root, "dist/src/verification/guardedModules.js"),
+      [
+        "export const GUARDED_MODULES = [",
+        '  { module: "src/verification/workflowPolicy.ts", test: "tests/workflowPolicy.test.ts", marker: "workflowPolicy" },',
+        '  { module: "src/verification/workflowDocument.ts", test: "tests/workflowPolicy.test.ts", marker: "workflowDocument" },',
+        '  { module: "src/verification/workflowDigest.ts", test: "tests/workflowDigest.test.ts", marker: "workflowDigest" },',
         "];",
         "",
       ].join("\n"),
     );
 
     const { status, output } = runHarness(root);
-    assert.notEqual(status, 0, `a shrunk manifest was accepted:\n${output}`);
+    assert.notEqual(status, 0, `an uncompiled manifest was accepted:
+${output}`);
     assert.match(
       output,
-      /does not contain the deliverable this verifier exists to check/,
-      `refused, but not by the deliverable guard:\n${output}`,
-    );
-    assert.match(
-      output,
-      /workflowPolicy\.ts is not declared/,
-      `the refusal does not name what the manifest dropped:\n${output}`,
-    );
-  });
-
-  /** The rounds 12-13 coordinated deletion: files, tests, anchor and manifest. */
-  it("refuses a coordinated deletion that removes the manifest source too", () => {
-    const root = makeRepositoryFixture();
-    for (const path of [
-      "src/verification/workflowPolicy.ts",
-      "src/verification/workflowDocument.ts",
-      "src/verification/workflowDigest.ts",
-      ".github/workflows/verify.yml",
-      "src/verification/guardedModules.ts",
-    ]) {
-      rmSync(join(root, path), { force: true });
-    }
-
-    const { status, output } = runHarness(root);
-    assert.notEqual(status, 0, `a coordinated deletion was accepted:\n${output}`);
-    assert.match(
-      output,
-      /guardedModules\.ts is missing from the working tree/,
-      `refused, but not for the deletion:\n${output}`,
+      /could not be loaded from the rebuilt output/,
+      `refused, but not for the manifest that did not survive the build:
+${output}`,
     );
   });
 
   /**
-   * The round-14 HIGH: `GIT_DIR` redirected at an empty repository made
-   * `git ls-tree` fail, the old `catch` returned `false`, and the guard turned
-   * itself off. Git is now required to answer FOR THIS TREE.
+   * A REQUIRED MODULE IS SIMPLY DELETED — isolated.
+   *
+   * `unguarded` refuses a missing module only when its manifest entry declares
+   * an ANCHOR, so the manifest here pairs every required module correctly and
+   * anchors none. The workflow itself stays present, so `REQUIRED_ANCHOR` is
+   * satisfied too, and the module-presence clause is the only one left that can
+   * fire. Without this isolation a mutation switching that clause off SURVIVED,
+   * because the coordinated-deletion case refused on the unloadable manifest
+   * first.
    */
-  it("refuses when GIT_DIR is redirected at another repository", () => {
+  it("refuses a single deleted required module, with every other clause satisfied", () => {
     const root = makeRepositoryFixture();
+    writeManifest(root, [
+      ["src/verification/workflowPolicy.ts", "tests/workflowPolicy.test.ts", "workflowPolicy"],
+      ["src/verification/workflowDocument.ts", "tests/workflowPolicy.test.ts", "workflowDocument"],
+      ["src/verification/workflowDigest.ts", "tests/workflowDigest.test.ts", "workflowDigest"],
+    ]);
     rmSync(join(root, "src/verification/workflowPolicy.ts"), { force: true });
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, `a deleted required module was accepted:
+${output}`);
+    assert.match(
+      output,
+      /src\/verification\/workflowPolicy\.ts is missing from the working tree/,
+      `refused, but not by the module-presence clause:
+${output}`,
+    );
+  });
+
+  /**
+   * ROUND-14 HIGH. `GIT_DIR` redirected at an empty repository made the old
+   * `git ls-tree` query throw, and the `catch` read the failure as "nothing
+   * owed". The requirement now consults no subprocess, so redirection changes
+   * nothing. The tree is stripped by RELABELLING rather than deleting, so
+   * `unguarded` cannot refuse first and mask the point.
+   */
+  it("still refuses when GIT_DIR is redirected at another repository", () => {
+    const root = makeRepositoryFixture();
+    writeManifest(root, [["src/verification/testArtifacts.ts", "tests/sample.test.ts", "sample"]]);
 
     const decoy = mkdtempSync(join(tmpdir(), "sf-decoy-git-"));
     created.push(decoy);
@@ -3951,25 +4154,16 @@ describe("TASK-017 round-14: a repository cannot shed the deliverable", () => {
     const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
 
     assert.notEqual(result.status ?? -1, 0, `GIT_DIR redirection disabled the guard:\n${output}`);
-    assert.match(
-      output,
-      /git reports this working tree as|workflowPolicy\.ts is missing from the working tree/,
-      `refused, but not for the redirection or the deletion:\n${output}`,
-    );
+    assert.match(output, /does not pair src\/verification\/workflowPolicy\.ts/, output);
   });
 
-  /**
-   * The same failure by a different route: a repository whose git cannot answer
-   * at all. The old `catch` treated that as "not a repository, nothing owed";
-   * the requirement now asks git nothing, so breaking it changes nothing.
-   */
-  it("refuses a repository whose git cannot answer, rather than skipping the check", () => {
+  /** The same property with git present but always failing. */
+  it("still refuses when git cannot answer at all", () => {
     const root = makeRepositoryFixture();
-    rmSync(join(root, "src/verification/workflowDigest.ts"), { force: true });
+    writeManifest(root, [["src/verification/testArtifacts.ts", "tests/sample.test.ts", "sample"]]);
 
     const shimDir = mkdtempSync(join(tmpdir(), "sf-nogit-"));
     created.push(shimDir);
-    // `npx` must still resolve, so only `git` is shadowed.
     writeFileSync(join(shimDir, "git"), "#!/bin/sh\nexit 127\n", { mode: 0o755 });
 
     const result = spawnSync(process.execPath, ["scripts/verify.mjs"], {
@@ -3980,61 +4174,87 @@ describe("TASK-017 round-14: a repository cannot shed the deliverable", () => {
     const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
 
     assert.notEqual(result.status ?? -1, 0, `a broken git disabled the guard:\n${output}`);
-    assert.match(
-      output,
-      /workflowDigest\.ts is missing from the working tree/,
-      `refused, but not for the deletion the broken git was meant to hide:\n${output}`,
-    );
+    assert.match(output, /does not pair src\/verification\/workflowPolicy\.ts/, output);
   });
 
   /**
-   * RENAMING IS NOT AN ESCAPE — the round-4 CRITICAL, re-tested because this
-   * round's first remediation attempt reintroduced exactly it by keying the gate
-   * on the package name. Nothing the tree calls itself changes what it owes.
+   * ROUND-4 CRITICAL, re-tested because round 14's first remediation attempt
+   * reintroduced it by keying the gate on the package name. Nothing a tree calls
+   * itself changes what it owes.
    */
   it("refuses a stripped repository however the package names itself", () => {
     for (const name of ["fixture", "not-this-repository", ""]) {
       const root = makeRepositoryFixture();
-      rmSync(join(root, ".github/workflows/verify.yml"), { force: true });
+      writeManifest(root, [["src/verification/testArtifacts.ts", "tests/sample.test.ts", "sample"]]);
       writeFileSync(join(root, "package.json"), JSON.stringify({ name, type: "module" }, null, 2));
 
       const { status, output } = runHarness(root);
       assert.notEqual(status, 0, `renaming to "${name}" shed the requirement:\n${output}`);
-      assert.match(output, /verify\.yml is missing from the working tree/, output);
+      assert.match(output, /does not pair src\/verification\/workflowPolicy\.ts/, output);
     }
   });
 
   /**
-   * AN EMPTIED MANIFEST, distinct from a shrunk one: the round-8 bypass, where
-   * the source is present and declares nothing at all.
-   *
-   * DELIBERATELY ON A NON-REPOSITORY TREE. The first version of this case used a
-   * repository fixture, and the mutation that switched this guard off entirely
-   * SURVIVED: with the manifest emptied, `declaredModules` is empty, so the
-   * required-set guard refuses first and the case passed on its neighbour's
-   * refusal. The assertion made it worse by accepting either message through an
-   * alternation. Sibling-guard masking has been the finding in this task nine
-   * times, and it was reintroduced here while fixing it.
-   *
-   * A tree with no `.git` owes no required set, so exactly one guard can fire.
+   * THE REQUIRED ANCHOR, ISOLATED. Deleting the workflow alone is caught by the
+   * round-12 `missingAnchors` guard, which reads the manifest — so the manifest
+   * entries drop their `anchor` field here, leaving only the verifier's own
+   * REQUIRED_ANCHOR able to fire.
+   */
+  it("refuses a missing workflow even when the manifest stops anchoring it", () => {
+    const root = makeRepositoryFixture();
+    rmSync(join(root, ".github/workflows/verify.yml"), { force: true });
+    writeManifest(root, [
+      ["src/verification/workflowPolicy.ts", "tests/workflowPolicy.test.ts", "workflowPolicy"],
+      ["src/verification/workflowDocument.ts", "tests/workflowPolicy.test.ts", "workflowDocument"],
+      ["src/verification/workflowDigest.ts", "tests/workflowDigest.test.ts", "workflowDigest"],
+    ]);
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, `a missing anchor was accepted:\n${output}`);
+    assert.match(
+      output,
+      /\.github\/workflows\/verify\.yml is missing from the working tree/,
+      `refused, but not by the verifier's own anchor requirement:\n${output}`,
+    );
+  });
+
+  /**
+   * THE COORDINATED DELETION of rounds 12-13, including the manifest source
+   * itself, which is what made the round-13 dynamic import throw.
+   */
+  it("refuses a coordinated deletion that removes the manifest source too", () => {
+    const root = makeRepositoryFixture();
+    for (const path of [
+      "src/verification/workflowPolicy.ts",
+      "src/verification/workflowDocument.ts",
+      "src/verification/workflowDigest.ts",
+      "tests/workflowPolicy.test.ts",
+      "tests/workflowDigest.test.ts",
+      ".github/workflows/verify.yml",
+      "src/verification/guardedModules.ts",
+    ]) {
+      rmSync(join(root, path), { force: true });
+    }
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, `a coordinated deletion was accepted:\n${output}`);
+    assert.match(
+      output,
+      /could not be loaded from the rebuilt output|is missing from the working tree/,
+      `refused, but not for the deletion:\n${output}`,
+    );
+  });
+
+  /**
+   * AN EMPTIED MANIFEST, on a NON-REPOSITORY tree so that exactly one guard can
+   * fire. A repository tree would be refused by the required-set check first,
+   * and an earlier version of this case passed on precisely that neighbour while
+   * the guard it names was switched off entirely — a mutation proved it.
    */
   it("refuses a manifest emptied of every entry, where no other guard can fire", () => {
     const root = makeFixtureRepo();
     assert.equal(existsSync(join(root, ".git")), false, "the fixture must owe no required set");
-
-    writeFileSync(
-      join(root, "src/verification/guardedModules.ts"),
-      [
-        "export interface GuardedModule {",
-        "  readonly module: string;",
-        "  readonly test: string;",
-        "  readonly marker: string;",
-        "  readonly anchor?: string;",
-        "}",
-        "export const GUARDED_MODULES: readonly GuardedModule[] = [];",
-        "",
-      ].join("\n"),
-    );
+    writeManifest(root, []);
 
     const { status, output } = runHarness(root);
     assert.notEqual(status, 0, `an emptied manifest was accepted:\n${output}`);
@@ -4043,18 +4263,5 @@ describe("TASK-017 round-14: a repository cannot shed the deliverable", () => {
       /produced no entries while its source is present/,
       `refused, but not by the empty-manifest guard:\n${output}`,
     );
-  });
-
-  /**
-   * THE OTHER HALF OF THE DISTINCTION. A tree that is NOT a repository owes
-   * nothing and still verifies. Without this, requiring the deliverable
-   * everywhere would look identical to requiring it of repositories, and the
-   * fixtures above would be the only evidence either way.
-   */
-  it("still accepts a non-repository fixture, which owes no deliverable", () => {
-    const root = makeFixtureRepo();
-    assert.equal(existsSync(join(root, ".git")), false, "the fixture is unexpectedly a repository");
-    const { status, output } = runHarness(root);
-    assert.equal(status, 0, `a non-repository fixture was refused:\n${output}`);
   });
 });

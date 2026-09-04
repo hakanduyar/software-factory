@@ -1307,11 +1307,21 @@ describe("TASK-017: a guarded module may not lose the test that guards it", () =
     );
   });
 
-  /** Deletion and exclusion are different holes; both questions must be asked. */
-  it("checks the filesystem AND the compiled set", () => {
-    assert.match(VERIFIER, /existsSync\(join\(REPO_ROOT, test\)\)/, "deletion is not detected");
-    assert.match(VERIFIER, /sourceTests\.includes\(test\)/, "exclusion from compilation is not detected");
-  });
+  /**
+   * DELETION AND EXCLUSION ARE DIFFERENT HOLES, AND BOTH ARE NOW PROVEN BY
+   * RUNNING THE VERIFIER rather than by reading it.
+   *
+   * This used to be two `assert.match` calls against the verifier's source
+   * text. A mutation deleted the compiled-set line outright and this case
+   * stayed green, because a COMMENT written during round-15 remediation
+   * contained the very token the regex searched for. The case was checking
+   * that somebody had typed a string, which is round 15's finding exactly.
+   *
+   * Both clauses moved to `tests/verificationHarnessEndToEnd.test.ts`:
+   * "refuses a declared test that has been deleted" and "refuses a declared
+   * test that exists but is excluded from compilation". Each declares a real
+   * pair, withholds exactly one property, and asserts the refusal REASON.
+   */
 
   it("nowhere names this repository, which would make the gate renameable", () => {
     assert.ok(
@@ -2732,11 +2742,11 @@ describe("TASK-017 round-14 CRITICAL: the required deliverable set lives in the 
 
     assert.match(
       verifier,
-      /const REQUIRED_MODULES = \[/,
+      /const REQUIRED_GUARDS = \[/,
       "the required deliverable set is not a literal in the verifier",
     );
     /**
-     * The set must NAME the deliverable. A `REQUIRED_MODULES` that existed but
+     * The set must NAME the deliverable. A `REQUIRED_GUARDS` that existed but
      * listed nothing would satisfy the assertion above while requiring nothing
      * at all — the round-8 empty-manifest bypass, relocated.
      */
