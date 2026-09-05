@@ -206,6 +206,34 @@ export function parseWorkflow(source: string): ParseResult {
     );
   }
   /**
+   * A %TAG DIRECTIVE IS REFUSED (round-16 review, HIGH 4).
+   *
+   * The reviewer's fixture was `%TAG !e! tag:example.com,2020:` in front of the
+   * shipped workflow. It parsed, normalised and passed every policy check: the
+   * directive declares a handle, and a handle that no node uses is simply
+   * dropped. Explicit tags ON nodes were already refused by `normalise`, so
+   * nothing was exploitable — but this file claims a CLOSED model in which
+   * anything outside it refuses, and a construct that is read and discarded is
+   * outside it. The claim was wrong, which makes it a finding whether or not it
+   * is reachable.
+   *
+   * Asserted as an exact match against the two handles YAML defines implicitly,
+   * so redefining `!` or `!!` to a different prefix is refused as well as
+   * adding a new handle. `tags` is always populated, so this cannot read
+   * "absent, therefore allowed".
+   */
+  const DEFAULT_TAG_HANDLES: Readonly<Record<string, string>> = {
+    "!": "!",
+    "!!": "tag:yaml.org,2002:",
+  };
+  const declaredTagHandles = Object.entries(document.directives?.tags ?? {});
+  const custom = declaredTagHandles.filter(([handle, prefix]) => DEFAULT_TAG_HANDLES[handle] !== prefix);
+  if (custom.length > 0) {
+    return refuse(
+      `the workflow declares the tag handle ${custom[0]![0]}, and this reader models no tag handles beyond YAML's own`,
+    );
+  }
+  /**
    * PARSE FAILURE REFUSES. It never means "absent, therefore allowed" — the
    * direction that turns "we could not tell" into "it is fine", which is the
    * failure this whole area keeps producing.

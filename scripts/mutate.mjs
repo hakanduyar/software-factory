@@ -272,8 +272,8 @@ const MUTATIONS = [
   {
     id: "the manifest is declared but nothing fails on a broken pair",
     edits: [[VERIFIER, "if (unguarded.length > 0) {", "if (false) {"]],
-    tests: [T_WF],
-    expect: "refuses when a guarded module has no test",
+    tests: [T_E2E],
+    expect: "refuses a declared test that has been deleted",
   },
   /**
    * BOTH PAIR CLAUSES, AGAINST THE RUNNING VERIFIER. These were the last two
@@ -301,8 +301,8 @@ const MUTATIONS = [
   {
     id: "a paired test need not mention the module it guards",
     edits: [[VERIFIER, "  if (!body.includes(marker)) {", "  void marker;\n  if (false) {"]],
-    tests: [T_WF],
-    expect: "verifier itself to check the marker",
+    tests: [T_E2E],
+    expect: "refuses a declared test that never mentions the module it guards",
   },
   {
     id: "the workflow guard loses its anchor",
@@ -357,18 +357,70 @@ const MUTATIONS = [
   {
     id: "the manifest need not pair a required module with its named test",
     edits: [[VERIFIER,
-      "    if (!freshGuarded.some((entry) => entry.module === module && entry.test === test)) {",
+      "    if (!guarded.some((entry) => entry.module === module && entry.test === test)) {",
       "    if (false) {"]],
     tests: [T_E2E],
     expect: "refuses a manifest that relabels required pairs onto one trivial test",
   },
   {
-    id: "an unloadable manifest is treated as an empty one",
+    id: "an unloadable manifest is diagnosed as an empty one",
     edits: [[VERIFIER,
-      "  if (freshGuarded === undefined) {",
-      "  if (false) {"]],
+      "    manifest === undefined",
+      "    false"]],
     tests: [T_E2E],
-    expect: "refuses a coordinated deletion that removes the manifest source too",
+    expect: "refuses a stale manifest on a tree that is not a repository",
+  },
+  {
+    id: "a pair may be declared twice",
+    edits: [[VERIFIER,
+      "if (duplicatePairs.length > 0) {",
+      "if (false) {"]],
+    tests: [T_E2E],
+    expect: "refuses a manifest that declares the same pair twice",
+  },
+  // ---- round-16: presence is not detection --------------------------------
+  /**
+   * THE CANARY. Each required test is run against a build of its module with
+   * every export replaced, and must FAIL. These three switch off the clauses
+   * that make that a refusal rather than a remark.
+   */
+  {
+    id: "a test that detects nothing is not refused",
+    edits: [[VERIFIER,
+      "    if (undetected.length > 0) {",
+      "    if (false) {"]],
+    tests: [T_E2E],
+    expect: "refuses a required test that does not exercise the module it guards",
+  },
+  {
+    id: "a module with no exports is treated as guardable",
+    edits: [[VERIFIER,
+      "      if (names.length === 0) {",
+      "      if (false) {"]],
+    tests: [T_E2E],
+    expect: "refuses required modules that export nothing at run time",
+  },
+  {
+    id: "the canary run's outcome is not consulted",
+    edits: [[VERIFIER,
+      "      if (run.status === 0) {",
+      "      if (false) {"]],
+    tests: [T_E2E],
+    expect: "refuses a required test that does not exercise the module it guards",
+  },
+  /**
+   * THE OTHER DIRECTION, and it is the one that matters most here: a canary
+   * that refused EVERY repository would satisfy the three cases above while
+   * breaking the complete fixture, which is exactly how the first attempt at
+   * this guard was caught.
+   */
+  {
+    id: "the canary refuses even a test that does detect the change",
+    edits: [[VERIFIER,
+      "      if (run.status === 0) {",
+      "      if (run.status !== -12345) {"]],
+    tests: [T_E2E],
+    expect: "accepts a repository whose deliverable is present, compiled and executed",
   },
   {
     id: "the workflow anchor is no longer required",
@@ -403,7 +455,7 @@ const MUTATIONS = [
   {
     id: "an empty manifest is accepted",
     edits: [[VERIFIER,
-      "if (guarded.length === 0 && existsSync(join(REPO_ROOT, MANIFEST_SOURCE))) {",
+      "if (existsSync(join(REPO_ROOT, MANIFEST_SOURCE)) && guarded.length === 0) {",
       "if (false) {"]],
     tests: [T_E2E],
     expect: "refuses a manifest emptied of every entry, where no other guard can fire",
@@ -470,8 +522,8 @@ const MUTATIONS = [
     edits: [[VERIFIER,
       "  if (anchored && !existsSync(join(REPO_ROOT, module))) {",
       "  void anchored;\n  if (false) {"]],
-    tests: [T_WF],
-    expect: "acts on the anchor",
+    tests: [T_E2E],
+    expect: "refuses a deleted module whose entry still anchors a present artifact",
   },
   // ---- round-8: comment boundary, null values, local actions ---------------
   {
@@ -721,8 +773,8 @@ const MUTATIONS = [
     edits: [[VERIFIER,
       "      .filter(({ anchor }) => anchor !== undefined && !existsSync(join(REPO_ROOT, anchor)))",
       "      .filter(() => false)"]],
-    tests: [T_WF],
-    expect: "makes the verifier refuse a declared anchor that is absent",
+    tests: [T_E2E],
+    expect: "refuses a manifest that anchors an artifact the tree does not contain",
   },
   {
     id: "the Node pin may come after the commands it is meant to pin",
@@ -741,6 +793,22 @@ const MUTATIONS = [
     expect: "is exactly the three runners this repository has reasoned about",
   },
   // ---- round-13 review -----------------------------------------------------
+  {
+    id: "a tag directive is read and discarded rather than refused",
+    edits: [[DOCUMENT,
+      "  if (custom.length > 0) {",
+      "  if (false) {"]],
+    tests: [T_WF],
+    expect: "refuses the shipped workflow behind a %TAG directive",
+  },
+  {
+    id: "only NEW tag handles are refused, so a default may be redefined",
+    edits: [[DOCUMENT,
+      "DEFAULT_TAG_HANDLES[handle] !== prefix",
+      "DEFAULT_TAG_HANDLES[handle] === undefined && prefix.length >= 0"]],
+    tests: [T_WF],
+    expect: "refuses %TAG !! tag:example.com,2020:",
+  },
   {
     id: "the YAML version is requested but not asserted",
     edits: [[DOCUMENT,

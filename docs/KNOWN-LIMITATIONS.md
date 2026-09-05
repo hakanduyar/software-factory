@@ -1026,6 +1026,18 @@ this reader misreads it too, and nothing here would notice. What remains ours,
 and what the review rounds should keep attacking, is the normalisation and the
 semantic allowlist above it.
 
+A second overclaim in the same sentence survived until round 16. "Anything else
+is refused rather than represented" was true of every construct a NODE can
+carry, and false of a DIRECTIVE: `%TAG !e! tag:example.com,2020:` in front of the
+shipped workflow parsed, normalised and passed all thirteen policy checks,
+because a handle no node uses is simply dropped. Nothing was exploitable —
+explicit tags on nodes were already refused — so the defect was entirely in the
+claim, which is the reason it is recorded rather than quietly fixed: a closed
+model that silently discards a construct is not closed, and the sentence above
+had been saying otherwise for eight rounds. `parseWorkflow` now asserts the tag
+handles are exactly the two YAML defines implicitly, so declaring a new handle
+or redefining `!` or `!!` refuses.
+
 The phrase "a YAML 1.2 parser" was itself an overclaim until round 13, and the
 correction is worth keeping visible. `parseAllDocuments` is called with
 `version: "1.2"`, and that option is a DEFAULT for documents that do not say
@@ -1107,9 +1119,12 @@ verifier producing it was the committed one.
 
 ## L-18 - The deliverable requirement keys on `.git`, so a tree without one skips it
 
-`REQUIRED_MODULES` in `scripts/verify.mjs` names the modules this repository owes
-— the workflow policy, the document reader and the digest — and refuses when the
-working tree lacks them or the manifest stops declaring them. Five review rounds
+`REQUIRED_GUARDS` in `scripts/verify.mjs` names the module → test PAIRS this
+repository owes
+— the workflow policy, the document reader and the digest, each bound to the
+test that guards it — and refuses when the working tree lacks them, when they are
+not compiled, or when the manifest stops pairing them exactly this way. Six review
+rounds
 attacked the previous versions of that guard, each time by deleting one more file
 than the last, so the list is now a literal in the verifier and cannot be shrunk
 by editing anything the attacker controls.
@@ -1134,10 +1149,66 @@ attacker precisely the thing the attack was for. It is not that the tree is safe
 it is that the tree is no longer a candidate.
 
 **Kept honest by:** `tests/verificationHarnessEndToEnd.test.ts` runs the real
-verifier against repositories stripped six different ways — a shrunk manifest, a
+verifier against trees stripped many different ways — a shrunk manifest, a
 coordinated deletion including the manifest source, `GIT_DIR` redirected at
-another repository, a `git` that always fails, three different package names, and
-a manifest emptied of every entry — and asserts a refusal naming the missing
-deliverable each time. The same suite asserts a complete repository fixture still
-passes and that a non-repository fixture still passes, so the refusals are not
-merely "everything fails".
+another repository, a `git` that always fails, three different package names,
+required modules excluded from compilation, a manifest relabelling every pair
+onto one trivial test, and a manifest emptied of every entry — and asserts a
+refusal naming the missing deliverable each time.
+
+An earlier version of this paragraph said "repositories stripped six different
+ways", which round 16 corrected on two counts: the count had gone stale, and two
+of the cases deliberately run on trees that are NOT repositories, because the
+empty-manifest and stale-manifest guards are the only ones that can fire there.
+The same suite asserts a complete repository fixture still passes and that a
+non-repository fixture still passes, so the refusals are not merely "everything
+fails".
+
+## L-19 - The deliverable canary proves a test EXERCISES its module, not that it asserts anything worthwhile
+
+**Status:** OPEN, deliberate. Recorded because the stronger reading — "the
+required tests are known to be meaningful" — claims more than the mechanism
+delivers.
+
+Six rounds of review defeated this guard by widening a deletion; round 16
+defeated it without deleting anything at all. Every file stayed exactly where it
+was — `.git`, the workflow, the manifest, all three modules, both paired tests —
+and their CONTENTS were emptied: modules reduced to `export {};`, tests reduced
+to a marker comment and no assertions. Presence, compilation and pairing all
+held. Three tests executed. Verification reported success over nothing.
+
+Presence is a question about files, and no question about files can tell an
+empty one from a full one in any way that survives the next round. So the
+verifier now asks a question about BEHAVIOUR: for each required pair it imports
+the compiled module, builds a replacement in which every export throws when
+called or is a sentinel object when read, substitutes it through an ESM load
+hook, and runs the paired test. The test must FAIL. A test that passes against a
+module whose every export has been replaced does not exercise that module,
+whatever it is named and wherever it is declared.
+
+Nothing is written to the tree to do this. The substitution lives in a load hook
+in a temporary directory, `cwd` stays the repository, and the working tree is
+byte-identical before and after — which matters because the same run reports
+tree consistency.
+
+**The limitation, stated exactly.** This proves the test EXERCISES the module.
+It does not prove the test asserts anything worthwhile about it. A test calling
+into the module and discarding the result would still fail here, because the
+replacement throws — so the canary cannot distinguish a rigorous test from a
+credulous one that happens to touch the same functions. It also says nothing
+about modules the manifest declares but `REQUIRED_GUARDS` does not name.
+
+What covers that gap is `scripts/mutate.mjs`, which changes real behaviour one
+edit at a time and requires a NAMED test to fail for each. The canary is the
+cheap deterministic floor that runs on every verification; mutation testing is
+the expensive measurement that runs deliberately. Neither replaces the other,
+and claiming the floor is the ceiling is the exact shape of overclaim this file
+exists to prevent.
+
+**Kept honest by:** `tests/verificationHarnessEndToEnd.test.ts` reproduces the
+round-16 attack in both halves — "refuses required modules that export nothing
+at run time" and "refuses a required test that does not exercise the module it
+guards" — and asserts that a complete repository fixture, whose stub tests do
+exercise their stub modules, still passes. `scripts/mutate.mjs` switches each
+clause of the canary off in turn, including one mutation that makes it refuse
+every repository, which the complete fixture catches.

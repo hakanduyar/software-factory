@@ -128,8 +128,19 @@
  * `CLEAN_ROOM_CI` roadmap item.
  */
 
-import { execFileSync } from "node:child_process";
-import { existsSync, lstatSync, readFileSync, readdirSync, realpathSync, rmSync, statSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import {
+  existsSync,
+  lstatSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -1613,67 +1624,6 @@ assertTreeIsSafe("after building", checkerFreshlyEmitted);
 const sourceTests = allSources.filter((path) => checker.isSourceTest(path));
 
 /**
- * GUARDED MODULES AND THE TESTS THAT GUARD THEM (TASK-017 rounds 3-8).
- *
- * The list itself lives in `src/verification/guardedModules.ts` and is imported
- * from the COMPILED module, so the verifier and its tests read the same values.
- * It used to live here with tests asserting this file's SOURCE TEXT, and
- * commenting every entry out then left the text present, the tests passing, and
- * the runtime manifest empty (round-8 review, HIGH 4).
- *
- * A pair means: if the MODULE is present, the TEST must be present, compiled,
- * and must MENTION the module. An ANCHOR makes a pair mandatory even when the
- * module is gone, because removing a module and its test together once left the
- * shipped workflow completely unvalidated.
- *
- * Imported dynamically and tolerantly: this runs before the audit, and a tree
- * that cannot produce the module has bigger problems than this check, which the
- * rest of the verifier reports in its own words.
- */
-const guarded = await (async () => {
-  try {
-    const module = await import(`file://${join(REPO_ROOT, OUTPUT_DIR, "src/verification/guardedModules.js")}`);
-    return module.GUARDED_MODULES ?? [];
-  } catch {
-    return [];
-  }
-})();
-
-const unguarded = guarded.flatMap(({ module, test, marker, anchor }) => {
-  /**
-   * A DECLARED ANCHOR MUST EXIST (round-12 review, HIGH 1).
-   *
-   * The anchor used to be consulted only when the anchor FILE was still there,
-   * which made the guard conditional on the very thing an attacker deletes.
-   * Removing the workflow, all four modules and both test files together left
-   * the suite green at 102 test files — the entire deliverable gone, and
-   * verification reporting success.
-   *
-   * The requirement is now tied to the DECLARATION rather than to the artifact:
-   * this manifest says `.github/workflows/verify.yml` is guarded, so it has to
-   * be there. Removing the workflow legitimately means removing these entries
-   * too, which is a visible diff in a file whose whole purpose is to be read.
-   */
-  const anchored = anchor !== undefined;
-  if (anchored && !existsSync(join(REPO_ROOT, module))) {
-    return [[module, test, `is missing while ${anchor} is still present and unvalidated`]];
-  }
-  if (!existsSync(join(REPO_ROOT, module))) return [];
-  if (!existsSync(join(REPO_ROOT, test))) return [[module, test, "is missing"]];
-  if (!sourceTests.includes(test)) return [[module, test, "exists but is not compiled, so it never runs"]];
-  let body = "";
-  try {
-    body = readFileSync(join(REPO_ROOT, test), "utf8");
-  } catch {
-    return [[module, test, "could not be read"]];
-  }
-  if (!body.includes(marker)) {
-    return [[module, test, `never mentions ${marker}, so it does not guard this module`]];
-  }
-  return [];
-});
-
-/**
  * THE REQUIRED DELIVERABLE SET IS A LITERAL HERE, AND THE GIT QUESTION FAILS
  * CLOSED (round-14 review, CRITICAL 1 and HIGH 2).
  *
@@ -1744,48 +1694,6 @@ const MANIFEST_SOURCE = "src/verification/guardedModules.ts";
 const looksLikeRepository = existsSync(join(REPO_ROOT, ".git"));
 
 
-/**
- * A DECLARED ANCHOR MUST BE IN THE TREE (round-12 review, HIGH 1).
- *
- * The anchor used to be consulted only when the anchor FILE still existed,
- * which made the guard conditional on the very thing an attacker deletes.
- * Removing the workflow, all four verification modules and both test files
- * together left the suite green at 102 test files: the entire deliverable gone,
- * and verification reporting success.
- *
- * The requirement is tied to the DECLARATION instead. This manifest says
- * `.github/workflows/verify.yml` is guarded, so it has to be there. Removing
- * the workflow legitimately means removing those entries too, which is a
- * visible diff in a file whose whole purpose is to be read.
- *
- * Reported separately from `unguarded` because the subject is different: that
- * message is about a module lacking its test, and this is about the manifest
- * naming an artifact the tree does not have.
- */
-const missingAnchors = [
-  ...new Set(
-    guarded
-      .filter(({ anchor }) => anchor !== undefined && !existsSync(join(REPO_ROOT, anchor)))
-      .map(({ anchor }) => anchor),
-  ),
-];
-if (missingAnchors.length > 0) {
-  fail(
-    "verification refused: the guarded-module manifest anchors " +
-      missingAnchors.map((anchor) => `\`${anchor}\``).join(", ") +
-      ", which the tree does not contain. Deleting the artifact a guard exists for does not remove the guard; " +
-      "removing it deliberately means removing its manifest entries in the same change.",
-  );
-}
-
-if (unguarded.length > 0) {
-  fail(
-    "verification refused: a guarded module is present without the test that guards it — " +
-      unguarded.map(([module, test, why]) => `${module} needs ${test}, which ${why}`).join("; ") +
-      ". These pin safety properties whose loss would otherwise be silent, so this is a " +
-      "verification failure rather than a smaller test run.",
-  );
-}
 const generatedFiles = listFiles(OUTPUT_DIR);
 const compiledTests = generatedFiles.filter((path) => checker.isTestArtifact(path));
 assertEverythingWasReadable("before auditing");
@@ -1904,6 +1812,198 @@ if (!audit.clean) {
   console.error("Stale output removed and rebuilt; the rebuilt tree is consistent. Continuing.\n");
 }
 
+// --- 6a. the manifest, read from the output the build actually produced ----
+/**
+ * ONE READ, AFTER THE REPAIR, FOR EVERY TREE (round-16 review, HIGH 2).
+ *
+ * The manifest used to be imported near the top of this file, before the
+ * stale-output repair, and three consumers read that value: the anchor check,
+ * `unguarded`, and the empty-manifest guard. Round 15 fixed the required-set
+ * check alone by re-importing inside its own branch, and round 16 walked
+ * straight through the gap that left — on a tree with no `.git` the re-import
+ * never happened, so a preseeded `dist` manifest satisfied the empty-manifest
+ * guard while the rebuilt manifest was absent. Exit 0, one test run.
+ *
+ * Repairing three consumers separately would have been three chances to miss
+ * one, which is how round 15 became round 16. There is now a single read, it
+ * happens after the rebuild, and everything downstream uses it.
+ */
+/**
+ * GUARDED MODULES AND THE TESTS THAT GUARD THEM (TASK-017 rounds 3-8).
+ *
+ * The list itself lives in `src/verification/guardedModules.ts` and is imported
+ * from the COMPILED module, so the verifier and its tests read the same values.
+ * It used to live here with tests asserting this file's SOURCE TEXT, and
+ * commenting every entry out then left the text present, the tests passing, and
+ * the runtime manifest empty (round-8 review, HIGH 4).
+ *
+ * A pair means: if the MODULE is present, the TEST must be present, compiled,
+ * and must MENTION the module. An ANCHOR makes a pair mandatory even when the
+ * module is gone, because removing a module and its test together once left the
+ * shipped workflow completely unvalidated.
+ *
+ * NO CACHE-BUSTER, AND THE REASON IS THE POINT. Round 15 imported this module
+ * twice — once near the top of the file and once after the repair — and the
+ * second import needed `?v=${Date.now()}` or Node would have returned the first
+ * one, which was read from exactly the stale artifact the repair deleted. There
+ * is now ONE import, after the rebuild, so there is no earlier copy to defeat.
+ *
+ * A mutation is what settled this: deleting the cache-buster changed nothing,
+ * because nothing could depend on it. Keeping it would have been a third
+ * unfalsifiable claim in the same file. If a second read of this module is ever
+ * added, it needs one again — and it should not be added.
+ *
+ * Imported dynamically, and a failure to load is DISTINCT from an empty
+ * manifest: `manifest` is `undefined` when the import threw and an array when
+ * it did not. Round 8 emptied the entries; round 16 arranged for the file to be
+ * absent from the rebuilt output. Those need different messages, so `guarded`
+ * is the value the checks below iterate and `manifest` is the value that says
+ * whether there was anything to iterate at all.
+ */
+const manifest = await (async () => {
+  try {
+    const url = `file://${join(REPO_ROOT, OUTPUT_DIR, "src/verification/guardedModules.js")}`;
+    const loaded = await import(url);
+    return loaded.GUARDED_MODULES ?? [];
+  } catch {
+    return undefined;
+  }
+})();
+const guarded = manifest ?? [];
+
+const unguarded = guarded.flatMap(({ module, test, marker, anchor }) => {
+  /**
+   * A DECLARED ANCHOR MUST EXIST (round-12 review, HIGH 1).
+   *
+   * The anchor used to be consulted only when the anchor FILE was still there,
+   * which made the guard conditional on the very thing an attacker deletes.
+   * Removing the workflow, all four modules and both test files together left
+   * the suite green at 102 test files — the entire deliverable gone, and
+   * verification reporting success.
+   *
+   * The requirement is now tied to the DECLARATION rather than to the artifact:
+   * this manifest says `.github/workflows/verify.yml` is guarded, so it has to
+   * be there. Removing the workflow legitimately means removing these entries
+   * too, which is a visible diff in a file whose whole purpose is to be read.
+   */
+  const anchored = anchor !== undefined;
+  if (anchored && !existsSync(join(REPO_ROOT, module))) {
+    return [[module, test, `is missing while ${anchor} is still present and unvalidated`]];
+  }
+  if (!existsSync(join(REPO_ROOT, module))) return [];
+  if (!existsSync(join(REPO_ROOT, test))) return [[module, test, "is missing"]];
+  if (!sourceTests.includes(test)) return [[module, test, "exists but is not compiled, so it never runs"]];
+  let body = "";
+  try {
+    body = readFileSync(join(REPO_ROOT, test), "utf8");
+  } catch {
+    return [[module, test, "could not be read"]];
+  }
+  if (!body.includes(marker)) {
+    return [[module, test, `never mentions ${marker}, so it does not guard this module`]];
+  }
+  return [];
+});
+
+/**
+ * A DECLARED ANCHOR MUST BE IN THE TREE (round-12 review, HIGH 1).
+ *
+ * The anchor used to be consulted only when the anchor FILE still existed,
+ * which made the guard conditional on the very thing an attacker deletes.
+ * Removing the workflow, all four verification modules and both test files
+ * together left the suite green at 102 test files: the entire deliverable gone,
+ * and verification reporting success.
+ *
+ * The requirement is tied to the DECLARATION instead. This manifest says
+ * `.github/workflows/verify.yml` is guarded, so it has to be there. Removing
+ * the workflow legitimately means removing those entries too, which is a
+ * visible diff in a file whose whole purpose is to be read.
+ *
+ * Reported separately from `unguarded` because the subject is different: that
+ * message is about a module lacking its test, and this is about the manifest
+ * naming an artifact the tree does not have.
+ */
+const missingAnchors = [
+  ...new Set(
+    guarded
+      .filter(({ anchor }) => anchor !== undefined && !existsSync(join(REPO_ROOT, anchor)))
+      .map(({ anchor }) => anchor),
+  ),
+];
+if (missingAnchors.length > 0) {
+  fail(
+    "verification refused: the guarded-module manifest anchors " +
+      missingAnchors.map((anchor) => `\`${anchor}\``).join(", ") +
+      ", which the tree does not contain. Deleting the artifact a guard exists for does not remove the guard; " +
+      "removing it deliberately means removing its manifest entries in the same change.",
+  );
+}
+
+if (unguarded.length > 0) {
+  fail(
+    "verification refused: a guarded module is present without the test that guards it — " +
+      unguarded.map(([module, test, why]) => `${module} needs ${test}, which ${why}`).join("; ") +
+      ". These pin safety properties whose loss would otherwise be silent, so this is a " +
+      "verification failure rather than a smaller test run.",
+  );
+}
+
+
+
+/**
+ * ONE GUARD, ONE TRIGGER, TWO DIAGNOSES (round-8 bypass; round-16 HIGH 2).
+ *
+ * A manifest that says nothing disables every deletion guard at once, and there
+ * are two ways to arrange that: EMPTY the entries (round 8 commented them out)
+ * or arrange for the file to be ABSENT from the rebuilt output (round 16
+ * preseeded `dist` and excluded the source from compilation).
+ *
+ * These were briefly two checks. They are one, because their trigger condition
+ * is identical — the source is present and the run has no entries — so a
+ * separate "unloadable" check could never be the SOLE reason for any refusal.
+ * That is the unfalsifiable-claim shape this task has now deleted three times.
+ * What genuinely differs is the DIAGNOSIS, so that is what branches, and a
+ * mutation can switch the branch off and be killed by the case that names it.
+ *
+ * Keyed on the SOURCE being present, so a tree that legitimately declares no
+ * manifest owes nothing. Placed BEFORE the required-set check because "the
+ * manifest did not survive the build" is a more precise account of such a tree
+ * than any list of pairs it failed to declare.
+ */
+if (existsSync(join(REPO_ROOT, MANIFEST_SOURCE)) && guarded.length === 0) {
+  fail(
+    manifest === undefined
+      ? `verification refused: ${MANIFEST_SOURCE} could not be loaded from the rebuilt output. ` +
+          "Every deletion guard reads it, so a manifest that does not survive the build disables all of them."
+      : `verification refused: ${MANIFEST_SOURCE} produced no entries while its source is present. ` +
+          "An empty manifest disables every deletion guard at once.",
+  );
+}
+
+/**
+ * A PAIR IS DECLARED ONCE (round-16 review, non-blocking note).
+ *
+ * The reviewer observed that a manifest may declare the same pair twice, that
+ * nothing was bypassed by it, and that the handling was not explicit. Both
+ * halves of that are worth acting on: a duplicate entry is checked twice and
+ * reported twice, which is harmless, and it is also the shape that makes a
+ * later "the manifest declares N pairs" claim quietly wrong.
+ *
+ * So it refuses rather than de-duplicating. Silently collapsing duplicates
+ * would make the manifest's text and its meaning disagree, and this file exists
+ * because that disagreement is where every round-8-to-16 finding lived.
+ */
+const declaredPairs = guarded.map(({ module, test }) => `${module} -> ${test}`);
+const duplicatePairs = [...new Set(declaredPairs.filter((pair, index) => declaredPairs.indexOf(pair) !== index))];
+if (duplicatePairs.length > 0) {
+  fail(
+    "verification refused: the guarded-module manifest declares " +
+      duplicatePairs.map((pair) => `\`${pair}\``).join(", ") +
+      " more than once. A pair checked twice is not checked harder, and a manifest whose text and meaning " +
+      "disagree is how this guard has been defeated before.",
+  );
+}
+
 // --- 6b. the deliverable must be present, compiled, paired AND EXECUTED -----
 /**
  * SIXTH ITERATION OF ONE ATTACK (round-15 review, CRITICAL 1 and 2).
@@ -1942,39 +2042,6 @@ if (!audit.clean) {
  * this process is about to execute, not the ones it hoped to.
  */
 if (looksLikeRepository) {
-  /**
-   * RE-READ THE MANIFEST FROM THE REBUILT OUTPUT. The copy loaded before the
-   * repair may have come from exactly the stale artifact the repair deleted. The
-   * cache-buster is required: a plain re-import returns Node's cached module.
-   */
-  const freshGuarded = await (async () => {
-    try {
-      const url = `file://${join(REPO_ROOT, OUTPUT_DIR, "src/verification/guardedModules.js")}?v=${Date.now()}`;
-      const loaded = await import(url);
-      return loaded.GUARDED_MODULES ?? [];
-    } catch {
-      return undefined;
-    }
-  })();
-
-  /**
-   * A MANIFEST THAT DOES NOT SURVIVE THE BUILD IS THE WHOLE STALENESS CHECK.
-   *
-   * An earlier version also asked whether `MANIFEST_SOURCE` was compiled, to
-   * catch entries served from a preseeded `dist` artifact. That clause could
-   * never fire on its own: the stale-output repair above deletes any generated
-   * file with no source, so by the time execution reaches here an uncompiled
-   * manifest has already become an unloadable one. A mutation proved it by
-   * switching the clause off with nothing failing. Two checks for one condition
-   * is one check and one unfalsifiable claim.
-   */
-  if (freshGuarded === undefined) {
-    fail(
-      `verification refused: ${MANIFEST_SOURCE} could not be loaded from the rebuilt output. ` +
-        "Every deletion guard reads it, so a manifest that does not survive the build disables all of them.",
-    );
-  }
-
   const shortfalls = [];
 
   for (const { module, test } of REQUIRED_GUARDS) {
@@ -2002,7 +2069,7 @@ if (looksLikeRepository) {
       shortfalls.push(`${test}, which must guard ${module}, is missing from the working tree`);
     }
 
-    if (!freshGuarded.some((entry) => entry.module === module && entry.test === test)) {
+    if (!guarded.some((entry) => entry.module === module && entry.test === test)) {
       shortfalls.push(`${MANIFEST_SOURCE} does not pair ${module} with ${test}`);
     }
   }
@@ -2021,26 +2088,143 @@ if (looksLikeRepository) {
     );
   }
 }
+  // --- 6c. and the tests must DETECT a change in what they guard -----------
+  /**
+   * SEVENTH ITERATION OF ONE ATTACK (round-16 review, CRITICAL 1).
+   *
+   *   round 8   the guard rested on the manifest's ENTRIES    -> comment them out
+   *   round 12  it rested on the ANCHOR file                  -> delete the workflow
+   *   round 13  it rested on `workflowPolicy.ts`              -> delete that too
+   *   round 14  it rested on the manifest's CONTENTS          -> shrink the manifest
+   *   round 15  it rested on the module->TEST pair            -> relabel it, or
+   *                                                              stop compiling
+   *   round 16  it rested on PRESENCE                         -> keep every file,
+   *                                                              empty them all
+   *
+   * Round 16 kept `.git`, the workflow, the manifest and every exact pair, and
+   * replaced the three required modules with `export {};` and their paired tests
+   * with marker-bearing bodies containing no assertions. Presence, compilation
+   * and pairing all held. Exit 0, three tests executed, nothing guarded.
+   *
+   * Every previous fix asked a question about FILES. This one asks a question
+   * about BEHAVIOUR, which is the only kind an empty file cannot satisfy: each
+   * required test is run against a version of its module whose every export has
+   * been replaced, and it must FAIL. A test that passes either way does not
+   * guard anything, whatever it is named and wherever it is declared.
+   *
+   * WHAT THIS PROVES, EXACTLY, and no more: that the paired test EXERCISES the
+   * module. A test that calls into it and asserts nothing about the result
+   * would still fail here, because the replacement throws. Proving the
+   * assertions are MEANINGFUL is what `scripts/mutate.mjs` is for, and L-19
+   * records the boundary rather than letting this look like more than it is.
+   *
+   * The substitution happens in an ESM load hook, so nothing on disk changes:
+   * the tree stays byte-identical, `cwd` stays this repository, and every path
+   * a test resolves relative to the repository root still resolves.
+   */
+if (looksLikeRepository) {
+  const canaryDir = mkdtempSync(join(tmpdir(), "sf-canary-"));
+  try {
+    writeFileSync(
+      join(canaryDir, "hooks.mjs"),
+      [
+        "export async function load(url, context, nextLoad) {",
+        '  if (url === process.env["SF_CANARY_TARGET"]) {',
+        '    return { format: "module", shortCircuit: true, source: process.env["SF_CANARY_SOURCE"] };',
+        "  }",
+        "  return nextLoad(url, context);",
+        "}",
+        "",
+      ].join("\n"),
+    );
+    writeFileSync(
+      join(canaryDir, "register.mjs"),
+      [
+        'import { register } from "node:module";',
+        'register("./hooks.mjs", import.meta.url);',
+        "",
+      ].join("\n"),
+    );
 
-/**
- * AN EMPTY MANIFEST IS ITSELF A FAILURE. Commenting the entries out was the
- * round-8 bypass, and a check that quietly does nothing is the shape this whole
- * area keeps producing. Kept distinct from the coverage check above because it
- * catches a manifest that failed to LOAD, including in trees that owe no
- * required set.
- *
- * ORDERED AFTER THE REQUIRED-SET CHECK (round-15). It used to run first, so a
- * repository that excluded the manifest from compilation was refused for
- * "produced no entries" rather than for the exclusion — the precise reason was
- * masked by a broader neighbour, and a test naming the exclusion passed on the
- * neighbour's refusal.
- */
-if (guarded.length === 0 && existsSync(join(REPO_ROOT, MANIFEST_SOURCE))) {
-  fail(
-    "verification refused: the guarded-module manifest produced no entries while its source is present. " +
-      "An empty or unloadable manifest disables every deletion guard at once.",
-  );
+    const undetected = [];
+    for (const { module, test } of REQUIRED_GUARDS) {
+      const moduleUrl = `file://${join(REPO_ROOT, checker.compiledPathForSource(module, EMIT_LAYOUT))}`;
+      const testArtifact = join(REPO_ROOT, checker.compiledPathForSourceTest(test, EMIT_LAYOUT));
+
+      /**
+       * Imported plainly. `REQUIRED_GUARDS` names each module once and nothing
+       * else in this run imports them, so there is no earlier copy for Node to
+       * return — and a `?canary=${Date.now()}` that can never change an outcome
+       * is decoration, not defence.
+       */
+      let real;
+      try {
+        real = await import(moduleUrl);
+      } catch (error) {
+        undetected.push(
+          `${module} could not be loaded from the build: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        continue;
+      }
+
+      /**
+       * NOTHING TO REPLACE IS NOTHING TO DETECT. `export {};` compiles, is
+       * paired, and is exactly what round 16 shipped in place of the
+       * deliverable. A module with no run-time exports cannot be guarded by
+       * any test, so the shortfall is in the module rather than in the test.
+       */
+      const names = Object.keys(real);
+      if (names.length === 0) {
+        undetected.push(`${module} exports nothing at run time, so no test could detect a change in it`);
+        continue;
+      }
+
+      const replacement = names
+        .map((name) => {
+          const sentinel = 'Object.freeze({ sfCanary: "replaced" })';
+          if (name === "default") {
+            return typeof real[name] === "function"
+              ? 'export default function () { throw new Error("SF_CANARY"); }'
+              : `export default ${sentinel};`;
+          }
+          return typeof real[name] === "function"
+            ? `export function ${name}() { throw new Error("SF_CANARY"); }`
+            : `export const ${name} = ${sentinel};`;
+        })
+        .join("\n");
+
+      const run = spawnSync(process.execPath, ["--import", join(canaryDir, "register.mjs"), "--test", testArtifact], {
+        cwd: REPO_ROOT,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          SF_CANARY_TARGET: moduleUrl,
+          SF_CANARY_SOURCE: replacement,
+        },
+      });
+
+      if (run.status === 0) {
+        undetected.push(
+          `${test} passes against a ${module} whose every export has been replaced, so it does not exercise it`,
+        );
+      }
+    }
+
+    if (undetected.length > 0) {
+      fail(
+        "verification refused: this repository runs the tests that name the deliverable, but they do not guard it.\n" +
+          undetected.map((line) => `  - ${line}`).join("\n") +
+          "\nEach required test was run against a build of its module with every export replaced, and had to fail. " +
+          "A test that passes either way is a label, not a guard — which is how a complete deliverable was once " +
+          "reduced to empty files with verification still reporting success.",
+      );
+    }
+  } finally {
+    rmSync(canaryDir, { recursive: true, force: true });
+  }
 }
+
+
 
 // --- 7. refuse a run that would prove nothing -------------------------------
 const emptiness = checker.assertRunnableSuite(audit.expected);

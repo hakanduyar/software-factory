@@ -2597,6 +2597,53 @@ describe("TASK-017 round-12 note: the runner allowlist is stated, not inferred",
  * schema to use when the document does not say for itself, and `%YAML 1.1`
  * says for itself.
  */
+/**
+ * ROUND-16 HIGH 4. A %TAG DIRECTIVE WAS ACCEPTED AND DISCARDED.
+ *
+ * `workflowDocument.ts` claims a closed model: anything it does not represent
+ * refuses. A tag directive whose handle no node used was neither represented
+ * nor refused — it was dropped, and the shipped workflow behind it passed all
+ * thirteen policy checks. Nothing was exploitable, because explicit tags on
+ * NODES were already refused; the defect is that the documented invariant was
+ * not the enforced one, which is how the two drift apart.
+ */
+describe("TASK-017 round-16 HIGH: a tag directive is refused, not discarded", () => {
+  /** The reviewer's fixture, verbatim, in front of the real workflow. */
+  it("refuses the shipped workflow behind a %TAG directive", () => {
+    const parsed = parseWorkflow("%TAG !e! tag:example.com,2020:\n---\n" + SOURCE);
+
+    assert.equal(parsed.ok, false, "a tag directive was accepted and discarded");
+    assert.match(parsed.ok === false ? parsed.reason : "", /tag handle !e!/);
+  });
+
+  /** REDEFINING a default handle is the same construct wearing a familiar name. */
+  for (const directive of ["%TAG ! !local-", "%TAG !! tag:example.com,2020:"]) {
+    it(`refuses ${directive}`, () => {
+      const parsed = parseWorkflow(`${directive}\n---\nname: verify\n`);
+
+      assert.equal(parsed.ok, false, `${directive} was accepted`);
+    });
+  }
+
+  /**
+   * NON-VACUITY, and it is the whole risk here: a check that refused every
+   * document with directives would pass the cases above and break the version
+   * assertion beside it. The two implicit handles must still be admitted.
+   */
+  it("still accepts a document with no tag directive", () => {
+    const parsed = parseWorkflow("%YAML 1.2\n---\nname: verify\n");
+
+    assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+  });
+
+  /** And the shipped workflow itself, which declares no directives at all. */
+  it("still accepts the shipped workflow", () => {
+    const parsed = parseWorkflow(SOURCE);
+
+    assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+  });
+});
+
 describe("TASK-017 round-13 HIGH: the YAML version is asserted, not merely requested", () => {
   /**
    * The reviewer's fixture: a 1.1 directive plus the shipped workflow with
@@ -2787,19 +2834,24 @@ describe("TASK-017 round-14 CRITICAL: the required deliverable set lives in the 
       "whether this is a repository is decided by something other than the filesystem",
     );
     /**
-     * Anchored to the line start: round 13's survivor was a mutation that
-     * PREPENDED `false &&`, which a substring match still satisfied.
+     * TWO FURTHER ASSERTIONS USED TO SIT HERE, matching the source text of the
+     * shortfall refusal and of the empty-manifest guard (round-16 review,
+     * HIGH 3). Both are removed rather than respelled.
+     *
+     * They tested that somebody had typed a line, and they broke the moment the
+     * guards they named were legitimately reworded — which is the same weakness
+     * from the other side: a regex over source text fails on a rename and
+     * passes on a comment. Both properties are proven behaviourally in
+     * `tests/verificationHarnessEndToEnd.test.ts` ("refuses a shrunk manifest
+     * that keeps its path but drops the deliverable" and "refuses a manifest
+     * emptied of every entry, where no other guard can fire"), each with a
+     * mutation that switches the guard off and is killed by that named case.
+     *
+     * What remains above is deliberately different in kind: one asserts a
+     * DELETED design has not come back, and the other pins the single
+     * expression that decides whether the requirement applies at all — neither
+     * is a claim that some guard exists and works.
      */
-    assert.match(
-      verifier,
-      /\n  if \(shortfalls\.length > 0\) \{/,
-      "a shortfall in the required set is not refused",
-    );
-    assert.match(
-      verifier,
-      /\nif \(guarded\.length === 0 && existsSync/,
-      "an empty manifest is not refused",
-    );
   });
 
   /**
