@@ -392,6 +392,44 @@ const MUTATIONS = [
     tests: [T_E2E],
     expect: "refuses a required test that does not exercise the module it guards",
   },
+  // ---- round-18: the canary must not measure its own generator -----------
+  {
+    id: "the replacement is generated for identifiers only",
+    edits: [[VERIFIER,
+      "        const alias = name === \"default\" ? \"default\" : JSON.stringify(name);\n        return `const ${local} = ${value};\\nexport { ${local} as ${alias} };`;",
+      "        return name === \"default\"\n          ? `const ${local} = ${value};\\nexport default ${local};`\n          : `const ${local} = ${value};\\nexport const ${name} = ${local};`;"]],
+    tests: [T_E2E],
+    expect: "accepts a repository whose module exports a name that is not an identifier",
+  },
+  /**
+   * THE SELF-CHECK'S OTHER HALF. No FIXTURE can reach either arm — only a
+   * defect in this verifier's own generator triggers them — so the generator is
+   * what the mutations break, and the healthy-repository controls catch it.
+   */
+  {
+    id: "the replacement need not offer every export the module did",
+    edits: [[VERIFIER,
+      "      ...names.map((name, index) => {",
+      "      ...names.slice(1).map((name, index) => {"]],
+    tests: [T_E2E],
+    expect: "accepts a repository whose deliverable is present, compiled and executed",
+  },
+  {
+    id: "an abandoned replacement in the output is inherited",
+    edits: [[VERIFIER,
+      "  if (abandoned.length > 0) {",
+      "  if (false) {"]],
+    tests: [T_E2E],
+    expect: "refuses output that still holds an abandoned canary replacement",
+  },
+  {
+    id: "the paired test runs through a worker that outlives the timeout",
+    edits: [[VERIFIER,
+      "    const run = spawnSync(process.execPath, [artifact], {",
+      "    const run = spawnSync(process.execPath, [\"--test\", artifact], {"]],
+    tests: [T_E2E],
+    expect: "refuses a required test that cannot be measured against a replaced module",
+  },
   {
     id: "a test need not pass against its own module first",
     edits: [[VERIFIER,

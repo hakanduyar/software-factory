@@ -1202,23 +1202,48 @@ on a timeout, or never spawned — is UNMEASURED and refuses, because round 17 a
 hung the verifier indefinitely with a test that looped forever, and silence is
 not a pass.
 
-The timeout is also the only route to that unmeasured path. `node --test` runs
-each file in a child process, so a test that kills itself still leaves the runner
-exiting non-zero, which is an ordinary failure — a fixture attempting exactly
-that proved detection rather than unmeasurability. The bound is therefore
-shortenable through the environment so a case can reach the branch in seconds
-instead of two minutes. It can only SHORTEN, and shortening it makes runs
+The timeout is also the only route to that unmeasured path, and reaching it
+safely took two corrections. `node --test` runs each file in a child process, so
+a test that kills itself still leaves the runner exiting non-zero — an ordinary
+failure, not unmeasurability. Worse, killing that runner on a timeout ORPHANED
+the worker: round 18 measured a spinning test alive past 65 seconds and a
+mutation run accumulating them. The paired test is therefore executed directly
+rather than through `--test`, so there is one process and killing it kills
+everything. The bound is shortenable through the environment so a case can reach
+the branch in seconds instead of two minutes. It can only SHORTEN, and shortening it makes runs
 unmeasured, which refuses: no value makes anything pass that would otherwise
 fail. No mutation covers the override itself, because removing it changes no
 outcome, only how long a fixture waits — it is an affordance, not a guard, and
 this paragraph says so rather than leaving a reviewer to discover it.
 
 The compiled output is therefore written during verification, inside a
-`try/finally` that restores it. `dist/` is build output, this project sets no
-`incremental`, and every verification rebuilds and re-emits before reaching this
-point, so an interrupted run cannot leave a replacement behind for the next one
-to read. The SOURCE tree is untouched throughout, which is what the same run's
-tree-consistency report is about.
+`try/finally` that restores it. The SOURCE tree is untouched throughout, which is
+what the same run's tree-consistency report is about.
+
+**The cleanup claim that used to stand here was false, and it is worth saying
+how.** It read: an interrupted run cannot leave a replacement behind, because
+every verification rebuilds before reaching this point. The rebuild part is true
+and the conclusion is not — `finally` does not run on a `SIGKILL`, so a killed
+verification leaves the replacement sitting in `dist/`. Round 18 demonstrated it
+in one line. I had already watched exactly this happen to `scripts/mutate.mjs`,
+whose own `finally` was skipped by a kill and left a disabled guard behind, and
+I wrote the claim anyway.
+
+What is true is narrower. The next verification rebuilds and overwrites, so an
+abandoned replacement cannot corrupt a later verification. What it can do is sit
+in the output directory in the meantime, where a concurrent build, a developer
+running compiled tests directly, or any other reader of `dist/` will see a module
+that no build produced. That window is real and it is the cost of substituting in
+place rather than through a hook the test could detect.
+
+So the abandoned replacement is now found rather than reasoned about. Every
+verification scans the output directory for the canary marker BEFORE it builds —
+before, because afterwards the rebuild has erased the evidence, which is exactly
+why an earlier version of this check placed inside the canary section could never
+fire and was deleted as unfalsifiable. Finding one refuses the run and says to
+delete the output directory. It does not clean up silently: output nobody wrote
+is not a state a verification should quietly repair on its way to reporting
+success.
 
 **The limitation, stated exactly.** This proves the test EXERCISES the module.
 It does not prove the test asserts anything worthwhile about it. A test calling
@@ -1242,6 +1267,25 @@ cheap deterministic floor that runs on every verification; mutation testing is
 the expensive measurement that runs deliberately. Neither replaces the other,
 and claiming the floor is the ceiling is the exact shape of overclaim this file
 exists to prevent.
+
+**One clause here is a self-check rather than a guard, and is declared as
+such.** After substituting, the verifier loads the replacement and requires it to
+offer the same export names the real module offered; if it does not, that is
+reported as a shortfall in this verifier rather than as detection. Round 18's
+CRITICAL was exactly this failure — a generator that emitted `export const
+foo-bar =` for a legal exported name, producing a syntax error the canary read as
+success — so the check exists to stop a bug in this file from masquerading as
+evidence.
+
+Neither half of it can be reached by a FIXTURE, because only a defect in this
+verifier's own generator triggers either one. What covers them is mutation of
+the generator: reverting it to identifier-only output makes the replacement fail
+to load, and dropping an export from it makes the names disagree. Both are
+killed by healthy-repository controls — a repository whose module exports a
+non-identifier name must be accepted, and a complete repository must be accepted
+— because the symptom of this check firing wrongly is a good repository being
+refused. Saying that plainly is better than letting a self-check read as one
+more guard against the tree.
 
 **Kept honest by:** `tests/verificationHarnessEndToEnd.test.ts` reproduces the
 round-16 attack in both halves — "refuses required modules that export nothing

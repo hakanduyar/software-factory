@@ -1505,6 +1505,43 @@ if (escaping.length > 0) {
 assertEverythingWasReadable("before building");
 assertEverythingWasRegular("before building");
 
+/**
+ * AN ABANDONED CANARY REPLACEMENT IS FOUND BEFORE THE BUILD ERASES IT
+ * (round-18 review, HIGH 3).
+ *
+ * Section 6c replaces a compiled module on disk and restores it in a `finally`.
+ * L-19 claimed that made an interrupted run harmless. It does not: a SIGKILL
+ * skips `finally`, the replacement stays in the output directory, and anything
+ * reading `dist/` before the next build sees it. I had already seen exactly
+ * this failure with `scripts/mutate.mjs` and wrote the claim anyway.
+ *
+ * An earlier version of the check ran INSIDE section 6c, where the rebuild had
+ * already overwritten the evidence, so it could never fire and was deleted as
+ * unfalsifiable. That reasoning was right about the placement and wrong about
+ * the risk. Here — before anything is built — it is both reachable and true.
+ *
+ * It refuses rather than cleaning up: output nobody wrote is not a state this
+ * run should quietly repair on the way to reporting success.
+ */
+const CANARY_MARKER = "SF_CANARY_REPLACEMENT";
+if (existsSync(join(REPO_ROOT, OUTPUT_DIR))) {
+  const abandoned = listFiles(OUTPUT_DIR).filter((path) => {
+    try {
+      return readFileSync(join(REPO_ROOT, path), "utf8").includes(CANARY_MARKER);
+    } catch {
+      return false;
+    }
+  });
+  if (abandoned.length > 0) {
+    fail(
+      "verification refused: the output directory still holds a canary replacement — " +
+        abandoned.join(", ") +
+        ". An earlier verification was killed while a module was substituted, so this output is not what any " +
+        "build produced. Delete the output directory and run again.",
+    );
+  }
+}
+
 // --- 3. build, and prove it actually emitted the checker ---------------------
 const buildStartedAt = Date.now();
 build();
@@ -2152,19 +2189,6 @@ if (looksLikeRepository) {
    * test that looped forever; silence is not a pass.
    */
   /**
-   * A LABEL FOR ANYONE WHO SEES ONE, NOT A GUARD.
-   *
-   * An earlier version of this section refused when a compiled module still
-   * held the marker, reasoning that an interrupted run could leave a
-   * replacement behind. A fixture proved that cannot happen: this project sets
-   * no `incremental`, so every verification rebuilds and re-emits every module
-   * before reaching here, and the poisoned copy is gone before it can be read.
-   * The check could never fire, and an unfalsifiable claim is worse than no
-   * claim — the fourth one deleted in three rounds. What protects the tree is
-   * the restore in the `finally` below plus that unconditional rebuild.
-   */
-  const CANARY_MARKER = "SF_CANARY_REPLACEMENT";
-  /**
    * LIVENESS, NOT CORRECTNESS, AND SHORTENABLE SO IT CAN BE EVIDENCED.
    *
    * Round 17 hung the verifier with a paired test that looped forever, and this
@@ -2189,7 +2213,17 @@ if (looksLikeRepository) {
   const runPairedTest = (artifact) => {
     const env = { ...process.env };
     delete env["NODE_TEST_CONTEXT"];
-    const run = spawnSync(process.execPath, ["--test", artifact], {
+    /**
+     * RUN THE FILE, NOT `node --test <file>` (round-18 review, HIGH 2).
+     *
+     * `--test` runs each file in a WORKER. Killing the parent on timeout left
+     * the worker spinning forever with the parent's stdout and stderr still
+     * open: the reviewer measured a test alive past 65 seconds and a mutation
+     * run that accumulated orphans. Node's test runner works perfectly well
+     * when the file is simply executed — it reports through the exit code —
+     * so there is one process, and killing it kills everything.
+     */
+    const run = spawnSync(process.execPath, [artifact], {
       cwd: REPO_ROOT,
       encoding: "utf8",
       timeout: CANARY_TIMEOUT_MS,
@@ -2259,28 +2293,82 @@ if (looksLikeRepository) {
       continue;
     }
 
+    /**
+     * VALID FOR ANY EXPORT NAME (round-18 review, CRITICAL 1).
+     *
+     * The names come from `Object.keys` of the real module, and a module may
+     * export one that is not an identifier: `export { weird as "foo-bar" }` is
+     * ordinary ES2022. The previous generator emitted `export const foo-bar =`,
+     * which does not parse — so the substituted run died on a syntax error,
+     * that counted as the test detecting the change, and the canary was
+     * measuring its own generator. The whole deliverable passed while guarding
+     * nothing.
+     *
+     * Every binding is therefore declared under a generated identifier and
+     * exported through a STRING-LITERAL alias, which is legal for every
+     * possible name. `default` keeps its keyword form.
+     */
     const replacement = [
       `// ${CANARY_MARKER}`,
-      ...names.map((name) => {
-        const sentinel = 'Object.freeze({ sfCanary: "replaced" })';
-        if (name === "default") {
-          return typeof real[name] === "function"
-            ? 'export default function () { throw new Error("SF_CANARY"); }'
-            : `export default ${sentinel};`;
-        }
-        return typeof real[name] === "function"
-          ? `export function ${name}() { throw new Error("SF_CANARY"); }`
-          : `export const ${name} = ${sentinel};`;
+      ...names.map((name, index) => {
+        const local = `__sfCanary${index}`;
+        const value =
+          typeof real[name] === "function"
+            ? `function () { throw new Error("SF_CANARY"); }`
+            : 'Object.freeze({ sfCanary: "replaced" })';
+        const alias = name === "default" ? "default" : JSON.stringify(name);
+        return `const ${local} = ${value};\nexport { ${local} as ${alias} };`;
       }),
     ].join("\n");
 
     let substituted;
     try {
       writeFileSync(compiledModule, replacement);
-      substituted = runPairedTest(testArtifact);
+
+      /**
+       * THE REPLACEMENT MUST ITSELF LOAD, AND EXPORT THE SAME NAMES.
+       *
+       * This is the structural half of the same finding, and it matters more
+       * than the syntax fix: without it, ANY defect in the generator — a name
+       * it spells wrongly, a value it cannot express, a future export form —
+       * makes the substituted run fail, and a failure is what this section
+       * reads as success. The canary would keep reporting a healthy
+       * deliverable while measuring nothing but its own bugs.
+       *
+       * So the replacement is loaded before the test runs, and it must offer
+       * exactly the names the real module offered. A cache-buster is required
+       * and is load-bearing here: this is the SECOND import of this path in
+       * this process, and without it Node returns the original module, whose
+       * names of course match.
+       */
+      let rebuilt;
+      try {
+        rebuilt = await import(`file://${compiledModule}?canary=${Date.now()}`);
+      } catch (error) {
+        // `rebuilt` is already undefined: the assignment above threw. A
+        // mutation setting it to `{}` here survived, which is what an
+        // unreachable line looks like from the outside.
+        undetected.push(
+          `the canary replacement for ${module} could not be loaded (${error instanceof Error ? error.message : String(error)}), ` +
+            "so a failing test would be measuring this verifier rather than the module",
+        );
+      }
+      if (rebuilt !== undefined) {
+        const missing = names.filter((name) => !(name in rebuilt));
+        if (missing.length > 0) {
+          undetected.push(
+            `the canary replacement for ${module} does not offer ${missing.join(", ")}, ` +
+              "so a failing test would be measuring this verifier rather than the module",
+          );
+        } else {
+          substituted = runPairedTest(testArtifact);
+        }
+      }
     } finally {
       writeFileSync(compiledModule, original);
     }
+
+    if (substituted === undefined) continue;
 
     if (substituted.outcome === "passed") {
       undetected.push(

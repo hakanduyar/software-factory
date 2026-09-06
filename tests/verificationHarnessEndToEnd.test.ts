@@ -4188,10 +4188,98 @@ describe("TASK-017: a repository must present, compile and RUN its deliverable",
 
     const { status, output } = runHarness(root, { SF_CANARY_TIMEOUT_MS: "4000" });
     assert.notEqual(status, 0, `an unmeasurable canary was accepted:\n${output}`);
+    /**
+     * AND IT LEFT NOTHING SPINNING (round-18 review, HIGH 2). `node --test`
+     * ran each file in a worker, so killing the parent on timeout orphaned an
+     * infinite loop — the reviewer measured one alive past 65 seconds and a
+     * mutation run that accumulated them. Running the file directly means one
+     * process, and killing it kills everything.
+     */
+    const survivors = spawnSync("pgrep", ["-f", join(root, "dist")], { encoding: "utf8" });
+    const stragglers = (survivors.stdout ?? "").trim();
+    /**
+     * KILLED BEFORE ASSERTING, deliberately. A mutation reverts this to
+     * `--test` on purpose, and an assertion that failed first would leave the
+     * orphan spinning at full CPU for the rest of the mutation run — the test
+     * would report the defect and then inflict it.
+     */
+    for (const pid of stragglers.split("\n").filter((line) => line.length > 0)) {
+      spawnSync("kill", ["-9", pid]);
+    }
+    assert.equal(stragglers, "", `the killed canary left processes running: ${stragglers}`);
     assert.match(
       output,
       /could not be measured against a replaced src\/verification\/workflowDigest\.ts/,
       `refused, but not for the unmeasurable run:\n${output}`,
+    );
+  });
+
+  /**
+   * ROUND-18 CRITICAL. A module may export a name that is not an identifier —
+   * `export { weird as "foo-bar" }` is ordinary ES2022 — and the first
+   * generator emitted `export const foo-bar =`, which does not parse. The
+   * substituted run then died on a syntax error, that counted as the test
+   * detecting the change, and a deliverable guarding nothing passed.
+   *
+   * This fixture is the healthy case: the odd name must be replaceable, and the
+   * repository must be ACCEPTED. Reverting the generator makes the replacement
+   * unloadable, which this case then catches.
+   */
+  it("accepts a repository whose module exports a name that is not an identifier", () => {
+    const root = makeRepositoryFixture();
+    writeFileSync(
+      join(root, "src/verification/workflowDigest.ts"),
+      ['const stub = "workflowDigest";', 'export { stub as "digest-stub" };', ""].join("\n"),
+    );
+    writeFileSync(
+      join(root, "tests/workflowDigest.test.ts"),
+      [
+        'import assert from "node:assert/strict";',
+        'import { describe, it } from "node:test";',
+        'import * as digest from "../src/verification/workflowDigest.js";',
+        "// guards workflowDigest",
+        'describe("tests/workflowDigest.test.ts", () => {',
+        '  it("exercises what it guards", () => {',
+        '    assert.equal(digest["digest-stub"], "workflowDigest");',
+        "  });",
+        "});",
+        "",
+      ].join("\n"),
+    );
+
+    const { status, output } = runHarness(root);
+    assert.equal(status, 0, `a module exporting a non-identifier name was refused:\n${output}`);
+  });
+
+  /**
+   * ROUND-18 HIGH 3. `finally` does not run on SIGKILL, so a killed
+   * verification leaves the replacement in the output directory. L-19 claimed
+   * otherwise. The scan happens BEFORE the build, because afterwards the
+   * rebuild has erased the evidence — which is why the first version of this
+   * check could never fire and was deleted.
+   */
+  it("refuses output that still holds an abandoned canary replacement", () => {
+    const root = makeRepositoryFixture();
+    runHarness(root);
+    /**
+     * BUILT AT RUN TIME, NOT WRITTEN OUT. Spelling the marker literally here
+     * put it into this file's own compiled output, and the scan — which reads
+     * every emitted file — refused the whole repository on its own test suite.
+     * A guard that searches the tree for a string must not be described using
+     * that string.
+     */
+    const marker = `SF_CANARY${"_"}REPLACEMENT`;
+    writeFileSync(
+      join(root, "dist/src/verification/workflowDigest.js"),
+      `// ${marker}\nconst a = "workflowDigest";\nexport { a as workflowDigestStub };\n`,
+    );
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, `an abandoned canary replacement was accepted:\n${output}`);
+    assert.match(
+      output,
+      /output directory still holds a canary replacement/,
+      `refused, but not for the abandoned replacement:\n${output}`,
     );
   });
 
