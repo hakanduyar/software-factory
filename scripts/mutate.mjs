@@ -37,7 +37,7 @@
 
 import { createHash } from "node:crypto";
 import { execFileSync, spawnSync } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -937,6 +937,71 @@ const only = process.argv.includes("--only")
 const selected = only === undefined ? MUTATIONS : MUTATIONS.filter((m) => m.id.includes(only));
 
 const touched = [...new Set(selected.flatMap((m) => m.edits.map(([file]) => file)))].sort();
+
+/**
+ * AN INTERRUPTED RUN MUST NOT LEAVE A DISABLED GUARD BEHIND.
+ *
+ * Every mutation is restored in a `finally`, and a `finally` does not run on a
+ * SIGKILL. This has now corrupted evidence twice, and both times silently:
+ *
+ *   - a run of mine was killed mid-flight and left `} else if (false) {` in
+ *     `scripts/verify.mjs`, disabling the required-module compilation clause.
+ *     `npm test` then passed green over it.
+ *   - a run inside an INDEPENDENT REVIEW was killed and left
+ *     `const looksLikeRepository = false;`, which disables the entire
+ *     deliverable requirement, in the frozen review candidate's worktree.
+ *
+ * Both were found by looking. Nothing made them announce themselves, and a
+ * measurement harness whose failure mode is "the tree now silently proves less"
+ * is worse than no harness, because its output still reads like evidence.
+ *
+ * So the restore data is written to disk BEFORE the first edit and removed only
+ * after the last one is undone. A journal found at startup means the previous
+ * run did not finish: the recorded bytes are put back and this run REFUSES.
+ * It refuses rather than continuing because an interrupted run is exactly the
+ * situation in which nobody should be told a number.
+ */
+const JOURNAL = join(REPO_ROOT, ".mutation-journal.json");
+if (existsSync(JOURNAL)) {
+  let saved;
+  try {
+    saved = JSON.parse(readFileSync(JOURNAL, "utf8"));
+  } catch {
+    saved = undefined;
+  }
+  if (saved === null || typeof saved !== "object" || typeof saved.files !== "object" || saved.files === null) {
+    console.error(
+      `ABORT: ${JOURNAL} exists but cannot be read, so a previous run was interrupted and this one cannot ` +
+        "know what it left behind. Restore the working tree from git before running again.",
+    );
+    process.exit(2);
+  }
+  const repaired = [];
+  for (const [file, encoded] of Object.entries(saved.files)) {
+    const path = join(REPO_ROOT, file);
+    const original = Buffer.from(encoded, "base64");
+    let current;
+    try {
+      current = readFileSync(path);
+    } catch {
+      current = undefined;
+    }
+    if (current === undefined || !current.equals(original)) {
+      writeFileSync(path, original);
+      repaired.push(file);
+    }
+  }
+  rmSync(JOURNAL, { force: true });
+  console.error(
+    "ABORT: a previous mutation run was interrupted before it could restore the tree.\n" +
+      (repaired.length > 0
+        ? `Put back from the journal: ${repaired.join(", ")}.\n`
+        : "Every recorded file was already intact.\n") +
+      "Run again to measure. This run refuses so an interrupted run can never be mistaken for a measured one.",
+  );
+  process.exit(2);
+}
+
 const baseline = new Map(touched.map((file) => [file, readFileSync(join(REPO_ROOT, file))]));
 const hashes = new Map(touched.map((file) => [file, sha256(file)]));
 for (const file of touched) {
@@ -955,6 +1020,24 @@ if (start.fail !== 0) {
   console.error("BASELINE NOT GREEN");
   process.exit(1);
 }
+
+/**
+ * Written only now: everything above can still exit without having touched a
+ * file, and a journal left by a run that mutated nothing would refuse the next
+ * one for no reason.
+ */
+writeFileSync(
+  JOURNAL,
+  JSON.stringify(
+    {
+      startedAt: new Date().toISOString(),
+      note: "A previous mutation run was interrupted. scripts/mutate.mjs restores these on its next start.",
+      files: Object.fromEntries([...baseline].map(([file, bytes]) => [file, bytes.toString("base64")])),
+    },
+    null,
+    2,
+  ),
+);
 
 const results = [];
 for (const mutation of selected) {
@@ -1007,6 +1090,13 @@ for (const mutation of selected) {
     }
   }
 }
+
+/**
+ * The loop is over and every `finally` ran, so nothing is outstanding. Removed
+ * BEFORE the closing checks so that a failure in them leaves a clean tree and a
+ * loud message rather than a journal that refuses the next run.
+ */
+rmSync(JOURNAL, { force: true });
 
 const restored = build();
 if (!restored.ok) {

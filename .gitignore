@@ -15,3 +15,8 @@ dist/
 *.db
 *.db-wal
 *.db-shm
+
+# Crash journal for scripts/mutate.mjs. Present only while mutations are
+# applied; its presence on startup means the previous run was killed, and the
+# harness puts the recorded bytes back and refuses.
+.mutation-journal.json
