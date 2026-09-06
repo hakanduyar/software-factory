@@ -1179,17 +1179,46 @@ held. Three tests executed. Verification reported success over nothing.
 
 Presence is a question about files, and no question about files can tell an
 empty one from a full one in any way that survives the next round. So the
-verifier now asks a question about BEHAVIOUR: for each required pair it imports
-the compiled module, builds a replacement in which every export throws when
-called or is a sentinel object when read, substitutes it through an ESM load
-hook, and runs the paired test. The test must FAIL. A test that passes against a
-module whose every export has been replaced does not exercise that module,
-whatever it is named and wherever it is declared.
+verifier now asks a question about BEHAVIOUR: for each required pair it builds a
+replacement module in which every export throws when called or is a sentinel
+object when read, and requires the paired test to PASS against the real module
+and FAIL against the replacement.
 
-Nothing is written to the tree to do this. The substitution lives in a load hook
-in a temporary directory, `cwd` stays the repository, and the working tree is
-byte-identical before and after — which matters because the same run reports
-tree consistency.
+Both halves are load-bearing, and the second was learned the hard way. The first
+version installed the replacement through an ESM load hook fed from the
+environment, and counted ANY non-zero exit as detection. Round 17's reviewer
+wrote a test that ignored its module entirely and threw whenever
+`SF_CANARY_SOURCE` was set: it failed on cue, that was read as detection, and
+verification passed over a deliverable guarding nothing. The mechanism announced
+itself and then believed the answer it had prompted.
+
+So the substitution is no longer visible. The compiled module is replaced ON
+DISK and restored afterwards — no environment variable, no `--import` in
+`process.execArgv`, nothing to key on except the module's own contents, which is
+the thing under test. And a failure must be ATTRIBUTABLE: a test that fails both
+ways proves nothing about the module, so the baseline run must pass before the
+substituted run's failure counts. A run that neither passes nor fails — killed
+on a timeout, or never spawned — is UNMEASURED and refuses, because round 17 also
+hung the verifier indefinitely with a test that looped forever, and silence is
+not a pass.
+
+The timeout is also the only route to that unmeasured path. `node --test` runs
+each file in a child process, so a test that kills itself still leaves the runner
+exiting non-zero, which is an ordinary failure — a fixture attempting exactly
+that proved detection rather than unmeasurability. The bound is therefore
+shortenable through the environment so a case can reach the branch in seconds
+instead of two minutes. It can only SHORTEN, and shortening it makes runs
+unmeasured, which refuses: no value makes anything pass that would otherwise
+fail. No mutation covers the override itself, because removing it changes no
+outcome, only how long a fixture waits — it is an affordance, not a guard, and
+this paragraph says so rather than leaving a reviewer to discover it.
+
+The compiled output is therefore written during verification, inside a
+`try/finally` that restores it. `dist/` is build output, this project sets no
+`incremental`, and every verification rebuilds and re-emits before reaching this
+point, so an interrupted run cannot leave a replacement behind for the next one
+to read. The SOURCE tree is untouched throughout, which is what the same run's
+tree-consistency report is about.
 
 **The limitation, stated exactly.** This proves the test EXERCISES the module.
 It does not prove the test asserts anything worthwhile about it. A test calling
@@ -1197,6 +1226,15 @@ into the module and discarding the result would still fail here, because the
 replacement throws — so the canary cannot distinguish a rigorous test from a
 credulous one that happens to touch the same functions. It also says nothing
 about modules the manifest declares but `REQUIRED_GUARDS` does not name.
+
+And it does not defeat a test written specifically to defeat it. Nothing stops a
+paired test from reading its own compiled module off disk and behaving
+differently when the contents look replaced; substituting in place removes the
+INCIDENTAL tells — an environment variable, a loader flag — rather than making
+the substitution undetectable in principle. What it buys is that a test must now
+be deliberately adversarial to produce a false green, instead of merely careless
+or freshly generated. That is a real reduction and it is not the same as a
+guarantee, which is the distinction this whole file exists to keep.
 
 What covers that gap is `scripts/mutate.mjs`, which changes real behaviour one
 edit at a time and requires a NAMED test to fail for each. The canary is the
@@ -1208,7 +1246,10 @@ exists to prevent.
 **Kept honest by:** `tests/verificationHarnessEndToEnd.test.ts` reproduces the
 round-16 attack in both halves — "refuses required modules that export nothing
 at run time" and "refuses a required test that does not exercise the module it
-guards" — and asserts that a complete repository fixture, whose stub tests do
-exercise their stub modules, still passes. `scripts/mutate.mjs` switches each
-clause of the canary off in turn, including one mutation that makes it refuse
-every repository, which the complete fixture catches.
+guards" — and the round-17 attack in three: a test that fails on a cue rather
+than on its module, a test that does not pass against its own module, and a test
+that cannot be measured because it hangs once its module is replaced. A complete
+repository fixture, whose stub tests do exercise their stub modules, must still
+pass. `scripts/mutate.mjs` switches each clause off in turn, including one
+mutation that makes the canary refuse every repository, which that complete
+fixture catches.

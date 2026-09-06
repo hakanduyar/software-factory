@@ -871,10 +871,30 @@ export function checkVerificationCommand(root: YamlMap): PolicyVerdict {
   if (stepValues(root, "run") === undefined) {
     return refuse("a step gives run: something other than a single command, so the verification cannot be judged");
   }
+  /**
+   * AN ALLOWLIST OF ONE, NOT A DENYLIST OF SPELLINGS (round-17 review, HIGH 3).
+   *
+   * This used to name the tools it did not want: `node --test`, a bare or
+   * `npx`-prefixed `tsc`, `verify.mjs`. The reviewer added
+   * `./node_modules/.bin/tsc -p tsconfig.json`, which is none of those spellings
+   * and every bit the second definition of "verified" this guard exists to
+   * refuse. `checkRunAllowlist` caught it sibling-wise, so nothing was
+   * exploitable — but the guard NAMED by AC-4 did not refuse it on its own, and
+   * a guard that only works because its neighbour does is the masking shape
+   * this task has found fourteen times.
+   *
+   * So the question is inverted. Rather than listing ways to invoke a tool
+   * directly — a list that can never be finished, since a path, a shell, an
+   * alias or an env-var prefix all reach the same binary — every run command
+   * must BE an npm invocation. Adding a legitimate one means editing this
+   * allowlist, which is a visible diff.
+   */
   for (const command of declaredRunCommands(root)) {
-    if (/\bnode\s+--test\b/.test(command) || /(^|\s)(npx\s+)?tsc\b/.test(command) || /\bverify\.mjs\b/.test(command)) {
+    const trimmed = command.trim();
+    const executable = trimmed.split(/\s+/)[0] ?? "";
+    if (executable !== "npm") {
       return refuse(
-        `the workflow runs ${JSON.stringify(command.trim())} directly, which is a second definition of "verified"`,
+        `the workflow runs ${JSON.stringify(trimmed)} directly, which is a second definition of "verified"`,
       );
     }
   }

@@ -197,11 +197,14 @@ function addDeliverable(root: string): void {
   );
 }
 
-function runHarness(root: string): { status: number; output: string } {
+function runHarness(
+  root: string,
+  extraEnv: Record<string, string> = {},
+): { status: number; output: string } {
   const result = spawnSync(process.execPath, ["scripts/verify.mjs"], {
     cwd: root,
     encoding: "utf8",
-    env: harnessEnv({ PATH: process.env["PATH"] ?? "" }),
+    env: harnessEnv({ PATH: process.env["PATH"] ?? "", ...extraEnv }),
   });
   return {
     status: result.status ?? -1,
@@ -4078,6 +4081,117 @@ describe("TASK-017: a repository must present, compile and RUN its deliverable",
       output,
       /could not be loaded from the rebuilt output/,
       `refused, but not for the manifest that did not survive the build:\n${output}`,
+    );
+  });
+
+  /**
+   * ROUND-17 CRITICAL AND HIGH 2. The first canary passed its replacement
+   * through the environment and treated ANY non-zero exit as detection. The
+   * reviewer wrote a test that ignored its module entirely and threw whenever
+   * `SF_CANARY_SOURCE` was set: it "failed" on cue, that counted as detection,
+   * and verification exited 0 over a deliverable guarding nothing.
+   *
+   * The substitution is no longer visible and a failure must now be
+   * ATTRIBUTABLE — pass against the real module, fail against the replaced one.
+   * These four cases pin the clauses that make each half true.
+   */
+
+  /** A paired test that exercises its module, written from a template. */
+  function pairedTest(file: string, markers: readonly string[], body: readonly string[]): string {
+    return [
+      'import assert from "node:assert/strict";',
+      'import { describe, it } from "node:test";',
+      ...markers.map((marker) => `import { ${marker}Stub } from "../src/verification/${marker}.js";`),
+      `describe(${JSON.stringify(file)}, () => {`,
+      '  it("exercises what it guards", () => {',
+      ...body,
+      "  });",
+      "});",
+      "",
+    ].join("\n");
+  }
+
+  /** THE REVIEWER'S OWN FIXTURE, which no longer has an environment to read. */
+  it("refuses a test that fails on a cue rather than on its module", () => {
+    const root = makeRepositoryFixture();
+    for (const [file, markers] of [
+      ["tests/workflowPolicy.test.ts", ["workflowPolicy", "workflowDocument"]],
+      ["tests/workflowDigest.test.ts", ["workflowDigest"]],
+    ] as const) {
+      writeFileSync(
+        join(root, file),
+        [
+          'import assert from "node:assert/strict";',
+          'import { describe, it } from "node:test";',
+          ...markers.map((marker) => `// guards ${marker}`),
+          `describe(${JSON.stringify(file)}, () => {`,
+          '  it("throws on a cue, and otherwise ignores its module", () => {',
+          '    if (process.env["SF_CANARY_SOURCE"] !== undefined) throw new Error("cued");',
+          "    assert.equal(1, 1);",
+          "  });",
+          "});",
+          "",
+        ].join("\n"),
+      );
+    }
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, `a test failing on a cue was accepted as detection:\n${output}`);
+    assert.match(
+      output,
+      /passes against a src\/verification\/workflowPolicy\.ts whose every export has been replaced/,
+      `refused, but not because the cue no longer fires:\n${output}`,
+    );
+  });
+
+  /** BASELINE NOT GREEN. A test that fails either way attributes nothing. */
+  it("refuses a required test that does not pass against its own module", () => {
+    const root = makeRepositoryFixture();
+    writeFileSync(
+      join(root, "tests/workflowDigest.test.ts"),
+      pairedTest("tests/workflowDigest.test.ts", ["workflowDigest"], [
+        '    assert.equal(workflowDigestStub, "this is not what the module exports");',
+      ]),
+    );
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, `a test that fails against its own module was accepted:\n${output}`);
+    assert.match(
+      output,
+      /tests\/workflowDigest\.test\.ts does not pass against its own src\/verification\/workflowDigest\.ts/,
+      `refused, but not for the baseline:\n${output}`,
+    );
+  });
+
+  /**
+   * UNMEASURED IS NOT DETECTED. Round 17 hung the verifier with a test that
+   * looped forever. This one passes its baseline and spins only once the
+   * sentinel replaces the string it waits on, so the replacement is the only
+   * thing that can trigger it, and the bound is shortened to keep the case
+   * quick.
+   *
+   * A first version killed the test process instead, to avoid waiting at all.
+   * It did not work and the reason is worth recording: `node --test` runs each
+   * file in a child, so a test that kills itself leaves the RUNNER exiting
+   * non-zero, which the canary correctly reads as an ordinary failure — the
+   * fixture proved detection rather than unmeasurability.
+   */
+  it("refuses a required test that cannot be measured against a replaced module", () => {
+    const root = makeRepositoryFixture();
+    writeFileSync(
+      join(root, "tests/workflowDigest.test.ts"),
+      pairedTest("tests/workflowDigest.test.ts", ["workflowDigest"], [
+        '    while (typeof workflowDigestStub !== "string") { /* spins once replaced */ }',
+        '    assert.equal(workflowDigestStub, "workflowDigest");',
+      ]),
+    );
+
+    const { status, output } = runHarness(root, { SF_CANARY_TIMEOUT_MS: "4000" });
+    assert.notEqual(status, 0, `an unmeasurable canary was accepted:\n${output}`);
+    assert.match(
+      output,
+      /could not be measured against a replaced src\/verification\/workflowDigest\.ts/,
+      `refused, but not for the unmeasurable run:\n${output}`,
     );
   });
 

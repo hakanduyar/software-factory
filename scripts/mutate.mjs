@@ -387,38 +387,62 @@ const MUTATIONS = [
   {
     id: "a test that detects nothing is not refused",
     edits: [[VERIFIER,
-      "    if (undetected.length > 0) {",
-      "    if (false) {"]],
+      "  if (undetected.length > 0) {",
+      "  if (false) {"]],
     tests: [T_E2E],
     expect: "refuses a required test that does not exercise the module it guards",
   },
   {
+    id: "a test need not pass against its own module first",
+    edits: [[VERIFIER,
+      '    if (baseline.outcome !== "passed") {',
+      "    if (false) {"]],
+    tests: [T_E2E],
+    expect: "refuses a required test that does not pass against its own module",
+  },
+  {
+    id: "a run that could not be measured counts as detection",
+    edits: [[VERIFIER,
+      '    } else if (substituted.outcome !== "failed") {',
+      "    } else if (false) {"]],
+    tests: [T_E2E],
+    expect: "refuses a required test that cannot be measured against a replaced module",
+  },
+  {
+    id: "a run that never completed is read as an ordinary failure",
+    edits: [[VERIFIER,
+      '    if (run.error !== undefined || run.status === null) {',
+      "    if (false) {"]],
+    tests: [T_E2E],
+    expect: "refuses a required test that cannot be measured against a replaced module",
+  },
+  {
     id: "a module with no exports is treated as guardable",
     edits: [[VERIFIER,
-      "      if (names.length === 0) {",
-      "      if (false) {"]],
+      "    if (names.length === 0) {",
+      "    if (false) {"]],
     tests: [T_E2E],
     expect: "refuses required modules that export nothing at run time",
   },
   {
     id: "the canary run's outcome is not consulted",
     edits: [[VERIFIER,
-      "      if (run.status === 0) {",
-      "      if (false) {"]],
+      '    if (substituted.outcome === "passed") {',
+      "    if (false) {"]],
     tests: [T_E2E],
     expect: "refuses a required test that does not exercise the module it guards",
   },
   /**
    * THE OTHER DIRECTION, and it is the one that matters most here: a canary
-   * that refused EVERY repository would satisfy the three cases above while
-   * breaking the complete fixture, which is exactly how the first attempt at
-   * this guard was caught.
+   * that refused EVERY repository would satisfy the cases above while breaking
+   * the complete fixture, which is how the first attempt at this guard was
+   * caught.
    */
   {
     id: "the canary refuses even a test that does detect the change",
     edits: [[VERIFIER,
-      "      if (run.status === 0) {",
-      "      if (run.status !== -12345) {"]],
+      '    if (substituted.outcome === "passed") {',
+      '    if (substituted.outcome !== "this is never an outcome") {']],
     tests: [T_E2E],
     expect: "accepts a repository whose deliverable is present, compiled and executed",
   },
@@ -816,6 +840,14 @@ const MUTATIONS = [
       '  const forced: string | undefined = effectiveVersion;\n  if (forced !== "1.2" && forced === "\\u0000never") {']],
     tests: [T_WF],
     expect: "refuses a document that declares YAML 1.1",
+  },
+  {
+    id: "the verification guard lists spellings instead of allowing npm",
+    edits: [[POLICY,
+      '    const executable = trimmed.split(/\\s+/)[0] ?? "";\n    if (executable !== "npm") {',
+      '    const executable = trimmed.split(/\\s+/)[0] ?? "";\n    void executable;\n    if (/\\bnode\\s+--test\\b/.test(trimmed) || /(^|\\s)(npx\\s+)?tsc\\b/.test(trimmed)) {']],
+    tests: [T_WF],
+    expect: "refuses a tool invoked by a direct executable path",
   },
   {
     id: "checkInstall reads past a run it cannot parse",

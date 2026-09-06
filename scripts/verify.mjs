@@ -132,7 +132,6 @@ import { execFileSync, spawnSync } from "node:child_process";
 import {
   existsSync,
   lstatSync,
-  mkdtempSync,
   readFileSync,
   readdirSync,
   realpathSync,
@@ -140,7 +139,6 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -2123,104 +2121,184 @@ if (looksLikeRepository) {
    * a test resolves relative to the repository root still resolves.
    */
 if (looksLikeRepository) {
-  const canaryDir = mkdtempSync(join(tmpdir(), "sf-canary-"));
-  try {
-    writeFileSync(
-      join(canaryDir, "hooks.mjs"),
-      [
-        "export async function load(url, context, nextLoad) {",
-        '  if (url === process.env["SF_CANARY_TARGET"]) {',
-        '    return { format: "module", shortCircuit: true, source: process.env["SF_CANARY_SOURCE"] };',
-        "  }",
-        "  return nextLoad(url, context);",
-        "}",
-        "",
-      ].join("\n"),
-    );
-    writeFileSync(
-      join(canaryDir, "register.mjs"),
-      [
-        'import { register } from "node:module";',
-        'register("./hooks.mjs", import.meta.url);',
-        "",
-      ].join("\n"),
-    );
+  /**
+   * SUBSTITUTED IN PLACE, WITH A BASELINE AND A TIMEOUT (round-17 CRITICAL,
+   * HIGH 2).
+   *
+   * The first version of this canary passed the replacement through the
+   * environment and installed it with an ESM load hook, then treated ANY
+   * non-zero exit as detection. Round 16's reviewer wrote a test that ignored
+   * the module entirely and threw whenever `SF_CANARY_SOURCE` was set: it
+   * "failed" on cue, the canary called that detection, and verification exited
+   * 0 over a deliverable that guarded nothing. The mechanism announced itself
+   * and then believed the answer it had prompted.
+   *
+   * Two things were wrong, and they need different repairs.
+   *
+   * 1. THE SUBSTITUTION MUST NOT BE VISIBLE. It now replaces the compiled
+   *    module ON DISK and restores it, so there is no environment variable, no
+   *    `--import` in `process.execArgv`, and nothing to key on except the
+   *    module's own contents — which is the thing under test. This is what
+   *    `scripts/mutate.mjs` has always done, and the reason it works.
+   *
+   * 2. A FAILURE MUST BE ATTRIBUTABLE. The test is run FIRST against its real
+   *    module and must PASS. A test that fails either way tells us nothing, and
+   *    counting it as detection is the empty-set-authority shape this
+   *    repository has now found five times. Only a pass-then-fail pair is
+   *    evidence, which is exactly the discipline mutation testing rests on.
+   *
+   * A run that neither passes nor fails — killed on timeout, or never spawned —
+   * is UNMEASURED and refuses. Round 17 hung the verifier indefinitely with a
+   * test that looped forever; silence is not a pass.
+   */
+  /**
+   * A LABEL FOR ANYONE WHO SEES ONE, NOT A GUARD.
+   *
+   * An earlier version of this section refused when a compiled module still
+   * held the marker, reasoning that an interrupted run could leave a
+   * replacement behind. A fixture proved that cannot happen: this project sets
+   * no `incremental`, so every verification rebuilds and re-emits every module
+   * before reaching here, and the poisoned copy is gone before it can be read.
+   * The check could never fire, and an unfalsifiable claim is worse than no
+   * claim — the fourth one deleted in three rounds. What protects the tree is
+   * the restore in the `finally` below plus that unconditional rebuild.
+   */
+  const CANARY_MARKER = "SF_CANARY_REPLACEMENT";
+  /**
+   * LIVENESS, NOT CORRECTNESS, AND SHORTENABLE SO IT CAN BE EVIDENCED.
+   *
+   * Round 17 hung the verifier with a paired test that looped forever, and this
+   * bounds that. A timeout is also the ONLY way a canary run reaches the
+   * "neither passed nor failed" path: `node --test` runs each file in a child,
+   * so a test that kills itself still leaves the runner exiting non-zero, which
+   * is an ordinary failure. Without a shortenable bound the unmeasured branch
+   * could not be reached by any fixture that finishes in reasonable time, and
+   * an unreachable branch is the shape this task has deleted four times.
+   *
+   * So the override exists to make the branch testable, and it can only
+   * SHORTEN. Setting it low makes canary runs unmeasured, which refuses; there
+   * is no value that makes anything pass that would otherwise fail.
+   *
+   * NO MUTATION COVERS THE OVERRIDE ITSELF, deliberately and stated rather than
+   * left to be discovered: removing it changes no outcome, only how long the
+   * fixture waits. It is an affordance, not a guard, and pretending otherwise
+   * would be one more unfalsifiable claim.
+   */
+  const CANARY_TIMEOUT_MS = Math.min(120_000, Number(process.env["SF_CANARY_TIMEOUT_MS"]) || 120_000);
 
-    const undetected = [];
-    for (const { module, test } of REQUIRED_GUARDS) {
-      const moduleUrl = `file://${join(REPO_ROOT, checker.compiledPathForSource(module, EMIT_LAYOUT))}`;
-      const testArtifact = join(REPO_ROOT, checker.compiledPathForSourceTest(test, EMIT_LAYOUT));
-
-      /**
-       * Imported plainly. `REQUIRED_GUARDS` names each module once and nothing
-       * else in this run imports them, so there is no earlier copy for Node to
-       * return — and a `?canary=${Date.now()}` that can never change an outcome
-       * is decoration, not defence.
-       */
-      let real;
-      try {
-        real = await import(moduleUrl);
-      } catch (error) {
-        undetected.push(
-          `${module} could not be loaded from the build: ${error instanceof Error ? error.message : String(error)}`,
-        );
-        continue;
-      }
-
-      /**
-       * NOTHING TO REPLACE IS NOTHING TO DETECT. `export {};` compiles, is
-       * paired, and is exactly what round 16 shipped in place of the
-       * deliverable. A module with no run-time exports cannot be guarded by
-       * any test, so the shortfall is in the module rather than in the test.
-       */
-      const names = Object.keys(real);
-      if (names.length === 0) {
-        undetected.push(`${module} exports nothing at run time, so no test could detect a change in it`);
-        continue;
-      }
-
-      const replacement = names
-        .map((name) => {
-          const sentinel = 'Object.freeze({ sfCanary: "replaced" })';
-          if (name === "default") {
-            return typeof real[name] === "function"
-              ? 'export default function () { throw new Error("SF_CANARY"); }'
-              : `export default ${sentinel};`;
-          }
-          return typeof real[name] === "function"
-            ? `export function ${name}() { throw new Error("SF_CANARY"); }`
-            : `export const ${name} = ${sentinel};`;
-        })
-        .join("\n");
-
-      const run = spawnSync(process.execPath, ["--import", join(canaryDir, "register.mjs"), "--test", testArtifact], {
-        cwd: REPO_ROOT,
-        encoding: "utf8",
-        env: {
-          ...process.env,
-          SF_CANARY_TARGET: moduleUrl,
-          SF_CANARY_SOURCE: replacement,
-        },
-      });
-
-      if (run.status === 0) {
-        undetected.push(
-          `${test} passes against a ${module} whose every export has been replaced, so it does not exercise it`,
-        );
-      }
+  const runPairedTest = (artifact) => {
+    const env = { ...process.env };
+    delete env["NODE_TEST_CONTEXT"];
+    const run = spawnSync(process.execPath, ["--test", artifact], {
+      cwd: REPO_ROOT,
+      encoding: "utf8",
+      timeout: CANARY_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+      env,
+    });
+    /**
+     * ONE CONDITION. These were two clauses — `run.error` and a null status —
+     * and a mutation switched the second off with nothing failing, because a
+     * timeout sets BOTH and the first already caught it. The remaining case for
+     * a null status without an error is a child killed from outside, which the
+     * merged condition covers. The detail reports every fact rather than
+     * branching on one, so there is no untested arm of a message either.
+     */
+    if (run.error !== undefined || run.status === null) {
+      return {
+        outcome: "unmeasured",
+        detail:
+          `the run did not complete (error: ${run.error?.message ?? "none"}, ` +
+          `signal: ${run.signal ?? "none"}, status: ${run.status ?? "none"})`,
+      };
     }
+    return { outcome: run.status === 0 ? "passed" : "failed", detail: `exit ${run.status}` };
+  };
 
-    if (undetected.length > 0) {
-      fail(
-        "verification refused: this repository runs the tests that name the deliverable, but they do not guard it.\n" +
-          undetected.map((line) => `  - ${line}`).join("\n") +
-          "\nEach required test was run against a build of its module with every export replaced, and had to fail. " +
-          "A test that passes either way is a label, not a guard — which is how a complete deliverable was once " +
-          "reduced to empty files with verification still reporting success.",
+  const undetected = [];
+  for (const { module, test } of REQUIRED_GUARDS) {
+    const compiledModule = join(REPO_ROOT, checker.compiledPathForSource(module, EMIT_LAYOUT));
+    const testArtifact = join(REPO_ROOT, checker.compiledPathForSourceTest(test, EMIT_LAYOUT));
+
+    let original;
+    try {
+      original = readFileSync(compiledModule, "utf8");
+    } catch (error) {
+      undetected.push(
+        `${module} could not be read from the build: ${error instanceof Error ? error.message : String(error)}`,
       );
+      continue;
     }
-  } finally {
-    rmSync(canaryDir, { recursive: true, force: true });
+
+    let real;
+    try {
+      real = await import(`file://${compiledModule}`);
+    } catch (error) {
+      undetected.push(
+        `${module} could not be loaded from the build: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      continue;
+    }
+
+    /**
+     * NOTHING TO REPLACE IS NOTHING TO DETECT. `export {};` compiles, is
+     * paired, and is exactly what round 16 shipped in place of the deliverable.
+     */
+    const names = Object.keys(real);
+    if (names.length === 0) {
+      undetected.push(`${module} exports nothing at run time, so no test could detect a change in it`);
+      continue;
+    }
+
+    const baseline = runPairedTest(testArtifact);
+    if (baseline.outcome !== "passed") {
+      undetected.push(
+        `${test} does not pass against its own ${module} (${baseline.detail}), so nothing it does against a ` +
+          "replaced one could be attributed to the replacement",
+      );
+      continue;
+    }
+
+    const replacement = [
+      `// ${CANARY_MARKER}`,
+      ...names.map((name) => {
+        const sentinel = 'Object.freeze({ sfCanary: "replaced" })';
+        if (name === "default") {
+          return typeof real[name] === "function"
+            ? 'export default function () { throw new Error("SF_CANARY"); }'
+            : `export default ${sentinel};`;
+        }
+        return typeof real[name] === "function"
+          ? `export function ${name}() { throw new Error("SF_CANARY"); }`
+          : `export const ${name} = ${sentinel};`;
+      }),
+    ].join("\n");
+
+    let substituted;
+    try {
+      writeFileSync(compiledModule, replacement);
+      substituted = runPairedTest(testArtifact);
+    } finally {
+      writeFileSync(compiledModule, original);
+    }
+
+    if (substituted.outcome === "passed") {
+      undetected.push(
+        `${test} passes against a ${module} whose every export has been replaced, so it does not exercise it`,
+      );
+    } else if (substituted.outcome !== "failed") {
+      undetected.push(`${test} could not be measured against a replaced ${module}: ${substituted.detail}`);
+    }
+  }
+
+  if (undetected.length > 0) {
+    fail(
+      "verification refused: this repository runs the tests that name the deliverable, but they do not guard it.\n" +
+        undetected.map((line) => `  - ${line}`).join("\n") +
+        "\nEach required test had to PASS against its own module and FAIL against a build of it with every export " +
+        "replaced. A test that passes either way is a label rather than a guard; one that fails either way proves " +
+        "nothing about the module at all.",
+    )
   }
 }
 

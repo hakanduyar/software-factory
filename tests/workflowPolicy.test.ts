@@ -2607,6 +2607,66 @@ describe("TASK-017 round-12 note: the runner allowlist is stated, not inferred",
  * NODES were already refused; the defect is that the documented invariant was
  * not the enforced one, which is how the two drift apart.
  */
+/**
+ * ROUND-17 HIGH 3. `checkVerificationCommand` listed the SPELLINGS it did not
+ * want — `node --test`, a bare or npx-prefixed `tsc`, `verify.mjs` — and the
+ * reviewer reached the same binary by a path none of them matched.
+ */
+describe("TASK-017 round-17 HIGH: the verification command is an allowlist, not a denylist", () => {
+  function withRun(commands: readonly string[]): string {
+    return [
+      "name: verify",
+      '"on":', "  push:", "    branches:", '      - "main"',
+      "permissions:", "  contents: read",
+      "jobs:", "  verify:", "    runs-on: ubuntu-latest", "    steps:",
+      ...commands.map((command) => `      - run: ${command}`),
+      "",
+    ].join("\n");
+  }
+
+  /** The reviewer's fixture: the tool by its path, beside the real commands. */
+  it("refuses a tool invoked by a direct executable path", () => {
+    const parsed = parseWorkflow(withRun(["npm ci", "./node_modules/.bin/tsc -p tsconfig.json", "npm test"]));
+
+    assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+    if (!parsed.ok) return;
+    const verdict = checkVerificationCommand(parsed.root);
+
+    assert.equal(verdict.ok, false, "a tool invoked by path was accepted as verification");
+    assert.match(verdict.ok === false ? verdict.reason : "", /node_modules\/\.bin\/tsc/);
+  });
+
+  /** Every reachable spelling, not the three that were listed. */
+  for (const command of [
+    "node --test dist/tests",
+    "npx tsc -p tsconfig.json",
+    "tsc",
+    "node scripts/verify.mjs",
+    "bash -c 'npm test'",
+    "env FOO=1 npm test",
+  ]) {
+    it(`refuses ${JSON.stringify(command)}`, () => {
+      const parsed = parseWorkflow(withRun(["npm ci", command, "npm test"]));
+
+      assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+      if (!parsed.ok) return;
+
+      assert.equal(checkVerificationCommand(parsed.root).ok, false, `${command} was accepted`);
+    });
+  }
+
+  /** NON-VACUITY: the commands this repository actually runs still pass. */
+  it("still accepts a workflow whose only commands are npm", () => {
+    const parsed = parseWorkflow(withRun(["npm ci", "npm test"]));
+
+    assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+    if (!parsed.ok) return;
+    const verdict = checkVerificationCommand(parsed.root);
+
+    assert.equal(verdict.ok, true, verdict.ok ? "" : verdict.reason);
+  });
+});
+
 describe("TASK-017 round-16 HIGH: a tag directive is refused, not discarded", () => {
   /** The reviewer's fixture, verbatim, in front of the real workflow. */
   it("refuses the shipped workflow behind a %TAG directive", () => {
