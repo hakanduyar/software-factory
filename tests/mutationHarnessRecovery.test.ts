@@ -22,9 +22,18 @@
  */
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  cpSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { after, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -114,14 +123,19 @@ describe("TASK-017: an interrupted mutation run cannot be mistaken for a measure
     const { status, output } = runHarness(root);
 
     assert.notEqual(status, 0, `an unreadable journal was ignored:\n${output}`);
-    assert.match(output, /cannot be read/, output);
+    assert.match(output, /does not hold a readable record/, output);
+    assert.match(output, /Nothing was written/, output);
   });
 
   /**
-   * NON-VACUITY. Without this, "refuse whenever the file exists" would satisfy
-   * every case above — including refusing every ordinary run.
+   * NON-VACUITY, STRENGTHENED (round-19 review, non-blocking note 2).
+   *
+   * This used to assert only that two refusal messages were ABSENT, which an
+   * unconditional refusal carrying a third message would have satisfied. It now
+   * requires the run to reach the ownership file it creates for itself — proof
+   * that it went past the recovery check rather than merely failing elsewhere.
    */
-  it("does not refuse when no journal is present", () => {
+  it("does not refuse when no journal is present, and takes ownership instead", () => {
     const { root } = fixture();
     assert.equal(existsSync(join(root, ".mutation-journal.json")), false);
 
@@ -129,8 +143,127 @@ describe("TASK-017: an interrupted mutation run cannot be mistaken for a measure
 
     assert.doesNotMatch(
       output,
-      /interrupted before it could restore the tree|cannot be read/,
+      /interrupted before it could restore the tree|does not hold a readable record|is held by a running/,
       `a tree with no journal was treated as interrupted:\n${output}`,
     );
+    assert.equal(
+      existsSync(join(root, ".mutation-journal.json")),
+      true,
+      "the run never reached the point of claiming ownership, so this proves nothing about the recovery check",
+    );
+  });
+
+  /**
+   * ROUND-19 CRITICAL. The journal names the files to write, and it had no
+   * containment: `../outside` put the recorded bytes into a file OUTSIDE the
+   * repository. Nothing outside the tree may be written, and because the
+   * journal is refused rather than acted on, it must survive untouched.
+   */
+  it("refuses a journal that names a path outside the repository", () => {
+    const { root } = fixture();
+    const outside = join(root, "..", `sf-outside-${process.pid}.txt`);
+    writeFileSync(outside, "untouched\n");
+    created.push(outside);
+    journal(root, { [`../${basename(outside)}`]: "PWNED\n" });
+
+    const { status, output } = runHarness(root);
+
+    assert.notEqual(status, 0, `a path outside the repository was accepted:\n${output}`);
+    assert.match(output, /not an ordinary file inside this repository/, output);
+    assert.equal(readFileSync(outside, "utf8"), "untouched\n", "a file outside the repository was written");
+    assert.equal(
+      existsSync(join(root, ".mutation-journal.json")),
+      true,
+      "the journal was deleted even though nothing was restored",
+    );
+  });
+
+  /** The same escape by a different route: an in-tree name, an external target. */
+  it("refuses a recorded path that is a symlink", () => {
+    const { root } = fixture();
+    const outside = join(root, "..", `sf-linked-${process.pid}.txt`);
+    writeFileSync(outside, "untouched\n");
+    created.push(outside);
+    symlinkSync(outside, join(root, "scripts/linked.mjs"));
+    journal(root, { "scripts/linked.mjs": "PWNED\n" });
+
+    const { status, output } = runHarness(root);
+
+    assert.notEqual(status, 0, `a symlinked target was accepted:\n${output}`);
+    assert.match(output, /not an ordinary file inside this repository/, output);
+    assert.equal(readFileSync(outside, "utf8"), "untouched\n", "the symlink's target was written through");
+  });
+
+  /**
+   * ROUND-19 HIGH 2. `Buffer.from(x, "base64")` decodes almost anything, so a
+   * corrupt value was written over the real file — and the journal was then
+   * deleted, destroying the only record of what had been touched.
+   */
+  it("refuses unreadable content without writing it, and keeps the journal", () => {
+    const { root, victim } = fixture();
+    const before = readFileSync(victim, "utf8");
+    writeFileSync(
+      join(root, ".mutation-journal.json"),
+      JSON.stringify({ owner: 1, startedAt: "x", files: { "scripts/verify.mjs": "%%%not-base64%%%" } }),
+    );
+
+    const { status, output } = runHarness(root);
+
+    assert.notEqual(status, 0, `undecodable content was accepted:\n${output}`);
+    assert.match(output, /records unreadable content/, output);
+    assert.equal(readFileSync(victim, "utf8"), before, "the victim file was overwritten with corrupt bytes");
+    assert.equal(existsSync(join(root, ".mutation-journal.json")), true, "the journal was deleted after refusing");
+  });
+
+  /** `typeof [] === "object"`, which the first schema check accepted. */
+  it("refuses a journal whose files are an array rather than a record", () => {
+    const { root } = fixture();
+    writeFileSync(
+      join(root, ".mutation-journal.json"),
+      JSON.stringify({ owner: 1, startedAt: "x", files: [] }),
+    );
+
+    const { status, output } = runHarness(root);
+
+    assert.notEqual(status, 0, `files: [] was accepted as a record:\n${output}`);
+    assert.match(output, /does not hold a readable record/, output);
+  });
+
+  /**
+   * ROUND-19 HIGH 3. Two runs started at once both passed a plain existsSync
+   * check and mutated the same files, reporting UNMEASURED and SURVIVED while
+   * both printed restored-tree success lines. Ownership is now taken with an
+   * atomic create, so a live owner is refused.
+   */
+  it("refuses to start while a live process owns the journal", () => {
+    const { root } = fixture();
+    writeFileSync(
+      join(root, ".mutation-journal.json"),
+      JSON.stringify({ owner: process.pid, startedAt: "x", files: {} }),
+    );
+
+    const { status, output } = runHarness(root);
+
+    assert.notEqual(status, 0, `a second concurrent run was allowed to start:\n${output}`);
+    assert.match(output, new RegExp(`held by a running mutation process \\(pid ${process.pid}\\)`), output);
+    assert.equal(existsSync(join(root, ".mutation-journal.json")), true, "the live owner's journal was removed");
+  });
+
+  /**
+   * A run killed BEFORE it recorded anything mutated nothing, so there is
+   * nothing to put back — but it still refuses, and clears its own stale
+   * ownership so the next invocation is not blocked forever.
+   */
+  it("clears stale ownership from a dead process, and still refuses", () => {
+    const { root } = fixture();
+    writeFileSync(
+      join(root, ".mutation-journal.json"),
+      JSON.stringify({ owner: 2147483646, startedAt: "x", files: {} }),
+    );
+
+    const { status, output } = runHarness(root);
+
+    assert.notEqual(status, 0, `a stale ownership file was treated as runnable:\n${output}`);
+    assert.match(output, /interrupted before it recorded anything/, output);
   });
 });

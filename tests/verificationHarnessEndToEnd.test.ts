@@ -4262,11 +4262,15 @@ describe("TASK-017: a repository must present, compile and RUN its deliverable",
     const root = makeRepositoryFixture();
     runHarness(root);
     /**
-     * BUILT AT RUN TIME, NOT WRITTEN OUT. Spelling the marker literally here
-     * put it into this file's own compiled output, and the scan — which reads
-     * every emitted file — refused the whole repository on its own test suite.
-     * A guard that searches the tree for a string must not be described using
-     * that string.
+     * BUILT AT RUN TIME, NOT WRITTEN OUT.
+     *
+     * Spelling the marker literally here put it into this file's own compiled
+     * output, and the scan — which then refused on any occurrence anywhere in
+     * an emitted file — refused the whole repository on its own test suite.
+     * The scan now matches only a file whose FIRST LINE is the marker comment,
+     * so this would no longer trip it; the construction stays because the
+     * incident is worth keeping visible, and because a fixture should not
+     * depend on the precise width of the guard it is testing.
      */
     const marker = `SF_CANARY${"_"}REPLACEMENT`;
     writeFileSync(

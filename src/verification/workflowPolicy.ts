@@ -816,9 +816,31 @@ export const INSTALL_ALIASES: readonly string[] = [
   "isnt", "isnta", "isntal", "isntall", "add",
 ];
 
-function isNpmSubcommand(command: string, subcommands: readonly string[]): boolean {
-  const match = /^npm\s+([a-z-]+)\b/.exec(command.trim());
-  return match !== null && subcommands.includes(match[1] ?? "");
+/**
+ * ANY TOKEN, NOT THE FIRST ONE (round-19 review, HIGH 5).
+ *
+ * The previous detector read the word directly after `npm`, and the reviewer put
+ * an option in front of it: `npm --prefix foo install` installs, and this guard
+ * saw `--prefix` and said nothing. `checkRunAllowlist` refused the workflow, so
+ * nothing was exploitable — but the guard AC-3 NAMES did not refuse it on its
+ * own, which is the sibling-masking finding this task has now had seventeen
+ * times.
+ *
+ * Skipping options properly would mean knowing which of them consume the next
+ * token, and npm's option grammar is not something to reimplement here — that
+ * is the same guessing machine this task refused to build for YAML. So the
+ * question is widened instead of parsed: if any token of an `npm` command is an
+ * install alias, it refuses. `npm run add` is refused too, which is
+ * conservative and wrong in nobody's favour: it is not an allowed command
+ * either way.
+ */
+function mentionsNpmSubcommand(command: string, subcommands: readonly string[]): boolean {
+  const trimmed = command.trim();
+  if (!/^npm\b/.test(trimmed)) return false;
+  return trimmed
+    .split(/\s+/)
+    .slice(1)
+    .some((token) => subcommands.includes(token));
 }
 
 export function checkInstall(root: YamlMap): PolicyVerdict {
@@ -840,7 +862,7 @@ export function checkInstall(root: YamlMap): PolicyVerdict {
    * outright rather than forbidding it only when it runs.
    */
   for (const command of declaredRunCommands(root)) {
-    if (isNpmSubcommand(command, INSTALL_ALIASES)) {
+    if (mentionsNpmSubcommand(command, INSTALL_ALIASES)) {
       return refuse(
         `the workflow runs ${JSON.stringify(command.trim())}, which may resolve differently than the lockfile records`,
       );

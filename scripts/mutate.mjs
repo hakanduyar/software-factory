@@ -37,8 +37,17 @@
 
 import { createHash } from "node:crypto";
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import {
+  closeSync,
+  existsSync,
+  lstatSync,
+  openSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { dirname, isAbsolute, join, normalize, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -806,6 +815,14 @@ const MUTATIONS = [
   },
   // ---- round-11 review -----------------------------------------------------
   {
+    id: "the install guard reads only the word after npm",
+    edits: [[POLICY,
+      '  if (!/^npm\\b/.test(trimmed)) return false;\n  return trimmed\n    .split(/\\s+/)\n    .slice(1)\n    .some((token) => subcommands.includes(token));',
+      '  const match = /^npm\\s+([a-z-]+)\\b/.exec(trimmed);\n  return match !== null && subcommands.includes(match[1] ?? "");']],
+    tests: [T_WF],
+    expect: 'refuses "npm --prefix foo install" at checkInstall itself',
+  },
+  {
     id: "the shortest isnt alias goes missing again",
     edits: [[POLICY,
       '  "isnt", "isnta", "isntal", "isntall", "add",',
@@ -816,8 +833,8 @@ const MUTATIONS = [
   {
     id: "only the long spelling reaches the install guard",
     edits: [[POLICY,
-      "    if (isNpmSubcommand(command, INSTALL_ALIASES)) {",
-      '    if (isNpmSubcommand(command, ["install"])) {']],
+      "    if (mentionsNpmSubcommand(command, INSTALL_ALIASES)) {",
+      '    if (mentionsNpmSubcommand(command, ["install"])) {']],
     tests: [T_WF],
     expect: "refuses npm isnt at checkInstall itself",
   },
@@ -936,6 +953,21 @@ const only = process.argv.includes("--only")
   : undefined;
 const selected = only === undefined ? MUTATIONS : MUTATIONS.filter((m) => m.id.includes(only));
 
+/**
+ * AN EMPTY SELECTION MEASURES NOTHING (round-19 review, non-blocking note).
+ *
+ * `--only <something that matches nothing>` ran zero mutations and still
+ * printed a summary. It failed closed in this checkout only because the
+ * baseline test set was then empty and the run collapsed elsewhere, which is
+ * luck rather than a guard.
+ */
+if (selected.length === 0) {
+  console.error(
+    `ABORT: no mutation matches ${JSON.stringify(only)}. A run that measures nothing must not report a result.`,
+  );
+  process.exit(2);
+}
+
 const touched = [...new Set(selected.flatMap((m) => m.edits.map(([file]) => file)))].sort();
 
 /**
@@ -962,35 +994,172 @@ const touched = [...new Set(selected.flatMap((m) => m.edits.map(([file]) => file
  * situation in which nobody should be told a number.
  */
 const JOURNAL = join(REPO_ROOT, ".mutation-journal.json");
-if (existsSync(JOURNAL)) {
+
+/**
+ * THE JOURNAL IS ALSO THE LOCK (round-19 review, HIGH 3).
+ *
+ * Two runs started at once both passed a plain `existsSync` check, mutated the
+ * same files, and reported `UNMEASURED` and `SURVIVED` respectively — while both
+ * printed restored-tree success lines. Neither number meant anything, and a
+ * killed peer would have been left with no recovery coverage at all.
+ *
+ * Ownership is therefore taken with `openSync(..., "wx")`, which creates the
+ * file or fails, atomically, with no window between the test and the create. It
+ * is claimed HERE, before the baseline build, because that build takes minutes
+ * and is exactly the window the reviewer drove two runs through.
+ */
+const ROOT_REAL = realpathSync(REPO_ROOT);
+
+/** A recorded path this run is willing to write. Everything else refuses. */
+function containedTarget(file) {
+  if (typeof file !== "string" || file.length === 0 || file.includes("\0")) return undefined;
+  if (isAbsolute(file)) return undefined;
+  const normalised = normalize(file);
+  if (normalised !== file) return undefined;
+  if (normalised === ".." || normalised.startsWith("../")) return undefined;
+
+  const target = join(REPO_ROOT, normalised);
+  const rel = relative(ROOT_REAL, target);
+  if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) return undefined;
+
+  /**
+   * THE PATH MUST NOT LEAD OUT THROUGH A LINK. `../outside` was the reviewer's
+   * first reproduction and an in-repository SYMLINK was the second: the name
+   * stayed inside the tree and the bytes landed on its external target. So the
+   * containing directory is resolved, and the entry itself must be an ordinary
+   * file if it exists at all — never a symlink, directory, FIFO or device.
+   */
+  let parentReal;
+  try {
+    parentReal = realpathSync(dirname(target));
+  } catch {
+    return undefined;
+  }
+  const parentRel = relative(ROOT_REAL, parentReal);
+  if (parentRel.startsWith("..") || isAbsolute(parentRel)) return undefined;
+
+  if (existsSync(target)) {
+    let stats;
+    try {
+      stats = lstatSync(target);
+    } catch {
+      return undefined;
+    }
+    if (!stats.isFile()) return undefined;
+  }
+  return target;
+}
+
+/** Strictly base64, verified by round-trip rather than by `Buffer`'s tolerance. */
+function decodeStrictBase64(encoded) {
+  if (typeof encoded !== "string") return undefined;
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(encoded)) return undefined;
+  const bytes = Buffer.from(encoded, "base64");
+  return bytes.toString("base64") === encoded ? bytes : undefined;
+}
+
+function refuseJournal(reason) {
+  console.error(
+    `ABORT: ${JOURNAL} ${reason}\n` +
+      "Nothing was written. A journal this run cannot fully trust is not a journal it may act on, and an " +
+      "interrupted run must never be mistaken for a measured one.",
+  );
+  process.exit(2);
+}
+
+let ownership;
+try {
+  ownership = openSync(JOURNAL, "wx");
+} catch (error) {
+  if (error?.code !== "EEXIST") throw error;
+  ownership = undefined;
+}
+
+if (ownership === undefined) {
   let saved;
   try {
     saved = JSON.parse(readFileSync(JOURNAL, "utf8"));
   } catch {
     saved = undefined;
   }
-  if (saved === null || typeof saved !== "object" || typeof saved.files !== "object" || saved.files === null) {
+  if (
+    saved === null ||
+    typeof saved !== "object" ||
+    Array.isArray(saved) ||
+    typeof saved.files !== "object" ||
+    saved.files === null ||
+    Array.isArray(saved.files)
+  ) {
+    refuseJournal("exists but does not hold a readable record of what a previous run touched.");
+  }
+
+  const entries = Object.entries(saved.files);
+
+  /**
+   * A LIVE OWNER IS A CONCURRENT RUN, NOT A CRASH. Nothing was recorded yet, so
+   * there is nothing to put back — but this run still refuses rather than
+   * joining it.
+   */
+  if (entries.length === 0) {
+    const owner = typeof saved.owner === "number" ? saved.owner : undefined;
+    let alive = false;
+    if (owner !== undefined) {
+      try {
+        process.kill(owner, 0);
+        alive = true;
+      } catch {
+        alive = false;
+      }
+    }
+    if (alive) {
+      refuseJournal(`is held by a running mutation process (pid ${owner}). Only one run may own this repository.`);
+    }
+    rmSync(JOURNAL, { force: true });
     console.error(
-      `ABORT: ${JOURNAL} exists but cannot be read, so a previous run was interrupted and this one cannot ` +
-        "know what it left behind. Restore the working tree from git before running again.",
+      "ABORT: a previous mutation run was interrupted before it recorded anything, so nothing was mutated.\n" +
+        "Its ownership file has been cleared. Run again to measure.",
     );
     process.exit(2);
   }
+
+  /**
+   * VALIDATE EVERY ENTRY BEFORE WRITING ANY (round-19 CRITICAL, and HIGH 2).
+   *
+   * The first version validated nothing and wrote as it went, so a journal
+   * naming `../outside` modified a file outside the repository, and a value of
+   * `%%%not-base64%%%` was decoded by `Buffer`'s tolerant parser and written
+   * over the real one — after which the journal was deleted, destroying the
+   * only record of what had been touched. Two phases, and the second only runs
+   * if the first accepted everything.
+   */
+  const plan = [];
+  for (const [file, encoded] of entries) {
+    const target = containedTarget(file);
+    if (target === undefined) {
+      refuseJournal(`records ${JSON.stringify(file)}, which is not an ordinary file inside this repository.`);
+    }
+    const original = decodeStrictBase64(encoded);
+    if (original === undefined) {
+      refuseJournal(`records unreadable content for ${JSON.stringify(file)}.`);
+    }
+    plan.push([file, target, original]);
+  }
+
   const repaired = [];
-  for (const [file, encoded] of Object.entries(saved.files)) {
-    const path = join(REPO_ROOT, file);
-    const original = Buffer.from(encoded, "base64");
+  for (const [file, target, original] of plan) {
     let current;
     try {
-      current = readFileSync(path);
+      current = readFileSync(target);
     } catch {
       current = undefined;
     }
     if (current === undefined || !current.equals(original)) {
-      writeFileSync(path, original);
+      writeFileSync(target, original);
       repaired.push(file);
     }
   }
+
+  /** Removed only now: every recorded file has been put back. */
   rmSync(JOURNAL, { force: true });
   console.error(
     "ABORT: a previous mutation run was interrupted before it could restore the tree.\n" +
@@ -1001,6 +1170,10 @@ if (existsSync(JOURNAL)) {
   );
   process.exit(2);
 }
+
+/** Ownership is held from here on; the contents arrive after the baseline. */
+writeFileSync(ownership, JSON.stringify({ owner: process.pid, startedAt: new Date().toISOString(), files: {} }));
+closeSync(ownership);
 
 const baseline = new Map(touched.map((file) => [file, readFileSync(join(REPO_ROOT, file))]));
 const hashes = new Map(touched.map((file) => [file, sha256(file)]));
@@ -1030,6 +1203,7 @@ writeFileSync(
   JOURNAL,
   JSON.stringify(
     {
+      owner: process.pid,
       startedAt: new Date().toISOString(),
       note: "A previous mutation run was interrupted. scripts/mutate.mjs restores these on its next start.",
       files: Object.fromEntries([...baseline].map(([file, bytes]) => [file, bytes.toString("base64")])),

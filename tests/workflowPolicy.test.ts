@@ -2612,6 +2612,56 @@ describe("TASK-017 round-12 note: the runner allowlist is stated, not inferred",
  * want — `node --test`, a bare or npx-prefixed `tsc`, `verify.mjs` — and the
  * reviewer reached the same binary by a path none of them matched.
  */
+/**
+ * ROUND-19 HIGH 5. `checkInstall` read the word directly after `npm`, so an
+ * option in front of the subcommand hid it: `npm --prefix foo install`
+ * installs, and the guard AC-3 names saw `--prefix` and said nothing.
+ * `checkRunAllowlist` refused the workflow, which is sibling masking, not a
+ * guard holding.
+ */
+describe("TASK-017 round-19 HIGH: an install is refused wherever the subcommand sits", () => {
+  function withRun(commands: readonly string[]): string {
+    return [
+      "name: verify",
+      '"on":', "  push:", "    branches:", '      - "main"',
+      "permissions:", "  contents: read",
+      "jobs:", "  verify:", "    runs-on: ubuntu-latest", "    steps:",
+      ...commands.map((command) => `      - run: ${command}`),
+      "",
+    ].join("\n");
+  }
+
+  for (const command of [
+    "npm --prefix foo install",
+    "npm --prefix=foo install",
+    "npm --loglevel silly i",
+    "npm -w pkg add left-pad",
+    "npm install",
+  ]) {
+    it(`refuses ${JSON.stringify(command)} at checkInstall itself`, () => {
+      const parsed = parseWorkflow(withRun(["npm ci", command, "npm test"]));
+
+      assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+      if (!parsed.ok) return;
+      const verdict = checkInstall(parsed.root);
+
+      assert.equal(verdict.ok, false, `${command} was accepted by the install guard itself`);
+      assert.match(verdict.ok === false ? verdict.reason : "", /resolve differently than the lockfile records/);
+    });
+  }
+
+  /** NON-VACUITY: the commands this repository actually runs still pass. */
+  it("still accepts a workflow whose only commands are npm ci and npm test", () => {
+    const parsed = parseWorkflow(withRun(["npm ci", "npm test"]));
+
+    assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+    if (!parsed.ok) return;
+    const verdict = checkInstall(parsed.root);
+
+    assert.equal(verdict.ok, true, verdict.ok ? "" : verdict.reason);
+  });
+});
+
 describe("TASK-017 round-17 HIGH: the verification command is an allowlist, not a denylist", () => {
   function withRun(commands: readonly string[]): string {
     return [

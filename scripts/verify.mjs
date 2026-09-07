@@ -1524,10 +1524,36 @@ assertEverythingWasRegular("before building");
  * run should quietly repair on the way to reporting success.
  */
 const CANARY_MARKER = "SF_CANARY_REPLACEMENT";
+/**
+ * NARROWED TWICE, BECAUSE A GUARD THAT REFUSES HONEST TREES IS ALSO BROKEN
+ * (round-19 review, HIGH 4).
+ *
+ * The first version read EVERY file under the output directory and refused on
+ * any occurrence of the marker anywhere in it. Two things were wrong with that.
+ * It refused this repository's own test suite once, because a fixture spelled
+ * the marker literally and the compiler copied it into `dist`. And the reviewer
+ * showed the general case: a legitimate module that merely CONTAINS the string
+ * passes one run and is refused by the next.
+ *
+ * Both come from asking a question far wider than the thing being detected. The
+ * canary writes the marker as the FIRST LINE of a file it replaces wholesale,
+ * so that is what is checked — not "mentions it somewhere". A module may now
+ * contain the string wherever it likes and be read exactly as what it is:
+ * ordinary content that happens to name a marker.
+ *
+ * NARROWING BY PATH TOO would be better still — the canary only ever writes the
+ * compiled paths of `REQUIRED_GUARDS` — and it is not done here, deliberately.
+ * This runs BEFORE the build, and both that list and the compiled checker that
+ * maps a source path to its artifact come later in the file. Reaching for them
+ * here threw `Cannot access 'REQUIRED_GUARDS' before initialization` on the
+ * first attempt. Widening the scan to every emitted file and narrowing the
+ * QUESTION is the version that fits where the check has to run.
+ */
 if (existsSync(join(REPO_ROOT, OUTPUT_DIR))) {
   const abandoned = listFiles(OUTPUT_DIR).filter((path) => {
     try {
-      return readFileSync(join(REPO_ROOT, path), "utf8").includes(CANARY_MARKER);
+      const first = readFileSync(join(REPO_ROOT, path), "utf8").split("\n", 1)[0] ?? "";
+      return first.trim() === `// ${CANARY_MARKER}`;
     } catch {
       return false;
     }
