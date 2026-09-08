@@ -29,6 +29,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  linkSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -247,6 +248,92 @@ describe("TASK-017: an interrupted mutation run cannot be mistaken for a measure
     assert.notEqual(status, 0, `a second concurrent run was allowed to start:\n${output}`);
     assert.match(output, new RegExp(`held by a running mutation process \\(pid ${process.pid}\\)`), output);
     assert.equal(existsSync(join(root, ".mutation-journal.json")), true, "the live owner's journal was removed");
+  });
+
+  /**
+   * ROUND-20 CRITICAL. `lstat` reports a hardlink as an ordinary regular file,
+   * because that is what it is. The escape is that the INODE may also be named
+   * outside the repository, and a write follows the inode rather than the name.
+   */
+  it("refuses a recorded path that is a hardlink to another inode name", () => {
+    const { root } = fixture();
+    const outside = join(root, "..", `sf-hardlink-${process.pid}.txt`);
+    writeFileSync(outside, "untouched\n");
+    created.push(outside);
+    linkSync(outside, join(root, "scripts/linked.mjs"));
+    journal(root, { "scripts/linked.mjs": "PWNED\n" });
+
+    const { status, output } = runHarness(root);
+
+    assert.notEqual(status, 0, `a hardlinked target was accepted:\n${output}`);
+    assert.match(output, /not an ordinary file inside this repository/, output);
+    assert.equal(readFileSync(outside, "utf8"), "untouched\n", "the hardlinked inode was written through");
+    assert.equal(existsSync(join(root, ".mutation-journal.json")), true, "the journal was deleted after refusing");
+  });
+
+  /**
+   * ROUND-20 HIGH 3. The liveness check lived inside the empty-journal branch,
+   * so it only ever ran for a journal that had recorded nothing — which is the
+   * one moment it did not matter. Once a real run populated its journal, a
+   * second process restored the first run's files underneath it and deleted its
+   * journal; the victim then reported a false SURVIVED.
+   */
+  it("refuses a POPULATED journal whose owner is still alive", () => {
+    const { root, victim } = fixture();
+    const before = readFileSync(victim, "utf8");
+    writeFileSync(
+      join(root, ".mutation-journal.json"),
+      JSON.stringify({
+        owner: process.pid,
+        startedAt: "x",
+        files: { "scripts/verify.mjs": Buffer.from("SOMETHING ELSE\n").toString("base64") },
+      }),
+    );
+
+    const { status, output } = runHarness(root);
+
+    assert.notEqual(status, 0, `a live owner's populated journal was taken over:\n${output}`);
+    assert.match(output, new RegExp(`held by a running mutation process \\(pid ${process.pid}\\)`), output);
+    assert.equal(readFileSync(victim, "utf8"), before, "the live owner's file was restored underneath it");
+    assert.equal(existsSync(join(root, ".mutation-journal.json")), true, "the live owner's journal was deleted");
+  });
+
+  /**
+   * ROUND-20 HIGH 4. Two records for one file have no single original.
+   *
+   * THE FIRST VERSION OF THIS CASE USED `./scripts/verify.mjs` as the second
+   * name and proved nothing: the normalisation check rejects that spelling
+   * before the duplicate check is reached, so the case passed whether or not
+   * the duplicate check existed, and its mutation SURVIVED. Sibling masking, in
+   * a test written to catch sibling masking.
+   *
+   * A symlinked directory is the honest version: both names normalise to
+   * themselves, both resolve inside the repository, both are ordinary files
+   * with one link — every containment guard is satisfied, and only the identity
+   * check can refuse them.
+   */
+  it("refuses a journal recording the same file twice", () => {
+    const { root, victim } = fixture();
+    const before = readFileSync(victim, "utf8");
+    symlinkSync(join(root, "scripts"), join(root, "linkdir"));
+    writeFileSync(
+      join(root, ".mutation-journal.json"),
+      JSON.stringify({
+        owner: 2147483646,
+        startedAt: "x",
+        files: {
+          "scripts/verify.mjs": Buffer.from("first\n").toString("base64"),
+          "linkdir/verify.mjs": Buffer.from("second\n").toString("base64"),
+        },
+      }),
+    );
+
+    const { status, output } = runHarness(root);
+
+    assert.notEqual(status, 0, `contradictory records were acted on:\n${output}`);
+    assert.match(output, /more than once, with no single original/, output);
+    assert.equal(readFileSync(victim, "utf8"), before, "a contradictory record was written anyway");
+    assert.equal(existsSync(join(root, ".mutation-journal.json")), true, "the journal was deleted after refusing");
   });
 
   /**

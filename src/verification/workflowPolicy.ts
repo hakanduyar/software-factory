@@ -835,11 +835,28 @@ export const INSTALL_ALIASES: readonly string[] = [
  * either way.
  */
 function mentionsNpmSubcommand(command: string, subcommands: readonly string[]): boolean {
-  const trimmed = command.trim();
-  if (!/^npm\b/.test(trimmed)) return false;
-  return trimmed
+  /**
+   * NO ANCHOR, AND QUOTES STRIPPED (round-20 review, HIGH 5).
+   *
+   * Requiring the command to BEGIN with `npm` missed `env FOO=1 npm install`
+   * and `/usr/bin/npm install`, and comparing raw tokens missed `npm "install"`
+   * and `npm 'install'`. Each is an install, and each satisfied the guard AC-3
+   * names while `checkRunAllowlist` refused the workflow — sibling masking for
+   * the eighteenth time in this task.
+   *
+   * A shell command line is not something to parse here. The question is
+   * therefore the widest one that is still true: does any token of this command
+   * NAME an install? Quotes come off first, because they change nothing about
+   * what the shell will run.
+   *
+   * It refuses more than installs — `echo install` would be refused too. That
+   * is conservative in the safe direction and costs nothing: no such command is
+   * allowed by this policy anyway.
+   */
+  return command
+    .trim()
     .split(/\s+/)
-    .slice(1)
+    .map((token) => token.replace(/^["']+|["']+$/g, ""))
     .some((token) => subcommands.includes(token));
 }
 

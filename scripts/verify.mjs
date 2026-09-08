@@ -2264,15 +2264,17 @@ if (looksLikeRepository) {
      * merged condition covers. The detail reports every fact rather than
      * branching on one, so there is no untested arm of a message either.
      */
+    const said = `${run.stdout ?? ""}${run.stderr ?? ""}`;
     if (run.error !== undefined || run.status === null) {
       return {
         outcome: "unmeasured",
+        said,
         detail:
           `the run did not complete (error: ${run.error?.message ?? "none"}, ` +
           `signal: ${run.signal ?? "none"}, status: ${run.status ?? "none"})`,
       };
     }
-    return { outcome: run.status === 0 ? "passed" : "failed", detail: `exit ${run.status}` };
+    return { outcome: run.status === 0 ? "passed" : "failed", said, detail: `exit ${run.status}` };
   };
 
   const undetected = [];
@@ -2402,6 +2404,33 @@ if (looksLikeRepository) {
       );
     } else if (substituted.outcome !== "failed") {
       undetected.push(`${test} could not be measured against a replaced ${module}: ${substituted.detail}`);
+    } else if (!/SF_CANARY|sfCanary/.test(substituted.said)) {
+      /**
+       * PASS-THEN-FAIL IS NOT ATTRIBUTION (round-20 review, CRITICAL 2).
+       *
+       * Comparing two exit codes was still only comparing two exit codes. The
+       * reviewer wrote a paired test that never reads its module and keeps a
+       * counter on disk: it passes on even invocations and fails on odd ones,
+       * so the baseline passed, the substituted run failed, and the canary
+       * called that detection. Any alternating test defeats an ordering rule,
+       * and running more times cannot fix it — a period-two toggler produces
+       * exactly the sequence a real guard produces.
+       *
+       * So the failure must NAME the replacement. Every replaced export either
+       * throws `SF_CANARY` when called or is the sentinel `{ sfCanary }` when
+       * read, and a test that genuinely touched one surfaces that text in the
+       * failure `node:test` prints. A test that failed for its own reasons says
+       * nothing about the module, and that is now the difference between
+       * evidence and coincidence.
+       *
+       * WHAT THIS STILL DOES NOT PROVE is unchanged and recorded in L-19: a
+       * test can exercise a module without asserting anything worthwhile about
+       * it. Mutation testing covers that; this covers attribution.
+       */
+      undetected.push(
+        `${test} fails against a replaced ${module} without ever mentioning the replacement, so the failure ` +
+          `is not attributable to it (${substituted.detail})`,
+      );
     }
   }
 

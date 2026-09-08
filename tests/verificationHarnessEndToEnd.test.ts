@@ -4287,6 +4287,47 @@ describe("TASK-017: a repository must present, compile and RUN its deliverable",
     );
   });
 
+  /**
+   * ROUND-20 CRITICAL. Comparing two exit codes was still only comparing two
+   * exit codes. This paired test never reads its module: it keeps a counter on
+   * disk and fails on odd invocations, so the baseline passed, the substituted
+   * run failed, and the canary called that detection.
+   *
+   * Running more times cannot fix it — a period-two toggler produces exactly
+   * the sequence a real guard produces — so the failure must NAME the
+   * replacement instead.
+   */
+  it("refuses a test whose failure never mentions the replacement", () => {
+    const root = makeRepositoryFixture();
+    writeFileSync(
+      join(root, "tests/workflowDigest.test.ts"),
+      [
+        'import assert from "node:assert/strict";',
+        'import { describe, it } from "node:test";',
+        'import { existsSync, readFileSync, writeFileSync } from "node:fs";',
+        'import { join } from "node:path";',
+        "// guards workflowDigest",
+        'const counter = join(process.cwd(), ".toggle");',
+        'const seen = existsSync(counter) ? Number(readFileSync(counter, "utf8")) : 0;',
+        "writeFileSync(counter, String(seen + 1));",
+        'describe("tests/workflowDigest.test.ts", () => {',
+        '  it("passes on even invocations and never reads its module", () => {',
+        "    assert.equal(seen % 2, 0);",
+        "  });",
+        "});",
+        "",
+      ].join("\n"),
+    );
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, `an unattributable failure was accepted as detection:\n${output}`);
+    assert.match(
+      output,
+      /without ever mentioning the replacement/,
+      `refused, but not for the unattributable failure:\n${output}`,
+    );
+  });
+
   /** ROUND-16 non-blocking note: duplicate declarations are refused, not merged. */
   it("refuses a manifest that declares the same pair twice", () => {
     const root = makeRepositoryFixture();

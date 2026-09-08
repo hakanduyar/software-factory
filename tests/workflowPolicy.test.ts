@@ -2631,12 +2631,21 @@ describe("TASK-017 round-19 HIGH: an install is refused wherever the subcommand 
     ].join("\n");
   }
 
+  /**
+   * ROUND-20 HIGH 5 added the lower four: anchoring on a leading `npm` missed a
+   * command prefixed by `env` or spelled with a path, and comparing raw tokens
+   * missed quoting. Each is an install, and each satisfied the guard AC-3 names.
+   */
   for (const command of [
     "npm --prefix foo install",
     "npm --prefix=foo install",
     "npm --loglevel silly i",
     "npm -w pkg add left-pad",
     "npm install",
+    "env FOO=1 npm install",
+    "/usr/bin/npm install",
+    'npm "install"',
+    "npm 'install'",
   ]) {
     it(`refuses ${JSON.stringify(command)} at checkInstall itself`, () => {
       const parsed = parseWorkflow(withRun(["npm ci", command, "npm test"]));

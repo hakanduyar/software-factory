@@ -47,7 +47,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, isAbsolute, join, normalize, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, normalize, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -67,6 +67,16 @@ const T_HON = "dist/tests/knownLimitationsHonesty.test.js";
 const T_PUSH = "dist/tests/pushAuthorization.test.js";
 const T_BIND = "dist/tests/candidateBinding.test.js";
 const T_DIG = "dist/tests/workflowDigest.test.js";
+const T_REC = "dist/tests/mutationHarnessRecovery.test.js";
+/**
+ * MUTATING THIS FILE ITSELF (round-20 review). The recovery path lives here,
+ * and `tests/mutationHarnessRecovery.test.ts` runs a COPY of this script in a
+ * fixture — so a mutation of this file is carried into that copy and the
+ * fixtures measure it, without the harness ever mutating the process that is
+ * running. The circularity I refused earlier was mutating the RUNNING harness;
+ * this is not that.
+ */
+const VERIFIER_MUT = "scripts/mutate.mjs";
 const T_E2E = "dist/tests/verificationHarnessEndToEnd.test.js";
 
 /**
@@ -386,6 +396,49 @@ const MUTATIONS = [
       "if (false) {"]],
     tests: [T_E2E],
     expect: "refuses a manifest that declares the same pair twice",
+  },
+  // ---- round-20: containment, ownership and attribution -------------------
+  /**
+   * ANCHORS BUILT BY CONCATENATION, because this file is the file being mutated
+   * (round-20 remediation).
+   *
+   * A mutation's `from` string lives in this file, so an anchor written as one
+   * literal appears TWICE — once in the code and once in the definition naming
+   * it — and the harness reported `UNMEASURED (anchor x2)` for all three. Split
+   * across a `+`, the full text exists only in the code, and the value the
+   * harness searches for is still exactly right.
+   */
+  {
+    id: "a hardlinked name is treated as an ordinary file",
+    edits: [[VERIFIER_MUT, "    if (stats.nlink !== 1)" + " return undefined;", "    void stats;"]],
+    tests: [T_REC],
+    expect: "refuses a recorded path that is a hardlink to another inode name",
+  },
+  {
+    id: "a populated journal skips the liveness question",
+    edits: [[VERIFIER_MUT, "  if (owner" + "Alive) {", "  if (false) {"]],
+    tests: [T_REC],
+    expect: "refuses a POPULATED journal whose owner is still alive",
+  },
+  {
+    id: "the same file may be recorded twice",
+    edits: [[VERIFIER_MUT, "      if (claimed" + ".has(target)) {", "      if (false) {"]],
+    tests: [T_REC],
+    expect: "refuses a journal recording the same file twice",
+  },
+  {
+    id: "any failure counts as detection, attributable or not",
+    edits: [[VERIFIER, '    } else if (!/SF_CANARY|sfCanary/.test(substituted.said)) {', "    } else if (false) {"]],
+    tests: [T_E2E],
+    expect: "refuses a test whose failure never mentions the replacement",
+  },
+  {
+    id: "the install guard only sees a command that begins with npm",
+    edits: [[POLICY,
+      "  return command\n    .trim()\n    .split(/\\s+/)\n    .map((token) => token.replace(/^[\"']+|[\"']+$/g, \"\"))\n    .some((token) => subcommands.includes(token));",
+      "  const trimmed = command.trim();\n  if (!/^npm\\b/.test(trimmed)) return false;\n  return trimmed.split(/\\s+/).slice(1).some((token) => subcommands.includes(token));"]],
+    tests: [T_WF],
+    expect: 'refuses "env FOO=1 npm install" at checkInstall itself',
   },
   // ---- round-16: presence is not detection --------------------------------
   /**
@@ -815,14 +868,6 @@ const MUTATIONS = [
   },
   // ---- round-11 review -----------------------------------------------------
   {
-    id: "the install guard reads only the word after npm",
-    edits: [[POLICY,
-      '  if (!/^npm\\b/.test(trimmed)) return false;\n  return trimmed\n    .split(/\\s+/)\n    .slice(1)\n    .some((token) => subcommands.includes(token));',
-      '  const match = /^npm\\s+([a-z-]+)\\b/.exec(trimmed);\n  return match !== null && subcommands.includes(match[1] ?? "");']],
-    tests: [T_WF],
-    expect: 'refuses "npm --prefix foo install" at checkInstall itself',
-  },
-  {
     id: "the shortest isnt alias goes missing again",
     edits: [[POLICY,
       '  "isnt", "isnta", "isntal", "isntall", "add",',
@@ -1046,8 +1091,43 @@ function containedTarget(file) {
       return undefined;
     }
     if (!stats.isFile()) return undefined;
+
+    /**
+     * A HARDLINK IS A SECOND NAME FOR SOMEBODY ELSE'S FILE (round-20 CRITICAL).
+     *
+     * `lstat` reports a hardlink as an ordinary regular file, because that is
+     * what it is — the escape is that the INODE may also be named outside this
+     * repository, and a write follows the inode, not the name. The reviewer
+     * linked an external file into the tree and the recovery path wrote
+     * straight through it.
+     *
+     * There is no way to ask "is this inode also named elsewhere?" without
+     * walking the filesystem, so the link count answers instead: a file this
+     * harness recorded is a file it read from the repository, and that has
+     * exactly one name. More than one is refused rather than investigated.
+     *
+     * It closes the round-20 HIGH about conflicting entries too: two in-tree
+     * names for one inode cannot both be recorded if neither can be recorded.
+     */
+    if (stats.nlink !== 1) return undefined;
   }
-  return target;
+
+  /**
+   * RESOLVED, SO TWO NAMES FOR ONE FILE ARE ONE NAME (round-20 remediation,
+   * found by a surviving mutation).
+   *
+   * The duplicate check below compared the JOINED paths, which made it blind to
+   * aliases: with a symlinked directory, `scripts/verify.mjs` and
+   * `linkdir/verify.mjs` pass every containment test above, name the same file,
+   * and compared unequal — so both were written, in order, and the last one
+   * won. Returning the path through the RESOLVED parent collapses the alias
+   * here, so there is one identity per file and the duplicate check sees it.
+   *
+   * The first fixture for this missed it, because it used `./scripts/verify.mjs`
+   * as the second name — which the normalisation check above rejects first. The
+   * mutation survived, and the survivor was the finding.
+   */
+  return join(parentReal, basename(normalised));
 }
 
 /** Strictly base64, verified by round-trip rather than by `Buffer`'s tolerance. */
@@ -1096,24 +1176,34 @@ if (ownership === undefined) {
   const entries = Object.entries(saved.files);
 
   /**
-   * A LIVE OWNER IS A CONCURRENT RUN, NOT A CRASH. Nothing was recorded yet, so
-   * there is nothing to put back — but this run still refuses rather than
-   * joining it.
+   * IS THE OWNER STILL ALIVE? ASKED FIRST, AND FOR EVERY JOURNAL (round-20
+   * review, HIGH 3).
+   *
+   * This check used to sit inside the `entries.length === 0` branch, so it only
+   * ever ran for a journal that had recorded nothing. The moment a real run
+   * populated its journal — which is the whole of its working life — a second
+   * process skipped the liveness question entirely, restored the FIRST run's
+   * files underneath it and deleted its journal. The reviewer reproduced it and
+   * the victim reported a false `SURVIVED`.
+   *
+   * A live owner means a concurrent run, never a crash, so nothing is touched
+   * and nothing is removed.
    */
+  const owner = typeof saved.owner === "number" ? saved.owner : undefined;
+  let ownerAlive = false;
+  if (owner !== undefined) {
+    try {
+      process.kill(owner, 0);
+      ownerAlive = true;
+    } catch {
+      ownerAlive = false;
+    }
+  }
+  if (ownerAlive) {
+    refuseJournal(`is held by a running mutation process (pid ${owner}). Only one run may own this repository.`);
+  }
+
   if (entries.length === 0) {
-    const owner = typeof saved.owner === "number" ? saved.owner : undefined;
-    let alive = false;
-    if (owner !== undefined) {
-      try {
-        process.kill(owner, 0);
-        alive = true;
-      } catch {
-        alive = false;
-      }
-    }
-    if (alive) {
-      refuseJournal(`is held by a running mutation process (pid ${owner}). Only one run may own this repository.`);
-    }
     rmSync(JOURNAL, { force: true });
     console.error(
       "ABORT: a previous mutation run was interrupted before it recorded anything, so nothing was mutated.\n" +
@@ -1133,8 +1223,20 @@ if (ownership === undefined) {
    * if the first accepted everything.
    */
   const plan = [];
+  const claimed = new Set();
   for (const [file, encoded] of entries) {
     const target = containedTarget(file);
+    if (target !== undefined) {
+      /**
+       * ONE RECORD PER FILE (round-20 review, HIGH 4). Two names for one file
+       * with different recorded bytes are a contradiction, and acting on it
+       * wrote both values in turn and then reported success.
+       */
+      if (claimed.has(target)) {
+        refuseJournal(`records ${JSON.stringify(file)} more than once, with no single original to put back.`);
+      }
+      claimed.add(target);
+    }
     if (target === undefined) {
       refuseJournal(`records ${JSON.stringify(file)}, which is not an ordinary file inside this repository.`);
     }
