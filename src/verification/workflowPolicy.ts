@@ -853,11 +853,21 @@ function mentionsNpmSubcommand(command: string, subcommands: readonly string[]):
    * is conservative in the safe direction and costs nothing: no such command is
    * allowed by this policy anyway.
    */
-  return command
-    .trim()
-    .split(/\s+/)
-    .map((token) => token.replace(/^["']+|["']+$/g, ""))
-    .some((token) => subcommands.includes(token));
+  /**
+   * AND NOT ONLY WHITESPACE-SEPARATED (round-21 review, HIGH 2).
+   *
+   * `npm${IFS}install` is an install: bash expands `$IFS` to a space. Splitting
+   * on whitespace saw one token and said nothing. Expanding shell variables
+   * here is out of the question, so the alias is looked for as a WORD anywhere
+   * in the command — bounded by anything that is not a name character, which
+   * `$`, `{` and `}` all are.
+   *
+   * `npm ci` is unaffected: the `i` in `ci` is preceded by a name character and
+   * is not a word on its own.
+   */
+  const flattened = command.replace(/["']/g, "");
+  const word = new RegExp(`(^|[^A-Za-z0-9-])(${subcommands.join("|")})([^A-Za-z0-9-]|$)`);
+  return word.test(flattened);
 }
 
 export function checkInstall(root: YamlMap): PolicyVerdict {

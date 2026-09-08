@@ -129,6 +129,7 @@
  */
 
 import { execFileSync, spawnSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import {
   existsSync,
   lstatSync,
@@ -2236,6 +2237,26 @@ if (looksLikeRepository) {
    */
   const CANARY_TIMEOUT_MS = Math.min(120_000, Number(process.env["SF_CANARY_TIMEOUT_MS"]) || 120_000);
 
+  /**
+   * THE ATTRIBUTION TOKEN IS FRESH EVERY RUN (round-21 review, CRITICAL 1).
+   *
+   * Round 20 made the substituted run's failure name the replacement, which
+   * fixed the stateful toggler. Round 21 forged the name instead: a paired test
+   * that never reads its module, keeps a counter, and writes the literal
+   * "SF_CANARY" into its own assertion message. It failed on cue, the output
+   * contained the token, and the canary called that attribution.
+   *
+   * A constant a test can type is not evidence. The token is now random per
+   * run, so nothing checked into the tree can contain it and no test can print
+   * it without having read the replacement this run generated.
+   *
+   * WHAT REMAINS, and it is the same residual L-19 already records: a test
+   * deliberately written to defeat this could read its own replaced module off
+   * disk and echo the token. Substituting in place removes the incidental
+   * tells; it does not make the substitution invisible to a determined author.
+   */
+  const CANARY_TOKEN = `SF_CANARY_${randomBytes(12).toString("hex")}`;
+
   const runPairedTest = (artifact) => {
     const env = { ...process.env };
     delete env["NODE_TEST_CONTEXT"];
@@ -2342,8 +2363,8 @@ if (looksLikeRepository) {
         const local = `__sfCanary${index}`;
         const value =
           typeof real[name] === "function"
-            ? `function () { throw new Error("SF_CANARY"); }`
-            : 'Object.freeze({ sfCanary: "replaced" })';
+            ? `function () { throw new Error(${JSON.stringify(CANARY_TOKEN)}); }`
+            : `Object.freeze({ sfCanary: ${JSON.stringify(CANARY_TOKEN)} })`;
         const alias = name === "default" ? "default" : JSON.stringify(name);
         return `const ${local} = ${value};\nexport { ${local} as ${alias} };`;
       }),
@@ -2404,7 +2425,7 @@ if (looksLikeRepository) {
       );
     } else if (substituted.outcome !== "failed") {
       undetected.push(`${test} could not be measured against a replaced ${module}: ${substituted.detail}`);
-    } else if (!/SF_CANARY|sfCanary/.test(substituted.said)) {
+    } else if (!substituted.said.includes(CANARY_TOKEN)) {
       /**
        * PASS-THEN-FAIL IS NOT ATTRIBUTION (round-20 review, CRITICAL 2).
        *
@@ -2417,9 +2438,11 @@ if (looksLikeRepository) {
        * exactly the sequence a real guard produces.
        *
        * So the failure must NAME the replacement. Every replaced export either
-       * throws `SF_CANARY` when called or is the sentinel `{ sfCanary }` when
-       * read, and a test that genuinely touched one surfaces that text in the
-       * failure `node:test` prints. A test that failed for its own reasons says
+       * throws a token generated FOR THIS RUN when called, or carries it as
+       * the sentinel's value when read, and a test that genuinely touched one
+       * surfaces that token in the failure `node:test` prints. Round 21 forged
+       * a constant marker by typing it into an assertion message; a random
+       * token cannot be typed in advance. A test that failed for its own reasons says
        * nothing about the module, and that is now the difference between
        * evidence and coincidence.
        *

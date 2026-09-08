@@ -52,7 +52,15 @@ function fixture(): { root: string; victim: string } {
   const root = mkdtempSync(join(tmpdir(), "sf-mutate-"));
   created.push(root);
   mkdirSync(join(root, "scripts"), { recursive: true });
+  /**
+   * BOTH HALVES OF THE HARNESS. The definitions moved into `mutations.mjs` so
+   * `scripts/preflight.mjs` can read them without starting a three-hour run,
+   * and `mutate.mjs` imports them — so a fixture copying only one gets a script
+   * that cannot load, and every case here would "refuse" for that reason
+   * instead of the one it names.
+   */
   cpSync(join(REPO_ROOT, "scripts/mutate.mjs"), join(root, "scripts/mutate.mjs"));
+  cpSync(join(REPO_ROOT, "scripts/mutations.mjs"), join(root, "scripts/mutations.mjs"));
   const victim = join(root, "scripts/verify.mjs");
   writeFileSync(victim, 'const looksLikeRepository = existsSync(join(REPO_ROOT, ".git"));\n');
   return { root, victim };
@@ -296,6 +304,28 @@ describe("TASK-017: an interrupted mutation run cannot be mistaken for a measure
     assert.match(output, new RegExp(`held by a running mutation process \\(pid ${process.pid}\\)`), output);
     assert.equal(readFileSync(victim, "utf8"), before, "the live owner's file was restored underneath it");
     assert.equal(existsSync(join(root, ".mutation-journal.json")), true, "the live owner's journal was deleted");
+  });
+
+  /**
+   * ROUND-21 CRITICAL. A DANGLING symlink is not "absent". `existsSync` follows
+   * it and reports false, so the whole ordinary-file check was skipped and the
+   * write then followed the link and CREATED a file outside the repository.
+   * `lstat` describes the link itself, which is the right question.
+   */
+  it("refuses a recorded path that is a dangling symlink, creating nothing", () => {
+    const { root } = fixture();
+    const outside = join(root, "..", `sf-dangling-${process.pid}.txt`);
+    created.push(outside);
+    rmSync(outside, { force: true });
+    symlinkSync(outside, join(root, "scripts/dangling.mjs"));
+    journal(root, { "scripts/dangling.mjs": "PWNED\n" });
+
+    const { status, output } = runHarness(root);
+
+    assert.notEqual(status, 0, `a dangling symlink was accepted:\n${output}`);
+    assert.match(output, /not an ordinary file inside this repository/, output);
+    assert.equal(existsSync(outside), false, "the dangling symlink's target was created outside the repository");
+    assert.equal(existsSync(join(root, ".mutation-journal.json")), true, "the journal was deleted after refusing");
   });
 
   /**

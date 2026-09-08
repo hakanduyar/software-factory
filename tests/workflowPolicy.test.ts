@@ -2644,6 +2644,7 @@ describe("TASK-017 round-19 HIGH: an install is refused wherever the subcommand 
     "npm install",
     "env FOO=1 npm install",
     "/usr/bin/npm install",
+    "npm${IFS}install",
     'npm "install"',
     "npm 'install'",
   ]) {

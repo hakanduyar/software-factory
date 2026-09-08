@@ -1297,3 +1297,44 @@ repository fixture, whose stub tests do exercise their stub modules, must still
 pass. `scripts/mutate.mjs` switches each clause off in turn, including one
 mutation that makes the canary refuse every repository, which that complete
 fixture catches.
+
+## L-20 - The suite's `git` is a Node reimplementation of two queries, not git
+
+**Status:** OPEN, deliberate. Recorded because the stronger reading — "the
+workspace guard is tested against git" — claims more than the mechanism
+delivers.
+
+AC-12 is unqualified: no test may require anything installed on the host beyond
+Node itself. The round-21 review ran the compiled suite with a `PATH` holding
+only Node and found 89 failures, every one `spawnSync git ENOENT`. That had been
+true for the whole life of this repository and twenty-one reviews had not looked.
+
+The failures come from a guard that exists on purpose. `assertWorkspace` proves a
+workspace is a real repository by asking git — `git -C <path> rev-parse
+--show-toplevel`, and the message says "not merely a `.git` filesystem entry" —
+so a planted directory cannot satisfy it. Deleting that question to pass AC-12
+would have removed the property; planting `.git` in the fixtures would have made
+the property untestable, since the guard's whole point is to refuse exactly that.
+
+So the tests bring their own `git`: `tests/support/nodeGit.ts` writes a small
+Node executable, puts it first on `PATH`, and implements the two things the suite
+asks for — `init`, and `rev-parse --show-toplevel`, which walks upward for a
+`.git` DIRECTORY and exits non-zero when there is none. Anything else exits
+non-zero rather than pretending to succeed, so an unexpected git call fails
+loudly instead of being quietly answered.
+
+**The limitation, stated exactly.** The suite now exercises a reimplementation of
+two git queries rather than git. If real git and this shim disagree about what a
+repository is — a worktree file rather than a directory, a `GIT_DIR` in the
+environment, an `includeIf` in a config, a submodule — the tests would not
+notice, and the production path still calls real git. The shim is faithful about
+the one distinction the guard turns on, and it is not git.
+
+The alternative was a suite that cannot run without a host dependency the frozen
+criteria forbid, and the criteria are frozen. Recording the trade-off is the
+honest half of taking it.
+
+**Kept honest by:** `tests/support/nodeGit.ts` refuses any command it does not
+implement, so a test that starts depending on more of git fails rather than
+passing on a stub; the workspace cases that require a REFUSAL for a
+non-repository still assert it, and they fail if the shim answers wrongly.

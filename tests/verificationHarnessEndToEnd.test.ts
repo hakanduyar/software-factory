@@ -34,6 +34,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 
+import { writeRepositoryLayout } from "./support/nodeGit.js";
+
 const REPO_ROOT = process.cwd();
 const created: string[] = [];
 
@@ -3881,7 +3883,14 @@ describe("TASK-017: a repository must present, compile and RUN its deliverable",
   function makeRepositoryFixture(): string {
     const root = makeFixtureRepo();
     addDeliverable(root);
-    spawnSync("git", ["init", "--quiet"], { cwd: root, encoding: "utf8" });
+    /**
+     * WRITTEN, NOT SHELLED OUT FOR (AC-12). `scripts/verify.mjs` decides
+     * whether a tree is a repository by reading `.git` from the filesystem and
+     * asks no subprocess — that was round 14's fix for a guard a broken `git`
+     * could switch off — so these fixtures never needed git either. Under a
+     * PATH holding only Node they were 142 of the suite's failures.
+     */
+    writeRepositoryLayout(root);
     return root;
   }
 
@@ -4328,6 +4337,48 @@ describe("TASK-017: a repository must present, compile and RUN its deliverable",
     );
   });
 
+  /**
+   * ROUND-21 CRITICAL. Round 20 required the substituted failure to NAME the
+   * replacement. This test forges the name: it never reads its module, keeps a
+   * counter, and writes the literal marker into its own assertion message. It
+   * failed on cue, the output contained the marker, and that was called
+   * attribution.
+   *
+   * The token is now generated per run, so a literal typed into a test cannot
+   * match it. The fixture keeps the OLD constant deliberately — if the token
+   * ever becomes predictable again, this case fails.
+   */
+  it("refuses a test that prints the marker without touching its module", () => {
+    const root = makeRepositoryFixture();
+    writeFileSync(
+      join(root, "tests/workflowDigest.test.ts"),
+      [
+        'import assert from "node:assert/strict";',
+        'import { describe, it } from "node:test";',
+        'import { existsSync, readFileSync, writeFileSync } from "node:fs";',
+        'import { join } from "node:path";',
+        "// guards workflowDigest",
+        'const counter = join(process.cwd(), ".forge");',
+        'const seen = existsSync(counter) ? Number(readFileSync(counter, "utf8")) : 0;',
+        "writeFileSync(counter, String(seen + 1));",
+        'describe("tests/workflowDigest.test.ts", () => {',
+        '  it("paired check", () => {',
+        '    assert.notEqual(seen, 1, "SF_CANARY sfCanary SF_CANARY_REPLACEMENT");',
+        "  });",
+        "});",
+        "",
+      ].join("\n"),
+    );
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, `a forged attribution was accepted:\n${output}`);
+    assert.match(
+      output,
+      /without ever mentioning the replacement/,
+      `refused, but not for the forged attribution:\n${output}`,
+    );
+  });
+
   /** ROUND-16 non-blocking note: duplicate declarations are refused, not merged. */
   it("refuses a manifest that declares the same pair twice", () => {
     const root = makeRepositoryFixture();
@@ -4614,7 +4665,7 @@ ${output}`,
 
     const decoy = mkdtempSync(join(tmpdir(), "sf-decoy-git-"));
     created.push(decoy);
-    spawnSync("git", ["init", "--quiet", decoy], { encoding: "utf8" });
+    writeRepositoryLayout(decoy);
 
     const result = spawnSync(process.execPath, ["scripts/verify.mjs"], {
       cwd: root,

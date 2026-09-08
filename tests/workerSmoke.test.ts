@@ -13,6 +13,14 @@ import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
 import { describe, it } from "node:test";
 
+import { ensureNodeGit } from "./support/nodeGit.js";
+
+/**
+ * THE CLI UNDER TEST RUNS `git init` (AC-12). Production keeps calling real
+ * git; the suite supplies a Node one so no test needs git on the host.
+ */
+ensureNodeGit();
+
 import { runWorkerSmoke } from "../src/cli/workerSmoke.js";
 import type { ProcessResult, ProcessRunner } from "../src/ports/processRunner.js";
 import { fakeCliPath } from "./support/fakeCli.js";
