@@ -38,7 +38,7 @@ let installed: string | undefined;
 
 const SHIM = `#!/usr/bin/env node
 "use strict";
-const { existsSync, mkdirSync, statSync, writeFileSync } = require("node:fs");
+const { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } = require("node:fs");
 const { dirname, join, resolve } = require("node:path");
 
 const argv = process.argv.slice(2);
@@ -48,12 +48,45 @@ while (argv[0] === "-C") {
   cwd = resolve(cwd, argv.shift());
 }
 
-/** A repository is a directory holding a \`.git\` DIRECTORY, at or above here. */
+/**
+ * A repository is a directory holding \`.git\`, at or above here — as a
+ * DIRECTORY or as the FILE a linked worktree uses (round-22 review, HIGH 5).
+ * Recognising only the directory made this shim stricter than git, so a
+ * worktree checkout would have been refused by the suite and accepted in
+ * production.
+ *
+ * \`GIT_DIR\` IS honoured, as real git honours it — and that is the whole point
+ * of the shim rather than an accident of it.
+ *
+ * The first version ignored it, reasoning that \`probeGitRepository\` now strips
+ * the variable so the shim need only match the environment production gives
+ * git. That reasoning made the production guard UNTESTABLE: with the
+ * sanitisation disabled, the shim still refused the directory, so the case
+ * asserting the guard passed either way. A mutation removing the sanitisation
+ * SURVIVED, which is how it was found.
+ *
+ * A test double has to model the thing it stands in for, not the thing the
+ * caller currently does. Real git with \`GIT_DIR\` set treats the working
+ * directory as the work tree, so that is what this reports.
+ */
 function toplevel(from) {
+  /**
+   * The environment answers first, exactly as git lets it. probeGitRepository
+   * strips these before asking, so seeing one here means the guard under test
+   * is not doing its job.
+   */
+  const redirected = process.env.GIT_DIR;
+  if (redirected !== undefined && redirected.length > 0 && existsSync(redirected)) {
+    return resolve(process.env.GIT_WORK_TREE ?? from);
+  }
   let dir = resolve(from);
   for (;;) {
     const dot = join(dir, ".git");
-    if (existsSync(dot) && statSync(dot).isDirectory()) return dir;
+    if (existsSync(dot)) {
+      const stats = statSync(dot);
+      if (stats.isDirectory()) return dir;
+      if (stats.isFile() && /^gitdir:\s*\S/.test(readFileSync(dot, "utf8"))) return dir;
+    }
     const up = dirname(dir);
     if (up === dir) return undefined;
     dir = up;

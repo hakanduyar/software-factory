@@ -101,8 +101,25 @@ function makeFixtureRepo(
   );
   writeFileSync(join(root, "package.json"), JSON.stringify({ name: "fixture", type: "module" }, null, 2));
 
-  // Reuse this repository's typescript rather than installing one.
-  symlinkSync(join(REPO_ROOT, "node_modules"), join(root, "node_modules"), "dir");
+  /**
+   * REUSE THIS REPOSITORY'S PACKAGES, ENTRY BY ENTRY.
+   *
+   * This was one symlink to the whole of `node_modules`, so a fixture could not
+   * replace anything inside it. `scripts/verify.mjs` now runs the compiler as
+   * `node node_modules/.bin/tsc` — no shell, no `npx`, no PATH lookup, which is
+   * what AC-12 required — so a fixture that wants to answer `--showConfig`
+   * differently has to substitute THAT file. Linking each entry separately, and
+   * giving `.bin` its own real directory, makes that possible while still
+   * installing nothing.
+   */
+  mkdirSync(join(root, "node_modules/.bin"), { recursive: true });
+  for (const entry of readdirSync(join(REPO_ROOT, "node_modules"))) {
+    if (entry === ".bin") continue;
+    symlinkSync(join(REPO_ROOT, "node_modules", entry), join(root, "node_modules", entry));
+  }
+  for (const entry of readdirSync(join(REPO_ROOT, "node_modules/.bin"))) {
+    symlinkSync(join(REPO_ROOT, "node_modules/.bin", entry), join(root, "node_modules/.bin", entry));
+  }
   return root;
 }
 
@@ -225,6 +242,34 @@ function runHarness(
  * The build must genuinely SUCCEED so the only thing wrong is the config the
  * verifier was handed.
  */
+/**
+ * REPLACE THE COMPILER THE VERIFIER WILL RUN, IN NODE (round-22 review,
+ * CRITICAL 1).
+ *
+ * The shims here used to be `/bin/sh` scripts that located the real `npx` with
+ * `sh -c command -v npx`, so the FIXTURES required a shell on PATH — 132 of the
+ * suite's failures under AC-12's command came from that and from `npx`'s own
+ * use of one. `scripts/verify.mjs` now runs `node node_modules/.bin/tsc`, so
+ * the thing to substitute is that file, and a plain JavaScript file suffices:
+ * it is executed BY node, so it needs no interpreter line and no PATH lookup.
+ */
+function writeTscShim(root: string, body: readonly string[]): void {
+  const real = join(REPO_ROOT, "node_modules/typescript/bin/tsc");
+  const shim = join(root, "node_modules/.bin/tsc");
+  rmSync(shim, { force: true });
+  writeFileSync(
+    shim,
+    [
+      'const { spawnSync } = require("node:child_process");',
+      "const args = process.argv.slice(2);",
+      `const REAL = ${JSON.stringify(real)};`,
+      "const delegate = () => spawnSync(process.execPath, [REAL, ...args], { stdio: \"inherit\" }).status ?? 1;",
+      ...body,
+      "",
+    ].join("\n"),
+  );
+}
+
 function runWithShowConfigShim(root: string, answer: string): { status: number; output: string } {
   /**
    * The shimmed answer inherits the fixture's real `include` unless the caller
@@ -248,32 +293,18 @@ function runWithShowConfigShim(root: string, answer: string): { status: number; 
   }
   const realisticAnswer = JSON.stringify(shown);
 
-  const realNpx = spawnSync("sh", ["-c", "command -v npx"], { encoding: "utf8" }).stdout.trim();
-  assert.ok(realNpx.length > 0, "the fixture needs a real npx to delegate to");
-
-  const shimDir = mkdtempSync(join(tmpdir(), "sf-shim-"));
-  created.push(shimDir);
-  writeFileSync(
-    join(shimDir, "npx"),
-    [
-      "#!/bin/sh",
-      'for a in "$@"; do',
-      `  if [ "$a" = "--showConfig" ]; then cat <<'SHOWCONFIG'`,
-      realisticAnswer,
-      "SHOWCONFIG",
-      "    exit 0",
-      "  fi",
-      "done",
-      `exec ${realNpx} "$@"`,
-      "",
-    ].join("\n"),
-    { mode: 0o755 },
-  );
+  writeTscShim(root, [
+    'if (args.includes("--showConfig")) {',
+    `  process.stdout.write(${JSON.stringify(realisticAnswer)});`,
+    "  process.exit(0);",
+    "}",
+    "process.exit(delegate());",
+  ]);
 
   const result = spawnSync(process.execPath, ["scripts/verify.mjs"], {
     cwd: root,
     encoding: "utf8",
-    env: harnessEnv({ PATH: `${shimDir}:${process.env["PATH"] ?? ""}` }),
+    env: harnessEnv({ PATH: process.env["PATH"] ?? "" }),
   });
   return {
     status: result.status ?? -1,
@@ -292,36 +323,31 @@ function runWithShowConfigShim(root: string, answer: string): { status: number; 
  * build that CREATES the condition is not an artificial case either: a compiler
  * plugin, a postinstall script or a `prepare` hook can emit whatever it likes.
  */
+/**
+ * Run the harness with a build that PLANTS something afterwards. `after` is
+ * NODE SOURCE executed inside the compiler shim, with `require` available and
+ * the fixture root as the working directory.
+ */
 function runWithBuildThatPlants(root: string, after: string): { status: number; output: string } {
-  const realNpx = spawnSync("sh", ["-c", "command -v npx"], { encoding: "utf8" }).stdout.trim();
-  assert.ok(realNpx.length > 0, "the fixture needs a real npx to delegate to");
-
-  const shimDir = mkdtempSync(join(tmpdir(), "sf-buildshim-"));
-  created.push(shimDir);
-  writeFileSync(
-    join(shimDir, "npx"),
-    [
-      "#!/bin/sh",
-      'for a in "$@"; do',
-      `  if [ "$a" = "--showConfig" ]; then exec ${realNpx} "$@"; fi`,
-      // ...and the file LISTING, which is a question rather than a build. Round
-      // 11 added `--listFilesOnly` before the first build, so without this the
-      // `after` action fires on it and a case meaning "on the second BUILD"
-      // silently acts one invocation early.
-      `  if [ "$a" = "--listFilesOnly" ]; then exec ${realNpx} "$@"; fi`,
-      "done",
-      `${realNpx} "$@" || exit $?`,
-      after,
-      "exit 0",
-      "",
-    ].join("\n"),
-    { mode: 0o755 },
-  );
+  writeTscShim(root, [
+    // A `--showConfig` or `--listFilesOnly` is a QUESTION, not a build. Round 11
+    // added the listing before the first build, so acting on it would fire a
+    // case meaning "on the second BUILD" one invocation early.
+    'if (args.includes("--showConfig") || args.includes("--listFilesOnly")) process.exit(delegate());',
+    "const status = delegate();",
+    "if (status !== 0) process.exit(status);",
+    // NODE, NOT SHELL. `execSync` finds `/bin/sh` by absolute path, but the
+    // fragments it ran — `printf`, `ln`, `cp`, `rm`, `mkdir`, `chmod` — are all
+    // PATH lookups, and AC-12's command has no PATH to find them on. The
+    // planting step is ordinary Node code instead, so it depends on nothing.
+    after,
+    "process.exit(0);",
+  ]);
 
   const result = spawnSync(process.execPath, ["scripts/verify.mjs"], {
     cwd: root,
     encoding: "utf8",
-    env: harnessEnv({ PATH: `${shimDir}:${process.env["PATH"] ?? ""}` }),
+    env: harnessEnv({ PATH: process.env["PATH"] ?? "" }),
   });
   return { status: result.status ?? -1, output: `${result.stdout ?? ""}${result.stderr ?? ""}` };
 }
@@ -425,7 +451,7 @@ describe("TASK-010 remediation: the harness itself, end to end", () => {
 
     const { status, output } = runWithBuildThatPlants(
       root,
-      'printf "export const ghost = 1;\\n" > dist/src/ghost.js',
+      'require("node:fs").writeFileSync("dist/src/ghost.js", "export const ghost = 1;\\n");',
     );
     assert.notEqual(status, 0, `a real disagreement must fail:\n${output}`);
     assert.match(output, /ghost\.js/, "the unexplained artifact must be named");
@@ -1022,28 +1048,18 @@ describe("TASK-010 round 2: paths are judged by what they resolve to", () => {
    */
   it("distinguishes a killed config resolution from an unreadable one", () => {
     const root = makeFixtureRepo();
-    const realNpx = spawnSync("sh", ["-c", "command -v npx"], { encoding: "utf8" }).stdout.trim();
-    assert.ok(realNpx.length > 0);
-
-    const shimDir = mkdtempSync(join(tmpdir(), "sf-shim-kill-"));
-    created.push(shimDir);
-    writeFileSync(
-      join(shimDir, "npx"),
-      [
-        "#!/bin/sh",
-        'for a in "$@"; do',
-        '  if [ "$a" = "--showConfig" ]; then kill -TERM $$; sleep 5; fi',
-        "done",
-        `exec ${realNpx} "$@"`,
-        "",
-      ].join("\n"),
-      { mode: 0o755 },
-    );
+    writeTscShim(root, [
+      'if (args.includes("--showConfig")) {',
+      '  process.kill(process.pid, "SIGTERM");',
+      "  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5000);",
+      "}",
+      "process.exit(delegate());",
+    ]);
 
     const result = spawnSync(process.execPath, ["scripts/verify.mjs"], {
       cwd: root,
       encoding: "utf8",
-      env: { ...process.env, PATH: `${shimDir}:${process.env["PATH"] ?? ""}` },
+      env: { ...process.env },
     });
     const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
 
@@ -2079,7 +2095,7 @@ describe("TASK-010 round 9: the guard that runs AFTER the build", () => {
 
     const { status, output } = runWithBuildThatPlants(
       root,
-      `ln -s ${JSON.stringify(outsider)} dist/tests/planted.test.js`,
+      `require("node:fs").symlinkSync(${JSON.stringify(outsider)}, "dist/tests/planted.test.js");`,
     );
     assert.notEqual(status, 0, "a symlink created during the build was never noticed");
     assert.match(output, /planted\.test\.js/);
@@ -2089,7 +2105,7 @@ describe("TASK-010 round 9: the guard that runs AFTER the build", () => {
   /** The same shim, planting nothing, must still pass — or it proves nothing. */
   it("passes when the build plants nothing", () => {
     const root = makeFixtureRepo();
-    const { status, output } = runWithBuildThatPlants(root, "true");
+    const { status, output } = runWithBuildThatPlants(root, "");
     assert.equal(status, 0, `the shim itself broke the run:\n${output}`);
     assert.match(output, /tree-consistent/);
   });
@@ -2210,9 +2226,16 @@ describe("TASK-010 round 10: the repair rebuild is a build like any other", () =
     const marker = join(root, ".second-build");
     const { status, output } = runWithBuildThatPlants(
       root,
-      `if [ -f ${JSON.stringify(marker)} ]; then cp -r dist/. ${JSON.stringify(external)}/ && ` +
-        `rm -rf dist && ln -s ${JSON.stringify(external)} dist; ` +
-        `else : > ${JSON.stringify(marker)}; fi`,
+      [
+        'const fs = require("node:fs");',
+        `if (fs.existsSync(${JSON.stringify(marker)})) {`,
+        `  fs.cpSync("dist", ${JSON.stringify(external)}, { recursive: true });`,
+        '  fs.rmSync("dist", { recursive: true, force: true });',
+        `  fs.symlinkSync(${JSON.stringify(external)}, "dist");`,
+        "} else {",
+        `  fs.writeFileSync(${JSON.stringify(marker)}, "");`,
+        "}",
+      ].join("\n"),
     );
 
     assert.notEqual(status, 0, "the second build redirected the output and nothing looked again");
@@ -2343,7 +2366,14 @@ describe("TASK-010 round 11: readability, AFTER the build for real", () => {
    */
   it("REFUSES when the BUILD makes part of the output unreadable", () => {
     const root = makeFixtureRepo();
-    const { status, output } = runWithBuildThatPlants(root, "mkdir -p dist/hidden && chmod 000 dist/hidden");
+    const { status, output } = runWithBuildThatPlants(
+      root,
+      [
+        'const fs = require("node:fs");',
+        'fs.mkdirSync("dist/hidden", { recursive: true });',
+        'fs.chmodSync("dist/hidden", 0);',
+      ].join("\n"),
+    );
     try {
       assert.notEqual(status, 0, "a directory the build made unreadable was scanned as empty");
       assert.match(output, /could not be read|unreadable/i);
@@ -2580,39 +2610,33 @@ describe("TASK-010 round 14: an entry that is neither a file nor a directory", (
       return;
     }
 
-    const realNpx = spawnSync("sh", ["-c", "command -v npx"], { encoding: "utf8" }).stdout.trim();
-    assert.ok(realNpx.length > 0, "the fixture needs a real npx to delegate to");
-
-    const shimDir = mkdtempSync(join(tmpdir(), "sf-fifoshim-"));
-    created.push(shimDir);
-    writeFileSync(
-      join(shimDir, "npx"),
-      [
-        "#!/bin/sh",
-        "# Config and file-list queries pass straight through: making the FIFO",
-        "# during them would put it in the tree BEFORE the pre-build walk, which",
-        "# is the case the other test already covers.",
-        'for a in "$@"; do',
-        '  case "$a" in',
-        `    --showConfig|--listFilesOnly) exec ${realNpx} "$@" ;;`,
-        "  esac",
-        "done",
-        `${realNpx} "$@"`,
-        "rc=$?",
-        'if [ "$rc" -eq 0 ]; then',
-        "  mkdir -p dist/tests",
-        "  mkfifo dist/tests/emitted.test.js 2>/dev/null || true",
-        "fi",
-        'exit "$rc"',
-        "",
-      ].join("\n"),
-      { mode: 0o755 },
-    );
+    writeTscShim(root, [
+      // Config and file-list queries pass straight through: making the FIFO
+      // during them would put it in the tree BEFORE the pre-build walk, which
+      // is the case the other test already covers.
+      'if (args.includes("--showConfig") || args.includes("--listFilesOnly")) process.exit(delegate());',
+      "const status = delegate();",
+      "if (status === 0) {",
+      '  const { mkdirSync } = require("node:fs");',
+      '  mkdirSync("dist/tests", { recursive: true });',
+      // `mkfifo` is a host program, so it is invoked by absolute path if it is
+      // there and simply skipped if it is not — the surrounding case already
+      // treats an unmakeable FIFO as "not proven here".
+      '  const { spawnSync: run } = require("node:child_process");',
+      '  for (const candidate of ["/usr/bin/mkfifo", "/bin/mkfifo"]) {',
+      '    if (require("node:fs").existsSync(candidate)) {',
+      '      run(candidate, ["dist/tests/emitted.test.js"]);',
+      "      break;",
+      "    }",
+      "  }",
+      "}",
+      "process.exit(status);",
+    ]);
 
     const result = spawnSync(process.execPath, ["scripts/verify.mjs"], {
       cwd: root,
       encoding: "utf8",
-      env: harnessEnv({ PATH: `${shimDir}:${process.env["PATH"] ?? ""}` }),
+      env: harnessEnv({ PATH: process.env["PATH"] ?? "" }),
     });
     const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
 
@@ -2718,40 +2742,25 @@ describe("TASK-010 round 14: each refusal happens at the stage it claims", () =>
     const root = makeFixtureRepo();
     assert.equal(runHarness(root).status, 0, "the fixture must pass before the shim is used");
 
-    const realNpx = spawnSync("sh", ["-c", "command -v npx"], { encoding: "utf8" }).stdout.trim();
-    assert.ok(realNpx.length > 0, "the fixture needs a real npx to delegate to");
-
-    const shimDir = mkdtempSync(join(tmpdir(), "sf-lockshim-"));
-    created.push(shimDir);
-    writeFileSync(
-      join(shimDir, "npx"),
-      [
-        "#!/bin/sh",
-        "# Config and file-list queries pass straight through: locking during",
-        "# them would be caught by the PRE-build check and prove nothing.",
-        'for a in "$@"; do',
-        '  case "$a" in',
-        `    --showConfig|--listFilesOnly) exec ${realNpx} "$@" ;;`,
-        "  esac",
-        "done",
-        `${realNpx} "$@"`,
-        "rc=$?",
-        'if [ "$rc" -eq 0 ]; then',
-        "  mkdir -p dist/locked",
-        "  chmod 000 dist/locked",
-        "fi",
-        'exit "$rc"',
-        "",
-      ].join("\n"),
-      { mode: 0o755 },
-    );
+    writeTscShim(root, [
+      // Config and file-list queries pass straight through: locking during them
+      // would be caught by the PRE-build check and prove nothing.
+      'if (args.includes("--showConfig") || args.includes("--listFilesOnly")) process.exit(delegate());',
+      "const status = delegate();",
+      "if (status === 0) {",
+      '  const { chmodSync, mkdirSync } = require("node:fs");',
+      '  mkdirSync("dist/locked", { recursive: true });',
+      '  chmodSync("dist/locked", 0);',
+      "}",
+      "process.exit(status);",
+    ]);
 
     const locked = join(root, "dist/locked");
     try {
       const result = spawnSync(process.execPath, ["scripts/verify.mjs"], {
         cwd: root,
         encoding: "utf8",
-        env: harnessEnv({ PATH: `${shimDir}:${process.env["PATH"] ?? ""}` }),
+        env: harnessEnv({ PATH: process.env["PATH"] ?? "" }),
       });
       const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
 
@@ -4306,7 +4315,7 @@ describe("TASK-017: a repository must present, compile and RUN its deliverable",
    * the sequence a real guard produces — so the failure must NAME the
    * replacement instead.
    */
-  it("refuses a test whose failure never mentions the replacement", () => {
+  it("refuses a test whose failure never executes the module it guards", () => {
     const root = makeRepositoryFixture();
     writeFileSync(
       join(root, "tests/workflowDigest.test.ts"),
@@ -4332,7 +4341,7 @@ describe("TASK-017: a repository must present, compile and RUN its deliverable",
     assert.notEqual(status, 0, `an unattributable failure was accepted as detection:\n${output}`);
     assert.match(
       output,
-      /without ever mentioning the replacement/,
+      /without ever EXECUTING it/,
       `refused, but not for the unattributable failure:\n${output}`,
     );
   });
@@ -4374,8 +4383,54 @@ describe("TASK-017: a repository must present, compile and RUN its deliverable",
     assert.notEqual(status, 0, `a forged attribution was accepted:\n${output}`);
     assert.match(
       output,
-      /without ever mentioning the replacement/,
+      /without ever EXECUTING it/,
       `refused, but not for the forged attribution:\n${output}`,
+    );
+  });
+
+  /**
+   * ROUND-22 CRITICAL. Round 21 made the token random so it could not be typed
+   * in advance. This test does not type it — it READS it, out of the replaced
+   * module on disk, and throws it. It never imports the module, passes its
+   * baseline, and fails under substitution carrying the fresh token.
+   *
+   * Every version of that check asked what the test SAID, and a test can say
+   * anything. Coverage asks what it DID: reading a file as text never executes
+   * it, and no output can forge that.
+   */
+  it("refuses a test that reads the token out of the replaced module", () => {
+    const root = makeRepositoryFixture();
+    writeFileSync(
+      join(root, "tests/workflowDigest.test.ts"),
+      [
+        'import assert from "node:assert/strict";',
+        'import { describe, it } from "node:test";',
+        'import { readFileSync } from "node:fs";',
+        'import { join } from "node:path";',
+        "// guards workflowDigest",
+        'const replaced = join(process.cwd(), "dist/src/verification/workflowDigest.js");',
+        'let token: string | undefined;',
+        "try {",
+        '  token = /SF_CANARY_[0-9a-f]+/.exec(readFileSync(replaced, "utf8"))?.[0];',
+        "} catch {",
+        "  token = undefined;",
+        "}",
+        'describe("tests/workflowDigest.test.ts", () => {',
+        '  it("fails only when the replacement is present", () => {',
+        "    if (token !== undefined) throw new Error(token);",
+        "    assert.equal(1, 1);",
+        "  });",
+        "});",
+        "",
+      ].join("\n"),
+    );
+
+    const { status, output } = runHarness(root);
+    assert.notEqual(status, 0, `a token read off disk was accepted as attribution:\n${output}`);
+    assert.match(
+      output,
+      /without ever EXECUTING it/,
+      `refused, but not for the unexecuted module:\n${output}`,
     );
   });
 

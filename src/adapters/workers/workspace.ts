@@ -69,11 +69,38 @@ interface GitProbeResult {
  * cannot hang or flood workspace resolution.
  */
 function probeGitRepository(candidate: string, gitExecutable: string): GitProbeResult {
+  /**
+   * THE ENVIRONMENT MUST NOT ANSWER THE QUESTION (round-22 review, HIGH 5).
+   *
+   * This probe exists to decide whether CANDIDATE is a repository. Git also
+   * accepts that answer from the environment: with `GIT_DIR` pointing at a real
+   * repository, `rev-parse --show-toplevel` succeeds for an arbitrary directory,
+   * and the reviewer used exactly that to make `resolveWorkspace` accept one.
+   *
+   * The variables that redirect git are therefore removed from the child's
+   * environment. Nothing legitimate here depends on them: the question is about
+   * a path, and the path is passed as `-C` and `cwd`.
+   */
+  const environment = { ...process.env };
+  for (const redirect of [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+  ]) {
+    delete environment[redirect];
+  }
+
   const result = spawnSync(gitExecutable, ["-C", candidate, "rev-parse", "--show-toplevel"], {
     cwd: candidate,
     encoding: "utf8",
     shell: false,
     timeout: 10_000,
+    env: environment,
   });
 
   if (result.error !== undefined) {

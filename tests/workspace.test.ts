@@ -13,7 +13,7 @@
 
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { after, describe, it } from "node:test";
@@ -21,6 +21,7 @@ import { after, describe, it } from "node:test";
 import { resolveWorkspace } from "../src/adapters/workers/workspace.js";
 import { ValidationError } from "../src/domain/errors.js";
 import { cleanupTempWorkspaces, createTempWorkspace } from "./support/tempWorkspace.js";
+import { ensureNodeGit, writeRepositoryLayout } from "./support/nodeGit.js";
 
 after(cleanupTempWorkspaces);
 
@@ -132,5 +133,67 @@ describe("resolveWorkspace", () => {
       assert.ok(!error.message.includes("\n"), "thrown message must be a single line, not raw multi-line stderr");
       assert.ok(error.message.length < 1000, "thrown message must be bounded, not an unbounded dump");
     }
+  });
+});
+
+/**
+ * ROUND-22 HIGH 5 — THE ENVIRONMENT MUST NOT ANSWER A QUESTION ABOUT A PATH.
+ *
+ * `resolveWorkspace` proves a directory is a repository by asking git, and the
+ * message says "not merely a `.git` filesystem entry" precisely so a planted
+ * directory cannot satisfy it. Git will also take that answer from the
+ * ENVIRONMENT: with `GIT_DIR` pointing at a real repository, `rev-parse
+ * --show-toplevel` succeeds for any directory at all, and the reviewer used
+ * exactly that to make an arbitrary temporary directory pass.
+ *
+ * The probe now removes the redirection variables from the child's environment.
+ * Nothing legitimate depended on them — the question is about a path, and the
+ * path is passed as `-C` and as `cwd`.
+ */
+describe("TASK-017 round-22: a redirected git environment cannot vouch for a directory", () => {
+  const created: string[] = [];
+  const saved = new Map<string, string | undefined>();
+
+  after(() => {
+    for (const [name, value] of saved) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    for (const dir of created) rmSync(dir, { recursive: true, force: true });
+  });
+
+  function withEnv(name: string, value: string): void {
+    if (!saved.has(name)) saved.set(name, process.env[name]);
+    process.env[name] = value;
+  }
+
+  for (const redirect of ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"]) {
+    it(`refuses a non-repository even when ${redirect} points at a real one`, () => {
+      ensureNodeGit();
+      const real = mkdtempSync(join(tmpdir(), "sf-realrepo-"));
+      const notARepo = mkdtempSync(join(tmpdir(), "sf-notrepo-"));
+      created.push(real, notARepo);
+      writeRepositoryLayout(real);
+      withEnv(redirect, join(real, ".git"));
+
+      assert.throws(
+        () => resolveWorkspace(notARepo),
+        /not inside a real git repository/,
+        `${redirect} made an arbitrary directory pass as a repository`,
+      );
+    });
+  }
+
+  /** NON-VACUITY: a real repository still resolves with those variables set. */
+  it("still accepts a real repository while the environment is redirected", () => {
+    ensureNodeGit();
+    const real = mkdtempSync(join(tmpdir(), "sf-realrepo2-"));
+    const other = mkdtempSync(join(tmpdir(), "sf-other-"));
+    created.push(real, other);
+    writeRepositoryLayout(real);
+    writeRepositoryLayout(other);
+    withEnv("GIT_DIR", join(other, ".git"));
+
+    assert.equal(resolveWorkspace(real).root, realpathSync(real));
   });
 });

@@ -20,12 +20,14 @@ export const MANIFEST = "src/verification/guardedModules.ts";
 export const LIMITS = "docs/KNOWN-LIMITATIONS.md";
 export const FINANCIAL = "src/supervision/financialSafety.ts";
 export const BINDING = "src/github/candidateBinding.ts";
+export const WORKSPACE = "src/adapters/workers/workspace.ts";
 
 export const T_WF = "dist/tests/workflowPolicy.test.js";
 export const T_HON = "dist/tests/knownLimitationsHonesty.test.js";
 export const T_PUSH = "dist/tests/pushAuthorization.test.js";
 export const T_BIND = "dist/tests/candidateBinding.test.js";
 export const T_DIG = "dist/tests/workflowDigest.test.js";
+export const T_WS = "dist/tests/workspace.test.js";
 export const T_REC = "dist/tests/mutationHarnessRecovery.test.js";
 /**
  * MUTATING THIS FILE ITSELF (round-20 review). The recovery path lives here,
@@ -349,15 +351,24 @@ export const MUTATIONS = [
     tests: [T_E2E],
     expect: "refuses a manifest that declares the same pair twice",
   },
-  // ---- round-21: forgeable tokens, dangling links, shell expansion --------
   {
-    id: "the attribution token is a constant a test could type",
-    edits: [[VERIFIER,
-      "  const CANARY_TOKEN = `SF_CANARY_${randomBytes(12).toString(\"hex\")}`;",
-      '  const CANARY_TOKEN = "SF_CANARY";']],
-    tests: [T_E2E],
-    expect: "refuses a test that prints the marker without touching its module",
+    id: "a redirected git environment is passed to the probe",
+    edits: [[WORKSPACE,
+      "    delete environment[redirect];",
+      "    void redirect;"]],
+    tests: [T_WS],
+    expect: "refuses a non-repository even when GIT_DIR points at a real one",
   },
+  // ---- round-22: attribution is execution, not output --------------------
+  {
+    id: "coverage of the replaced module is not required",
+    edits: [[VERIFIER,
+      "    } else if (!substituted.executed.has(compiledModule)) {",
+      "    } else if (false) {"]],
+    tests: [T_E2E],
+    expect: "refuses a test that reads the token out of the replaced module",
+  },
+  // ---- round-21: forgeable tokens, dangling links, shell expansion --------
   {
     id: "a dangling symlink is read as an absent file",
     edits: [[VERIFIER_MUT,
@@ -406,10 +417,10 @@ export const MUTATIONS = [
   {
     id: "any failure counts as detection, attributable or not",
     edits: [[VERIFIER,
-      "    } else if (!substituted.said.includes(CANARY_TOKEN)) {",
+      "    } else if (!substituted.executed.has(compiledModule)) {",
       "    } else if (false) {"]],
     tests: [T_E2E],
-    expect: "refuses a test whose failure never mentions the replacement",
+    expect: "refuses a test whose failure never executes the module it guards",
   },
   // ---- round-16: presence is not detection --------------------------------
   /**

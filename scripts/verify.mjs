@@ -132,18 +132,36 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import {
   existsSync,
+  mkdtempSync,
+  readdirSync,
   lstatSync,
   readFileSync,
-  readdirSync,
   realpathSync,
   rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+
+/**
+ * THE COMPILER IS RUN BY NODE, NOT THROUGH A SHELL (round-22 review, CRITICAL 1).
+ *
+ * Every build here went through `npx tsc`, and `npx` runs its argument with
+ * `sh -c`. AC-12 says no test may require anything installed on the host beyond
+ * Node itself, and the reviewer's command — a PATH holding only Node — failed
+ * 132 tests with `spawn sh ENOENT`, every one of them an end-to-end fixture
+ * that builds a repository by running this file.
+ *
+ * `node_modules/.bin/tsc` is an ordinary JavaScript file with a shebang, so
+ * Node can execute it directly. That removes the shell, the PATH lookup and
+ * `npx`'s own resolution from the build path: the compiler is found by a path
+ * this file computes, and nothing in between can be substituted.
+ */
+const TSC = join(REPO_ROOT, "node_modules/.bin/tsc");
 
 /**
  * ONE ANSWER TO "IS THIS PATH OUTSIDE THE REPOSITORY?" (round-23 CRITICAL).
@@ -626,7 +644,7 @@ function listFiles(directory, skipExcluded = false) {
 }
 
 function build() {
-  execFileSync("npx", ["tsc", "-p", "tsconfig.json"], { cwd: REPO_ROOT, stdio: "inherit" });
+  execFileSync(process.execPath, [TSC, "-p", "tsconfig.json"], { cwd: REPO_ROOT, stdio: "inherit" });
 }
 
 // --- 1. refuse an unreasonable tree BEFORE building --------------------------
@@ -653,7 +671,7 @@ function build() {
 // the raw text would miss it entirely — a silent pass with no attacker involved.
 const configResolution = (() => {
   try {
-    const shown = execFileSync("npx", ["tsc", "-p", "tsconfig.json", "--showConfig"], {
+    const shown = execFileSync(process.execPath, [TSC, "-p", "tsconfig.json", "--showConfig"], {
       cwd: REPO_ROOT,
       encoding: "utf8",
       // A hung `--showConfig` would otherwise produce no verdict at all, which
@@ -876,7 +894,7 @@ if (isSymlink(join(REPO_ROOT, OUTPUT_DIR))) {
 function compilerInputs() {
   let listed;
   try {
-    listed = execFileSync("npx", ["tsc", "-p", "tsconfig.json", "--listFilesOnly"], {
+    listed = execFileSync(process.execPath, [TSC, "-p", "tsconfig.json", "--listFilesOnly"], {
       cwd: REPO_ROOT,
       encoding: "utf8",
       timeout: CONFIG_TIMEOUT_MS,
@@ -2257,9 +2275,52 @@ if (looksLikeRepository) {
    */
   const CANARY_TOKEN = `SF_CANARY_${randomBytes(12).toString("hex")}`;
 
+  /**
+   * DID THE TEST EXECUTE THE MODULE? (round-22 review, CRITICAL 2.)
+   *
+   * Round 21 required the substituted failure to NAME the replacement, and the
+   * token was made random per run so it could not be typed in advance. Round 22
+   * did not type it — it READ it, out of the replaced file on disk, and threw
+   * it. The test never imported the module, passed its baseline, failed under
+   * substitution with the fresh token, and the canary called that detection.
+   *
+   * Every version of this has asked what the test SAID. A test can say
+   * anything. So the question changes to what the test DID: V8 coverage names
+   * the scripts a process actually executed, and a test that reads a file as
+   * text never executes it. That is not forgeable by any output.
+   */
+  const executedFiles = (coverageDir) => {
+    const executed = new Set();
+    let entries;
+    try {
+      entries = readdirSync(coverageDir);
+    } catch {
+      return executed;
+    }
+    for (const entry of entries) {
+      let parsed;
+      try {
+        parsed = JSON.parse(readFileSync(join(coverageDir, entry), "utf8"));
+      } catch {
+        continue;
+      }
+      for (const script of parsed.result ?? []) {
+        const ran = (script.functions ?? []).some((fn) =>
+          (fn.ranges ?? []).some((range) => range.count > 0),
+        );
+        if (ran && typeof script.url === "string" && script.url.startsWith("file://")) {
+          executed.add(fileURLToPath(script.url));
+        }
+      }
+    }
+    return executed;
+  };
+
   const runPairedTest = (artifact) => {
     const env = { ...process.env };
     delete env["NODE_TEST_CONTEXT"];
+    const coverageDir = mkdtempSync(join(tmpdir(), "sf-canary-cov-"));
+    env["NODE_V8_COVERAGE"] = coverageDir;
     /**
      * RUN THE FILE, NOT `node --test <file>` (round-18 review, HIGH 2).
      *
@@ -2286,16 +2347,19 @@ if (looksLikeRepository) {
      * branching on one, so there is no untested arm of a message either.
      */
     const said = `${run.stdout ?? ""}${run.stderr ?? ""}`;
+    const executed = executedFiles(coverageDir);
+    rmSync(coverageDir, { recursive: true, force: true });
     if (run.error !== undefined || run.status === null) {
       return {
         outcome: "unmeasured",
         said,
+        executed,
         detail:
           `the run did not complete (error: ${run.error?.message ?? "none"}, ` +
           `signal: ${run.signal ?? "none"}, status: ${run.status ?? "none"})`,
       };
     }
-    return { outcome: run.status === 0 ? "passed" : "failed", said, detail: `exit ${run.status}` };
+    return { outcome: run.status === 0 ? "passed" : "failed", said, executed, detail: `exit ${run.status}` };
   };
 
   const undetected = [];
@@ -2425,7 +2489,7 @@ if (looksLikeRepository) {
       );
     } else if (substituted.outcome !== "failed") {
       undetected.push(`${test} could not be measured against a replaced ${module}: ${substituted.detail}`);
-    } else if (!substituted.said.includes(CANARY_TOKEN)) {
+    } else if (!substituted.executed.has(compiledModule)) {
       /**
        * PASS-THEN-FAIL IS NOT ATTRIBUTION (round-20 review, CRITICAL 2).
        *
@@ -2438,11 +2502,12 @@ if (looksLikeRepository) {
        * exactly the sequence a real guard produces.
        *
        * So the failure must NAME the replacement. Every replaced export either
-       * throws a token generated FOR THIS RUN when called, or carries it as
-       * the sentinel's value when read, and a test that genuinely touched one
-       * surfaces that token in the failure `node:test` prints. Round 21 forged
-       * a constant marker by typing it into an assertion message; a random
-       * token cannot be typed in advance. A test that failed for its own reasons says
+       * throws a token generated FOR THIS RUN when called, or carries it as the
+       * sentinel's value when read — but the token is no longer what decides
+       * attribution, because round 22 read it out of the replaced file and
+       * threw it without importing anything. What decides it is V8 COVERAGE of
+       * the replaced module: a test that reads a file as text never executes
+       * it, and no output can forge that. A test that failed for its own reasons says
        * nothing about the module, and that is now the difference between
        * evidence and coincidence.
        *
@@ -2451,8 +2516,8 @@ if (looksLikeRepository) {
        * it. Mutation testing covers that; this covers attribution.
        */
       undetected.push(
-        `${test} fails against a replaced ${module} without ever mentioning the replacement, so the failure ` +
-          `is not attributable to it (${substituted.detail})`,
+        `${test} fails against a replaced ${module} without ever EXECUTING it, so the failure is not ` +
+          `attributable to it (${substituted.detail})`,
       );
     }
   }

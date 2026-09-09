@@ -75,6 +75,8 @@ import {
   T_DIG,
   T_E2E,
   T_REC,
+  T_WS,
+  WORKSPACE,
   VERIFIER_MUT,
 } from "./mutations.mjs";
 
@@ -411,12 +413,41 @@ if (ownership === undefined) {
             `(${error?.code ?? "unknown"}).`,
         );
       }
+      /**
+       * THE OPENED FILE NAMES ITSELF (round-22 review, CRITICAL 3).
+       *
+       * `O_NOFOLLOW` protects only the FINAL component. The reviewer swapped a
+       * validated PARENT for a symlink or a same-device bind mount between
+       * `realpathSync(dirname(target))` and the open, and the descriptor then
+       * passed the device, type and link-count checks while pointing outside
+       * the repository.
+       *
+       * Every one of those checks describes a name resolved separately from the
+       * open. `/proc/self/fd/N` does not: it resolves the file THIS descriptor
+       * actually refers to, so there is no second resolution to race. If that
+       * path is not inside the repository, the swap happened and this refuses.
+       */
+      let openedPath;
+      try {
+        openedPath = realpathSync(`/proc/self/fd/${fd}`);
+      } catch {
+        openedPath = undefined;
+      }
+      const openedRel = openedPath === undefined ? ".." : relative(ROOT_REAL, openedPath);
       const opened = fstatSync(fd);
-      if (opened.dev !== ROOT_DEV || !opened.isFile() || opened.nlink !== 1) {
+      if (
+        openedPath === undefined ||
+        openedRel === "" ||
+        openedRel.startsWith("..") ||
+        isAbsolute(openedRel) ||
+        opened.dev !== ROOT_DEV ||
+        !opened.isFile() ||
+        opened.nlink !== 1
+      ) {
         closeSync(fd);
         refuseJournal(
           `records ${JSON.stringify(file)}, which is not the ordinary in-repository file it claimed to be ` +
-            "at the moment of writing.",
+            `at the moment of writing (the descriptor resolves to ${JSON.stringify(openedPath ?? "nothing")}).`,
         );
       }
       ftruncateSync(fd, 0);
@@ -555,8 +586,6 @@ if (!restored.ok) {
 }
 const end = runTests(allTests);
 console.log(`restored: pass=${end.pass} fail=${end.fail}`);
-/** The closing evidence is in; nothing is owed and nothing is owned. */
-rmSync(JOURNAL, { force: true });
 
 for (const file of touched) {
   if (sha256(file) !== hashes.get(file)) {
@@ -564,6 +593,16 @@ for (const file of touched) {
     process.exit(2);
   }
 }
+
+/**
+ * OWNERSHIP OUTLIVES THE LAST CHECK (round-22 review, HIGH 4).
+ *
+ * The journal was removed before this loop, so a second run could take the lock
+ * during the final byte verification; killing the first process then left
+ * incomplete closing evidence with nobody owning it. It is released here, after
+ * the last thing that can fail.
+ */
+rmSync(JOURNAL, { force: true });
 console.log("all touched files verified byte-for-byte against the run-start baseline");
 
 const bad = results.filter(([, outcome]) => outcome !== "KILLED");

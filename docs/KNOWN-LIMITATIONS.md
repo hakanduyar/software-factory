@@ -1338,3 +1338,52 @@ honest half of taking it.
 implement, so a test that starts depending on more of git fails rather than
 passing on a stub; the workspace cases that require a REFUSAL for a
 non-repository still assert it, and they fail if the shim answers wrongly.
+
+## L-21 - The journal's write-time containment is defence in depth, not mutation-proven
+
+**Status:** OPEN, deliberate, and classified by an explicit owner decision.
+
+`scripts/mutate.mjs` validates every path a crash journal records before writing
+any of them: relative, normalised, no `..`, an ordinary file, one link, and a
+containing directory that resolves inside this repository. Round 22 showed that
+all of those describe a NAME, and a name can stop meaning what it meant — a
+parent directory swapped for a symlink or a same-device bind mount between the
+check and the open leaves every one of them satisfied while the descriptor
+points outside the tree.
+
+So the write is also validated at the descriptor: the file is opened
+`O_NOFOLLOW`, and `/proc/self/fd/<n>` is resolved to learn what that descriptor
+actually refers to. That resolution comes from the open file rather than from a
+name looked up separately, so there is no second lookup to race, and a path that
+is not inside the repository refuses before anything is truncated.
+
+**What evidence exists.** The clause is exercised on every recovery: each restore
+opens through it, and the recovery fixtures in
+`tests/mutationHarnessRecovery.test.ts` all pass through it on their way to
+refusing or restoring. Its sibling checks — traversal, symlinks, hardlinks,
+dangling links, duplicate records, base64 fidelity, live owners — each have a
+fixture and a mutation.
+
+**What evidence does not exist, stated plainly.** There is no mutation proving
+this clause alone is load-bearing, and no fixture that reaches it as the SOLE
+reason for a refusal. Both would require a barrier inside the harness to stop it
+mid-run and swap a directory underneath it, and the owner has decided against
+adding production pause hooks to make a race deterministically triggerable. It
+is therefore defence in depth: it removes a real escape the reviewer
+demonstrated, and it is not acceptance evidence.
+
+This repository has deleted five clauses for being unfalsifiable, and the rule
+that produced those deletions would delete this one too. It is kept because a
+reviewer demonstrated the escape it closes and the owner classified it
+explicitly. Recording the disagreement between the rule and the decision is more
+honest than quietly applying whichever suits the current change.
+
+**AC-11 is not claimed for it.** That criterion asks that existing guards remain
+load-bearing and that the harness report zero survivors and zero unmeasured
+mutations, which it does. It does not say every clause carries its own mutation,
+and this entry exists so nobody reads the green mutation result as covering
+something it does not.
+
+**Kept honest by:** this entry, and by `scripts/mutations.mjs` containing no
+mutation claiming to cover the clause — an absence that would otherwise be
+invisible.

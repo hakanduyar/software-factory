@@ -1555,7 +1555,13 @@ describe("TASK-011 round 8: guards a reviewer's mutations survived", () => {
       wrapper,
       [
         "#!/bin/sh",
-        `printf '%s %s\n' "$$" "$(ps -o pgid= -p $$ | tr -d ' ')" >> ${JSON.stringify(record)}`,
+        // BUILTINS ONLY (AC-12). This asked `ps` and `tr` for the process
+        // group, and both are PATH lookups — with a PATH holding only Node the
+        // wrapper recorded a malformed line and the case failed for a reason it
+        // was not testing. Field five of /proc/<pid>/stat is the process group,
+        // and `read`/`echo` are shell builtins, so this needs nothing installed.
+        "read -r _ _ _ _ pgid _ < /proc/$$/stat",
+        `echo "$$ $pgid" >> ${JSON.stringify(record)}`,
         `exec ${JSON.stringify(process.execPath)} "$@"`,
         "",
       ].join("\n"),
