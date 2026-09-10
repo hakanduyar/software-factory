@@ -1,7 +1,58 @@
 # Pipeline state
 
 Where the autonomous review/remediation loop stands, recorded here rather than
-left in whatever conversation happened to be open. Written 2026-08-27.
+left in whatever conversation happened to be open. Written 2026-08-27,
+updated 2026-09-10.
+
+## Where this stands — 2026-09-10
+
+`TASK-017` (`CLEAN_ROOM_CI`) is ACCEPTED and INTEGRATED. `main` was
+fast-forwarded from `665bc35` to `d124e1b`; nothing was force-pushed and no
+history was rewritten, and `main`'s tree was proven equal to the reviewed tree
+before the push.
+
+| Fact | Value |
+|---|---|
+| Candidate reviewed | `d124e1b` on `feat/clean-room-ci` |
+| Tree | `bd7dbaeb8180429ebcc53d0628773ca4b30b497b`, unchanged across the review |
+| Frozen criteria | `docs/tasks/TASK-017-clean-room-ci.md` at `c287a42`, object `563d4cb` |
+| Verdict | `PASS_WITH_NON_BLOCKING_NOTES`, `Safe to commit: YES`, CRITICAL 0, HIGH 0 |
+| Reviewer | Codex CLI, `gpt-5.6-luna`, effort `xhigh`, fresh session, round 24 |
+| Suite | 2524 pass, 0 fail |
+| Strict AC-12 probe | 2513 pass, 0 fail, 11 expected `unshare` skips |
+| Mutation set | 94 KILLED, 0 survived, 0 unmeasured, both closing proofs present |
+
+Twenty-four rounds. The deliverable took eight; the other sixteen were spent on
+the machinery that proves the deliverable, and round 23 ended with an owner
+decision to REMOVE the "canary" rather than harden it an eighth time. Every
+version of it asked a child process to attest to its own honesty, and anything
+that child can produce it can fake. The reviewer was asked directly whether the
+removal took away a property `AC-1`–`AC-12` requires and answered that it did
+not: it removed an optional, repeatedly forgeable self-attestation surface, and
+`AC-11` rests where it always did, on the out-of-process mutation harness.
+`L-19` now says so in the register.
+
+### What comes next, and why
+
+`DURABLE_ORCHESTRATION` (`docs/tasks/TASK-018-durable-orchestration.md`),
+PROPOSED and awaiting `PLAN_APPROVAL`. It is placed ahead of model
+qualification and `MEASURED_MODEL_ROUTER` by owner instruction.
+
+The reason is in the twenty-four rounds themselves. The Factory's DURABLE state
+is well defended and TASK-008 and TASK-012 defend it; the state of work IN
+FLIGHT lived in process memory, ad-hoc files and scratchpad scripts, and was
+lost whenever anything died. A finished review sat unnoticed for hours because
+nothing emitted a completion event. Work was reported as running three times
+when no process had been started. A killed mutation run left the tree poisoned
+twice. Measuring models is worth little while the thing invoking them cannot
+survive a restart.
+
+Note that TASK-018 cannot simply be appended to the roadmap catalog: `order` and
+`dependsOn` are reconciled DEFINITION fields, so renumbering the items after it
+would make an existing installation refuse its own persisted roadmap at startup.
+`DEFAULT_ROADMAP` was therefore left untouched, and the choice between appending
+at the end and introducing a declared catalog upgrade belongs to planning. The
+task file states both options and picks neither.
 
 ## Reviewer quota: probe, do not read the reset time
 
@@ -107,11 +158,13 @@ rather than untidiness.
    reports and never acts, and it says UNVERIFIABLE-HERE for the conditions a
    machine cannot check rather than scoring them as passes.
 
-Currently queued: `fix/review-notes-r14`, answering the round-14 non-blocking
-notes and the two round-15 blocking findings.
+Nothing is queued for review. `fix/review-notes-r14` named here previously is
+long since answered, and every branch this file lists is integrated.
 
-`EXECUTOR_WIRING` is UNBLOCKED: both prerequisites are accepted and integrated.
-`LOCAL_24_7_RUNTIME` remains `PLATFORM_CAPABILITY_BLOCKED`.
+`EXECUTOR_WIRING`, `GITHUB_ORCHESTRATION` and `CLEAN_ROOM_CI` are all accepted
+and integrated. `LOCAL_24_7_RUNTIME` remains `PLATFORM_CAPABILITY_BLOCKED`. The
+next review this pipeline runs is TASK-018's, and it cannot start until the
+owner freezes that task's criteria.
 
 ## One finding answered with a limit rather than a fix
 
