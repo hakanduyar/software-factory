@@ -359,15 +359,6 @@ export const MUTATIONS = [
     tests: [T_WS],
     expect: "refuses a non-repository even when GIT_DIR points at a real one",
   },
-  // ---- round-22: attribution is execution, not output --------------------
-  {
-    id: "coverage of the replaced module is not required",
-    edits: [[VERIFIER,
-      "    } else if (!substituted.executed.has(compiledModule)) {",
-      "    } else if (false) {"]],
-    tests: [T_E2E],
-    expect: "refuses a test that reads the token out of the replaced module",
-  },
   // ---- round-21: forgeable tokens, dangling links, shell expansion --------
   {
     id: "a dangling symlink is read as an absent file",
@@ -413,120 +404,6 @@ export const MUTATIONS = [
     edits: [[VERIFIER_MUT, "      if (claimed" + ".has(target)) {", "      if (false) {"]],
     tests: [T_REC],
     expect: "refuses a journal recording the same file twice",
-  },
-  {
-    id: "any failure counts as detection, attributable or not",
-    edits: [[VERIFIER,
-      "    } else if (!substituted.executed.has(compiledModule)) {",
-      "    } else if (false) {"]],
-    tests: [T_E2E],
-    expect: "refuses a test whose failure never executes the module it guards",
-  },
-  // ---- round-16: presence is not detection --------------------------------
-  /**
-   * THE CANARY. Each required test is run against a build of its module with
-   * every export replaced, and must FAIL. These three switch off the clauses
-   * that make that a refusal rather than a remark.
-   */
-  {
-    id: "a test that detects nothing is not refused",
-    edits: [[VERIFIER,
-      "  if (undetected.length > 0) {",
-      "  if (false) {"]],
-    tests: [T_E2E],
-    expect: "refuses a required test that does not exercise the module it guards",
-  },
-  // ---- round-18: the canary must not measure its own generator -----------
-  {
-    id: "the replacement is generated for identifiers only",
-    edits: [[VERIFIER,
-      "        const alias = name === \"default\" ? \"default\" : JSON.stringify(name);\n        return `const ${local} = ${value};\\nexport { ${local} as ${alias} };`;",
-      "        return name === \"default\"\n          ? `const ${local} = ${value};\\nexport default ${local};`\n          : `const ${local} = ${value};\\nexport const ${name} = ${local};`;"]],
-    tests: [T_E2E],
-    expect: "accepts a repository whose module exports a name that is not an identifier",
-  },
-  /**
-   * THE SELF-CHECK'S OTHER HALF. No FIXTURE can reach either arm — only a
-   * defect in this verifier's own generator triggers them — so the generator is
-   * what the mutations break, and the healthy-repository controls catch it.
-   */
-  {
-    id: "the replacement need not offer every export the module did",
-    edits: [[VERIFIER,
-      "      ...names.map((name, index) => {",
-      "      ...names.slice(1).map((name, index) => {"]],
-    tests: [T_E2E],
-    expect: "accepts a repository whose deliverable is present, compiled and executed",
-  },
-  {
-    id: "an abandoned replacement in the output is inherited",
-    edits: [[VERIFIER,
-      "  if (abandoned.length > 0) {",
-      "  if (false) {"]],
-    tests: [T_E2E],
-    expect: "refuses output that still holds an abandoned canary replacement",
-  },
-  {
-    id: "the paired test runs through a worker that outlives the timeout",
-    edits: [[VERIFIER,
-      "    const run = spawnSync(process.execPath, [artifact], {",
-      "    const run = spawnSync(process.execPath, [\"--test\", artifact], {"]],
-    tests: [T_E2E],
-    expect: "refuses a required test that cannot be measured against a replaced module",
-  },
-  {
-    id: "a test need not pass against its own module first",
-    edits: [[VERIFIER,
-      '    if (baseline.outcome !== "passed") {',
-      "    if (false) {"]],
-    tests: [T_E2E],
-    expect: "refuses a required test that does not pass against its own module",
-  },
-  {
-    id: "a run that could not be measured counts as detection",
-    edits: [[VERIFIER,
-      '    } else if (substituted.outcome !== "failed") {',
-      "    } else if (false) {"]],
-    tests: [T_E2E],
-    expect: "refuses a required test that cannot be measured against a replaced module",
-  },
-  {
-    id: "a run that never completed is read as an ordinary failure",
-    edits: [[VERIFIER,
-      '    if (run.error !== undefined || run.status === null) {',
-      "    if (false) {"]],
-    tests: [T_E2E],
-    expect: "refuses a required test that cannot be measured against a replaced module",
-  },
-  {
-    id: "a module with no exports is treated as guardable",
-    edits: [[VERIFIER,
-      "    if (names.length === 0) {",
-      "    if (false) {"]],
-    tests: [T_E2E],
-    expect: "refuses required modules that export nothing at run time",
-  },
-  {
-    id: "the canary run's outcome is not consulted",
-    edits: [[VERIFIER,
-      '    if (substituted.outcome === "passed") {',
-      "    if (false) {"]],
-    tests: [T_E2E],
-    expect: "refuses a required test that does not exercise the module it guards",
-  },
-  /**
-   * THE OTHER DIRECTION, and it is the one that matters most here: a canary
-   * that refused EVERY repository would satisfy the cases above while breaking
-   * the complete fixture, which is how the first attempt at this guard was
-   * caught.
-   */
-  {
-    id: "the canary refuses even a test that does detect the change",
-    edits: [[VERIFIER,
-      '    if (substituted.outcome === "passed") {',
-      '    if (substituted.outcome !== "this is never an outcome") {']],
-    tests: [T_E2E],
-    expect: "accepts a repository whose deliverable is present, compiled and executed",
   },
   {
     id: "the workflow anchor is no longer required",

@@ -1164,139 +1164,62 @@ The same suite asserts a complete repository fixture still passes and that a
 non-repository fixture still passes, so the refusals are not merely "everything
 fails".
 
-## L-19 - The deliverable canary proves a test EXERCISES its module, not that it asserts anything worthwhile
+## L-19 - `npm test` is not acceptance evidence, and self-attestation was removed
 
-**Status:** OPEN, deliberate. Recorded because the stronger reading — "the
-required tests are known to be meaningful" — claims more than the mechanism
-delivers.
+**Status:** OPEN, deliberate, and the result of an explicit owner decision.
 
-Six rounds of review defeated this guard by widening a deletion; round 16
-defeated it without deleting anything at all. Every file stayed exactly where it
-was — `.git`, the workflow, the manifest, all three modules, both paired tests —
-and their CONTENTS were emptied: modules reduced to `export {};`, tests reduced
-to a marker comment and no assertions. Presence, compilation and pairing all
-held. Three tests executed. Verification reported success over nothing.
+`scripts/verify.mjs` proves things about the TREE: that the required modules are
+present, compiled, paired with the tests the verifier names, and anchored to the
+shipped workflow. It makes no claim about what those tests ASSERT. A repository
+whose modules were reduced to `export {};` and whose tests were reduced to
+marker comments would satisfy every check here.
 
-Presence is a question about files, and no question about files can tell an
-empty one from a full one in any way that survives the next round. So the
-verifier now asks a question about BEHAVIOUR: for each required pair it builds a
-replacement module in which every export throws when called or is a sentinel
-object when read, and requires the paired test to PASS against the real module
-and FAIL against the replacement.
+### What used to be here, and why it is gone
 
-Both halves are load-bearing, and the second was learned the hard way. The first
-version installed the replacement through an ESM load hook fed from the
-environment, and counted ANY non-zero exit as detection. Round 17's reviewer
-wrote a test that ignored its module entirely and threw whenever
-`SF_CANARY_SOURCE` was set: it failed on cue, that was read as detection, and
-verification passed over a deliverable guarding nothing. The mechanism announced
-itself and then believed the answer it had prompted.
+Round 16 added a "canary": each required test was run against a build of its
+module with every export replaced, and had to fail. Seven independent reviews
+defeated it, each in a different way:
 
-So the substitution is no longer visible. The compiled module is replaced ON
-DISK and restored afterwards — no environment variable, no `--import` in
-`process.execArgv`, nothing to key on except the module's own contents, which is
-the thing under test. And a failure must be ATTRIBUTABLE: a test that fails both
-ways proves nothing about the module, so the baseline run must pass before the
-substituted run's failure counts. A run that neither passes nor fails — killed
-on a timeout, or never spawned — is UNMEASURED and refuses, because round 17 also
-hung the verifier indefinitely with a test that looped forever, and silence is
-not a pass.
+- an environment variable told the test when it was being watched;
+- a stateful test failed on cue without touching the module;
+- a bug in the replacement generator made the run fail, and that counted;
+- a scan meant to find leftovers refused honest trees instead;
+- a token was forged by typing the constant into an assertion message;
+- the same token, made random, was forged by reading it off disk;
+- and a coverage record proving execution was simply written by the test.
 
-The timeout is also the only route to that unmeasured path, and reaching it
-safely took two corrections. `node --test` runs each file in a child process, so
-a test that kills itself still leaves the runner exiting non-zero — an ordinary
-failure, not unmeasurability. Worse, killing that runner on a timeout ORPHANED
-the worker: round 18 measured a spinning test alive past 65 seconds and a
-mutation run accumulating them. The paired test is therefore executed directly
-rather than through `--test`, so there is one process and killing it kills
-everything. The bound is shortenable through the environment so a case can reach
-the branch in seconds instead of two minutes. It can only SHORTEN, and shortening it makes runs
-unmeasured, which refuses: no value makes anything pass that would otherwise
-fail. No mutation covers the override itself, because removing it changes no
-outcome, only how long a fixture waits — it is an affordance, not a guard, and
-this paragraph says so rather than leaving a reviewer to discover it.
+The shape never changed. Every version asked a child process to attest to its
+own honesty, and anything that child can produce, it can fake. An eighth
+spelling of the question would not have differed in kind, so the mechanism was
+removed rather than hardened again.
 
-The compiled output is therefore written during verification, inside a
-`try/finally` that restores it. The SOURCE tree is untouched throughout, which is
-what the same run's tree-consistency report is about.
+### Where the property actually lives
 
-**The cleanup claim that used to stand here was false, and it is worth saying
-how.** It read: an interrupted run cannot leave a replacement behind, because
-every verification rebuilds before reaching this point. The rebuild part is true
-and the conclusion is not — `finally` does not run on a `SIGKILL`, so a killed
-verification leaves the replacement sitting in `dist/`. Round 18 demonstrated it
-in one line. I had already watched exactly this happen to `scripts/mutate.mjs`,
-whose own `finally` was skipped by a kill and left a disabled guard behind, and
-I wrote the claim anyway.
+What the canary tried to establish — that these tests genuinely guard these
+modules — is established by `scripts/mutate.mjs`, and properly: out of process,
+by changing real behaviour one edit at a time and requiring a NAMED test to
+fail, with a preflight that refuses invalid definitions, a green baseline, and
+byte-for-byte restoration proofs. That is also what AC-11 asks for, and it is
+not forgeable by a test writing a file, because the evidence is the difference
+between two runs of code the harness controls.
 
-What is true is narrower. The next verification rebuilds and overwrites, so an
-abandoned replacement cannot corrupt a later verification. What it can do is sit
-in the output directory in the meantime, where a concurrent build, a developer
-running compiled tests directly, or any other reader of `dist/` will see a module
-that no build produced. That window is real and it is the cost of substituting in
-place rather than through a hook the test could detect.
+### The limitation, stated exactly
 
-So the abandoned replacement is now found rather than reasoned about. Every
-verification scans the output directory for the canary marker BEFORE it builds —
-before, because afterwards the rebuild has erased the evidence, which is exactly
-why an earlier version of this check placed inside the canary section could never
-fire and was deleted as unfalsifiable. Finding one refuses the run and says to
-delete the output directory. It does not clean up silently: output nobody wrote
-is not a state a verification should quietly repair on its way to reporting
-success.
+**A green `npm test` is not acceptance evidence.** On its own it would not
+notice a deliverable emptied of behaviour. Acceptance in this repository rests
+on the whole chain and always has:
 
-**The limitation, stated exactly.** This proves the test EXERCISES the module.
-It does not prove the test asserts anything worthwhile about it. A test calling
-into the module and discarding the result would still fail here, because the
-replacement throws — so the canary cannot distinguish a rigorous test from a
-credulous one that happens to touch the same functions. It also says nothing
-about modules the manifest declares but `REQUIRED_GUARDS` does not name.
+    mutation preflight → full mutation set → both restoration proofs
+    → full suite → the strict AC-12 probe → independent review
 
-And it does not defeat a test written specifically to defeat it. Nothing stops a
-paired test from reading its own compiled module off disk and behaving
-differently when the contents look replaced; substituting in place removes the
-INCIDENTAL tells — an environment variable, a loader flag — rather than making
-the substitution undetectable in principle. What it buys is that a test must now
-be deliberately adversarial to produce a false green, instead of merely careless
-or freshly generated. That is a real reduction and it is not the same as a
-guarantee, which is the distinction this whole file exists to keep.
+AC-8 already says a green CI run is not acceptance; this entry says the same
+thing about a green local run, and names the chain that is.
 
-What covers that gap is `scripts/mutate.mjs`, which changes real behaviour one
-edit at a time and requires a NAMED test to fail for each. The canary is the
-cheap deterministic floor that runs on every verification; mutation testing is
-the expensive measurement that runs deliberately. Neither replaces the other,
-and claiming the floor is the ceiling is the exact shape of overclaim this file
-exists to prevent.
-
-**One clause here is a self-check rather than a guard, and is declared as
-such.** After substituting, the verifier loads the replacement and requires it to
-offer the same export names the real module offered; if it does not, that is
-reported as a shortfall in this verifier rather than as detection. Round 18's
-CRITICAL was exactly this failure — a generator that emitted `export const
-foo-bar =` for a legal exported name, producing a syntax error the canary read as
-success — so the check exists to stop a bug in this file from masquerading as
-evidence.
-
-Neither half of it can be reached by a FIXTURE, because only a defect in this
-verifier's own generator triggers either one. What covers them is mutation of
-the generator: reverting it to identifier-only output makes the replacement fail
-to load, and dropping an export from it makes the names disagree. Both are
-killed by healthy-repository controls — a repository whose module exports a
-non-identifier name must be accepted, and a complete repository must be accepted
-— because the symptom of this check firing wrongly is a good repository being
-refused. Saying that plainly is better than letting a self-check read as one
-more guard against the tree.
-
-**Kept honest by:** `tests/verificationHarnessEndToEnd.test.ts` reproduces the
-round-16 attack in both halves — "refuses required modules that export nothing
-at run time" and "refuses a required test that does not exercise the module it
-guards" — and the round-17 attack in three: a test that fails on a cue rather
-than on its module, a test that does not pass against its own module, and a test
-that cannot be measured because it hangs once its module is replaced. A complete
-repository fixture, whose stub tests do exercise their stub modules, must still
-pass. `scripts/mutate.mjs` switches each clause off in turn, including one
-mutation that makes the canary refuse every repository, which that complete
-fixture catches.
+**Kept honest by:** `scripts/mutate.mjs` mutating `workflowPolicy.ts`,
+`workflowDocument.ts` and `workflowDigest.ts` and requiring their named tests to
+fail; the chain refusing to freeze a candidate without both closing proofs; and
+`tests/verificationHarnessEndToEnd.test.ts` still proving that a tree missing,
+uncompiled, unpaired or unanchored deliverable is refused.
 
 ## L-20 - The suite's `git` is a Node reimplementation of two queries, not git
 
