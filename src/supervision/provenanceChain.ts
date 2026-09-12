@@ -52,7 +52,25 @@ export const MAX_CHAIN_ENTRIES = 10_000;
  * publication record that could be edited without breaking a digest would be
  * worth less than no record at all.
  */
-export const PROVENANCE_KINDS = ["IMPLEMENTED_BY", "RUN_CONFIGURED", "BLOCKED", "PUBLISHED_AS"] as const;
+/**
+ * `CATALOG_UPGRADED` was added by TASK-018, for the same reason: a declared,
+ * versioned change to the roadmap catalog's DEFINITIONS actually happened to
+ * this database — from which version, to which, by which steps. It is the only
+ * durable evidence that a row's definition changed for a legitimate reason
+ * rather than by a hand edit, and `reconcileRoadmapWithCatalog` refusing every
+ * OTHER definition change is what makes that evidence worth having.
+ *
+ * It carries no `resourceKey` and is not an `IMPLEMENTED_BY` entry, so it can
+ * never make `unprovenCompletion` believe work was done. An upgrade restores
+ * knowledge, never authority.
+ */
+export const PROVENANCE_KINDS = [
+  "IMPLEMENTED_BY",
+  "RUN_CONFIGURED",
+  "BLOCKED",
+  "PUBLISHED_AS",
+  "CATALOG_UPGRADED",
+] as const;
 export type ProvenanceKind = (typeof PROVENANCE_KINDS)[number];
 
 export interface ProvenanceEntry {

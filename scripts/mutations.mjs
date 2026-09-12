@@ -40,6 +40,17 @@ export const T_REC = "dist/tests/mutationHarnessRecovery.test.js";
 export const VERIFIER_MUT = "scripts/mutate.mjs";
 export const T_E2E = "dist/tests/verificationHarnessEndToEnd.test.js";
 
+// ---- TASK-018 Part A: the versioned catalog upgrade -----------------------
+export const CATALOG_UP = "src/supervision/catalogUpgrade.ts";
+export const ROADMAP_CAT = "src/supervision/roadmapCatalog.ts";
+export const SUP_TYPES = "src/supervision/supervisorTypes.ts";
+export const SUP_SVC = "src/supervision/supervisorService.ts";
+export const SUP_REPO = "src/adapters/supervision/sqliteSupervisorRepository.ts";
+
+export const T_CATUP = "dist/tests/catalogUpgrade.test.js";
+export const T_CATPERS = "dist/tests/catalogUpgradePersistence.test.js";
+export const T_ROADMAP = "dist/tests/roadmapStructuralIntegrity.test.js";
+
 export const MUTATIONS = [
   // ---- AC-1: only runners this repository knows to be unmetered -------------
   {
@@ -823,5 +834,142 @@ export const MUTATIONS = [
       "  void 0;"]],
     tests: [T_WF],
     expect: "checkVerificationCommand refuses a run: it cannot read, on its own",
+  },
+
+  // =========================================================================
+  // TASK-018 PART A — the versioned catalog upgrade
+  //
+  // The guard being measured here is unusual: it is the one mechanism in this
+  // repository allowed to CHANGE a persisted roadmap definition, and every
+  // other guard exists to refuse exactly that. So each mutation below asks the
+  // same question from a different side — can the upgrade be made to accept
+  // something it must refuse, to lose progress it must keep, or to leave the
+  // database in a state that is neither the old one nor the new one.
+  // =========================================================================
+
+  // ---- AC-1: the recorded version, and what its absence means --------------
+  {
+    id: "an absent version record is read as the current version",
+    edits: [[CATALOG_UP,
+      "  const recorded = input.recordedVersion ?? PRE_UPGRADE_CATALOG_VERSION;",
+      "  const recorded = input.recordedVersion ?? buildVersion;"]],
+    tests: [T_CATUP],
+    expect: "treats an ABSENT version record as v1",
+  },
+  {
+    id: "a nonsense version record is read as absent instead of refused",
+    edits: [[SUP_REPO,
+      "    if (!Number.isSafeInteger(parsed) || parsed < 1) {",
+      "    if (!Number.isSafeInteger(parsed) || parsed < -1) {"]],
+    tests: [T_CATPERS],
+    expect: "REFUSES a version record that is not a positive integer",
+  },
+  {
+    id: "a fresh database records no catalog version",
+    edits: [[SUP_REPO,
+      "        writeMeta.run(CATALOG_VERSION_KEY, String(ROADMAP_CATALOG_VERSION));",
+      "        void ROADMAP_CATALOG_VERSION;"]],
+    tests: [T_CATPERS],
+    expect: "a database created by this build records THIS build's version",
+  },
+
+  // ---- AC-2: reconciliation gains no power to adopt a disagreeing row ------
+  {
+    id: "reconciliation adopts a disagreeing definition instead of refusing",
+    edits: [[ROADMAP_CAT,
+      "    const disagreement = DEFINITION_FIELDS.find((field) => !sameDefinition(field, row, declared));",
+      "    const disagreement = DEFINITION_FIELDS.find((field) => !sameDefinition(field, row, declared) && false);"]],
+    tests: [T_ROADMAP],
+    expect: "detects a persisted workClass that disagrees with the catalog",
+  },
+
+  // ---- AC-3: only between recognised versions, by declared steps -----------
+  {
+    id: "a gap in the declared chain is bridged with whatever step is first",
+    edits: [[CATALOG_UP,
+      "    const step = steps.find((candidate) => candidate.from === current);",
+      "    const step = steps.find((candidate) => candidate.from === current) ?? steps[0];"]],
+    tests: [T_CATUP],
+    expect: "REFUSES a GAP in the declared chain",
+  },
+  {
+    id: "a database from a newer build is downgraded instead of refused",
+    edits: [[CATALOG_UP,
+      "  if (recorded > buildVersion) {",
+      "  if (recorded > buildVersion + 1000) {"]],
+    tests: [T_CATUP],
+    expect: "REFUSES a recorded version NEWER than this build",
+  },
+
+  // ---- AC-4: unexpected divergence refuses --------------------------------
+  {
+    id: "the upgrade stops comparing rows against the version they claim to be at",
+    edits: [[CATALOG_UP,
+      "    const disagreement = DEFINITION_FIELDS.find((field) => !sameDefinition(field, row, declared));",
+      "    const disagreement = DEFINITION_FIELDS.find((field) => !sameDefinition(field, row, declared) && false);"]],
+    tests: [T_CATUP],
+    expect: "REFUSES a hand-edited definition",
+  },
+  {
+    id: "a key the FROM catalog never declared is invented instead of refused",
+    edits: [[CATALOG_UP,
+      "    const declared = from.byKey.get(row.key);",
+      "    const declared = (from.byKey.get(row.key) ?? row) as RoadmapItem | undefined;"]],
+    tests: [T_CATUP],
+    expect: "REFUSES a key version 1 never declared",
+  },
+  {
+    id: "an item the target catalog drops is kept silently, discarding nothing visibly",
+    edits: [[CATALOG_UP,
+      "    const target = to.byKey.get(row.key);",
+      "    const target = (to.byKey.get(row.key) ?? declared) as RoadmapItem | undefined;"]],
+    tests: [T_CATUP],
+    expect: "would DROP a persisted item",
+  },
+
+  // ---- AC-7/AC-8: progress survives, authority is not created --------------
+  {
+    id: "the upgrade takes the whole row from the catalog, losing progress",
+    edits: [[CATALOG_UP,
+      "    upgraded.push({\n      ...row,\n      key: target.key,",
+      "    upgraded.push({\n      ...target,\n      key: target.key,"]],
+    tests: [T_CATUP],
+    expect: "carries every PROGRESS field across untouched",
+  },
+  {
+    id: "the upgrade records itself as something other than an upgrade",
+    edits: [[SUP_SVC,
+      '      kind: "CATALOG_UPGRADED",',
+      '      kind: "RUN_CONFIGURED",']],
+    tests: [T_CATPERS],
+    expect: "moves the rows AND the version record, preserves progress, and records why",
+  },
+
+  // ---- AC-5: the two writes are one transaction ---------------------------
+  {
+    id: "a failed version write is committed instead of rolled back",
+    edits: [[SUP_REPO,
+      "        writeMeta.run(CATALOG_VERSION_KEY, String(toCatalogVersion));\n        db.exec(\"COMMIT\");\n      } catch (error) {\n        db.exec(\"ROLLBACK\");",
+      "        writeMeta.run(CATALOG_VERSION_KEY, String(toCatalogVersion));\n        db.exec(\"COMMIT\");\n      } catch (error) {\n        db.exec(\"COMMIT\");"]],
+    tests: [T_CATPERS],
+    expect: "a failure writing the version record rolls the rows back too",
+  },
+  {
+    id: "the upgrade records a version one behind the one it applied",
+    edits: [[SUP_REPO,
+      "        writeMeta.run(CATALOG_VERSION_KEY, String(toCatalogVersion));\n        db.exec(\"COMMIT\");",
+      "        writeMeta.run(CATALOG_VERSION_KEY, String(toCatalogVersion - 1));\n        db.exec(\"COMMIT\");"]],
+    tests: [T_CATPERS],
+    expect: "is IDEMPOTENT",
+  },
+
+  // ---- AC-9: the dependency is real ---------------------------------------
+  {
+    id: "the router stops depending on durable orchestration",
+    edits: [[SUP_TYPES,
+      'dependsOn: ["EXECUTOR_WIRING", "DURABLE_ORCHESTRATION"]',
+      'dependsOn: ["EXECUTOR_WIRING"]']],
+    tests: [T_CATPERS],
+    expect: "is NOT eligible while durable orchestration is not DONE",
   },
 ];

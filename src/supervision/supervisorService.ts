@@ -19,6 +19,12 @@
  *   - ambiguity fails closed rather than being retried.
  */
 
+import {
+  CATALOG_UPGRADE_STEPS,
+  planCatalogUpgrade,
+  ROADMAP_CATALOG_VERSION,
+  type CatalogUpgradeStep,
+} from "./catalogUpgrade.js";
 import { reconcileRoadmapWithCatalog, unprovenCompletion } from "./roadmapCatalog.js";
 import {
   ConcurrencyError,
@@ -116,6 +122,18 @@ export interface SupervisorServiceDeps {
    * is precisely the channel this task closes.
    */
   readonly roadmapCatalog?: readonly RoadmapItem[];
+  /**
+   * The roadmap catalog version this installation declares (TASK-018 AC-1).
+   *
+   * Injectable for the same reason `roadmapCatalog` is: the upgrade's refusals
+   * have to be drivable without shipping a fake past in `DEFAULT_ROADMAP`.
+   */
+  readonly catalogVersion?: number;
+  /**
+   * The declared upgrade steps (TASK-018 AC-3). Defaults to the ones this build
+   * ships, and to NONE when a catalog is injected — see `catalogUpgradeSteps`.
+   */
+  readonly catalogUpgradeSteps?: readonly CatalogUpgradeStep[];
   readonly log?: (line: string) => void;
   readonly ownerId?: string;
 }
@@ -2758,9 +2776,122 @@ export class SupervisorService {
    * `state.roadmap` instead would be reading exactly the row this exists to
    * distrust, so the reconciled state REPLACES it rather than sitting beside it.
    */
+  /**
+   * The declared upgrade steps that apply to THIS installation (TASK-018 AC-3).
+   *
+   * An INJECTED catalog gets none. `CATALOG_UPGRADE_STEPS` describes the past of
+   * `DEFAULT_ROADMAP` specifically, and applying it to a catalog someone else
+   * supplied would compare their rows against a history those rows never had —
+   * which is exactly the silent misreading this mechanism exists to refuse.
+   */
+  private catalogUpgradeSteps(): readonly CatalogUpgradeStep[] {
+    if (this.deps.catalogUpgradeSteps !== undefined) {
+      return this.deps.catalogUpgradeSteps;
+    }
+    return this.deps.roadmapCatalog === undefined ? CATALOG_UPGRADE_STEPS : [];
+  }
+
+  /**
+   * Applies a declared catalog upgrade, or refuses (TASK-018 AC-1..AC-9).
+   *
+   * RUNS BEFORE RECONCILIATION, and that order is the whole point. After a
+   * definition changes in the catalog, reconciliation is guaranteed to refuse
+   * the persisted rows — correctly, because it cannot tell a legitimate release
+   * from a hand edit. This is the one thing that can, because it compares the
+   * rows against the version they claim to be at rather than against the
+   * version this build wants them to reach.
+   *
+   * It writes through `applyCatalogUpgrade` rather than `commit`, because the
+   * roadmap and the recorded version have to move in one transaction.
+   */
+  private async upgradeCatalog(
+    state: SupervisorState,
+  ): Promise<{ readonly state: SupervisorState; readonly result?: TickResult }> {
+    const recorded = await this.deps.repository.readCatalogVersion();
+    const verdict = planCatalogUpgrade({
+      ...(recorded === undefined ? {} : { recordedVersion: recorded }),
+      persisted: state.roadmap,
+      buildVersion: this.deps.catalogVersion ?? ROADMAP_CATALOG_VERSION,
+      steps: this.catalogUpgradeSteps(),
+    });
+
+    if (verdict.kind === "ALREADY_CURRENT") {
+      return { state };
+    }
+    if (verdict.kind === "REFUSE") {
+      /**
+       * THE PROBLEM GOES FIRST, for the same reason `structuralRefusal` says so:
+       * `boundedDiagnostic` truncates, and a shared preamble pushes the specific
+       * finding off the end of exactly the message an operator reads. The first
+       * draft of this one led with the preamble and cut the offending field name
+       * in half — "workCla…" — which a test caught before a person had to.
+       */
+      const action =
+        `${verdict.problem}. The roadmap catalog cannot be upgraded to the one this build declares, so what an ` +
+        "item IS cannot be established. Run a build that declares that version, or restore from a known-good backup.";
+      this.log(`[supervisor] roadmap catalog upgrade refused: ${verdict.problem}`);
+      return {
+        state,
+        result: {
+          kind: "WAITING_FOR_HUMAN",
+          roadmapKey: state.roadmap[0]?.key ?? "unknown",
+          reason: "HUMAN_DECISION_REQUIRED",
+          humanActionRequired: boundedDiagnostic(action),
+        },
+      };
+    }
+
+    /**
+     * The audit record is appended BEFORE the write and travels inside the same
+     * transaction (AC-7). Recording it afterwards would leave a window in which
+     * the definitions had moved and nothing said why — which is the state a
+     * hand edit produces, and the one this record exists to distinguish from.
+     */
+    const appended = appendProvenance(state.provenance, {
+      kind: "CATALOG_UPGRADED",
+      roadmapKey: verdict.auditKey,
+      detail: verdict.detail,
+      recordedAt: this.deps.clock.now(),
+    });
+    if (!appended.ok) {
+      this.log(`[supervisor] roadmap catalog upgrade could not be recorded: ${appended.reason}`);
+      return {
+        state,
+        result: {
+          kind: "WAITING_FOR_HUMAN",
+          roadmapKey: state.roadmap[0]?.key ?? "unknown",
+          reason: "HUMAN_DECISION_REQUIRED",
+          humanActionRequired: boundedDiagnostic(
+            `The roadmap catalog upgrade cannot be recorded in durable provenance (${appended.reason}), and an ` +
+              "upgrade that leaves no record is indistinguishable from a hand edit. Nothing was changed.",
+          ),
+        },
+      };
+    }
+
+    const next: SupervisorState = {
+      ...state,
+      version: state.version + 1,
+      roadmap: verdict.roadmap,
+      provenance: appended.chain,
+      provenanceAnchor: anchorFor(appended.chain),
+    };
+    const saved = await this.deps.repository.applyCatalogUpgrade(next, state.version, verdict.to);
+    this.log(`[supervisor] ${verdict.detail}`);
+    return { state: saved };
+  }
+
   private async catalogState(
     state: SupervisorState,
   ): Promise<{ readonly state: SupervisorState; readonly result?: TickResult }> {
+    // The upgrade first: after a declared definition change, reconciliation
+    // would otherwise refuse rows that are legitimately at the older version.
+    const upgraded = await this.upgradeCatalog(state);
+    if (upgraded.result !== undefined) {
+      return upgraded;
+    }
+    state = upgraded.state;
+
     const verdict = reconcileRoadmapWithCatalog(state.roadmap, this.roadmapCatalog());
     if (!verdict.ok) {
       return { state, result: this.structuralRefusal(state, verdict.problem) };

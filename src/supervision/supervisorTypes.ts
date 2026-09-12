@@ -402,8 +402,32 @@ export const DEFAULT_ROADMAP: readonly RoadmapItem[] = [
   { key: "TELEGRAM_CONTROL_PLANE", title: "Telegram control plane", dependsOn: ["SUPERVISOR_SERVICE"], status: "PENDING", workClass: "NORMAL_IMPLEMENTATION", order: 8 },
   { key: "N8N_INTEGRATION_BUS", title: "n8n integration bus", dependsOn: ["SUPERVISOR_SERVICE"], status: "PENDING", workClass: "NORMAL_IMPLEMENTATION", order: 9 },
   { key: "CONTROL_ROOM", title: "Control Room operational visibility", dependsOn: ["GITHUB_ORCHESTRATION"], status: "PENDING", workClass: "NORMAL_IMPLEMENTATION", order: 10 },
-  { key: "MEASURED_MODEL_ROUTER", title: "Benchmark-driven model router", dependsOn: ["EXECUTOR_WIRING"], status: "PENDING", workClass: "HIGH_RISK_IMPLEMENTATION", order: 11 },
-  { key: "BACKUP_RECOVERY", title: "Backup and disaster recovery on existing storage", dependsOn: ["LOCAL_24_7_RUNTIME"], status: "PENDING", workClass: "HIGH_RISK_IMPLEMENTATION", order: 12 },
-  { key: "RELEASE_HARDENING", title: "Public-release separation and hardening", dependsOn: ["CONTROL_ROOM", "BACKUP_RECOVERY"], status: "PENDING", workClass: "ARCHITECTURE_SECURITY", order: 13 },
-  { key: "END_TO_END_ACCEPTANCE", title: "Final end-to-end autonomous acceptance", dependsOn: ["RELEASE_HARDENING", "MEASURED_MODEL_ROUTER", "TELEGRAM_CONTROL_PLANE", "N8N_INTEGRATION_BUS", "CLEAN_ROOM_CI"], status: "PENDING", workClass: "ARCHITECTURE_SECURITY", order: 14 },
+  /**
+   * TASK-018, and the reason the four rows after it are renumbered.
+   *
+   * TASK-017 took twenty-four review rounds, and a large share of the
+   * WALL-CLOCK cost was orchestration failing unobserved rather than review or
+   * remediation: the continuation owner was a shell script in a scratchpad with
+   * no schema, no tests and no recovery; a finished review sat unnoticed for
+   * hours because nothing emitted a completion event; work was reported as
+   * running when no process had been started; a killed mutation run left the
+   * tree poisoned twice. The durable state this repository defends — SQLite,
+   * the hash chain, this catalog — was never the problem. The state of work IN
+   * FLIGHT was.
+   *
+   * It is a real DEPENDENCY of `MEASURED_MODEL_ROUTER` rather than a note about
+   * priority, because a router that measures models is worth little while the
+   * thing invoking them cannot survive a restart, and every measurement it
+   * recorded would inherit those losses.
+   *
+   * Adding that edge is what made `catalogUpgrade.ts` necessary. `dependsOn`
+   * and `order` are DEFINITION fields, so changing them here would otherwise
+   * make every existing database refuse its own roadmap at startup — and the
+   * only ways out would be to weaken that guard or to hand-edit the database.
+   */
+  { key: "DURABLE_ORCHESTRATION", title: "Orchestration that survives the death of any one process", dependsOn: ["SUPERVISOR_SERVICE", "EXECUTOR_WIRING"], status: "PENDING", workClass: "ARCHITECTURE_SECURITY", order: 11 },
+  { key: "MEASURED_MODEL_ROUTER", title: "Benchmark-driven model router", dependsOn: ["EXECUTOR_WIRING", "DURABLE_ORCHESTRATION"], status: "PENDING", workClass: "HIGH_RISK_IMPLEMENTATION", order: 12 },
+  { key: "BACKUP_RECOVERY", title: "Backup and disaster recovery on existing storage", dependsOn: ["LOCAL_24_7_RUNTIME"], status: "PENDING", workClass: "HIGH_RISK_IMPLEMENTATION", order: 13 },
+  { key: "RELEASE_HARDENING", title: "Public-release separation and hardening", dependsOn: ["CONTROL_ROOM", "BACKUP_RECOVERY"], status: "PENDING", workClass: "ARCHITECTURE_SECURITY", order: 14 },
+  { key: "END_TO_END_ACCEPTANCE", title: "Final end-to-end autonomous acceptance", dependsOn: ["RELEASE_HARDENING", "MEASURED_MODEL_ROUTER", "TELEGRAM_CONTROL_PLANE", "N8N_INTEGRATION_BUS", "CLEAN_ROOM_CI"], status: "PENDING", workClass: "ARCHITECTURE_SECURITY", order: 15 },
 ];

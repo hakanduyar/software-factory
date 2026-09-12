@@ -18,6 +18,28 @@ export interface SupervisorRepository {
   create(state: SupervisorState): Promise<SupervisorState>;
   /** CAS on `version`; throws ConcurrencyError when the expected version is stale. */
   compareAndSave(next: SupervisorState, expectedVersion: number): Promise<SupervisorState>;
+  /**
+   * The roadmap catalog version this database records (TASK-018 AC-1).
+   *
+   * `undefined` means NO RECORD, which every database written before TASK-018
+   * is, and which `planCatalogUpgrade` reads as exactly one version rather than
+   * as "whatever the rows happen to be".
+   */
+  readCatalogVersion(): Promise<number | undefined>;
+  /**
+   * Moves the state and the recorded catalog version TOGETHER (TASK-018 AC-5).
+   *
+   * Deliberately NOT `compareAndSave` followed by a second write. Two writes
+   * have a gap between them, and a process that dies inside that gap leaves a
+   * database whose rows are at one version and whose record says another — the
+   * half-applied state AC-6 exists to make impossible. Implementations must
+   * make this atomic and must keep the CAS semantics `compareAndSave` has.
+   */
+  applyCatalogUpgrade(
+    next: SupervisorState,
+    expectedVersion: number,
+    toCatalogVersion: number,
+  ): Promise<SupervisorState>;
 }
 
 /**

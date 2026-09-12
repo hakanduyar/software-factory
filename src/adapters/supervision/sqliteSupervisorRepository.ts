@@ -26,6 +26,7 @@ import {
   SchemaVersionError,
   ValidationError,
 } from "../../domain/errors.js";
+import { ROADMAP_CATALOG_VERSION } from "../../supervision/catalogUpgrade.js";
 import { encodeSupervisorState, parseSupervisorState } from "../../supervision/supervisorSerialization.js";
 import type { SupervisorRepository } from "../../supervision/supervisorPorts.js";
 import type { SupervisorState } from "../../supervision/supervisorTypes.js";
@@ -36,6 +37,17 @@ export const SUPERVISOR_SCHEMA_VERSION = 1;
 
 /** There is exactly one supervisor state per database. */
 const SINGLETON_ID = "supervisor";
+
+/**
+ * Where the roadmap catalog version is recorded (TASK-018 AC-1).
+ *
+ * In `supervisor_meta` beside `schema_version` rather than inside the state
+ * blob, for two reasons. It is a fact about the database rather than about the
+ * supervisor's work, which is the same reason `schema_version` lives there; and
+ * it can then be read WITHOUT parsing the state, so a database whose rows this
+ * build cannot yet interpret can still say which catalog it is at.
+ */
+const CATALOG_VERSION_KEY = "roadmap_catalog_version";
 
 export interface SqliteSupervisorRepository extends SupervisorRepository {
   close(): void;
@@ -201,6 +213,33 @@ export function createSqliteSupervisorRepository(path: string): SqliteSupervisor
   const insert = db.prepare("INSERT INTO supervisor_state (id, version, data) VALUES (?, ?, ?)");
   const find = db.prepare("SELECT id, version, data FROM supervisor_state WHERE id = ?");
   const update = db.prepare("UPDATE supervisor_state SET version = ?, data = ? WHERE id = ? AND version = ?");
+  const readMeta = db.prepare("SELECT value FROM supervisor_meta WHERE key = ?");
+  const writeMeta = db.prepare(
+    "INSERT INTO supervisor_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+  );
+
+  /**
+   * Reads the recorded catalog version, or refuses.
+   *
+   * A row that is present but not a positive integer is CORRUPTION, not an
+   * absent record: treating "abc" as "no record" would let anyone who can write
+   * one byte into `supervisor_meta` move the database back to v1 and have the
+   * upgrade re-run against rows it no longer describes. Absence means v1;
+   * nonsense means stop.
+   */
+  function recordedCatalogVersion(): number | undefined {
+    const row = readMeta.get(CATALOG_VERSION_KEY) as { readonly value: string } | undefined;
+    if (row === undefined) {
+      return undefined;
+    }
+    const parsed = Number(row.value);
+    if (!Number.isSafeInteger(parsed) || parsed < 1) {
+      throw new SchemaIntegrityError(
+        `supervisor_meta.${CATALOG_VERSION_KEY} value ${JSON.stringify(row.value)} is not a positive integer`,
+      );
+    }
+    return parsed;
+  }
 
   interface Row {
     readonly id: string;
@@ -244,7 +283,22 @@ export function createSqliteSupervisorRepository(path: string): SqliteSupervisor
         const parsed = parseSupervisorState(canonical, { version: state.version });
         assertChainPersistable(parsed.provenance, parsed.provenanceAnchor, "create");
       })();
-      insert.run(SINGLETON_ID, state.version, canonical);
+      /**
+       * A database created by THIS build is at this build's catalog version
+       * (AC-1), and the two facts are written together so that a crash cannot
+       * produce a state with no version record — which would be indistinguishable
+       * from a pre-TASK-018 database and would be "upgraded" from a past it
+       * never had.
+       */
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        insert.run(SINGLETON_ID, state.version, canonical);
+        writeMeta.run(CATALOG_VERSION_KEY, String(ROADMAP_CATALOG_VERSION));
+        db.exec("COMMIT");
+      } catch (error) {
+        db.exec("ROLLBACK");
+        throw error;
+      }
       return state;
     },
 
@@ -289,6 +343,62 @@ export function createSqliteSupervisorRepository(path: string): SqliteSupervisor
         throw new ConcurrencyError(
           `supervisor state version conflict: expected ${expectedVersion}, found ${current.version}`,
         );
+      }
+      return next;
+    },
+
+    async readCatalogVersion(): Promise<number | undefined> {
+      return recordedCatalogVersion();
+    },
+
+    /**
+     * The state and the version record move together, or neither moves (AC-5).
+     *
+     * Everything that can REFUSE happens before `BEGIN`, so a refusal never
+     * opens a transaction it has to roll back. Inside the transaction there are
+     * exactly two statements; SQLite's own atomicity is what makes AC-6 true,
+     * and a process killed between them leaves the journal to roll the pair
+     * back rather than leaving rows at one version and the record at another.
+     */
+    async applyCatalogUpgrade(
+      next: SupervisorState,
+      expectedVersion: number,
+      toCatalogVersion: number,
+    ): Promise<SupervisorState> {
+      if (!Number.isSafeInteger(toCatalogVersion) || toCatalogVersion < 1) {
+        throw new ValidationError(`refusing to record roadmap catalog version ${JSON.stringify(toCatalogVersion)}`);
+      }
+
+      const encoded = encodeSupervisorState(
+        parseSupervisorState(encodeSupervisorState(next), { version: next.version }),
+      );
+      const persisted = parseSupervisorState(encoded, { version: next.version });
+
+      const stored = find.get(SINGLETON_ID) as Row | undefined;
+      if (stored === undefined) {
+        throw new ValidationError("no supervisor state exists to upgrade");
+      }
+      // An upgrade is a write like any other, so it is held to the same
+      // append-only and chain-integrity rules. AC-7's "history survives" is not
+      // a separate mechanism; it is these two checks refusing to let an upgrade
+      // be the one write that may rewrite the past.
+      assertProvenanceExtends(parseSupervisorState(stored.data, { version: stored.version }).provenance, persisted.provenance);
+      assertChainPersistable(persisted.provenance, persisted.provenanceAnchor, "upgrade");
+
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        const result = update.run(next.version, encoded, SINGLETON_ID, expectedVersion);
+        if (result.changes === 0) {
+          const current = find.get(SINGLETON_ID) as Row | undefined;
+          throw new ConcurrencyError(
+            `supervisor state version conflict: expected ${expectedVersion}, found ${current?.version ?? "nothing"}`,
+          );
+        }
+        writeMeta.run(CATALOG_VERSION_KEY, String(toCatalogVersion));
+        db.exec("COMMIT");
+      } catch (error) {
+        db.exec("ROLLBACK");
+        throw error;
       }
       return next;
     },

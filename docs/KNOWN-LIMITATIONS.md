@@ -1310,3 +1310,54 @@ something it does not.
 **Kept honest by:** this entry, and by `scripts/mutations.mjs` containing no
 mutation claiming to cover the clause — an absence that would otherwise be
 invisible.
+
+## L-22 - "killed at any point" is proven at two chosen points and one database guarantee
+
+**Status:** OPEN, and stated because AC-6's wording is broader than any test can
+literally be.
+
+TASK-018 AC-6 asks that a process killed **at any point** during a catalog
+upgrade leaves the database wholly pre-upgrade or wholly post-upgrade. Here is
+exactly what establishes that, and what does not.
+
+### What is proven
+
+**The adapter really does use one transaction.** A SQLite trigger makes the
+SECOND of its two statements — the version record — abort, after the first has
+already updated the state row. The row change is rolled back with it, and the
+database is left byte-identical to what it was. `scripts/mutations.mjs` mutates
+the `ROLLBACK` in that handler into a `COMMIT`, and the named test fails: the
+guarantee is measured, not asserted.
+
+**SQLite's crash atomicity holds for these exact bytes.** Two fixtures spawn a
+real child, run the adapter's two statements with the bytes production itself
+produced for this upgrade, and `SIGKILL` it — once with the transaction open,
+once after the commit. SIGKILL cannot be caught, so nothing tidies up. The first
+leaves the old state whole; the second leaves the new state whole; and a
+subsequent start reaches the target version exactly once, appending exactly one
+audit record.
+
+### What is NOT proven
+
+**The adapter itself was never killed mid-transaction.** The child replays
+production's bytes; it does not stop `applyCatalogUpgrade` between its own two
+statements. Doing that deterministically would need a pause or barrier inside
+production code that exists only for tests, and the owner has already ruled that
+out for the mutation journal, for the same reason: a hook that can stop a write
+is a hook that can stop a write.
+
+So "any point" is covered by argument rather than by enumeration — the two
+statements are adjacent inside one transaction, and SQLite's rollback journal is
+what makes every instant between them equivalent to the two that are tested. If
+that reasoning is wrong, the tests here would not notice.
+
+**What would reduce it:** killing a real supervisor process repeatedly at random
+instants under load and asserting the invariant each time. That is a soak test
+rather than a unit test, it is not deterministic, and a green run of it would
+prove less per run than the trigger fixture does. It is not worth the flake
+budget today; it is written down so that the choice is visible.
+
+**Kept honest by:** `tests/catalogUpgradePersistence.test.ts`, whose crash cases
+are named for the point they kill at rather than for the property they suggest,
+and the `ROLLBACK` mutation, which fails a named test if the transaction stops
+being one.
