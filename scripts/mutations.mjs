@@ -865,6 +865,25 @@ export const MUTATIONS = [
     expect: "REFUSES a version record that is not a positive integer",
   },
   {
+    id: "a corrupt version record crashes the tick instead of deciding",
+    /**
+     * The error TYPE is swapped rather than the check deleted or inverted, and
+     * both of those were tried first. Deleting it leaves the return below
+     * unreachable; inverting it leaves `error` as `unknown` afterwards, so
+     * `error.message` stops compiling. Either way preflight refuses the
+     * mutation as UNMEASURED rather than letting it measure anything.
+     *
+     * Matching a DIFFERENT error class narrows just as well and still builds,
+     * while a real `SchemaIntegrityError` now takes the rethrow — which is
+     * exactly the guard being off.
+     */
+    edits: [[SUP_SVC,
+      "      if (!(error instanceof SchemaIntegrityError)) {\n        throw error;\n      }\n      this.log(`[supervisor] the recorded roadmap catalog version could not be read: ${error.message}`);",
+      "      if (!(error instanceof ValidationError)) {\n        throw error;\n      }\n      this.log(`[supervisor] the recorded roadmap catalog version could not be read: ${error.message}`);"]],
+    tests: [T_CATPERS],
+    expect: "turns a corrupt version record into a human decision, not a stack trace",
+  },
+  {
     id: "a fresh database records no catalog version",
     edits: [[SUP_REPO,
       "        writeMeta.run(CATALOG_VERSION_KEY, String(ROADMAP_CATALOG_VERSION));",
@@ -884,19 +903,39 @@ export const MUTATIONS = [
   },
 
   // ---- AC-3: only between recognised versions, by declared steps -----------
+  /**
+   * ROUND-1 REVIEW, HIGH 2. This mutation used to be
+   * `steps.find(...) ?? steps[0]`, which does not bridge a gap — it loops
+   * forever, re-applying `1->2` from version 2. The test process died, the
+   * named test appeared among the wreckage, and the harness scored a HANG as a
+   * kill. `scripts/mutate.mjs` now refuses a run that did not finish; this
+   * mutation is also replaced by one that BRIDGES rather than hangs, so what it
+   * measures is the guard rather than the timeout.
+   */
   {
-    id: "a gap in the declared chain is bridged with whatever step is first",
+    id: "a gap in the declared chain is bridged by stopping the walk early",
     edits: [[CATALOG_UP,
-      "    const step = steps.find((candidate) => candidate.from === current);",
-      "    const step = steps.find((candidate) => candidate.from === current) ?? steps[0];"]],
+      "  while (current !== buildVersion) {",
+      "  while (current < buildVersion && steps.some((candidate) => candidate.from === current)) {"]],
     tests: [T_CATUP],
     expect: "REFUSES a GAP in the declared chain",
   },
+  /**
+   * ROUND-1 REVIEW, HIGH 1. Widening the CONDITION (`> buildVersion + 1000`)
+   * left the newer-than-build input to fall through to "no declared step leads
+   * forward from version 5" — a sibling guard, so the named test failed for the
+   * wrong reason and this guard was never measured.
+   *
+   * The CONSEQUENCE is mutated instead: a newer database is silently reported
+   * as already current. Nothing else can catch that, because nothing else looks
+   * at the question, and the result is the real bypass — a build quietly
+   * operating a database written by a newer one.
+   */
   {
-    id: "a database from a newer build is downgraded instead of refused",
+    id: "a database from a newer build is accepted as already current",
     edits: [[CATALOG_UP,
-      "  if (recorded > buildVersion) {",
-      "  if (recorded > buildVersion + 1000) {"]],
+      "    return {\n      kind: \"REFUSE\",\n      problem:\n        `the database records roadmap catalog version ${recorded}, which is newer than this build's ${buildVersion}; ` +\n        \"a catalog is never downgraded — run a build that declares that version\",\n    };",
+      "    return { kind: \"ALREADY_CURRENT\", version: recorded };"]],
     tests: [T_CATUP],
     expect: "REFUSES a recorded version NEWER than this build",
   },
@@ -910,13 +949,23 @@ export const MUTATIONS = [
     tests: [T_CATUP],
     expect: "REFUSES a hand-edited definition",
   },
+  /**
+   * ROUND-1 REVIEW, HIGH 1. This pointed at a test whose extra key (`INVENTED`)
+   * is in NEITHER catalog, so with the check disabled the target-drop refusal
+   * fired instead and the named test failed for the wrong reason.
+   *
+   * It now points at the case where the pre-seeded key is one the TARGET
+   * declares — `DURABLE_ORCHESTRATION`, arriving already DONE. The drop guard
+   * cannot fire there, so this guard is the only one left, and what it stops is
+   * a forged completion being carried across into the upgraded roadmap.
+   */
   {
     id: "a key the FROM catalog never declared is invented instead of refused",
     edits: [[CATALOG_UP,
       "    const declared = from.byKey.get(row.key);",
       "    const declared = (from.byKey.get(row.key) ?? row) as RoadmapItem | undefined;"]],
     tests: [T_CATUP],
-    expect: "REFUSES a key version 1 never declared",
+    expect: "REFUSES a pre-seeded row for a key only the TARGET declares",
   },
   {
     id: "an item the target catalog drops is kept silently, discarding nothing visibly",

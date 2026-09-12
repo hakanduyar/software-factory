@@ -210,6 +210,40 @@ describe("TASK-018 AC-1: the recorded catalog version", () => {
     }
   });
 
+  /**
+   * ROUND-1 REVIEW, non-blocking note. A corrupt version record made the
+   * repository throw and the supervisor produce a stack trace rather than a
+   * decision. Nothing was written and no executor ran, so it was not a bypass —
+   * but it is the same lesson as the round-8 HIGH: from an operator's side a
+   * crash and a refusal are not the same event.
+   */
+  it("turns a corrupt version record into a human decision, not a stack trace", async () => {
+    const path = await seedV1Database({ progress: true });
+    const before = readStateRow(path);
+    withRawDb(path, (db) =>
+      db
+        .prepare(
+          "INSERT INTO supervisor_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .run(CATALOG_VERSION_KEY, "not-a-version"),
+    );
+
+    const repository = createSqliteSupervisorRepository(path);
+    try {
+      const result = await realSupervisor(repository).tick();
+      assert.equal(result.kind, "WAITING_FOR_HUMAN");
+      const reported = JSON.stringify(result);
+      assert.match(reported, /is not a positive integer/);
+      assert.match(reported, /restore the supervisor database from a known-good backup/i);
+    } finally {
+      repository.close();
+    }
+
+    // And it decided without touching anything.
+    assert.deepEqual(readStateRow(path), before, "a refusal wrote to the database");
+    assert.equal(readVersionRow(path), "not-a-version", "the corrupt record was silently repaired");
+  });
+
   it("REFUSES a version record that is not a positive integer, rather than reading it as absent", async () => {
     // Absence means v1. Nonsense means STOP: reading it as absence would let
     // anyone who can write one byte re-run the upgrade against rows it no
@@ -357,6 +391,53 @@ describe("TASK-018 AC-5/AC-7/AC-9: a v1 database upgraded through a real tick", 
 // =====================================================================
 // AC-5 — the two writes are ONE transaction
 // =====================================================================
+
+describe("TASK-018 AC-5: the same input database produces byte-identical output", () => {
+  /**
+   * ROUND-1 REVIEW raised this as OWNER_DECISION_REQUIRED, and it is answered
+   * by satisfying the STRONGER reading rather than by choosing an easier one.
+   *
+   * AC-5 says "the same input database and the same declared steps produce
+   * byte-identical output, twice". The committed test only covered
+   * `planCatalogUpgrade`'s pure output, and the reviewer pointed out that a
+   * whole persisted database also contains the audit record's `recordedAt`,
+   * which comes from the clock — so two runs at different wall-clock instants
+   * differ, and under a literal reading AC-5 would fail.
+   *
+   * The clock is an INPUT to the supervisor, injected exactly like the
+   * repository and the catalog. So "the same input" includes it, and this runs
+   * the whole upgrade twice against two copies of one seed database with one
+   * fixed clock and compares the stored bytes. What that rules out is the
+   * nondeterminism AC-5 is actually about — map iteration order, set ordering,
+   * anything that would make two identical inputs diverge. It does not pretend
+   * that time is frozen in production.
+   *
+   * Stated here rather than argued in a report, so a later reader sees which
+   * reading the evidence supports.
+   */
+  it("two runs over identical inputs and one fixed clock store identical bytes", async () => {
+    const first = await seedV1Database({ progress: true });
+    const second = `${first}.twin`;
+    copyFileSync(first, second);
+    assert.deepEqual(readStateRow(second), readStateRow(first), "the twin is not a copy");
+
+    for (const path of [first, second]) {
+      const repository = createSqliteSupervisorRepository(path);
+      try {
+        await realSupervisor(repository).tick();
+      } finally {
+        repository.close();
+      }
+    }
+
+    const a = readStateRow(first);
+    const b = readStateRow(second);
+    assert.equal(a.version, b.version, "the two runs disagree on the state version");
+    assert.equal(a.data, b.data, "two identical inputs produced different stored bytes");
+    assert.equal(readVersionRow(first), readVersionRow(second));
+    assert.equal(readVersionRow(first), String(ROADMAP_CATALOG_VERSION));
+  });
+});
 
 describe("TASK-018 AC-5: the rows and the version record move together or not at all", () => {
   /**

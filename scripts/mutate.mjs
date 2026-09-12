@@ -101,8 +101,30 @@ function build() {
   return { ok: result.status === 0, output: `${result.stdout ?? ""}${result.stderr ?? ""}` };
 }
 
+/**
+ * A RUN THAT DID NOT FINISH IS NOT A RESULT (TASK-018 round-1 review, HIGH 2).
+ *
+ * A mutation that made the upgrade planner loop forever was reported KILLED.
+ * The test process grew until it died, node printed enough TAP for the named
+ * test to appear among the failures, and the name matched — so a HANG was
+ * scored as a guard doing its job. That is round-17's "any non-zero exit
+ * counted" defect in a new place: the harness read a failure it had not
+ * established the cause of.
+ *
+ * So a run now has a deadline, and a run that hits it — or that dies by signal
+ * — reports `timedOut` and can never be a kill, whatever its output says. The
+ * limit is generous because a real suite under a real mutation is slow; it is
+ * there to catch non-termination, not slowness.
+ */
+const TEST_TIMEOUT_MS = 10 * 60 * 1000;
+
 function runTests(files) {
-  const result = spawnSync("node", ["--test", ...files], { cwd: REPO_ROOT, encoding: "utf8" });
+  const result = spawnSync("node", ["--test", ...files], {
+    cwd: REPO_ROOT,
+    encoding: "utf8",
+    timeout: TEST_TIMEOUT_MS,
+    killSignal: "SIGKILL",
+  });
   const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
   const failed = output
     .split("\n")
@@ -112,7 +134,10 @@ function runTests(files) {
     const match = new RegExp(`^# ${label} (\\d+)$`, "m").exec(output);
     return match === null ? -1 : Number(match[1]);
   };
-  return { pass: count("pass"), fail: count("fail"), failed };
+  // `spawnSync` reports a timeout as ETIMEDOUT on `error`, and a killed child
+  // through `signal`. Either way the run did not reach its own conclusion.
+  const timedOut = result.error?.code === "ETIMEDOUT" || result.signal !== null;
+  return { pass: count("pass"), fail: count("fail"), failed, timedOut, signal: result.signal ?? undefined };
 }
 
 const only = process.argv.includes("--only")
@@ -487,6 +512,12 @@ if (!first.ok) {
 const allTests = [...new Set(selected.flatMap((m) => m.tests))];
 const start = runTests(allTests);
 console.log(`baseline: pass=${start.pass} fail=${start.fail}`);
+if (start.timedOut) {
+  // Distinguished from "not green": a baseline that never finished tells us
+  // nothing about the tree, and reporting it as failing tests would be a guess.
+  console.error("BASELINE DID NOT FINISH");
+  process.exit(1);
+}
 if (start.fail !== 0) {
   console.error("BASELINE NOT GREEN");
   process.exit(1);
@@ -538,7 +569,13 @@ for (const mutation of selected) {
       } else {
         const run = runTests(mutation.tests);
         const hit = run.failed.filter((name) => name.includes(mutation.expect));
-        if (run.fail > 0 && hit.length > 0) {
+        if (run.timedOut) {
+          // Checked BEFORE the failure counts, because a run that did not
+          // finish produces failure lines that mean nothing: the named test can
+          // appear among them simply because the process died while it ran.
+          console.log(`${mutation.id}: *** DID NOT FINISH *** (${run.signal ?? "timeout"}) — not a kill`);
+          results.push([mutation.id, "DID NOT FINISH"]);
+        } else if (run.fail > 0 && hit.length > 0) {
           console.log(`${mutation.id}: KILLED (${hit[0]})`);
           results.push([mutation.id, "KILLED"]);
         } else if (run.fail > 0) {
@@ -586,6 +623,10 @@ if (!restored.ok) {
 }
 const end = runTests(allTests);
 console.log(`restored: pass=${end.pass} fail=${end.fail}`);
+if (end.timedOut) {
+  console.error("ABORT: the restored tree's test run did not finish, so the tree is not proven green");
+  process.exit(2);
+}
 
 for (const file of touched) {
   if (sha256(file) !== hashes.get(file)) {

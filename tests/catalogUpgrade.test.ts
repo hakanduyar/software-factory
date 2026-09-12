@@ -136,6 +136,15 @@ describe("TASK-018 AC-3: migration runs only between recognised versions", () =>
     assert.match(problem, /never downgraded/);
   });
 
+  /**
+   * This case and "a version no declared step leads forward from" are two
+   * inputs to ONE guard — the walk refusing to continue where nothing declares
+   * a way forward — so a mutation of that guard fails both. That is not the
+   * sibling masking AC-21 forbids, which is a DIFFERENT guard catching the
+   * input and the named test failing for a reason nobody chose. Both of these
+   * fail for this guard's own reason, and the distinction is written down
+   * because "two tests failed" looks like the defect and is not.
+   */
   it("REFUSES a GAP in the declared chain rather than bridging it", () => {
     // 1->2 is declared; 2->3 is not, and the build wants 3.
     const problem = refusalOf(
@@ -201,6 +210,51 @@ describe("TASK-018 AC-4: unexpected divergence refuses the whole upgrade", () =>
     }
   });
 
+  /**
+   * ROUND-1 REVIEW, HIGH 1. The case below this one uses a key NEITHER catalog
+   * declares, so disabling the unknown-key check still hit the target-drop
+   * refusal: the named test failed for the wrong reason and the guard was never
+   * measured. AC-21 asks that exactly one guard can fire.
+   *
+   * This one leaves exactly one, and it is the attack that matters. The key is
+   * one only the TARGET declares — so a pre-seeded row for it passes the drop
+   * check — and it arrives already DONE. If the unknown-key check does not
+   * fire, that forged completion is carried across intact and
+   * MEASURED_MODEL_ROUTER becomes eligible for work nothing ever did.
+   */
+  it("REFUSES a pre-seeded row for a key only the TARGET declares, even with forged progress", () => {
+    const forged: RoadmapItem = {
+      key: "DURABLE_ORCHESTRATION",
+      title: "Orchestration that survives the death of any one process",
+      dependsOn: ["SUPERVISOR_SERVICE", "EXECUTOR_WIRING"],
+      status: "DONE",
+      workClass: "ARCHITECTURE_SECURITY",
+      order: 11,
+    };
+    const verdict = planCatalogUpgrade({ recordedVersion: 1, persisted: [...seededAtV1(), forged] });
+    const problem = refusalOf(verdict);
+    assert.match(problem, /"DURABLE_ORCHESTRATION" is not declared by catalog version 1/);
+  });
+
+  it("does NOT refuse the same key when the upgrade introduces it itself", () => {
+    // The positive control: the key is legitimate: it just may not arrive by
+    // being written into the database ahead of the upgrade that adds it.
+    const added = upgradedBy(planCatalogUpgrade({ recordedVersion: 1, persisted: seededAtV1() }))
+      .find((item) => item.key === "DURABLE_ORCHESTRATION");
+    assert.ok(added);
+    assert.equal(added.status, "PENDING");
+  });
+
+  /**
+   * A BEHAVIOUR CASE, NOT A MUTATION TARGET, and the difference is the point.
+   *
+   * `INVENTED` is in NEITHER catalog, so TWO guards can catch it: the unknown-key
+   * check first, and the target-drop check behind it. That makes it a fine
+   * description of what the upgrade does and a useless place to aim a mutation,
+   * because disabling the first guard still hits the second — which is exactly
+   * the round-1 finding. The mutation is aimed at the pre-seeded case above,
+   * where only one guard can fire.
+   */
   it("REFUSES a key version 1 never declared", () => {
     const extra: RoadmapItem = {
       key: "INVENTED",

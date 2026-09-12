@@ -2807,7 +2807,42 @@ export class SupervisorService {
   private async upgradeCatalog(
     state: SupervisorState,
   ): Promise<{ readonly state: SupervisorState; readonly result?: TickResult }> {
-    const recorded = await this.deps.repository.readCatalogVersion();
+    /**
+     * A CORRUPT VERSION RECORD IS AN ANSWER, NOT AN EXCEPTION (round-1 review).
+     *
+     * The same lesson as the round-8 HIGH above: a nonsense
+     * `roadmap_catalog_version` made the repository throw
+     * `SchemaIntegrityError`, and the supervisor produced a stack trace instead
+     * of a decision. Nothing was written and no executor ran, so it was not a
+     * bypass — but from an operator's side a crash and a refusal are not the
+     * same event.
+     *
+     * DELIBERATELY NARROW, for the reason that comment gives. Only this READ is
+     * converted. A refusal to WRITE keeps propagating, because that is the
+     * repository enforcing its own integrity and no caller should be able to
+     * mistake it for a verdict.
+     */
+    let recorded: number | undefined;
+    try {
+      recorded = await this.deps.repository.readCatalogVersion();
+    } catch (error) {
+      if (!(error instanceof SchemaIntegrityError)) {
+        throw error;
+      }
+      this.log(`[supervisor] the recorded roadmap catalog version could not be read: ${error.message}`);
+      return {
+        state,
+        result: {
+          kind: "WAITING_FOR_HUMAN",
+          roadmapKey: state.roadmap[0]?.key ?? "unknown",
+          reason: "HUMAN_DECISION_REQUIRED",
+          humanActionRequired: boundedDiagnostic(
+            `${error.message}. Which catalog this database is at cannot be established, so no upgrade and no ` +
+              "reconciliation can be trusted. Restore the supervisor database from a known-good backup.",
+          ),
+        },
+      };
+    }
     const verdict = planCatalogUpgrade({
       ...(recorded === undefined ? {} : { recordedVersion: recorded }),
       persisted: state.roadmap,
