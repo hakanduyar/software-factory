@@ -2,9 +2,61 @@
 
 Where the autonomous review/remediation loop stands, recorded here rather than
 left in whatever conversation happened to be open. Written 2026-08-27,
-updated 2026-09-10.
+updated 2026-09-13.
 
-## Where this stands — 2026-09-10
+## Where this stands — 2026-09-13
+
+`TASK-018 Part A` (the versioned catalog upgrade) is ACCEPTED and INTEGRATED.
+`main` was fast-forwarded from `e633179` to `d6ecf37`; nothing was force-pushed,
+no history was rewritten, and `main`'s tree was proven equal to the reviewed
+tree before the push.
+
+| Fact | Value |
+|---|---|
+| Candidate reviewed | `d6ecf37` on `feat/durable-orchestration` |
+| Tree | `5edc04af86fec19828f87c340125f5d63dacd250`, unchanged across the review |
+| Frozen criteria | `docs/tasks/TASK-018-durable-orchestration.md`, blob `97780139` |
+| Verdict | `PASS_WITH_NON_BLOCKING_NOTES`, `Safe to commit: YES`, CRITICAL 0, HIGH 0 |
+| Rounds | 2 |
+| Suite | 2568 pass, 0 fail |
+| Strict probe | 2557 pass, 0 fail, 11 expected `unshare` skips |
+| Mutation set | 109 KILLED, 0 survived, 0 unmeasured, 0 wrong test, 0 unfinished |
+
+Round 1 returned CHANGES_REQUIRED with two HIGH findings, both in the
+VERIFICATION rather than the production path. The more serious one is worth
+recording here because it outlives this task: a mutation that made the planner
+loop forever was scored KILLED, because the test process died with the named
+test among the failures and the harness read that as the guard working. That is
+round-17's "any non-zero exit counted" defect in a new place.
+`scripts/mutate.mjs` now runs tests under a deadline and reports
+`DID NOT FINISH` — checked BEFORE the failure counts, because failure lines from
+a process that died mid-run say nothing about why. Every future mutation run in
+this repository inherits that.
+
+### What Part A actually added
+
+One mechanism, and it is the first migration path this codebase has: a roadmap
+catalog DEFINITION may now change between two versions that are both written
+down, by a declared step, with the rows and the recorded version moving in one
+transaction. Everything else still refuses. `DURABLE_ORCHESTRATION` is in the
+catalog and `MEASURED_MODEL_ROUTER` now genuinely waits for it.
+
+### Next: TASK-018 Part B
+
+AC-11 to AC-20 of the same frozen criteria — durable run state, leases whose
+liveness is a fact, duplicate owners refused, a stall that is a measurement,
+completion events, startup reconciliation, idempotent transitions, the four
+deaths that actually happened, recoverable lost notifications, and recovery
+that never crosses a human gate. The criteria are already frozen; no further
+planning decision is needed to begin.
+
+One non-blocking note from round 2 belongs to that work: the AC-7 fixture does
+not populate `lastRunConfig`, which the criterion names. Production preserves it
+through the single `{ ...row, ...definition }` construction and the whole-row
+mutation is killed, so it is a coverage gap rather than a defect — but it is a
+gap, and it is recorded rather than closed quietly against a passed candidate.
+
+## Where this stood — 2026-09-10
 
 `TASK-017` (`CLEAN_ROOM_CI`) is ACCEPTED and INTEGRATED. `main` was
 fast-forwarded from `665bc35` to `d124e1b`; nothing was force-pushed and no
