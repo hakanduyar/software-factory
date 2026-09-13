@@ -20,11 +20,16 @@
  */
 
 import {
+  canonicalActivityId,
+  claimActivity,
   classifyActivity,
+  completeActivity,
   crashedItemsToRequeue,
   recordReconciliation,
   RECOVERY_TO_STATUS,
+  reportProgress,
   unobservedCompletions,
+  type ActivityLease,
   type LivenessProbe,
 } from "./activity.js";
 import {
@@ -153,6 +158,16 @@ export interface SupervisorServiceDeps {
   readonly liveness?: LivenessProbe;
   /** The interval AC-14 measures a stall against. Defaults to forty minutes. */
   readonly stallAfterMs?: number;
+  /**
+   * How this installation builds a lease for ITSELF (TASK-018 AC-12).
+   *
+   * Injected rather than imported so the supervisor keeps no dependency on
+   * `/proc`, and so a test can hand it a lease whose liveness it controls. The
+   * production adapter is `leaseForThisProcess`, which reads the same file the
+   * probe compares against — a lease built any other way would fail its own
+   * check and the holder would look dead to itself.
+   */
+  readonly activityLease?: (claimedAt: Timestamp) => ActivityLease | undefined;
   readonly log?: (line: string) => void;
   readonly ownerId?: string;
 }
@@ -1604,16 +1619,84 @@ export class SupervisorService {
       attempt,
       claimedAt: this.deps.clock.now(),
     };
+    /**
+     * THE DURABLE ACTIVITY, ALONGSIDE THE CLAIM (TASK-018 Part B, round-1
+     * CRITICAL).
+     *
+     * The first version of Part B built `claimActivity`, `reportProgress` and
+     * `completeActivity` and then called none of them from here, so a real
+     * review or verification process could still die with no lease, no
+     * heartbeat, no completion and nothing for reconciliation to find. The
+     * mechanism existed and the Factory did not use it, which is worth less
+     * than not having built it — it reads as covered.
+     *
+     * WHY BOTH RECORDS. `activeClaim` answers "what did this supervisor launch
+     * and must it be reconciled", and it is singular by design. The activity
+     * answers "is a process still working on this, and what did it end up
+     * doing", survives the supervisor itself, and is one of several. Neither
+     * replaces the other, and `activeClaim` is untouched.
+     */
+    const activityId = canonicalActivityId(item.key, action.kind, attempt);
+    const lease = this.deps.activityLease?.(this.deps.clock.now());
+    const probe = this.deps.liveness;
+    let activities = state.activities ?? [];
+
+    if (lease !== undefined && probe !== undefined) {
+      const claimedActivity = claimActivity(
+        activities,
+        { id: activityId, kind: action.kind, roadmapKey: item.key, lease, now: this.deps.clock.now() },
+        probe,
+      );
+      if (!claimedActivity.ok) {
+        /**
+         * Something else owns this, or ownership cannot be established. Either
+         * way this supervisor must not start a second one beside it — that is
+         * the duplicate-owner state AC-13 exists to make impossible, and the
+         * refusal names who holds it.
+         */
+        this.log(`[supervisor] not starting ${item.key}: ${claimedActivity.problem}`);
+        return {
+          kind: "CONCLUSION",
+          result: {
+            kind: "WAITING_FOR_RESOURCE",
+            roadmapKey: item.key,
+            reason: boundedDiagnostic(claimedActivity.problem),
+          },
+          wakeBasis: state,
+        };
+      }
+      activities = claimedActivity.activities;
+    }
+
     const claimed = await this.commit(state, {
       ...state,
       activeClaim: claim,
+      activities,
       roadmap: setAttempts(setStatus(state.roadmap, item.key, "ACTIVE"), item.key, attempt),
     });
 
-    // Second durable write: from here the launch may have happened.
+    // Second durable write: from here the launch may have happened, and the
+    // activity says so too — a heartbeat before the launch is what separates
+    // "claimed and never started" from "started and stopped reporting".
+    const launching =
+      lease === undefined || probe === undefined
+        ? claimed.activities ?? []
+        : (() => {
+            const beat = reportProgress(claimed.activities ?? [], activityId, {
+              at: this.deps.clock.now(),
+              progress: 1,
+            });
+            if (!beat.ok) {
+              this.log(`[supervisor] could not record the launch heartbeat: ${beat.problem}`);
+              return claimed.activities ?? [];
+            }
+            return beat.activities;
+          })();
+
     const running = await this.commit(claimed, {
       ...claimed,
       activeClaim: { ...claim, state: "RUNNING" },
+      activities: launching,
     });
 
     /**
@@ -1714,8 +1797,36 @@ export class SupervisorService {
       };
     }
 
+    /**
+     * THE COMPLETION EVENT (AC-15), written before anything else settles.
+     *
+     * This is the record that makes "the result has existed for hours and
+     * nobody noticed" impossible: it is durable, it names the outcome, and
+     * `unobservedCompletions` reads it out of the database without anything
+     * having to be told. A FAILED outcome is recorded just as a passing one is,
+     * because a failure nobody noticed is the same problem.
+     */
+    const finished =
+      lease === undefined || probe === undefined
+        ? running
+        : await (async () => {
+            const done = completeActivity(running.activities ?? [], activityId, {
+              state: outcome.kind === "COMPLETED" ? "COMPLETED" : "FAILED",
+              completion: {
+                outcome: outcome.kind,
+                detail: boundedDiagnostic(`${item.key} ${action.kind} attempt ${attempt}`),
+                at: this.deps.clock.now(),
+              },
+            });
+            if (!done.ok) {
+              this.log(`[supervisor] could not record the completion: ${done.problem}`);
+              return running;
+            }
+            return this.commit(running, { ...running, activities: done.activities });
+          })();
+
     return this.settle(
-      running,
+      finished,
       // R7-SEC-1: the snapshot this function captured, never whatever the
       // executor may have left behind in the object it was handed.
       settleItem,

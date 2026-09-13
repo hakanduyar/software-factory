@@ -449,6 +449,15 @@ function parseActivity(raw: unknown, index: number, context: string): Activity {
   if (TERMINAL_ACTIVITY_STATES.includes(state) && completion === undefined) {
     corrupt(itemContext, `state is ${state} but no completion was recorded`);
   }
+  /**
+   * ...and the converse (round-1 review, HIGH 3). An UNFINISHED activity
+   * carrying a completion is a record contradicting itself: a re-claim
+   * deliberately drops a dead owner's completion, so a row that has one while
+   * still RUNNING did not come from this code.
+   */
+  if (!TERMINAL_ACTIVITY_STATES.includes(state) && completion !== undefined) {
+    corrupt(itemContext, `state is ${state} but a completion was recorded`);
+  }
   if (observedAt !== undefined && !TERMINAL_ACTIVITY_STATES.includes(state)) {
     corrupt(itemContext, `state is ${state} but an observation was recorded`);
   }

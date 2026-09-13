@@ -20,6 +20,7 @@ import {
   type SqliteSupervisorRepository,
 } from "../adapters/supervision/sqliteSupervisorRepository.js";
 import { createNodeProcessRunner } from "../adapters/process/nodeProcessRunner.js";
+import { createProcLivenessProbe, leaseForThisProcess } from "../adapters/supervision/procLiveness.js";
 import { createSequentialIdGenerator } from "../domain/ids.js";
 import { DEFAULT_ROUTING_POLICY } from "../supervision/modelRouting.js";
 import { parseFinancialPolicy } from "../supervision/financialSafety.js";
@@ -356,6 +357,19 @@ function buildService(
     ids: createSequentialIdGenerator(),
     routingPolicy: DEFAULT_ROUTING_POLICY,
     resourceCatalog: RESOURCE_CATALOG,
+    /**
+     * TASK-018 Part B, and the round-1 CRITICAL was that these two lines were
+     * missing.
+     *
+     * Without them the supervisor records no activity, no lease and no
+     * completion, and reconciliation concludes nothing — so every durable
+     * orchestration property held in tests and in nothing that actually runs.
+     * This is the only place production decides that work in flight is
+     * observable, which is why it is wired at the top-level entry point rather
+     * than defaulted somewhere inside the service.
+     */
+    liveness: createProcLivenessProbe(),
+    activityLease: (claimedAt) => leaseForThisProcess(claimedAt),
     log,
   });
 }

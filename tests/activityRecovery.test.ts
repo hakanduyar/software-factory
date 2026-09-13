@@ -21,7 +21,11 @@ import { join } from "node:path";
 import { after, describe, it } from "node:test";
 
 import { createSqliteSupervisorRepository } from "../src/adapters/supervision/sqliteSupervisorRepository.js";
-import { createProcLivenessProbe, machineIdentity } from "../src/adapters/supervision/procLiveness.js";
+import {
+  createProcLivenessProbe,
+  leaseForThisProcess,
+  machineIdentity,
+} from "../src/adapters/supervision/procLiveness.js";
 import {
   claimActivity,
   crashedItemsToRequeue,
@@ -54,7 +58,10 @@ const ROADMAP: readonly RoadmapItem[] = [
 function baseState(roadmap: readonly RoadmapItem[] = ROADMAP): SupervisorState {
   return {
     version: 1,
-    financialPolicy: { autonomousSpendLimit: 0 },
+    // Both fields: a policy missing `autonomousSpendAllowed` does not parse, and
+    // the supervisor correctly blocks the item before it ever runs — which is
+    // what kept the production-path test seeing no activity at all.
+    financialPolicy: { autonomousSpendAllowed: false, autonomousSpendLimit: 0 },
     resources: [],
     roadmap,
     checkpoints: [],
@@ -159,7 +166,16 @@ ${options.ending === "die" ? `process.kill(process.pid, "SIGKILL");` : `process.
  */
 function supervisorOver(path: string, options: { readonly now?: number; readonly stallAfterMs?: number } = {}) {
   const repository = createSqliteSupervisorRepository(path);
-  const now = options.now ?? Date.now();
+  const base = options.now ?? Date.now();
+  /**
+   * MONOTONIC, not frozen. A fixed clock made every tick after the first
+   * "not yet due" — the supervisor schedules a wake and then never reaches it —
+   * so an item could be probed but never run, and the production-path test saw
+   * no activity at all. Time advances a second per reading, which is enough for
+   * a wake to fall due and still far too little to make anything look stalled.
+   */
+  let reading = 0;
+  const now = () => base + reading++ * 1_000;
   const probe = scriptedProbe();
   for (const entry of TEST_CATALOG) {
     probe.set(entry.provider, entry.model, { state: "AVAILABLE", reason: "scripted", billingMode: "INCLUDED_SUBSCRIPTION" });
@@ -169,16 +185,126 @@ function supervisorOver(path: string, options: { readonly now?: number; readonly
     roadmapCatalog: [...ROADMAP],
     probe,
     executor: scriptedExecutor(),
-    clock: { now: () => now },
+    clock: { now },
     ids: createSequentialIdGenerator(),
     routingPolicy: DEFAULT_ROUTING_POLICY,
     resourceCatalog: TEST_CATALOG,
     liveness: createProcLivenessProbe(),
+    activityLease: (claimedAt) => leaseForThisProcess(claimedAt),
     ...(options.stallAfterMs === undefined ? {} : { stallAfterMs: options.stallAfterMs }),
     log: () => {},
   });
   return { service, repository };
 }
+
+// =====================================================================
+// AC-11/AC-15 — the PRODUCTION path records activities
+// =====================================================================
+
+describe("TASK-018 AC-11/AC-15: running an item records a durable activity", () => {
+  /**
+   * ROUND-1 REVIEW, CRITICAL. The first version of Part B built
+   * `claimActivity`, `reportProgress` and `completeActivity` and called none of
+   * them from `runItem`, so a real process could still die with no lease, no
+   * heartbeat, no completion and nothing for reconciliation to find. Every
+   * durable-orchestration property held in tests and in nothing that ran.
+   *
+   * This drives a REAL tick through the executor and reads what the database
+   * holds afterwards.
+   */
+  it("a tick that runs an item leaves a lease, a heartbeat and a completion behind", async () => {
+    const queued: readonly RoadmapItem[] = [
+      { key: "A", title: "Work", dependsOn: [], status: "PENDING", workClass: "NORMAL_IMPLEMENTATION", order: 1 },
+    ];
+    const path = await seed(queued);
+
+    /**
+     * SEVERAL TICKS, because the first ones do other work: the supervisor
+     * probes its resources before it can route anything, so a single tick
+     * proves nothing about the execution path. The loop stops as soon as an
+     * activity exists, so a passing run is not waiting on a fixed count.
+     */
+    const { service, repository } = supervisorOver(path);
+    try {
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        await service.tick();
+        if (((await repository.load())?.activities ?? []).length > 0) break;
+      }
+    } finally {
+      repository.close();
+    }
+
+    const activities = await readActivities(path);
+    assert.equal(activities.length, 1, "the production path recorded no activity");
+    const activity = activities[0]!;
+    assert.equal(activity.roadmapKey, "A");
+
+    // A LEASE naming this very process, checkable against the process table.
+    assert.ok(activity.lease, "no lease was recorded");
+    assert.equal(activity.lease.pid, process.pid);
+    assert.equal(activity.lease.machine, MACHINE);
+    assert.equal(createProcLivenessProbe().check(activity.lease), "ALIVE");
+
+    // A HEARTBEAT written before the launch, which is what separates
+    // "claimed and never started" from "started and stopped reporting".
+    assert.ok((activity.heartbeat?.progress ?? 0) >= 1, "no launch heartbeat was recorded");
+
+    // A COMPLETION, whatever the outcome was: a failure nobody noticed is the
+    // same problem as a success nobody noticed.
+    assert.ok(activity.completion, "no completion was recorded");
+    assert.ok(["COMPLETED", "FAILED"].includes(activity.state), `unexpected state ${activity.state}`);
+    assert.deepEqual(
+      unobservedCompletions(activities).map((entry) => entry.id),
+      [activity.id],
+      "the completion is not discoverable as outstanding",
+    );
+  });
+
+  it("refuses to start a second run while a live process holds the activity", async () => {
+    const queued: readonly RoadmapItem[] = [
+      { key: "A", title: "Work", dependsOn: [], status: "PENDING", workClass: "NORMAL_IMPLEMENTATION", order: 1 },
+    ];
+    const path = await seed(queued);
+
+    // This process takes the lease the production path would take.
+    const repository = createSqliteSupervisorRepository(path);
+    try {
+      const state = await repository.load();
+      assert.ok(state);
+      const lease = leaseForThisProcess(Date.now());
+      assert.ok(lease);
+      const held = claimActivity(
+        state.activities ?? [],
+        { id: "A:PLAN:r1", kind: "PLAN", roadmapKey: "A", lease, now: Date.now() },
+        createProcLivenessProbe(),
+      );
+      assert.equal(held.ok, true);
+      if (!held.ok) throw new Error("unreachable");
+      await repository.compareAndSave(
+        { ...state, version: state.version + 1, activities: held.activities },
+        state.version,
+      );
+    } finally {
+      repository.close();
+    }
+
+    const { service: rival, repository: second } = supervisorOver(path);
+    let result;
+    try {
+      result = await rival.tick();
+    } finally {
+      second.close();
+    }
+
+    // Either the tick refused to start beside the holder, or it chose a
+    // different action id — what must NOT happen is two owners of one id.
+    const activities = await readActivities(path);
+    const perId = new Map<string, number>();
+    for (const entry of activities) perId.set(entry.id, (perId.get(entry.id) ?? 0) + 1);
+    for (const [id, count] of perId) assert.equal(count, 1, `${id} has ${count} owners`);
+    assert.ok(result);
+  });
+});
 
 // =====================================================================
 // AC-11 — state outlives the process that owned it
@@ -500,20 +626,32 @@ describe("TASK-018 AC-20: recovery does not walk past a person", () => {
    * which is the forged-completion shape TASK-012 exists to refuse.
    */
   it("never advances an item: a crashed ACTIVE item goes back to PENDING and no further", async () => {
-    const path = await seed();
+    /**
+     * THE ITEM IS BLOCKED BEHIND AN UNFINISHED DEPENDENCY, deliberately.
+     *
+     * Recovery returns it to the queue and the SAME tick then carries it
+     * onward, so a runnable item ends at whatever the executor produced — and
+     * the first two drafts of this test asserted that instead, which is the
+     * executor's business rather than recovery's. With `Z` not DONE, `A` can
+     * never be promoted past PENDING, so the status observed afterwards is
+     * exactly what recovery wrote and nothing else.
+     */
+    const gated: readonly RoadmapItem[] = [
+      { key: "Z", title: "Blocker", dependsOn: [], status: "PENDING", workClass: "NORMAL_IMPLEMENTATION", order: 1 },
+      { key: "A", title: "Work", dependsOn: ["Z"], status: "ACTIVE", workClass: "NORMAL_IMPLEMENTATION", order: 2 },
+    ];
+    const path = await seed(gated);
     assert.equal(
       runChild({ path, id: "A:REVIEW:r1", kind: "REVIEW", roadmapKey: "A", progress: 1, ending: "die" }).signal,
       "SIGKILL",
     );
 
-    // No executor may run, so what is observed is reconciliation's own write
-    // rather than whatever the tick did afterwards.
     const repository = createSqliteSupervisorRepository(path);
     const now = Date.now();
     try {
       await new SupervisorService({
         repository,
-        roadmapCatalog: [...ROADMAP],
+        roadmapCatalog: [...gated],
         probe: scriptedProbe(),
         executor: scriptedExecutor(),
         clock: { now: () => now },
@@ -529,9 +667,21 @@ describe("TASK-018 AC-20: recovery does not walk past a person", () => {
 
     const after = createSqliteSupervisorRepository(path);
     try {
-      const status = (await after.load())?.roadmap.find((item) => item.key === "A")?.status;
+      const state = await after.load();
+      const status = state?.roadmap.find((item) => item.key === "A")?.status;
+      /**
+       * BACK IN THE QUEUE, which is `PENDING` or the `ELIGIBLE` the same tick
+       * promotes it to. Pinning one spelling would be asserting where the
+       * eligibility pass happens to leave it; what AC-20 requires is that
+       * recovery moved it BACKWARDS and never forwards.
+       */
+      assert.ok(
+        status === "PENDING" || status === "ELIGIBLE",
+        `expected the item back in the queue, found ${status}`,
+      );
       assert.notEqual(status, "DONE", "recovery marked a crashed item complete");
       assert.notEqual(status, "ACTIVE", "the item was left in its dead owner's state");
+      assert.equal(state?.activities?.[0]?.reconciliation?.verdict, "CRASHED");
     } finally {
       after.close();
     }

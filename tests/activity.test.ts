@@ -44,6 +44,21 @@ function probeSaying(answer: Liveness | ((held: ActivityLease) => Liveness)): Li
   return { check: (held) => (typeof answer === "function" ? answer(held) : answer) };
 }
 
+/** The pid a claimant uses below, kept distinct from the incumbent's 4242. */
+const CLAIMANT_PID = 777;
+
+/**
+ * Answers per LEASE rather than globally.
+ *
+ * A claim now checks TWO things — that the incoming lease names a live process,
+ * and what the incumbent is doing — so a probe that gives one answer to both
+ * cannot express the cases. The claimant is alive unless a test says otherwise;
+ * the incumbent is whatever the test is about.
+ */
+function probeWhere(incumbent: Liveness, claimant: Liveness = "ALIVE"): LivenessProbe {
+  return { check: (held) => (held.pid === CLAIMANT_PID ? claimant : incumbent) };
+}
+
 function claimed(overrides: Partial<Activity> = {}): Activity {
   return {
     id: "CLEAN_ROOM_CI:REVIEW:r1",
@@ -70,37 +85,66 @@ describe("TASK-018 AC-13: an activity has exactly one owner", () => {
     id: "CLEAN_ROOM_CI:REVIEW:r1",
     kind: "REVIEW",
     roadmapKey: "CLEAN_ROOM_CI",
-    lease: lease({ pid: 777, processStartedAt: 5 }),
+    lease: lease({ pid: CLAIMANT_PID, processStartedAt: 5 }),
     now: T0 + 10,
   };
 
   it("CLAIMS an activity nothing holds — the positive control", () => {
-    const verdict = claimActivity([], request, probeSaying("GONE"));
+    const verdict = claimActivity([], request, probeWhere("GONE"));
     assert.equal(verdict.ok, true);
     if (!verdict.ok) throw new Error("unreachable");
     assert.equal(verdict.activities.length, 1);
     assert.equal(verdict.activity.state, "CLAIMED");
-    assert.equal(verdict.activity.lease?.pid, 777);
+    assert.equal(verdict.activity.lease?.pid, CLAIMANT_PID);
+  });
+
+  /**
+   * ROUND-1 REVIEW, HIGH 2. Liveness was checked only for the INCUMBENT, so a
+   * claim carrying a lease for a process that had already died was accepted and
+   * written — and the record then said an activity was owned by something that
+   * would never report progress, complete it, or release it.
+   */
+  it("REFUSES a claim whose OWN process is not running", () => {
+    const problem = problemOf(claimActivity([], request, probeWhere("GONE", "GONE")));
+    assert.match(problem, new RegExp(`refusing to claim .* for pid ${CLAIMANT_PID}`));
+    assert.match(problem, /not running/);
+  });
+
+  it("REFUSES a claim whose own process cannot be checked from here", () => {
+    const problem = problemOf(claimActivity([], request, probeWhere("GONE", "UNKNOWN")));
+    assert.match(problem, /not checkable from here/);
   });
 
   it("REFUSES a second owner while the first is alive, and names the holder", () => {
-    const problem = problemOf(claimActivity([claimed()], request, probeSaying("ALIVE")));
+    const problem = problemOf(claimActivity([claimed()], request, probeWhere("ALIVE")));
     assert.match(problem, /is held by pid 4242/);
     assert.match(problem, /"wsl-ubuntu"/);
     assert.match(problem, /still running/);
   });
 
   it("REFUSES when liveness cannot be established, rather than assuming either way", () => {
-    const problem = problemOf(claimActivity([claimed()], request, probeSaying("UNKNOWN")));
+    const problem = problemOf(claimActivity([claimed()], request, probeWhere("UNKNOWN")));
+    assert.match(problem, /cannot be established/);
+  });
+
+  /**
+   * ROUND-1 REVIEW, HIGH 2. "No owner is recorded" is not the same fact as "no
+   * owner exists", and taking it would resolve an unknown in the convenient
+   * direction.
+   */
+  it("REFUSES an unfinished activity that records no lease at all", () => {
+    const { lease: _none, ...orphaned } = claimed({ state: "RUNNING" });
+    const problem = problemOf(claimActivity([orphaned], request, probeWhere("ALIVE")));
+    assert.match(problem, /with no lease recorded/);
     assert.match(problem, /cannot be established/);
   });
 
   it("ALLOWS the claim once the previous holder is gone", () => {
-    const verdict = claimActivity([claimed()], request, probeSaying("GONE"));
+    const verdict = claimActivity([claimed()], request, probeWhere("GONE"));
     assert.equal(verdict.ok, true);
     if (!verdict.ok) throw new Error("unreachable");
     assert.equal(verdict.activities.length, 1, "a re-claim must not duplicate the record");
-    assert.equal(verdict.activity.lease?.pid, 777);
+    assert.equal(verdict.activity.lease?.pid, CLAIMANT_PID);
   });
 
   it("carries progress across a re-claim, but never a completion or an observation", () => {
@@ -111,7 +155,7 @@ describe("TASK-018 AC-13: an activity has exactly one owner", () => {
       observedAt: T0 + 3,
       reconciliation: { verdict: "LIVE", at: T0 + 2, detail: "stale" },
     });
-    const verdict = claimActivity([previous], request, probeSaying("GONE"));
+    const verdict = claimActivity([previous], request, probeWhere("GONE"));
     assert.equal(verdict.ok, true);
     if (!verdict.ok) throw new Error("unreachable");
     assert.deepEqual(verdict.activity.heartbeat, { at: T0 + 1, progress: 7 });
@@ -126,7 +170,7 @@ describe("TASK-018 AC-13: an activity has exactly one owner", () => {
       claimActivity(
         [claimed({ state: "COMPLETED", completion: { outcome: "PASS", detail: "done", at: T0 } })],
         request,
-        probeSaying("GONE"),
+        probeWhere("GONE"),
       ),
     );
     assert.match(problem, /already finished as COMPLETED/);
@@ -134,7 +178,7 @@ describe("TASK-018 AC-13: an activity has exactly one owner", () => {
   });
 
   it("REFUSES to act on durable state holding the same id twice", () => {
-    const problem = problemOf(claimActivity([claimed(), claimed()], request, probeSaying("GONE")));
+    const problem = problemOf(claimActivity([claimed(), claimed()], request, probeWhere("GONE")));
     assert.match(problem, /more than once/);
   });
 

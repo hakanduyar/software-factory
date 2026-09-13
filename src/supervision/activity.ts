@@ -194,6 +194,29 @@ export function claimActivity(
   if (activities.filter((entry) => entry.id === request.id).length > 1) {
     return { ok: false, problem: `durable state holds ${JSON.stringify(request.id)} more than once` };
   }
+
+  /**
+   * THE INCOMING LEASE MUST NAME A LIVE PROCESS (round-1 review, HIGH 2).
+   *
+   * Liveness was checked only for the EXISTING holder, so a claim carrying a
+   * lease for a process that had already died — or one this host cannot check —
+   * was accepted and written. The record then says an activity is owned by
+   * something that will never report progress, never complete it, and never
+   * release it, and the next reconciliation has to discover that separately.
+   *
+   * A claim is a statement that THIS process is about to do the work. If the
+   * process it names is not running, the statement is already false.
+   */
+  const mine = probe.check(request.lease);
+  if (mine !== "ALIVE") {
+    return {
+      ok: false,
+      problem:
+        `refusing to claim ${JSON.stringify(request.id)} for pid ${request.lease.pid} on ` +
+        `${JSON.stringify(request.lease.machine)}: that process is ${mine === "GONE" ? "not running" : "not checkable from here"}`,
+    };
+  }
+
   const existing = activities.find((entry) => entry.id === request.id);
 
   if (existing !== undefined) {
@@ -222,7 +245,22 @@ export function claimActivity(
      * proves, so the code is shaped to let each one be removed on its own.
      */
     const held = existing.lease;
-    if (held !== undefined) {
+    if (held === undefined) {
+      /**
+       * A NON-TERMINAL ACTIVITY WITH NO LEASE IS AMBIGUOUS, NOT FREE (round-1
+       * review, HIGH 2). Nothing here can say whether something is working on
+       * it, and "no owner is recorded" is not the same fact as "no owner
+       * exists". Taking it would be resolving an unknown in the convenient
+       * direction, which is the one thing this mechanism may never do.
+       */
+      return {
+        ok: false,
+        problem:
+          `activity ${JSON.stringify(request.id)} is ${existing.state} with no lease recorded, so whether ` +
+          "anything is still working on it cannot be established",
+      };
+    }
+    {
       const liveness = probe.check(held);
       if (liveness === "ALIVE") {
         return {
@@ -465,7 +503,21 @@ function settle<T>(
   if (current === undefined) {
     return { kind: "apply" };
   }
-  if (describe(current) === describe(incoming)) {
+  /**
+   * COMPARED STRUCTURALLY, NOT BY A CONCATENATED STRING (round-1 review, HIGH 3).
+   *
+   * `describe` joined the fields with delimiters, and delimiters collide:
+   * `{outcome: "a/b", detail: "c"}` and `{outcome: "a", detail: "b/c"}`
+   * produced the same text, so two genuinely different completions were
+   * accepted as an idempotent repeat and the disagreement vanished silently.
+   * That is precisely the "two owners disagree and nobody hears about it" case
+   * this function exists to refuse.
+   *
+   * `JSON.stringify` of the value escapes the field boundaries, so no choice of
+   * content can make two different records look alike. `describe` survives for
+   * the MESSAGE, where readability is the only requirement.
+   */
+  if (JSON.stringify(current) === JSON.stringify(incoming)) {
     return { kind: "noop" };
   }
   return {
