@@ -31,6 +31,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
+import type { Activity } from "../src/supervision/activity.js";
 import { BILLING_MODES } from "../src/supervision/financialSafety.js";
 import type { AiRunConfigRecord } from "../src/supervision/modelEnforcement.js";
 import type { ResourceRecord } from "../src/supervision/resourceTypes.js";
@@ -145,12 +146,26 @@ const PROVENANCE_FIELDS: Record<keyof Required<ProvenanceEntry>, true> = {
   digest: true,
 };
 
+const ACTIVITY_FIELDS: Record<keyof Required<Activity>, true> = {
+  id: true,
+  kind: true,
+  roadmapKey: true,
+  state: true,
+  lease: true,
+  heartbeat: true,
+  completion: true,
+  observedAt: true,
+  reconciliation: true,
+  updatedAt: true,
+};
+
 const STATE_FIELDS: Record<keyof Required<SupervisorState>, true> = {
   version: true,
   financialPolicy: true,
   resources: true,
   roadmap: true,
   checkpoints: true,
+  activities: true,
   activeClaim: true,
   nextWakeAt: true,
   escalations: true,
@@ -263,12 +278,31 @@ const MAXIMAL_PROVENANCE: Required<ProvenanceEntry> = (() => {
   return appended.chain[0] as Required<ProvenanceEntry>;
 })();
 
+/**
+ * A TERMINAL activity, because that is the only shape carrying every field at
+ * once: a completion and an observation exist only once the work has finished,
+ * and the parser refuses both on an unfinished one.
+ */
+const MAXIMAL_ACTIVITY: Required<Activity> = {
+  id: "LOCAL_24_7_RUNTIME:REVIEW:r2",
+  kind: "REVIEW",
+  roadmapKey: "LOCAL_24_7_RUNTIME",
+  state: "COMPLETED",
+  lease: { pid: 4242, processStartedAt: 99_000, machine: "wsl-ubuntu", claimedAt: 1_150 },
+  heartbeat: { at: 1_180, progress: 7 },
+  completion: { outcome: "PASS", detail: "verdict recorded", at: 1_190 },
+  observedAt: 1_195,
+  reconciliation: { verdict: "LIVE", at: 1_185, detail: "owner was running" },
+  updatedAt: 1_190,
+};
+
 const MAXIMAL_STATE: Required<SupervisorState> = {
   version: 9,
   financialPolicy: { autonomousSpendAllowed: false, autonomousSpendLimit: 0 },
   resources: [MAXIMAL_RESOURCE],
   roadmap: [MAXIMAL_ROADMAP_ITEM],
   checkpoints: [MAXIMAL_CHECKPOINT],
+  activities: [MAXIMAL_ACTIVITY],
   activeClaim: MAXIMAL_CLAIM,
   nextWakeAt: 1_600,
   escalations: [MAXIMAL_ESCALATION],
@@ -296,6 +330,7 @@ describe("TASK-006: every durable supervisor field survives serialization", () =
       CLAIM_FIELDS,
       ESCALATION_FIELDS,
       PROVENANCE_FIELDS,
+      ACTIVITY_FIELDS,
       STATE_FIELDS,
     ]) {
       assert.ok(Object.keys(map).length > 0);

@@ -12,6 +12,7 @@
  * recomputed on read rather than trusted; and ambiguity fails closed.
  */
 
+import type { Activity } from "./activity.js";
 import type { Timestamp } from "../domain/time.js";
 import type { AiRunConfigRecord } from "./modelEnforcement.js";
 import type { WorkClass } from "./modelRouting.js";
@@ -285,6 +286,20 @@ export interface SupervisorState {
   readonly resources: readonly ResourceRecord[];
   readonly roadmap: readonly RoadmapItem[];
   readonly checkpoints: readonly SessionCheckpoint[];
+  /**
+   * Long-running work IN FLIGHT (TASK-018 Part B).
+   *
+   * The durable state this repository defends was never the problem; the state
+   * of work in flight was, and it lived in process memory and scratchpad files
+   * until it died with whatever was holding it.
+   *
+   * OPTIONAL, and absent means none — the same forward-compatibility rule
+   * `provenance` follows, and for the same reason recorded as L-1: an operator
+   * whose supervisor stops loading because a newer build added a field. Making
+   * it required would also have rewritten twenty unrelated test fixtures to
+   * assert nothing, which is churn a reviewer then has to read.
+   */
+  readonly activities?: readonly Activity[];
   readonly activeClaim?: SupervisorActionClaim;
   /** When the next tick is worth running. Absent means "nothing scheduled". */
   readonly nextWakeAt?: Timestamp;

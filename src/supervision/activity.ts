@@ -351,6 +351,61 @@ export function unobservedCompletions(activities: readonly Activity[]): readonly
   return activities.filter((entry) => isTerminal(entry.state) && entry.observedAt === undefined);
 }
 
+/**
+ * The ONLY status recovery may move an item out of, and the only one it may
+ * move it to (AC-20).
+ *
+ * A crashed owner's item goes ACTIVE -> PENDING and nothing else. That single
+ * pair is what makes the Factory self-healing — without it a crash parks the
+ * item until a human notices, which is the state this whole task exists to
+ * remove — and it is also what makes recovery safe, because it only ever moves
+ * an item BACKWARDS into the queue it came from.
+ *
+ * A LIST OF PROTECTED STATUSES WAS WRITTEN HERE FIRST AND THEN DELETED, which
+ * is worth recording because the deletion is the finding. It named DONE,
+ * BLOCKED and WAITING_FOR_HUMAN_REQUIRED and refused them — and an item cannot
+ * be ACTIVE and also be any of those, so `status === "ACTIVE"` below already
+ * excluded every one of them. The clause could never be the sole reason for a
+ * refusal, and this repository has deleted five such clauses already. Keeping a
+ * sixth because it reads like a safety check is how a register of guards turns
+ * into decoration, and a mutation aimed at it would have been caught by the
+ * ACTIVE test instead — the sibling masking found in round 1 of Part A,
+ * repeated deliberately.
+ *
+ * What AC-20 actually requires is proven by the direction of the move, and the
+ * mutation that matters turns PENDING into anything further forward.
+ */
+export const RECOVERY_FROM_STATUS = "ACTIVE" as const;
+export const RECOVERY_TO_STATUS = "PENDING" as const;
+
+/**
+ * Which roadmap items a crashed activity should return to the queue.
+ *
+ * This is the only thing in this module that proposes an ACTION rather than
+ * recording a fact. It proposes; the caller decides and writes.
+ */
+export function crashedItemsToRequeue(
+  activities: readonly Activity[],
+  roadmap: readonly { readonly key: string; readonly status: string }[],
+): readonly string[] {
+  const requeue = new Set<string>();
+
+  for (const activity of activities) {
+    if (activity.reconciliation?.verdict !== "CRASHED") continue;
+    const item = roadmap.find((entry) => entry.key === activity.roadmapKey);
+    if (item === undefined) continue;
+    /**
+     * Only an item the crashed owner was actually working on. Every other
+     * status is one somebody else put it in — a human gate, a blocker, a
+     * result — and moving it would be recovery taking a decision instead of
+     * restoring knowledge.
+     */
+    if (item.status !== RECOVERY_FROM_STATUS) continue;
+    requeue.add(item.key);
+  }
+  return [...requeue];
+}
+
 export type TransitionVerdict =
   | { readonly ok: true; readonly activities: readonly Activity[]; readonly changed: boolean }
   | { readonly ok: false; readonly problem: string };

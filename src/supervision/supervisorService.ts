@@ -20,6 +20,14 @@
  */
 
 import {
+  classifyActivity,
+  crashedItemsToRequeue,
+  recordReconciliation,
+  RECOVERY_TO_STATUS,
+  unobservedCompletions,
+  type LivenessProbe,
+} from "./activity.js";
+import {
   CATALOG_UPGRADE_STEPS,
   planCatalogUpgrade,
   ROADMAP_CATALOG_VERSION,
@@ -134,6 +142,17 @@ export interface SupervisorServiceDeps {
    * ships, and to NONE when a catalog is injected — see `catalogUpgradeSteps`.
    */
   readonly catalogUpgradeSteps?: readonly CatalogUpgradeStep[];
+  /**
+   * How this installation finds out whether a lease holder is still running
+   * (TASK-018 AC-12). Injected for the same reason the probe and clock are: a
+   * test states the fact, and the production adapter reads `/proc`.
+   *
+   * ABSENT means liveness cannot be established, and reconciliation then
+   * concludes nothing — an unknown refuses.
+   */
+  readonly liveness?: LivenessProbe;
+  /** The interval AC-14 measures a stall against. Defaults to forty minutes. */
+  readonly stallAfterMs?: number;
   readonly log?: (line: string) => void;
   readonly ownerId?: string;
 }
@@ -433,7 +452,15 @@ export class SupervisorService {
     if (catalogued.result !== undefined) {
       return { kind: "REFUSAL", result: catalogued.result };
     }
-    const defined = catalogued.state;
+    /**
+     * 0c. WORK IN FLIGHT, before anything decides what to do next (TASK-018).
+     *
+     * After the definition is trusted and before eligibility is computed: an
+     * item whose owner crashed goes back to the queue here, so the selection
+     * below sees the roadmap as it actually is rather than as a dead process
+     * left it.
+     */
+    const defined = await this.reconcileActivities(catalogued.state);
 
     /**
      * 1a. RESOURCES RECONCILE BEFORE ANY PATH THAT CAN PUBLISH A WAKE
@@ -2776,6 +2803,106 @@ export class SupervisorService {
    * `state.roadmap` instead would be reading exactly the row this exists to
    * distrust, so the reconciled state REPLACES it rather than sitting beside it.
    */
+  /**
+   * How long without progress before a LIVE owner is called STALLED (AC-14).
+   *
+   * Forty minutes, which is the threshold the TASK-017 watchdog used and the one
+   * an operator here already reasons in. A stall is a MEASUREMENT against a
+   * stated interval; without the interval, "stalled" is an opinion.
+   */
+  private stallAfterMs(): number {
+    return this.deps.stallAfterMs ?? 40 * 60 * 1000;
+  }
+
+  /**
+   * Looks at work IN FLIGHT and writes down what it finds (AC-16, AC-19, AC-20).
+   *
+   * RECORDS, and acts only in the one narrow way `crashedItemsToRequeue`
+   * permits. A conclusion about a dead process is knowledge; freeing its lease,
+   * finishing its activity or advancing its item would be decisions, and each of
+   * those has a gate elsewhere.
+   *
+   * It never returns a refusal that stops the tick. A crashed activity is not a
+   * reason to stop the Factory — it is the reason the Factory can carry on,
+   * which is what separates this from the structural refusals above.
+   */
+  private async reconcileActivities(state: SupervisorState): Promise<SupervisorState> {
+    const activities = state.activities ?? [];
+    if (activities.length === 0) {
+      return state;
+    }
+    const probe = this.deps.liveness;
+    if (probe === undefined) {
+      /**
+       * No probe means liveness cannot be established here, and the invariant
+       * says an unknown REFUSES rather than being resolved in whichever
+       * direction is convenient. Leaving every record untouched is that
+       * refusal: nothing is concluded, and `claimActivity` still refuses a
+       * lease it cannot check.
+       */
+      return state;
+    }
+
+    const now = this.deps.clock.now();
+    let next = activities;
+    let changed = false;
+
+    for (const activity of activities) {
+      const verdict = classifyActivity(activity, { now, stallAfterMs: this.stallAfterMs() }, probe);
+      if (verdict === undefined) continue;
+      const recorded = recordReconciliation(next, activity.id, {
+        verdict: verdict.verdict,
+        at: now,
+        detail: boundedDiagnostic(verdict.detail),
+      });
+      if (!recorded.ok) {
+        this.log(`[supervisor] could not record a reconciliation verdict: ${recorded.problem}`);
+        continue;
+      }
+      if (recorded.changed) {
+        this.log(`[supervisor] ${verdict.verdict}: ${verdict.detail}`);
+      }
+      next = recorded.activities;
+      changed = changed || recorded.changed;
+    }
+
+    /**
+     * AC-19. A completion nothing has acted on is REPORTED, every tick, until
+     * something does. This is the answer to "the result has existed for hours
+     * and nobody noticed": it is read out of durable state rather than waited
+     * for, so a notification that was never delivered changes nothing.
+     */
+    for (const waiting of unobservedCompletions(next)) {
+      this.log(
+        `[supervisor] unobserved ${waiting.state} activity ${waiting.id}: ` +
+          `${waiting.completion?.outcome ?? "no outcome"}`,
+      );
+    }
+
+    // The one recovery ACTION. Its gate lives inside the function that proposes
+    // it, with the reasoning, rather than here at the call site.
+    const requeue = new Set(crashedItemsToRequeue(next, state.roadmap));
+    const roadmap =
+      requeue.size === 0
+        ? state.roadmap
+        : state.roadmap.map((item) => {
+            if (!requeue.has(item.key)) return item;
+            this.log(`[supervisor] returning ${item.key} to the queue: its owner crashed`);
+            /**
+             * BACKWARDS, into the queue it came from, and never anywhere else.
+             * This is the whole of AC-20 in one expression: a crash is a reason
+             * to try again and never a reason to be further along than before.
+             */
+            return { ...item, status: RECOVERY_TO_STATUS };
+          });
+    changed = changed || requeue.size > 0;
+
+    if (!changed) {
+      return state;
+    }
+    return this.commit(state, { ...state, activities: next, roadmap });
+  }
+
   /**
    * The declared upgrade steps that apply to THIS installation (TASK-018 AC-3).
    *

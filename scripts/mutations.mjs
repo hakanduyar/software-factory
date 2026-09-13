@@ -51,6 +51,14 @@ export const T_CATUP = "dist/tests/catalogUpgrade.test.js";
 export const T_CATPERS = "dist/tests/catalogUpgradePersistence.test.js";
 export const T_ROADMAP = "dist/tests/roadmapStructuralIntegrity.test.js";
 
+// ---- TASK-018 Part B: durable orchestration ------------------------------
+export const ACTIVITY = "src/supervision/activity.ts";
+export const PROCLIVE = "src/adapters/supervision/procLiveness.ts";
+
+export const T_ACT = "dist/tests/activity.test.js";
+export const T_PROCLIVE = "dist/tests/procLiveness.test.js";
+export const T_ACTREC = "dist/tests/activityRecovery.test.js";
+
 export const MUTATIONS = [
   // ---- AC-1: only runners this repository knows to be unmetered -------------
   {
@@ -1010,6 +1018,148 @@ export const MUTATIONS = [
       "        writeMeta.run(CATALOG_VERSION_KEY, String(toCatalogVersion - 1));\n        db.exec(\"COMMIT\");"]],
     tests: [T_CATPERS],
     expect: "is IDEMPOTENT",
+  },
+
+  // =========================================================================
+  // TASK-018 PART B — durable orchestration
+  //
+  // The property under measurement here is unusual in the other direction from
+  // Part A: these guards exist to stop the Factory believing that work is
+  // happening when nothing is running, and to stop a second owner starting
+  // beside a first. Each mutation asks whether a dead process can be mistaken
+  // for a live one, or the reverse.
+  // =========================================================================
+
+  // ---- AC-12: holding a lease requires being alive ------------------------
+  {
+    id: "a dead lease holder keeps the activity",
+    edits: [[ACTIVITY,
+      '      if (liveness === "ALIVE") {',
+      '      if (liveness === "ALIVE" || liveness === "GONE") {']],
+    tests: [T_ACTREC],
+    expect: "ALLOWS a real process to take over once the holder is dead",
+  },
+  {
+    id: "an unknown lease holder is treated as gone, so a second owner starts",
+    edits: [[ACTIVITY,
+      '      if (liveness === "UNKNOWN") {',
+      '      if (liveness === "UNKNOWN" && false) {']],
+    tests: [T_ACT],
+    expect: "REFUSES when liveness cannot be established",
+  },
+  {
+    id: "a reused pid is reported as the original holder",
+    edits: [[PROCLIVE,
+      "      if (started !== lease.processStartedAt) {",
+      "      if (started !== lease.processStartedAt && false) {"]],
+    tests: [T_PROCLIVE],
+    expect: "reports GONE when the pid is REUSED by an unrelated process",
+  },
+  {
+    id: "a lease from another machine is judged anyway",
+    edits: [[PROCLIVE,
+      "      if (lease.machine !== machine) {",
+      "      if (lease.machine !== machine && false) {"]],
+    tests: [T_PROCLIVE],
+    expect: "reports UNKNOWN for a lease from another machine",
+  },
+  {
+    id: "an unreadable /proc entry is read as death",
+    edits: [[PROCLIVE,
+      '        return (error as NodeJS.ErrnoException)?.code === "ENOENT" ? "GONE" : "UNKNOWN";',
+      '        return "GONE";']],
+    tests: [T_PROCLIVE],
+    expect: "UNKNOWN for one it cannot parse",
+  },
+  {
+    id: "the stat parser splits on the FIRST parenthesis",
+    edits: [[PROCLIVE,
+      '  const close = raw.lastIndexOf(")");\n  if (close === -1) return undefined;\n  const fields = raw.slice(close + 1).trim().split(/\\s+/);',
+      '  const close = raw.indexOf(")");\n  if (close === -1) return undefined;\n  const fields = raw.slice(close + 1).trim().split(/\\s+/);']],
+    tests: [T_PROCLIVE],
+    expect: "reads it when the executable name contains spaces and parentheses",
+  },
+
+  // ---- AC-14: a stall is a measurement, not an opinion ---------------------
+  {
+    id: "liveness stops deciding before recency, so a dead owner looks stalled",
+    edits: [[ACTIVITY,
+      '  if (liveness === "GONE") {',
+      '  if (liveness === "GONE" && false) {']],
+    tests: [T_ACT],
+    expect: "CRASHED when the owner is gone, however recent its last progress",
+  },
+  {
+    id: "a live owner that never reported anything is called LIVE forever",
+    edits: [[ACTIVITY,
+      "    if (waited > input.stallAfterMs) {",
+      "    if (waited > input.stallAfterMs && false) {"]],
+    tests: [T_ACT],
+    expect: "NEVER_STARTED when a live owner has held it without reporting anything",
+  },
+  {
+    id: "the stall threshold is ignored, so nothing is ever stalled",
+    edits: [[ACTIVITY,
+      "  if (since > input.stallAfterMs) {",
+      "  if (since > input.stallAfterMs && false) {"]],
+    tests: [T_ACT],
+    expect: "STALLED only when the owner is ALIVE and progress has stopped",
+  },
+
+  // ---- AC-17: idempotence, and disagreement refusing -----------------------
+  {
+    id: "a second, DISAGREEING completion overwrites the first",
+    edits: [[ACTIVITY,
+      '  return {\n    kind: "refuse",\n    problem:\n      `activity ${JSON.stringify(id)} already recorded ${what} as ${describe(current)}; ` +\n      `refusing to replace it with ${describe(incoming)}`,\n  };',
+      '  return { kind: "apply" };']],
+    tests: [T_ACT],
+    expect: "REFUSES a second completion that DISAGREES",
+  },
+  {
+    id: "progress is allowed to go backwards",
+    edits: [[ACTIVITY,
+      "    if (previous !== undefined && heartbeat.progress < previous.progress) {",
+      "    if (previous !== undefined && heartbeat.progress < previous.progress && false) {"]],
+    tests: [T_ACT],
+    expect: "REFUSES progress that goes backwards",
+  },
+
+  // ---- AC-15/AC-19: a result that exists is discoverable -------------------
+  {
+    id: "an unobserved completion is not reported as outstanding",
+    edits: [[ACTIVITY,
+      "  return activities.filter((entry) => isTerminal(entry.state) && entry.observedAt === undefined);",
+      "  return activities.filter((entry) => isTerminal(entry.state) && entry.observedAt !== undefined);"]],
+    tests: [T_ACT],
+    expect: "lists a completion nothing has acted on",
+  },
+
+  // ---- AC-16: a re-claim must not resurrect a dead owner's authority -------
+  {
+    id: "a re-claim carries the dead owner's completion forward",
+    edits: [[ACTIVITY,
+      "  return previous.heartbeat === undefined ? {} : { heartbeat: previous.heartbeat };",
+      "  return previous.heartbeat === undefined ? { ...previous } : { ...previous, heartbeat: previous.heartbeat };"]],
+    tests: [T_ACT],
+    expect: "carries progress across a re-claim, but never a completion or an observation",
+  },
+
+  // ---- AC-20: recovery restores knowledge, never authority -----------------
+  {
+    id: "recovery marks a crashed item DONE instead of re-queueing it",
+    edits: [["src/supervision/supervisorService.ts",
+      "            return { ...item, status: RECOVERY_TO_STATUS };",
+      '            return { ...item, status: "DONE" as const };']],
+    tests: [T_ACTREC],
+    expect: "never advances an item: a crashed ACTIVE item goes back to PENDING and no further",
+  },
+  {
+    id: "recovery re-queues an item whatever state somebody else put it in",
+    edits: [[ACTIVITY,
+      "    if (item.status !== RECOVERY_FROM_STATUS) continue;",
+      "    if (item.status === RECOVERY_FROM_STATUS && false) continue;"]],
+    tests: [T_ACTREC],
+    expect: "REFUSES to re-queue an item at WAITING_FOR_HUMAN_REQUIRED",
   },
 
   // ---- AC-9: the dependency is real ---------------------------------------

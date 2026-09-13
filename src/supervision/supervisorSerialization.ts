@@ -25,6 +25,14 @@
 
 import { PersistenceCorruptionError } from "../domain/errors.js";
 import {
+  ACTIVITY_STATES,
+  RECONCILIATION_VERDICTS,
+  TERMINAL_ACTIVITY_STATES,
+  type Activity,
+  type ActivityState,
+  type ReconciliationVerdict,
+} from "./activity.js";
+import {
   ACTION_STATES,
   ESCALATION_REASONS,
   ROADMAP_STATUSES,
@@ -360,6 +368,105 @@ function parseClaim(raw: unknown, context: string): SupervisorActionClaim {
   };
 }
 
+/**
+ * One in-flight activity (TASK-018 Part B).
+ *
+ * Parsed as strictly as everything else here, and for the same reason: this
+ * record is what a NEW process reads to decide whether an old one is still
+ * working. A row it half-understood would be worse than a row it refused,
+ * because the conclusion drawn from it is "nobody owns this, take it".
+ */
+function parseActivity(raw: unknown, index: number, context: string): Activity {
+  const itemContext = `${context}.activities[${index}]`;
+  const row = asObject(raw, itemContext);
+
+  const leaseRaw = row["lease"];
+  const lease =
+    leaseRaw === undefined
+      ? undefined
+      : (() => {
+          const leaseContext = `${itemContext}.lease`;
+          const leaseRow = asObject(leaseRaw, leaseContext);
+          return {
+            pid: nonNegativeInt(leaseRow, "pid", leaseContext),
+            processStartedAt: nonNegativeInt(leaseRow, "processStartedAt", leaseContext),
+            machine: str(leaseRow, "machine", leaseContext),
+            claimedAt: num(leaseRow, "claimedAt", leaseContext),
+          };
+        })();
+
+  const heartbeatRaw = row["heartbeat"];
+  const heartbeat =
+    heartbeatRaw === undefined
+      ? undefined
+      : (() => {
+          const beatContext = `${itemContext}.heartbeat`;
+          const beatRow = asObject(heartbeatRaw, beatContext);
+          return {
+            at: num(beatRow, "at", beatContext),
+            progress: nonNegativeInt(beatRow, "progress", beatContext),
+          };
+        })();
+
+  const completionRaw = row["completion"];
+  const completion =
+    completionRaw === undefined
+      ? undefined
+      : (() => {
+          const doneContext = `${itemContext}.completion`;
+          const doneRow = asObject(completionRaw, doneContext);
+          return {
+            outcome: str(doneRow, "outcome", doneContext),
+            detail: str(doneRow, "detail", doneContext),
+            at: num(doneRow, "at", doneContext),
+          };
+        })();
+
+  const reconciliationRaw = row["reconciliation"];
+  const reconciliation =
+    reconciliationRaw === undefined
+      ? undefined
+      : (() => {
+          const seenContext = `${itemContext}.reconciliation`;
+          const seenRow = asObject(reconciliationRaw, seenContext);
+          return {
+            verdict: oneOf<ReconciliationVerdict>(seenRow, "verdict", RECONCILIATION_VERDICTS, seenContext),
+            at: num(seenRow, "at", seenContext),
+            detail: str(seenRow, "detail", seenContext),
+          };
+        })();
+
+  const observedAt = optionalNum(row, "observedAt", itemContext);
+  const state = oneOf<ActivityState>(row, "state", ACTIVITY_STATES, itemContext);
+
+  /**
+   * A TERMINAL activity must carry the outcome its owner recorded.
+   *
+   * Otherwise a row saying COMPLETED with nothing to show for it would satisfy
+   * `unobservedCompletions` and be reported as a result — which is exactly the
+   * forged-DONE shape TASK-012 refuses on the roadmap, arriving by another door.
+   */
+  if (TERMINAL_ACTIVITY_STATES.includes(state) && completion === undefined) {
+    corrupt(itemContext, `state is ${state} but no completion was recorded`);
+  }
+  if (observedAt !== undefined && !TERMINAL_ACTIVITY_STATES.includes(state)) {
+    corrupt(itemContext, `state is ${state} but an observation was recorded`);
+  }
+
+  return {
+    id: str(row, "id", itemContext),
+    kind: str(row, "kind", itemContext),
+    roadmapKey: str(row, "roadmapKey", itemContext),
+    state,
+    ...(lease === undefined ? {} : { lease }),
+    ...(heartbeat === undefined ? {} : { heartbeat }),
+    ...(completion === undefined ? {} : { completion }),
+    ...(observedAt === undefined ? {} : { observedAt }),
+    ...(reconciliation === undefined ? {} : { reconciliation }),
+    updatedAt: num(row, "updatedAt", itemContext),
+  };
+}
+
 function parseEscalation(raw: unknown, index: number, context: string): HumanEscalation {
   const itemContext = `${context}.escalations[${index}]`;
   const row = asObject(raw, itemContext);
@@ -591,6 +698,30 @@ export function parseSupervisorState(json: string, expected: { readonly version:
           };
         })();
 
+  /**
+   * ABSENT means no activities, not corruption — the same forward-compatibility
+   * rule provenance follows above. Every database written before TASK-018 has
+   * no such field and is not damaged.
+   */
+  const activities =
+    row["activities"] === undefined
+      ? []
+      : asArray(row["activities"], `${context}.activities`).map((entry, index) =>
+          parseActivity(entry, index, context),
+        );
+  const activityIds = new Set<string>();
+  for (const activity of activities) {
+    if (activityIds.has(activity.id)) {
+      // Two rows for one id is the duplicate-owner state in durable form, and
+      // every later decision about "who holds this" would be a coin toss.
+      corrupt(context, `activities hold ${JSON.stringify(activity.id)} more than once`);
+    }
+    activityIds.add(activity.id);
+    if (!roadmapKeys.has(activity.roadmapKey)) {
+      corrupt(context, `activity ${JSON.stringify(activity.id)} references unknown roadmap item "${activity.roadmapKey}"`);
+    }
+  }
+
   const nextWakeAt = optionalNum(row, "nextWakeAt", context);
   return {
     version,
@@ -598,6 +729,9 @@ export function parseSupervisorState(json: string, expected: { readonly version:
     resources,
     roadmap,
     checkpoints,
+    // Emitted only when there is something to say, so a database that has never
+    // held an activity keeps the bytes it already had.
+    ...(activities.length === 0 ? {} : { activities }),
     ...(activeClaim === undefined ? {} : { activeClaim }),
     ...(nextWakeAt === undefined ? {} : { nextWakeAt }),
     escalations,
