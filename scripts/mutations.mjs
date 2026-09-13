@@ -52,6 +52,21 @@ export const T_CATPERS = "dist/tests/catalogUpgradePersistence.test.js";
 export const T_ROADMAP = "dist/tests/roadmapStructuralIntegrity.test.js";
 
 // ---- TASK-018 Part B: durable orchestration ------------------------------
+/**
+ * WHY THESE MUTATIONS SAY `Number.isNaN(0)` RATHER THAN `false`.
+ *
+ * `&& false` is the obvious way to switch a guard off, and it does not work
+ * here. TypeScript folds the condition, marks the branch unreachable, and stops
+ * applying control-flow narrowing inside it — so a `held` that the enclosing
+ * `if (held !== undefined)` had narrowed goes back to `ActivityLease |
+ * undefined`, the file stops compiling, and preflight refuses the mutation as
+ * UNMEASURED. Five mutations failed exactly that way, twice.
+ *
+ * `Number.isNaN(0)` is `false` at runtime and opaque to the checker, so the
+ * branch stays reachable, narrowing survives, and what changes is only the
+ * behaviour — which is the whole point of a mutation. `!Number.isNaN(0)` is the
+ * same trick for a condition that must become always-true.
+ */
 export const ACTIVITY = "src/supervision/activity.ts";
 export const PROCLIVE = "src/adapters/supervision/procLiveness.ts";
 
@@ -1043,7 +1058,7 @@ export const MUTATIONS = [
     id: "an unknown lease holder is treated as gone, so a second owner starts",
     edits: [[ACTIVITY,
       '      if (liveness === "UNKNOWN") {',
-      '      if (liveness === "UNKNOWN" && false) {']],
+      '      if (liveness === "UNKNOWN" && Number.isNaN(0)) {']],
     tests: [T_ACT],
     expect: "REFUSES when liveness cannot be established",
   },
@@ -1051,7 +1066,7 @@ export const MUTATIONS = [
     id: "a reused pid is reported as the original holder",
     edits: [[PROCLIVE,
       "      if (started !== lease.processStartedAt) {",
-      "      if (started !== lease.processStartedAt && false) {"]],
+      "      if (started !== lease.processStartedAt && Number.isNaN(0)) {"]],
     tests: [T_PROCLIVE],
     expect: "reports GONE when the pid is REUSED by an unrelated process",
   },
@@ -1059,7 +1074,7 @@ export const MUTATIONS = [
     id: "a lease from another machine is judged anyway",
     edits: [[PROCLIVE,
       "      if (lease.machine !== machine) {",
-      "      if (lease.machine !== machine && false) {"]],
+      "      if (lease.machine !== machine && Number.isNaN(0)) {"]],
     tests: [T_PROCLIVE],
     expect: "reports UNKNOWN for a lease from another machine",
   },
@@ -1085,7 +1100,7 @@ export const MUTATIONS = [
     id: "liveness stops deciding before recency, so a dead owner looks stalled",
     edits: [[ACTIVITY,
       '  if (liveness === "GONE") {',
-      '  if (liveness === "GONE" && false) {']],
+      '  if (liveness === "GONE" && Number.isNaN(0)) {']],
     tests: [T_ACT],
     expect: "CRASHED when the owner is gone, however recent its last progress",
   },
@@ -1093,7 +1108,7 @@ export const MUTATIONS = [
     id: "a live owner that never reported anything is called LIVE forever",
     edits: [[ACTIVITY,
       "    if (waited > input.stallAfterMs) {",
-      "    if (waited > input.stallAfterMs && false) {"]],
+      "    if (waited > input.stallAfterMs && Number.isNaN(0)) {"]],
     tests: [T_ACT],
     expect: "NEVER_STARTED when a live owner has held it without reporting anything",
   },
@@ -1101,25 +1116,32 @@ export const MUTATIONS = [
     id: "the stall threshold is ignored, so nothing is ever stalled",
     edits: [[ACTIVITY,
       "  if (since > input.stallAfterMs) {",
-      "  if (since > input.stallAfterMs && false) {"]],
+      "  if (since > input.stallAfterMs && Number.isNaN(0)) {"]],
     tests: [T_ACT],
     expect: "STALLED only when the owner is ALIVE and progress has stopped",
   },
 
   // ---- AC-17: idempotence, and disagreement refusing -----------------------
+  /**
+   * The CONDITION is widened rather than the refusal deleted. Deleting the
+   * `return` left `what` and `id` unused and the file stopped compiling, so
+   * preflight refused it as UNMEASURED. Treating every repeat as identical
+   * turns a disagreeing second completion into a silent no-op, which is the
+   * defect: two owners disagree and nobody hears about it.
+   */
   {
-    id: "a second, DISAGREEING completion overwrites the first",
+    id: "a second, DISAGREEING completion is silently treated as the same one",
     edits: [[ACTIVITY,
-      '  return {\n    kind: "refuse",\n    problem:\n      `activity ${JSON.stringify(id)} already recorded ${what} as ${describe(current)}; ` +\n      `refusing to replace it with ${describe(incoming)}`,\n  };',
-      '  return { kind: "apply" };']],
+      "  if (describe(current) === describe(incoming)) {",
+      "  if (describe(current) !== describe(incoming) || !Number.isNaN(0)) {"]],
     tests: [T_ACT],
     expect: "REFUSES a second completion that DISAGREES",
   },
   {
     id: "progress is allowed to go backwards",
     edits: [[ACTIVITY,
-      "    if (previous !== undefined && heartbeat.progress < previous.progress) {",
-      "    if (previous !== undefined && heartbeat.progress < previous.progress && false) {"]],
+      "  if (previous !== undefined && heartbeat.progress < previous.progress) {",
+      "  if (previous !== undefined && heartbeat.progress < previous.progress && Number.isNaN(0)) {"]],
     tests: [T_ACT],
     expect: "REFUSES progress that goes backwards",
   },
@@ -1145,11 +1167,18 @@ export const MUTATIONS = [
   },
 
   // ---- AC-20: recovery restores knowledge, never authority -----------------
+  /**
+   * The CONSTANT is mutated rather than its use. Writing `"DONE" as const` at
+   * the call site left `RECOVERY_TO_STATUS` imported and unused, so the file
+   * stopped compiling and preflight refused it. Changing what the constant MEANS
+   * is also the more honest statement of the defect: recovery advancing an item
+   * instead of returning it to the queue.
+   */
   {
     id: "recovery marks a crashed item DONE instead of re-queueing it",
-    edits: [["src/supervision/supervisorService.ts",
-      "            return { ...item, status: RECOVERY_TO_STATUS };",
-      '            return { ...item, status: "DONE" as const };']],
+    edits: [[ACTIVITY,
+      'export const RECOVERY_TO_STATUS = "PENDING" as const;',
+      'export const RECOVERY_TO_STATUS = "DONE" as const;']],
     tests: [T_ACTREC],
     expect: "never advances an item: a crashed ACTIVE item goes back to PENDING and no further",
   },
@@ -1157,7 +1186,7 @@ export const MUTATIONS = [
     id: "recovery re-queues an item whatever state somebody else put it in",
     edits: [[ACTIVITY,
       "    if (item.status !== RECOVERY_FROM_STATUS) continue;",
-      "    if (item.status === RECOVERY_FROM_STATUS && false) continue;"]],
+      "    if (item.status === RECOVERY_FROM_STATUS && Number.isNaN(0)) continue;"]],
     tests: [T_ACTREC],
     expect: "REFUSES to re-queue an item at WAITING_FOR_HUMAN_REQUIRED",
   },

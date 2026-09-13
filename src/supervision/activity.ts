@@ -211,14 +211,25 @@ export function claimActivity(
           "a retry is a new attempt, not a second claim on this one",
       };
     }
-    if (existing.lease !== undefined) {
-      const liveness = probe.check(existing.lease);
+    /**
+     * The lease is HOISTED, and that is not a style choice.
+     *
+     * Reading `existing.lease.pid` inside each branch makes the narrowing
+     * depend on the branches, so removing one — which is precisely what a
+     * mutation does — stops the file compiling and the harness reports
+     * UNMEASURED instead of measuring the guard. Preflight caught exactly that
+     * on three of these. A guard that cannot be mutated is a guard nothing
+     * proves, so the code is shaped to let each one be removed on its own.
+     */
+    const held = existing.lease;
+    if (held !== undefined) {
+      const liveness = probe.check(held);
       if (liveness === "ALIVE") {
         return {
           ok: false,
           problem:
-            `activity ${JSON.stringify(request.id)} is held by pid ${existing.lease.pid} on ` +
-            `${JSON.stringify(existing.lease.machine)}, which is still running`,
+            `activity ${JSON.stringify(request.id)} is held by pid ${held.pid} on ` +
+            `${JSON.stringify(held.machine)}, which is still running`,
         };
       }
       if (liveness === "UNKNOWN") {
@@ -230,8 +241,8 @@ export function claimActivity(
         return {
           ok: false,
           problem:
-            `activity ${JSON.stringify(request.id)} is held by pid ${existing.lease.pid} on ` +
-            `${JSON.stringify(existing.lease.machine)}, and whether it is still running cannot be established here`,
+            `activity ${JSON.stringify(request.id)} is held by pid ${held.pid} on ` +
+            `${JSON.stringify(held.machine)}, and whether it is still running cannot be established here`,
         };
       }
     }
@@ -287,19 +298,22 @@ export function classifyActivity(
   if (isTerminal(activity.state)) {
     return undefined;
   }
-  if (activity.lease === undefined) {
+  // HOISTED for the same reason as in `claimActivity`: so that each branch
+  // below can be removed by a mutation without the file ceasing to compile.
+  const held = activity.lease;
+  if (held === undefined) {
     return {
       verdict: "AMBIGUOUS",
       detail: `activity ${JSON.stringify(activity.id)} is ${activity.state} with no lease, so no owner can be checked`,
     };
   }
 
-  const liveness = probe.check(activity.lease);
+  const liveness = probe.check(held);
   if (liveness === "GONE") {
     return {
       verdict: "CRASHED",
       detail:
-        `activity ${JSON.stringify(activity.id)} was ${activity.state} and its owner (pid ${activity.lease.pid}) ` +
+        `activity ${JSON.stringify(activity.id)} was ${activity.state} and its owner (pid ${held.pid}) ` +
         "is gone, so what it had done is unknown",
     };
   }
@@ -307,19 +321,19 @@ export function classifyActivity(
     return {
       verdict: "AMBIGUOUS",
       detail:
-        `activity ${JSON.stringify(activity.id)} is held by pid ${activity.lease.pid} on ` +
-        `${JSON.stringify(activity.lease.machine)}, and whether it is still running cannot be established here`,
+        `activity ${JSON.stringify(activity.id)} is held by pid ${held.pid} on ` +
+        `${JSON.stringify(held.machine)}, and whether it is still running cannot be established here`,
     };
   }
 
   if (activity.heartbeat === undefined) {
-    const waited = input.now - activity.lease.claimedAt;
+    const waited = input.now - held.claimedAt;
     if (waited > input.stallAfterMs) {
       return {
         verdict: "NEVER_STARTED",
         detail:
           `activity ${JSON.stringify(activity.id)} has been claimed for ${waited}ms by a live pid ` +
-          `${activity.lease.pid} and has never reported progress`,
+          `${held.pid} and has never reported progress`,
       };
     }
     return { verdict: "LIVE", detail: `activity ${JSON.stringify(activity.id)} was claimed ${waited}ms ago` };
