@@ -18,6 +18,7 @@ import { join } from "node:path";
 import { after, describe, it } from "node:test";
 
 import {
+  bootIdentity,
   createProcLivenessProbe,
   leaseForThisProcess,
   machineIdentity,
@@ -28,6 +29,13 @@ import {
 import type { ActivityLease } from "../src/supervision/activity.js";
 
 const MACHINE = machineIdentity();
+/**
+ * The REAL boot identity, because the probe under test reads the real one.
+ * A host that cannot report it would make every check UNKNOWN, so the
+ * absence is asserted rather than papered over with a default.
+ */
+const BOOT = bootIdentity();
+assert.ok(BOOT !== undefined, "this host reports no boot id, so liveness cannot be checked at all");
 const children: number[] = [];
 
 after(() => {
@@ -75,7 +83,7 @@ describe("TASK-018 AC-12: holding a lease is a fact about a live process", () =>
     const started = processStartTime(pid);
     assert.ok(started !== undefined, "could not read the child's start time");
 
-    const lease: ActivityLease = { pid, processStartedAt: started, machine: MACHINE, claimedAt: 1 };
+    const lease: ActivityLease = { pid, processStartedAt: started, machine: MACHINE, boot: BOOT, claimedAt: 1 };
     const probe = createProcLivenessProbe();
     assert.equal(probe.check(lease), "ALIVE");
 
@@ -109,13 +117,14 @@ describe("TASK-018 AC-12: holding a lease is a fact about a live process", () =>
       pid,
       processStartedAt: started - 1, // the same pid, a different process
       machine: MACHINE,
+      boot: BOOT,
       claimedAt: 1,
     };
     assert.equal(createProcLivenessProbe().check(impostor), "GONE");
 
     // ...and the positive control: the genuine lease on the same live pid.
     assert.equal(
-      createProcLivenessProbe().check({ pid, processStartedAt: started, machine: MACHINE, claimedAt: 1 }),
+      createProcLivenessProbe().check({ pid, processStartedAt: started, machine: MACHINE, boot: BOOT, claimedAt: 1 }),
       "ALIVE",
     );
   });
@@ -140,7 +149,7 @@ describe("TASK-018 AC-12: holding a lease is a fact about a live process", () =>
   it("reports UNKNOWN for a pid that is not a pid", () => {
     const probe = createProcLivenessProbe();
     for (const pid of [0, -1, 1.5, Number.NaN]) {
-      assert.equal(probe.check({ pid, processStartedAt: 1, machine: MACHINE, claimedAt: 1 }), "UNKNOWN", `pid ${pid}`);
+      assert.equal(probe.check({ pid, processStartedAt: 1, machine: MACHINE, boot: BOOT, claimedAt: 1 }), "UNKNOWN", `pid ${pid}`);
     }
   });
 });
@@ -193,22 +202,74 @@ describe("TASK-018 AC-16: unreadable and zombie processes", () => {
     const between = Array.from({ length: 18 }, (_, index) => String(index + 100));
     fakeProc(501, `501 (dead) Z ${between.join(" ")} 777 0 0\n`);
     const probe = createProcLivenessProbe({ procRoot: root, machine: MACHINE });
-    assert.equal(probe.check({ pid: 501, processStartedAt: 777, machine: MACHINE, claimedAt: 1 }), "GONE");
+    assert.equal(probe.check({ pid: 501, processStartedAt: 777, machine: MACHINE, boot: BOOT, claimedAt: 1 }), "GONE");
   });
 
   it("reports ALIVE for the same process when it is merely sleeping — the positive control", () => {
     const between = Array.from({ length: 18 }, (_, index) => String(index + 100));
     fakeProc(502, `502 (alive) S ${between.join(" ")} 778 0 0\n`);
     const probe = createProcLivenessProbe({ procRoot: root, machine: MACHINE });
-    assert.equal(probe.check({ pid: 502, processStartedAt: 778, machine: MACHINE, claimedAt: 1 }), "ALIVE");
+    assert.equal(probe.check({ pid: 502, processStartedAt: 778, machine: MACHINE, boot: BOOT, claimedAt: 1 }), "ALIVE");
+  });
+
+  /**
+   * ROUND-2 REVIEW, HIGH 2 — the reviewer's own reproduction.
+   *
+   * `processStartedAt` is `/proc/<pid>/stat` field 22: ticks SINCE BOOT. After a
+   * restart the counter starts again, so an unrelated process can legitimately
+   * hold the same pid AND the same start tick — and `machine` does not separate
+   * them, because a machine identity is stable across reboots by design. All
+   * three matched and the probe said ALIVE for a process that had never existed
+   * when the lease was written.
+   *
+   * The boot identity is the missing third of the tuple, and it makes the WSL
+   * restart of AC-18 decidable rather than argued: every lease from a previous
+   * boot is knowably dead.
+   */
+  it("reports GONE for a lease written before a REBOOT, even when pid and start tick match exactly", () => {
+    const between = Array.from({ length: 18 }, (_, index) => String(index + 100));
+    fakeProc(601, `601 (after-reboot) S ${between.join(" ")} 5150 0 0\n`);
+
+    const probe = createProcLivenessProbe({ procRoot: root, machine: MACHINE, boot: "boot-AFTER" });
+    const beforeReboot = { pid: 601, processStartedAt: 5150, machine: MACHINE, boot: "boot-BEFORE", claimedAt: 1 };
+    assert.equal(
+      probe.check(beforeReboot),
+      "GONE",
+      "a process from a previous boot was reported as the lease holder",
+    );
+
+    // The positive control: the same everything, on the SAME boot.
+    assert.equal(probe.check({ ...beforeReboot, boot: "boot-AFTER" }), "ALIVE");
+  });
+
+  it("reports UNKNOWN when this host cannot say which boot it is on", () => {
+    const between = Array.from({ length: 18 }, (_, index) => String(index + 100));
+    fakeProc(602, `602 (running) S ${between.join(" ")} 900 0 0\n`);
+    // `boot: undefined` passed EXPLICITLY means "this host cannot say", which is
+    // a different fact from a boot that does not match and must not be resolved
+    // in either direction.
+    const probe = createProcLivenessProbe({ procRoot: root, machine: MACHINE, boot: undefined });
+    assert.equal(
+      probe.check({ pid: 602, processStartedAt: 900, machine: MACHINE, boot: "boot-X", claimedAt: 1 }),
+      "UNKNOWN",
+      "a host that cannot identify its own boot judged a lease anyway",
+    );
+  });
+
+  it("refuses to BUILD a lease when the boot cannot be established", () => {
+    // The other half: a lease that could never be checked is not written at
+    // all, and the caller then refuses to run rather than running unobserved.
+    assert.equal(leaseForThisProcess(1_000, { boot: undefined }), undefined);
+    // The positive control.
+    assert.ok(leaseForThisProcess(1_000) !== undefined);
   });
 
   it("reports GONE for an absent entry, and UNKNOWN for one it cannot parse", () => {
     const probe = createProcLivenessProbe({ procRoot: root, machine: MACHINE });
-    assert.equal(probe.check({ pid: 9999, processStartedAt: 1, machine: MACHINE, claimedAt: 1 }), "GONE");
+    assert.equal(probe.check({ pid: 9999, processStartedAt: 1, machine: MACHINE, boot: BOOT, claimedAt: 1 }), "GONE");
 
     fakeProc(503, "garbage with no parenthesis\n");
-    assert.equal(probe.check({ pid: 503, processStartedAt: 1, machine: MACHINE, claimedAt: 1 }), "UNKNOWN");
+    assert.equal(probe.check({ pid: 503, processStartedAt: 1, machine: MACHINE, boot: BOOT, claimedAt: 1 }), "UNKNOWN");
   });
 
   /**
@@ -231,7 +292,7 @@ describe("TASK-018 AC-16: unreadable and zombie processes", () => {
     mkdirSync(join(root, "504", "stat"), { recursive: true });
     const probe = createProcLivenessProbe({ procRoot: root, machine: MACHINE });
     assert.equal(
-      probe.check({ pid: 504, processStartedAt: 1, machine: MACHINE, claimedAt: 1 }),
+      probe.check({ pid: 504, processStartedAt: 1, machine: MACHINE, boot: BOOT, claimedAt: 1 }),
       "UNKNOWN",
       "an unreadable /proc entry was reported as a dead process",
     );

@@ -391,6 +391,10 @@ function parseActivity(raw: unknown, index: number, context: string): Activity {
             pid: nonNegativeInt(leaseRow, "pid", leaseContext),
             processStartedAt: nonNegativeInt(leaseRow, "processStartedAt", leaseContext),
             machine: str(leaseRow, "machine", leaseContext),
+            // REQUIRED, not optional. A lease with no boot identity cannot be
+            // told from one written before a restart, and an absent field would
+            // silently reintroduce exactly the collision it was added to close.
+            boot: str(leaseRow, "boot", leaseContext),
             claimedAt: num(leaseRow, "claimedAt", leaseContext),
           };
         })();

@@ -1637,8 +1637,46 @@ export class SupervisorService {
      * replaces the other, and `activeClaim` is untouched.
      */
     const activityId = canonicalActivityId(item.key, action.kind, attempt);
-    const lease = this.deps.activityLease?.(this.deps.clock.now());
     const probe = this.deps.liveness;
+    const leaseSource = this.deps.activityLease;
+    const lease = leaseSource?.(this.deps.clock.now());
+
+    /**
+     * A CONFIGURED INSTALLATION THAT CANNOT IDENTIFY ITSELF MUST NOT RUN
+     * (round-2 review, CRITICAL).
+     *
+     * The first version guarded every activity write with
+     * `lease !== undefined && probe !== undefined`, which reads as caution and
+     * is the exact opposite. When `leaseForThisProcess` could not read
+     * `/proc/<pid>/stat` it returned undefined, and the supervisor then ran the
+     * work, completed it, and marked the item DONE with no activity, no lease
+     * and nothing for reconciliation to find. Unknown liveness RAN THE WORK.
+     * That is fail-open in a codebase whose whole discipline is the reverse.
+     *
+     * The distinction that matters is between an installation that does not
+     * record activities at all — no probe and no lease source, which is how the
+     * demo and most fixtures are built — and one that is configured to and
+     * cannot. The first is a choice; the second is an unknown, and every
+     * unknown here refuses.
+     */
+    const recordsActivities = probe !== undefined && leaseSource !== undefined;
+    if (recordsActivities && lease === undefined) {
+      const problem =
+        `this supervisor cannot establish its own process identity, so it cannot take a lease on ${item.key}; ` +
+        "refusing to run work that nothing could later reconcile";
+      this.log(`[supervisor] ${problem}`);
+      return {
+        kind: "CONCLUSION",
+        result: {
+          kind: "WAITING_FOR_HUMAN",
+          roadmapKey: item.key,
+          reason: "HUMAN_DECISION_REQUIRED",
+          humanActionRequired: boundedDiagnostic(problem),
+        },
+        wakeBasis: state,
+      };
+    }
+
     let activities = state.activities ?? [];
 
     if (lease !== undefined && probe !== undefined) {

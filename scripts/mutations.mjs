@@ -1098,6 +1098,44 @@ export const MUTATIONS = [
     expect: "reads it when the executable name contains spaces and parentheses",
   },
 
+  /**
+   * ROUND-2 REVIEW. Neither of these two guards had a mutation aimed at it,
+   * which the reviewer noted as a coverage gap in an otherwise valid matrix.
+   * Both are the guards that round found missing, so both are measured now.
+   */
+  {
+    id: "production runs work when it cannot establish its own identity",
+    edits: [[SUP_SVC,
+      "    if (recordsActivities && lease === undefined) {",
+      "    if (recordsActivities && lease === undefined && Number.isNaN(0)) {"]],
+    tests: [T_ACTREC],
+    expect: "REFUSES to run when it cannot establish its own process identity",
+  },
+  {
+    id: "a lease from a previous boot is accepted as the current holder",
+    edits: [[PROCLIVE,
+      "      if (lease.boot !== boot) {",
+      "      if (lease.boot !== boot && Number.isNaN(0)) {"]],
+    tests: [T_PROCLIVE],
+    expect: "reports GONE for a lease written before a REBOOT",
+  },
+  /**
+   * The refusal becomes a lease with an EMPTY boot rather than being deleted.
+   * Deleting it leaves `boot` possibly-undefined where the returned lease needs
+   * a string, so the file stops compiling and preflight refuses the mutation as
+   * UNMEASURED — the guard is load-bearing for the types as well as the
+   * behaviour. Returning a lease nothing can ever check is the defect stated
+   * exactly.
+   */
+  {
+    id: "a lease is built without a boot identity, so it can never be checked",
+    edits: [[PROCLIVE,
+      "    return undefined;\n  }\n  return {\n    pid: process.pid,",
+      '    return { pid: process.pid, processStartedAt: started, machine: options.machine ?? machineIdentity(), boot: "", claimedAt };\n  }\n  return {\n    pid: process.pid,']],
+    tests: [T_PROCLIVE],
+    expect: "refuses to BUILD a lease when the boot cannot be established",
+  },
+
   // ---- AC-14: a stall is a measurement, not an opinion ---------------------
   {
     id: "liveness stops deciding before recency, so a dead owner looks stalled",

@@ -33,10 +33,11 @@ import {
 } from "../src/supervision/activity.js";
 
 const MACHINE = "wsl-ubuntu";
+const BOOT = "boot-aaaa";
 const T0 = 1_000_000;
 
 function lease(overrides: Partial<ActivityLease> = {}): ActivityLease {
-  return { pid: 4242, processStartedAt: 99, machine: MACHINE, claimedAt: T0, ...overrides };
+  return { pid: 4242, processStartedAt: 99, machine: MACHINE, boot: BOOT, claimedAt: T0, ...overrides };
 }
 
 /** A probe whose answer the test chooses, because that is the fact under test. */

@@ -354,6 +354,73 @@ describe("TASK-018 AC-11/AC-15: running an item records a durable activity", () 
     );
   });
 
+  /**
+   * ROUND-2 REVIEW, CRITICAL — the reviewer's own reproduction.
+   *
+   * The activity writes were guarded by `lease !== undefined && probe !==
+   * undefined`, which reads as caution and is the opposite. With the production
+   * probe and a lease source that cannot identify this process, the supervisor
+   * RAN the work, completed it, and marked the item DONE with no activity, no
+   * lease and nothing to reconcile. Unknown liveness ran the work.
+   *
+   * An installation that records no activities at all is a configuration; one
+   * that is configured to and cannot is an unknown, and unknowns refuse.
+   */
+  it("REFUSES to run when it cannot establish its own process identity", async () => {
+    const queued: readonly RoadmapItem[] = [
+      { key: "A", title: "Work", dependsOn: [], status: "PENDING", workClass: "NORMAL_IMPLEMENTATION", order: 1 },
+    ];
+    const path = await seed(queued);
+
+    let executorCalls = 0;
+    const repository = createSqliteSupervisorRepository(path);
+    const base = Date.now();
+    let reading = 0;
+    const probe = scriptedProbe();
+    for (const entry of TEST_CATALOG) {
+      probe.set(entry.provider, entry.model, { state: "AVAILABLE", reason: "scripted", billingMode: "INCLUDED_SUBSCRIPTION" });
+    }
+    try {
+      const service = new SupervisorService({
+        repository,
+        roadmapCatalog: [...queued],
+        probe,
+        executor: {
+          execute: async () => {
+            executorCalls += 1;
+            return { kind: "COMPLETED", detail: "should never run" };
+          },
+        },
+        clock: { now: () => base + reading++ * 1_000 },
+        ids: createSequentialIdGenerator(),
+        routingPolicy: DEFAULT_ROUTING_POLICY,
+        resourceCatalog: TEST_CATALOG,
+        liveness: createProcLivenessProbe(),
+        // Configured to record activities, and unable to say who it is.
+        activityLease: () => undefined,
+        log: () => {},
+      });
+      for (let attempt = 0; attempt < 5; attempt += 1) await service.tick();
+    } finally {
+      repository.close();
+    }
+
+    assert.equal(executorCalls, 0, "work ran without a durable activity");
+    assert.deepEqual(await readActivities(path), []);
+
+    const after = createSqliteSupervisorRepository(path);
+    try {
+      const state = await after.load();
+      assert.notEqual(
+        state?.roadmap.find((item) => item.key === "A")?.status,
+        "DONE",
+        "an item was completed with nothing to reconcile",
+      );
+    } finally {
+      after.close();
+    }
+  });
+
   it("refuses to start a second run while a live process holds the activity", async () => {
     const queued: readonly RoadmapItem[] = [
       { key: "A", title: "Work", dependsOn: [], status: "PENDING", workClass: "NORMAL_IMPLEMENTATION", order: 1 },
@@ -831,7 +898,7 @@ describe("TASK-018 AC-20: recovery does not walk past a person", () => {
       kind: "REVIEW",
       roadmapKey: "A",
       state: "RUNNING",
-      lease: { pid: 1, processStartedAt: 1, machine: MACHINE, claimedAt: 1 },
+      lease: { pid: 1, processStartedAt: 1, machine: MACHINE, boot: "any-boot", claimedAt: 1 },
       reconciliation: { verdict: "CRASHED", at: 2, detail: "owner gone" },
       updatedAt: 1,
     },

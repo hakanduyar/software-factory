@@ -146,6 +146,23 @@ const PROVENANCE_FIELDS: Record<keyof Required<ProvenanceEntry>, true> = {
   digest: true,
 };
 
+/**
+ * The LEASE's own fields, listed separately because it is a nested durable type
+ * and this guard only sees what it is told about.
+ *
+ * `boot` was added after a reviewer showed that pid plus start-tick plus
+ * machine can all match an unrelated process after a restart. A nested field
+ * dropped in transit is exactly the failure this whole file exists for, and
+ * `Activity.lease` being listed above says nothing about what is inside it.
+ */
+const ACTIVITY_LEASE_FIELDS: Record<keyof Required<NonNullable<Activity["lease"]>>, true> = {
+  pid: true,
+  processStartedAt: true,
+  machine: true,
+  boot: true,
+  claimedAt: true,
+};
+
 const ACTIVITY_FIELDS: Record<keyof Required<Activity>, true> = {
   id: true,
   kind: true,
@@ -288,7 +305,7 @@ const MAXIMAL_ACTIVITY: Required<Activity> = {
   kind: "REVIEW",
   roadmapKey: "LOCAL_24_7_RUNTIME",
   state: "COMPLETED",
-  lease: { pid: 4242, processStartedAt: 99_000, machine: "wsl-ubuntu", claimedAt: 1_150 },
+  lease: { pid: 4242, processStartedAt: 99_000, machine: "wsl-ubuntu", boot: "boot-1234", claimedAt: 1_150 },
   heartbeat: { at: 1_180, progress: 7 },
   completion: { outcome: "PASS", detail: "verdict recorded", at: 1_190 },
   observedAt: 1_195,
@@ -330,6 +347,7 @@ describe("TASK-006: every durable supervisor field survives serialization", () =
       CLAIM_FIELDS,
       ESCALATION_FIELDS,
       PROVENANCE_FIELDS,
+      ACTIVITY_LEASE_FIELDS,
       ACTIVITY_FIELDS,
       STATE_FIELDS,
     ]) {

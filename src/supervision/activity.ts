@@ -95,6 +95,22 @@ export interface ActivityLease {
   /** The OWNING PROCESS's start time, not the lease's. This is the anti-reuse half. */
   readonly processStartedAt: number;
   readonly machine: string;
+  /**
+   * WHICH BOOT of that machine (round-2 review, HIGH 2).
+   *
+   * `processStartedAt` comes from `/proc/<pid>/stat` field 22, which counts
+   * ticks SINCE BOOT. After a restart the counter starts again, so an unrelated
+   * process can legitimately hold the same pid AND the same start tick — and
+   * `machine` does not separate them, because a machine identity is stable
+   * across reboots by design. All three matched and the lease read ALIVE for a
+   * process that had never existed when it was written.
+   *
+   * A boot identity is the missing third of the tuple: pid and start tick are
+   * unique WITHIN a boot, and this says which boot. It also makes the WSL
+   * restart of AC-18 decidable rather than argued — every lease from a previous
+   * boot is knowably dead.
+   */
+  readonly boot: string;
   readonly claimedAt: Timestamp;
 }
 
