@@ -1084,7 +1084,10 @@ export const MUTATIONS = [
       '        return (error as NodeJS.ErrnoException)?.code === "ENOENT" ? "GONE" : "UNKNOWN";',
       '        return "GONE";']],
     tests: [T_PROCLIVE],
-    expect: "UNKNOWN for one it cannot parse",
+    // Aimed at the READ failure, not the parse failure. The parse case reaches
+    // the parser and never enters this catch, which is why this mutation
+    // survived its first run.
+    expect: "reports UNKNOWN when the entry cannot be READ",
   },
   {
     id: "the stat parser splits on the FIRST parenthesis",

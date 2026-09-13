@@ -210,4 +210,30 @@ describe("TASK-018 AC-16: unreadable and zombie processes", () => {
     fakeProc(503, "garbage with no parenthesis\n");
     assert.equal(probe.check({ pid: 503, processStartedAt: 1, machine: MACHINE, claimedAt: 1 }), "UNKNOWN");
   });
+
+  /**
+   * ONLY ENOENT IS EVIDENCE OF DEATH — and nothing tested that until a mutation
+   * survived to say so.
+   *
+   * The case above reaches the parser, because a file full of garbage still
+   * READS. The `catch` that separates "this process has ended" from "this host
+   * would not tell me" was never entered by any test, so replacing the whole
+   * expression with `return "GONE"` changed no result and the mutation
+   * survived. That is the harness doing its job: the guard was real and the
+   * coverage was not.
+   *
+   * A DIRECTORY where the file should be makes `readFileSync` throw EISDIR —
+   * deterministically, without needing a permission this test may not be able
+   * to arrange. Reported as death, it would let a second owner take a lease
+   * whose holder is still writing.
+   */
+  it("reports UNKNOWN when the entry cannot be READ, rather than treating it as death", () => {
+    mkdirSync(join(root, "504", "stat"), { recursive: true });
+    const probe = createProcLivenessProbe({ procRoot: root, machine: MACHINE });
+    assert.equal(
+      probe.check({ pid: 504, processStartedAt: 1, machine: MACHINE, claimedAt: 1 }),
+      "UNKNOWN",
+      "an unreadable /proc entry was reported as a dead process",
+    );
+  });
 });
