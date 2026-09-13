@@ -1668,12 +1668,53 @@ export class SupervisorService {
       activities = claimedActivity.activities;
     }
 
-    const claimed = await this.commit(state, {
-      ...state,
-      activeClaim: claim,
-      activities,
-      roadmap: setAttempts(setStatus(state.roadmap, item.key, "ACTIVE"), item.key, attempt),
-    });
+    /**
+     * A LOST RACE MUST STILL NAME THE WINNER (round-1 HIGH 5).
+     *
+     * Two supervisors evaluating the claim against the same snapshot both see a
+     * free activity; one commits and the other's CAS fails. The loser used to
+     * surface that as a bare `ConcurrencyError` — technically accurate, and it
+     * tells an operator nothing about who is running the work, which is what
+     * AC-13 requires the refusal to say.
+     *
+     * So a conflict is not the answer: it is the signal to look again. The
+     * state is re-read and the claim re-evaluated against what actually
+     * happened, and the winner's lease then produces the ordinary
+     * "held by pid N on M, which is still running" refusal. Bounded, because a
+     * loop that retries forever is a hang with good intentions.
+     */
+    let claimed: SupervisorState;
+    try {
+      claimed = await this.commit(state, {
+        ...state,
+        activeClaim: claim,
+        activities,
+        roadmap: setAttempts(setStatus(state.roadmap, item.key, "ACTIVE"), item.key, attempt),
+      });
+    } catch (error) {
+      if (!(error instanceof ConcurrencyError) || lease === undefined || probe === undefined) {
+        throw error;
+      }
+      const fresh = await this.deps.repository.load();
+      const recheck =
+        fresh === undefined
+          ? undefined
+          : claimActivity(
+              fresh.activities ?? [],
+              { id: activityId, kind: action.kind, roadmapKey: item.key, lease, now: this.deps.clock.now() },
+              probe,
+            );
+      const problem =
+        recheck !== undefined && !recheck.ok
+          ? recheck.problem
+          : `another supervisor changed ${item.key} while this one was claiming it`;
+      this.log(`[supervisor] lost the race for ${item.key}: ${problem}`);
+      return {
+        kind: "CONCLUSION",
+        result: { kind: "WAITING_FOR_RESOURCE", roadmapKey: item.key, reason: boundedDiagnostic(problem) },
+        wakeBasis: state,
+      };
+    }
 
     // Second durable write: from here the launch may have happened, and the
     // activity says so too — a heartbeat before the launch is what separates

@@ -412,6 +412,23 @@ export function createSqliteSupervisorRepository(path: string): SqliteSupervisor
 function ensureSchema(db: DatabaseSync): void {
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
+  /**
+   * WAIT FOR A CONCURRENT WRITER RATHER THAN FAILING AT IT (TASK-018 Part B,
+   * round-1 HIGH 5).
+   *
+   * Two supervisors racing for the same activity produced `SQLITE_BUSY —
+   * database is locked` in the loser, which says nothing about WHO won and is
+   * indistinguishable from a corrupt file to a caller. The design is now
+   * explicitly multi-process, so contention is ordinary rather than
+   * exceptional: the loser waits, then loses the CAS, then re-reads and finds
+   * the winner's lease — which is the refusal AC-13 asks for, naming the pid
+   * and the machine.
+   *
+   * Five seconds is far longer than any write here takes and far shorter than
+   * any human notices. It bounds the wait rather than removing it: a genuinely
+   * stuck writer still surfaces, as it should.
+   */
+  db.exec("PRAGMA busy_timeout = 5000");
   db.exec(`
     CREATE TABLE IF NOT EXISTS supervisor_meta (
       key   TEXT PRIMARY KEY,

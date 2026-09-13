@@ -14,7 +14,8 @@
  */
 
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { once } from "node:events";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -28,6 +29,7 @@ import {
 } from "../src/adapters/supervision/procLiveness.js";
 import {
   claimActivity,
+  completeActivity,
   crashedItemsToRequeue,
   observeCompletion,
   reportProgress,
@@ -99,14 +101,57 @@ async function readActivities(path: string): Promise<readonly Activity[]> {
  * It uses the production repository and the production claim logic. A child
  * that wrote the row itself would prove the test can write a row.
  */
-function runChild(options: {
+interface ChildOptions {
   readonly path: string;
   readonly id: string;
   readonly kind: string;
   readonly roadmapKey: string;
   readonly progress?: number;
-  readonly ending: "die" | "complete";
-}): { readonly status: number | null; readonly signal: string | null; readonly stderr: string } {
+  /**
+   * `hold` claims and then stays alive, so a rival really overlaps it.
+   * `interrupt` computes a completion and is killed BEFORE it is written.
+   */
+  readonly ending: "die" | "complete" | "hold" | "interrupt";
+}
+
+interface ChildResult {
+  readonly status: number | null;
+  readonly signal: string | null;
+  readonly stderr: string;
+}
+
+/**
+ * Starts a child WITHOUT waiting, so two of them can genuinely overlap.
+ *
+ * `runChild` runs one to completion and is the right tool for every sequential
+ * case; a race needs both processes in flight before either finishes, and
+ * `spawnSync` cannot express that.
+ */
+function spawnChild(options: ChildOptions): { readonly child: ChildProcess; readonly done: Promise<ChildResult> } {
+  const script = writeChildScript(options);
+  const child = spawn(process.execPath, [script], { stdio: ["ignore", "ignore", "pipe"] });
+  const chunks: string[] = [];
+  child.stderr?.on("data", (piece: Buffer) => chunks.push(piece.toString("utf8")));
+  const done = once(child, "exit").then(() => ({
+    status: child.exitCode,
+    signal: child.signalCode,
+    stderr: chunks.join(""),
+  }));
+  return { child, done };
+}
+
+/**
+ * Writes the child's program and returns its path.
+ *
+ * ONE program for every case, so the sequential and the racing children differ
+ * only in how they are started. A race against a differently-written child
+ * would prove something about that child.
+ *
+ * The claim goes through `compareAndSave`, so a loser fails its CAS exactly as
+ * a second supervisor would — which is the failure mode HIGH 5 was about, and
+ * why the child re-reads and re-evaluates instead of reporting the conflict.
+ */
+function writeChildScript(options: ChildOptions): string {
   const script = join(scratch, `child-${options.id.replace(/[^a-z0-9]/gi, "_")}-${Math.random().toString(36).slice(2)}.mjs`);
   writeFileSync(
     script,
@@ -116,41 +161,90 @@ import { createProcLivenessProbe, leaseForThisProcess } from ${JSON.stringify(`$
 import { claimActivity, reportProgress, completeActivity } from ${JSON.stringify(`${DIST}/supervision/activity.js`)};
 
 const repo = createSqliteSupervisorRepository(${JSON.stringify(options.path)});
-const state = await repo.load();
+const probe = createProcLivenessProbe();
 const lease = leaseForThisProcess(Date.now());
 if (lease === undefined) { console.error("no lease"); process.exit(3); }
 
-const claimed = claimActivity(state.activities ?? [], {
+const request = {
   id: ${JSON.stringify(options.id)},
   kind: ${JSON.stringify(options.kind)},
   roadmapKey: ${JSON.stringify(options.roadmapKey)},
   lease,
   now: Date.now(),
-}, createProcLivenessProbe());
-if (!claimed.ok) { console.error("REFUSED: " + claimed.problem); process.exit(4); }
+};
 
-let activities = claimed.activities;
+/**
+ * Claim, write, and on a LOST CAS look again rather than reporting the
+ * conflict: the winner's lease is what the refusal must name.
+ */
+let state = await repo.load();
+let claimed;
+let activities;
+for (let attempt = 0; attempt < 5; attempt += 1) {
+  claimed = claimActivity(state.activities ?? [], request, probe);
+  if (!claimed.ok) { console.error("REFUSED: " + claimed.problem); process.exit(4); }
+  activities = claimed.activities;
+  ${options.ending === "hold" ? "await new Promise((r) => setTimeout(r, 120));" : ""}
+  try {
+    await repo.compareAndSave({ ...state, version: state.version + 1, activities }, state.version);
+    break;
+  } catch (error) {
+    if (attempt === 4) { console.error("SAVE_ERROR: " + error); process.exit(7); }
+    state = await repo.load();
+  }
+}
+state = await repo.load();
 ${
   options.progress === undefined
     ? ""
-    : `const beat = reportProgress(activities, ${JSON.stringify(options.id)}, { at: Date.now(), progress: ${options.progress} });
-if (!beat.ok) { console.error("beat: " + beat.problem); process.exit(5); }
-activities = beat.activities;`
+    : `{
+  const beat = reportProgress(state.activities ?? [], ${JSON.stringify(options.id)}, { at: Date.now(), progress: ${options.progress} });
+  if (!beat.ok) { console.error("beat: " + beat.problem); process.exit(5); }
+  await repo.compareAndSave({ ...state, version: state.version + 1, activities: beat.activities }, state.version);
+  state = await repo.load();
+}`
 }
 ${
   options.ending === "complete"
-    ? `const done = completeActivity(activities, ${JSON.stringify(options.id)}, { state: "COMPLETED", completion: { outcome: "PASS", detail: "finished", at: Date.now() } });
-if (!done.ok) { console.error("done: " + done.problem); process.exit(6); }
-activities = done.activities;`
+    ? `{
+  const done = completeActivity(state.activities ?? [], ${JSON.stringify(options.id)}, { state: "COMPLETED", completion: { outcome: "PASS", detail: "finished", at: Date.now() } });
+  if (!done.ok) { console.error("done: " + done.problem); process.exit(6); }
+  await repo.compareAndSave({ ...state, version: state.version + 1, activities: done.activities }, state.version);
+}`
     : ""
 }
-
-await repo.compareAndSave({ ...state, version: state.version + 1, activities }, state.version);
+${
+  options.ending === "interrupt"
+    ? `{
+  // The EFFECT is computed and the process dies before the RECORD is written.
+  const done = completeActivity(state.activities ?? [], ${JSON.stringify(options.id)}, { state: "COMPLETED", completion: { outcome: "PASS", detail: "never written", at: Date.now() } });
+  if (!done.ok) { console.error("done: " + done.problem); process.exit(6); }
+  process.kill(process.pid, "SIGKILL");
+}`
+    : ""
+}
+${
+  options.ending === "hold"
+    ? `/**
+ * STAY ALIVE after winning, so the rival's retry finds a holder that is still
+ * running. Without this the winner exits immediately, the loser re-reads, sees
+ * a DEAD lease, and takes over -- which is correct behaviour and not the race
+ * being tested. The first version of this test had exactly that hole and
+ * reported two winners.
+ */
+await new Promise((r) => setTimeout(r, 2500));`
+    : ""
+}
 repo.close();
 ${options.ending === "die" ? `process.kill(process.pid, "SIGKILL");` : `process.exit(0);`}
 `,
     "utf8",
   );
+  return script;
+}
+
+function runChild(options: ChildOptions): ChildResult {
+  const script = writeChildScript(options);
   const result = spawnSync(process.execPath, [script], { encoding: "utf8", timeout: 60_000 });
   return { status: result.status, signal: result.signal, stderr: result.stderr ?? "" };
 }
@@ -370,6 +464,43 @@ describe("TASK-018 AC-13: a second owner is refused, not merged", () => {
     assert.equal(activities[0]?.state, "CLAIMED", "the rival changed the record it was refused");
   });
 
+  /**
+   * ROUND-1 REVIEW, HIGH 5. The sequential case above proves the refusal
+   * REASON; it does not prove what happens when two processes genuinely race.
+   * The reviewer ran that race and got `SQLITE_BUSY — database is locked` in one
+   * child and a bare `ConcurrencyError` in the other: both accurate, and
+   * neither says who is running the work.
+   *
+   * Both children are started before either can finish, so the ordering is the
+   * operating system's rather than the test's. Exactly one must win, the other
+   * must refuse, and the database must end with ONE owner.
+   */
+  it("two REAL processes racing leave exactly one owner, and the loser is told who won", async () => {
+    const path = await seed();
+    const racers = [0, 1].map(() =>
+      spawnChild({ path, id: "A:REVIEW:r1", kind: "REVIEW", roadmapKey: "A", progress: 1, ending: "hold" }),
+    );
+    const results = await Promise.all(racers.map((racer) => racer.done));
+
+    const winners = results.filter((entry) => entry.status === 0);
+    const losers = results.filter((entry) => entry.status !== 0);
+    assert.equal(winners.length, 1, `expected one winner, got ${winners.length}: ${JSON.stringify(results)}`);
+    assert.equal(losers.length, 1);
+
+    /**
+     * The loser must say WHO holds it. `SQLITE_BUSY` or a bare version conflict
+     * would satisfy "it did not proceed" and fail this, which is the point.
+     */
+    const complaint = losers[0]!.stderr;
+    assert.match(complaint, /REFUSED:/, `the loser did not refuse cleanly: ${complaint}`);
+    assert.match(complaint, /is held by pid \d+/, `the loser did not name the holder: ${complaint}`);
+    assert.match(complaint, /still running/, complaint);
+
+    const activities = await readActivities(path);
+    assert.equal(activities.length, 1, "a race produced more than one activity record");
+    assert.equal(activities.filter((entry) => entry.id === "A:REVIEW:r1").length, 1, "two owners of one id");
+  });
+
   it("ALLOWS a real process to take over once the holder is dead — the positive control", async () => {
     const path = await seed();
     const first = runChild({ path, id: "A:REVIEW:r1", kind: "REVIEW", roadmapKey: "A", progress: 1, ending: "die" });
@@ -435,6 +566,60 @@ describe("TASK-018 AC-16/AC-18: startup reconciliation after the deaths that hap
     } finally {
       after.close();
     }
+  });
+
+  /**
+   * ROUND-1 REVIEW, HIGH 4. The restart case was a same-process "supervisor
+   * equivalent" — a fresh repository and service inside the test runner — and
+   * the reviewer was right that it does not exercise a restart. This runs the
+   * tick in a REAL separate process that shares no memory with the parent, and
+   * the parent then reads what it left behind.
+   */
+  it("a supervisor in a SEPARATE process reconciles what a dead owner left", async () => {
+    const path = await seed();
+    assert.equal(
+      runChild({ path, id: "A:REVIEW:r1", kind: "REVIEW", roadmapKey: "A", progress: 5, ending: "die" }).signal,
+      "SIGKILL",
+    );
+
+    const tick = join(scratch, `tick-${Math.random().toString(36).slice(2)}.mjs`);
+    writeFileSync(
+      tick,
+      `
+import { createSqliteSupervisorRepository } from ${JSON.stringify(`${DIST}/adapters/supervision/sqliteSupervisorRepository.js`)};
+import { createProcLivenessProbe, leaseForThisProcess } from ${JSON.stringify(`${DIST}/adapters/supervision/procLiveness.js`)};
+import { SupervisorService } from ${JSON.stringify(`${DIST}/supervision/supervisorService.js`)};
+import { createSequentialIdGenerator } from ${JSON.stringify(`${DIST}/domain/ids.js`)};
+import { DEFAULT_ROUTING_POLICY } from ${JSON.stringify(`${DIST}/supervision/modelRouting.js`)};
+
+const repo = createSqliteSupervisorRepository(${JSON.stringify(path)});
+const state = await repo.load();
+const base = Date.now();
+let reading = 0;
+await new SupervisorService({
+  repository: repo,
+  roadmapCatalog: state.roadmap.map((item) => ({ ...item })),
+  probe: { probe: async () => ({ state: "UNKNOWN_FAILURE", reason: "no resources in this fixture" }) },
+  executor: { execute: async () => ({ kind: "FAILED", detail: "not reached" }) },
+  clock: { now: () => base + reading++ * 1000 },
+  ids: createSequentialIdGenerator(),
+  routingPolicy: DEFAULT_ROUTING_POLICY,
+  resourceCatalog: [],
+  liveness: createProcLivenessProbe(),
+  activityLease: (at) => leaseForThisProcess(at),
+  log: () => {},
+}).tick();
+repo.close();
+process.exit(0);
+`,
+      "utf8",
+    );
+    const restarted = spawnSync(process.execPath, [tick], { encoding: "utf8", timeout: 60_000 });
+    assert.equal(restarted.status, 0, `the separate supervisor failed: ${restarted.stderr}`);
+
+    const activities = await readActivities(path);
+    assert.equal(activities[0]?.reconciliation?.verdict, "CRASHED", "a separate process drew no conclusion");
+    assert.equal(activities[0]?.heartbeat?.progress, 5, "what the dead owner had done was lost");
   });
 
   it("a chain owner killed between its run and the freeze is CRASHED with its progress intact", async () => {
@@ -542,6 +727,55 @@ describe("TASK-018 AC-16/AC-18: startup reconciliation after the deaths that hap
     } finally {
       after.close();
     }
+  });
+});
+
+// =====================================================================
+// AC-17 — a transition interrupted before it is recorded
+// =====================================================================
+
+describe("TASK-018 AC-17: an interrupted transition is never half-applied", () => {
+  /**
+   * ROUND-1 REVIEW, HIGH 3 — "no interrupted-transition fixture exists".
+   *
+   * The criterion asks that a transition interrupted between its EFFECT and its
+   * RECORD is replayable or detectably incomplete, never silently half-applied.
+   * Here a real child computes a completion and is SIGKILLed before the write.
+   *
+   * The design makes the effect and the record the same single CAS write, which
+   * is why there is nothing in between to be lost — but "by construction" is an
+   * argument, and this is the measurement. What must be observable afterwards
+   * is that the activity is exactly as the child found it, and that the
+   * completion can still be applied by someone else.
+   */
+  it("a completion computed but never written leaves the activity untouched, and replayable", async () => {
+    const path = await seed();
+    const killed = runChild({
+      path,
+      id: "A:REVIEW:r1",
+      kind: "REVIEW",
+      roadmapKey: "A",
+      progress: 2,
+      ending: "interrupt",
+    });
+    assert.equal(killed.signal, "SIGKILL", `the child did not die as arranged: ${killed.stderr}`);
+
+    const activities = await readActivities(path);
+    assert.equal(activities.length, 1);
+    const activity = activities[0]!;
+    assert.equal(activity.state, "RUNNING", "an unwritten completion reached the database");
+    assert.equal(activity.completion, undefined, "a half-applied completion is visible");
+    assert.equal(activity.heartbeat?.progress, 2, "the progress the child DID record was lost");
+
+    // REPLAYABLE: the same transition still applies cleanly afterwards.
+    const replay = completeActivity(activities, "A:REVIEW:r1", {
+      state: "COMPLETED",
+      completion: { outcome: "PASS", detail: "applied by someone else", at: 9_000 },
+    });
+    assert.equal(replay.ok, true, replay.ok ? "" : replay.problem);
+    if (!replay.ok) throw new Error("unreachable");
+    assert.equal(replay.changed, true);
+    assert.equal(replay.activities[0]?.state, "COMPLETED");
   });
 });
 

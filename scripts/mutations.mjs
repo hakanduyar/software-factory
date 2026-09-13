@@ -1135,8 +1135,8 @@ export const MUTATIONS = [
   {
     id: "a second, DISAGREEING completion is silently treated as the same one",
     edits: [[ACTIVITY,
-      "  if (describe(current) === describe(incoming)) {",
-      "  if (describe(current) !== describe(incoming) || !Number.isNaN(0)) {"]],
+      "  if (JSON.stringify(current) === JSON.stringify(incoming)) {",
+      "  if (JSON.stringify(current) !== JSON.stringify(incoming) || !Number.isNaN(0)) {"]],
     tests: [T_ACT],
     expect: "REFUSES a second completion that DISAGREES",
   },

@@ -311,6 +311,29 @@ describe("TASK-018 AC-17: applying a transition twice is applying it once", () =
     assert.match(problem, /refusing to replace it with FAIL/);
   });
 
+  /**
+   * ROUND-1 REVIEW, HIGH 3 — the reviewer's own reproduction.
+   *
+   * The comparison joined the fields with delimiters, and delimiters collide:
+   * these two completions are genuinely different and produced identical text,
+   * so the second was accepted as an idempotent repeat and a real disagreement
+   * between two owners vanished without a word. Compared structurally now.
+   */
+  it("REFUSES two DIFFERENT completions whose fields would concatenate alike", () => {
+    const first = { outcome: "a/b", detail: "c", at: 1 };
+    const second = { outcome: "a", detail: "b/c", at: 1 };
+
+    const once = completeActivity([claimed()], claimed().id, { state: "COMPLETED", completion: first });
+    assert.equal(once.ok, true);
+    if (!once.ok) throw new Error("unreachable");
+
+    const problem = problemOf(
+      completeActivity(once.activities, claimed().id, { state: "COMPLETED", completion: second }),
+    );
+    assert.match(problem, /already recorded a completion/);
+    assert.match(problem, /refusing to replace it/);
+  });
+
   it("REFUSES the same completion recorded under a different state", () => {
     const once = completeActivity([claimed()], claimed().id, { state: "COMPLETED", completion });
     assert.equal(once.ok, true);
