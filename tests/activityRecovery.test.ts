@@ -798,6 +798,215 @@ process.exit(0);
 });
 
 // =====================================================================
+// AC-13/AC-16 — the two records of one fact must agree
+// =====================================================================
+
+describe("TASK-018 AC-13/AC-16: an activeClaim and its activity, together", () => {
+  /**
+   * ROUND-3 REVIEW, HIGH 1 — and the reviewer's point about coverage was the
+   * sharper half: the passing "live activity" fixture contained NO
+   * `activeClaim`, so it could not catch this.
+   *
+   * `reconcileClaim` was written when the supervisor was effectively
+   * single-process, where a RUNNING claim surviving into a tick could only mean
+   * its owner had died. Part B made that false and did not update it, so a
+   * second supervisor meeting a LIVE first one escalated RECOVERY_REQUIRED and
+   * drove the item to BLOCKED — while the activity beside it said LIVE. Two
+   * records of the same fact, and the older one won.
+   */
+  async function seedClaimAndActivity(options: { readonly holderAlive: boolean }): Promise<string> {
+    const path = await seed();
+    const repository = createSqliteSupervisorRepository(path);
+    try {
+      const state = await repository.load();
+      assert.ok(state);
+
+      const lease = leaseForThisProcess(Date.now());
+      assert.ok(lease);
+      // A dead holder is this process's own lease with a start time that cannot
+      // be ours — the same shape the kernel produces for a recycled pid.
+      const held = options.holderAlive ? lease : { ...lease, processStartedAt: lease.processStartedAt - 1 };
+
+      const claimed = claimActivity(
+        state.activities ?? [],
+        { id: "A:PLAN:r1", kind: "PLAN", roadmapKey: "A", lease, now: Date.now() },
+        createProcLivenessProbe(),
+      );
+      assert.equal(claimed.ok, true);
+      if (!claimed.ok) throw new Error("unreachable");
+      const activities = claimed.activities.map((entry) => ({ ...entry, lease: held }));
+
+      await repository.compareAndSave(
+        {
+          ...state,
+          version: state.version + 1,
+          activities,
+          activeClaim: {
+            actionId: "A:PLAN:a1",
+            roadmapKey: "A",
+            kind: "PLAN",
+            state: "RUNNING",
+            ownerId: "some-other-supervisor",
+            attempt: 1,
+            claimedAt: 1_000,
+          },
+        },
+        state.version,
+      );
+    } finally {
+      repository.close();
+    }
+    return path;
+  }
+
+  it("STANDS DOWN and names the holder when the claim's owner is still running", async () => {
+    const path = await seedClaimAndActivity({ holderAlive: true });
+    const { service, repository } = supervisorOver(path);
+    let result;
+    try {
+      result = await service.tick();
+    } finally {
+      repository.close();
+    }
+
+    const reported = JSON.stringify(result);
+    assert.doesNotMatch(reported, /RECOVERY_REQUIRED/, "a live owner was declared lost");
+    assert.match(reported, new RegExp(`is held by pid ${process.pid}`), reported);
+    assert.match(reported, /still running/);
+
+    const after = createSqliteSupervisorRepository(path);
+    try {
+      const state = await after.load();
+      assert.notEqual(state?.roadmap.find((item) => item.key === "A")?.status, "BLOCKED");
+      // The claim belongs to the live holder and must be left exactly as it was.
+      assert.equal(state?.activeClaim?.actionId, "A:PLAN:a1");
+      assert.equal(state?.activeClaim?.state, "RUNNING");
+    } finally {
+      after.close();
+    }
+  });
+
+  it("still escalates when the claim's owner is genuinely gone — the positive control", async () => {
+    const path = await seedClaimAndActivity({ holderAlive: false });
+    const { service, repository } = supervisorOver(path);
+    let result;
+    try {
+      result = await service.tick();
+    } finally {
+      repository.close();
+    }
+    // Whether the external action completed is unknowable, and Part B does not
+    // weaken that: a human decides.
+    assert.match(JSON.stringify(result), /RECOVERY_REQUIRED/);
+  });
+});
+
+// =====================================================================
+// AC-16 — no way to check means no further work
+// =====================================================================
+
+describe("TASK-018 AC-16: a supervisor that cannot check liveness schedules nothing", () => {
+  /**
+   * ROUND-3 REVIEW, HIGH 2. `reconcileActivities` carried a comment saying an
+   * unknown refuses and code that returned the state unchanged and let the tick
+   * carry on — so an unfinished activity sat there, nothing concluded anything
+   * about it, and the supervisor ran a DIFFERENT item to DONE. The comment
+   * described the invariant and the code did the opposite.
+   */
+  it("REFUSES to run anything while an activity is unfinished and liveness is uncheckable", async () => {
+    const both: readonly RoadmapItem[] = [
+      { key: "A", title: "Work", dependsOn: [], status: "ACTIVE", workClass: "NORMAL_IMPLEMENTATION", order: 1 },
+      { key: "B", title: "Other", dependsOn: [], status: "PENDING", workClass: "NORMAL_IMPLEMENTATION", order: 2 },
+    ];
+    const path = await seed(both);
+    assert.equal(
+      runChild({ path, id: "A:REVIEW:r1", kind: "REVIEW", roadmapKey: "A", progress: 1, ending: "die" }).signal,
+      "SIGKILL",
+    );
+
+    let executorCalls = 0;
+    const repository = createSqliteSupervisorRepository(path);
+    const base = Date.now();
+    let reading = 0;
+    const probe = scriptedProbe();
+    for (const entry of TEST_CATALOG) {
+      probe.set(entry.provider, entry.model, { state: "AVAILABLE", reason: "scripted", billingMode: "INCLUDED_SUBSCRIPTION" });
+    }
+    try {
+      const service = new SupervisorService({
+        repository,
+        roadmapCatalog: [...both],
+        probe,
+        executor: {
+          execute: async () => {
+            executorCalls += 1;
+            return { kind: "COMPLETED", detail: "should not run" };
+          },
+        },
+        clock: { now: () => base + reading++ * 1_000 },
+        ids: createSequentialIdGenerator(),
+        routingPolicy: DEFAULT_ROUTING_POLICY,
+        resourceCatalog: TEST_CATALOG,
+        // No `liveness` and no `activityLease`: this supervisor cannot check.
+        log: () => {},
+      });
+      for (let attempt = 0; attempt < 3; attempt += 1) await service.tick();
+    } finally {
+      repository.close();
+    }
+
+    assert.equal(executorCalls, 0, "work was scheduled while an activity's owner was uncheckable");
+
+    const after = createSqliteSupervisorRepository(path);
+    try {
+      const state = await after.load();
+      assert.notEqual(state?.roadmap.find((item) => item.key === "B")?.status, "DONE", "an unrelated item was completed");
+    } finally {
+      after.close();
+    }
+  });
+
+  it("runs normally when there is nothing unfinished to be unsure about", async () => {
+    // The positive control: no activities at all is a configuration, not an
+    // unknown, and must not stop the Factory.
+    const queued: readonly RoadmapItem[] = [
+      { key: "A", title: "Work", dependsOn: [], status: "PENDING", workClass: "NORMAL_IMPLEMENTATION", order: 1 },
+    ];
+    const path = await seed(queued);
+    let executorCalls = 0;
+    const repository = createSqliteSupervisorRepository(path);
+    const base = Date.now();
+    let reading = 0;
+    const probe = scriptedProbe();
+    for (const entry of TEST_CATALOG) {
+      probe.set(entry.provider, entry.model, { state: "AVAILABLE", reason: "scripted", billingMode: "INCLUDED_SUBSCRIPTION" });
+    }
+    try {
+      const service = new SupervisorService({
+        repository,
+        roadmapCatalog: [...queued],
+        probe,
+        executor: {
+          execute: async () => {
+            executorCalls += 1;
+            return { kind: "COMPLETED", detail: "ran" };
+          },
+        },
+        clock: { now: () => base + reading++ * 1_000 },
+        ids: createSequentialIdGenerator(),
+        routingPolicy: DEFAULT_ROUTING_POLICY,
+        resourceCatalog: TEST_CATALOG,
+        log: () => {},
+      });
+      for (let attempt = 0; attempt < 5; attempt += 1) await service.tick();
+    } finally {
+      repository.close();
+    }
+    assert.ok(executorCalls > 0, "an installation that records no activities was stopped anyway");
+  });
+});
+
+// =====================================================================
 // AC-17 — a transition interrupted before it is recorded
 // =====================================================================
 

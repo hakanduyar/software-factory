@@ -1111,6 +1111,36 @@ export const MUTATIONS = [
     tests: [T_ACTREC],
     expect: "REFUSES to run when it cannot establish its own process identity",
   },
+  /**
+   * ROUND-3 REVIEW. Neither of these guards existed to be mutated before, and
+   * the reviewer's sharper point was about coverage: the passing "live
+   * activity" fixture held no `activeClaim`, so nothing could have caught the
+   * two records of one fact disagreeing.
+   */
+  {
+    id: "a live claim holder is still declared lost",
+    edits: [[SUP_SVC,
+      '      if (probe.check(running.lease) === "ALIVE") {',
+      '      if (probe.check(running.lease) === "ALIVE" && Number.isNaN(0)) {']],
+    tests: [T_ACTREC],
+    expect: "STANDS DOWN and names the holder when the claim's owner is still running",
+  },
+  {
+    id: "a supervisor that cannot check liveness schedules work anyway",
+    edits: [[SUP_SVC,
+      "      if (unfinished.length === 0) {\n        return { state };\n      }",
+      "      if (unfinished.length >= 0) {\n        return { state };\n      }"]],
+    tests: [T_ACTREC],
+    expect: "REFUSES to run anything while an activity is unfinished and liveness is uncheckable",
+  },
+  {
+    id: "an empty boot identity is accepted when building a lease",
+    edits: [[PROCLIVE,
+      "  if (boot === undefined || boot.length === 0) {",
+      "  if (boot === undefined) {"]],
+    tests: [T_PROCLIVE],
+    expect: "refuses to BUILD a lease when the boot is empty",
+  },
   {
     id: "a lease from a previous boot is accepted as the current holder",
     edits: [[PROCLIVE,

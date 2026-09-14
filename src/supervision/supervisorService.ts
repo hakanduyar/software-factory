@@ -25,6 +25,7 @@ import {
   classifyActivity,
   completeActivity,
   crashedItemsToRequeue,
+  isTerminal,
   recordReconciliation,
   RECOVERY_TO_STATUS,
   reportProgress,
@@ -475,7 +476,19 @@ export class SupervisorService {
      * below sees the roadmap as it actually is rather than as a dead process
      * left it.
      */
-    const defined = await this.reconcileActivities(catalogued.state);
+    const inFlight = await this.reconcileActivities(catalogued.state);
+    if (inFlight.refusal !== undefined) {
+      return {
+        kind: "REFUSAL",
+        result: {
+          kind: "WAITING_FOR_HUMAN",
+          roadmapKey: inFlight.state.roadmap[0]?.key ?? "unknown",
+          reason: "HUMAN_DECISION_REQUIRED",
+          humanActionRequired: inFlight.refusal,
+        },
+      };
+    }
+    const defined = inFlight.state;
 
     /**
      * 1a. RESOURCES RECONCILE BEFORE ANY PATH THAT CAN PUBLISH A WAKE
@@ -645,6 +658,51 @@ export class SupervisorService {
         roadmap: countUnlaunchedAttempt(withUnlaunched, claim.roadmapKey),
       });
       return { state: cleared };
+    }
+
+    /**
+     * A RUNNING CLAIM IS NOT PROOF THAT ITS OWNER IS GONE (round-3 review,
+     * HIGH 1).
+     *
+     * This function was written when the supervisor was effectively
+     * single-process: a claim still RUNNING at the start of a tick could only
+     * mean the process that made it had died, so every one was treated as
+     * abandoned. Part B made that assumption false and did not update it, so a
+     * SECOND supervisor meeting a LIVE first one escalated RECOVERY_REQUIRED
+     * and drove the item to BLOCKED — while the activity beside it said LIVE.
+     * Two records of the same fact, and the older one won.
+     *
+     * The activity knows. It carries a lease whose liveness is checkable, so
+     * that is consulted before anything is concluded. A live holder means this
+     * supervisor stands down — the claim is THEIRS and is left exactly where it
+     * is — and says who has it, which is what AC-13 requires.
+     *
+     * GONE and UNKNOWN both still escalate. Whether the external action
+     * completed remains unknowable in both cases, and repeating it could
+     * duplicate real work; nothing here weakens that.
+     */
+    const probe = this.deps.liveness;
+    const running = (state.activities ?? []).find(
+      (entry) => entry.id === canonicalActivityId(claim.roadmapKey, claim.kind, claim.attempt),
+    );
+    if (probe !== undefined && running !== undefined && !isTerminal(running.state) && running.lease !== undefined) {
+      if (probe.check(running.lease) === "ALIVE") {
+        const holder =
+          `action ${claim.actionId} is held by pid ${running.lease.pid} on ` +
+          `${JSON.stringify(running.lease.machine)}, which is still running; this supervisor is standing down`;
+        this.log(`[supervisor] ${holder}`);
+        return {
+          // The claim is NOT dropped: it belongs to the process that is still
+          // working, and removing it would let a third supervisor start beside
+          // them both.
+          state,
+          result: {
+            kind: "WAITING_FOR_RESOURCE",
+            roadmapKey: claim.roadmapKey,
+            reason: boundedDiagnostic(holder),
+          },
+        };
+      }
     }
 
     // RUNNING under an owner that is gone. Whether the external action
@@ -3016,21 +3074,37 @@ export class SupervisorService {
    * reason to stop the Factory — it is the reason the Factory can carry on,
    * which is what separates this from the structural refusals above.
    */
-  private async reconcileActivities(state: SupervisorState): Promise<SupervisorState> {
+  private async reconcileActivities(
+    state: SupervisorState,
+  ): Promise<{ readonly state: SupervisorState; readonly refusal?: string }> {
     const activities = state.activities ?? [];
     if (activities.length === 0) {
-      return state;
+      return { state };
     }
     const probe = this.deps.liveness;
     if (probe === undefined) {
       /**
-       * No probe means liveness cannot be established here, and the invariant
-       * says an unknown REFUSES rather than being resolved in whichever
-       * direction is convenient. Leaving every record untouched is that
-       * refusal: nothing is concluded, and `claimActivity` still refuses a
-       * lease it cannot check.
+       * NO PROBE, WITH WORK IN FLIGHT, IS A REFUSAL (round-3 review, HIGH 2).
+       *
+       * The comment here used to claim that an unknown refuses, and the code
+       * returned the state unchanged and let the tick carry on — so an
+       * unfinished activity sat in durable state, nothing concluded anything
+       * about it, and the supervisor went and ran a DIFFERENT item to DONE. The
+       * comment described the invariant; the code did the opposite of it.
+       *
+       * A tick that cannot establish whether anything is still working must not
+       * schedule more work. It is only reached with activities present, because
+       * an installation with none has nothing to be unsure about.
        */
-      return state;
+      const unfinished = activities.filter((entry) => !isTerminal(entry.state));
+      if (unfinished.length === 0) {
+        return { state };
+      }
+      const problem =
+        `${unfinished.length} activit${unfinished.length === 1 ? "y is" : "ies are"} unfinished and this supervisor ` +
+        "has no way to check whether their owners are still running; refusing to schedule further work";
+      this.log(`[supervisor] ${problem}`);
+      return { state, refusal: boundedDiagnostic(problem) };
     }
 
     const now = this.deps.clock.now();
@@ -3069,9 +3143,25 @@ export class SupervisorService {
       );
     }
 
-    // The one recovery ACTION. Its gate lives inside the function that proposes
-    // it, with the reasoning, rather than here at the call site.
-    const requeue = new Set(crashedItemsToRequeue(next, state.roadmap));
+    /**
+     * The one recovery ACTION. Its gate lives inside the function that proposes
+     * it, with the reasoning, rather than here at the call site.
+     *
+     * AN ITEM WITH AN UNRESOLVED CLAIM IS LEFT ALONE (round-3 review, AC-20
+     * "Partial"). `reconcileClaim` owns that item and is STRICTER: a RUNNING
+     * claim whose owner is gone means the external action's outcome is
+     * unknowable, and it escalates for a human rather than re-queueing. Both
+     * mechanisms firing produced a requeue to PENDING that the escalation then
+     * overrode to BLOCKED — the right answer reached by accident, through two
+     * writes that disagreed.
+     *
+     * Precedence is explicit now: the claim decides for its own item, and this
+     * re-queues everything else.
+     */
+    const claimed = state.activeClaim?.roadmapKey;
+    const requeue = new Set(
+      crashedItemsToRequeue(next, state.roadmap).filter((key) => key !== claimed),
+    );
     const roadmap =
       requeue.size === 0
         ? state.roadmap
@@ -3088,9 +3178,9 @@ export class SupervisorService {
     changed = changed || requeue.size > 0;
 
     if (!changed) {
-      return state;
+      return { state };
     }
-    return this.commit(state, { ...state, activities: next, roadmap });
+    return { state: await this.commit(state, { ...state, activities: next, roadmap }) };
   }
 
   /**

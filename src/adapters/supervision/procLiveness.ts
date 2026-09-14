@@ -160,10 +160,17 @@ export function leaseForThisProcess(
   // `"boot" in options` rather than `??`, so passing `boot: undefined` MEANS
   // "this host cannot say" instead of silently falling back to the real one.
   const boot = "boot" in options ? options.boot : bootIdentity();
-  if (boot === undefined) {
-    // Same rule: without a boot identity the lease cannot be distinguished from
-    // one written before a restart, so it is not written at all. The caller
-    // refuses to run rather than running unobserved.
+  if (boot === undefined || boot.length === 0) {
+    /**
+     * Same rule: without a boot identity the lease cannot be distinguished from
+     * one written before a restart, so it is not written at all. The caller
+     * refuses to run rather than running unobserved.
+     *
+     * EMPTY COUNTS AS ABSENT (round-3 review, defensive note). The persisted
+     * parser already rejects an empty `boot`, but an in-memory lease built with
+     * one self-checked ALIVE — a shape only this constructor could produce, and
+     * one it therefore should not.
+     */
     return undefined;
   }
   return {

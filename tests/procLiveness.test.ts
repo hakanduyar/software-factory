@@ -264,6 +264,16 @@ describe("TASK-018 AC-16: unreadable and zombie processes", () => {
     assert.ok(leaseForThisProcess(1_000) !== undefined);
   });
 
+  /**
+   * ROUND-3 REVIEW, defensive note. The persisted parser already rejects an
+   * empty `boot`, but this constructor would build an in-memory lease with one
+   * — and that lease self-checked ALIVE. A shape only this function could
+   * produce is a shape it should not.
+   */
+  it("refuses to BUILD a lease when the boot is empty, not merely absent", () => {
+    assert.equal(leaseForThisProcess(1_000, { boot: "" }), undefined);
+  });
+
   it("reports GONE for an absent entry, and UNKNOWN for one it cannot parse", () => {
     const probe = createProcLivenessProbe({ procRoot: root, machine: MACHINE });
     assert.equal(probe.check({ pid: 9999, processStartedAt: 1, machine: MACHINE, boot: BOOT, claimedAt: 1 }), "GONE");
