@@ -509,6 +509,33 @@ function replace(activities: readonly Activity[], next: Activity): readonly Acti
  * So a repeat with the same content is free, and a repeat with different
  * content is a refusal naming both.
  */
+/**
+ * A record's content, independent of the order its keys were written in.
+ *
+ * `JSON.stringify` preserves insertion order, so two records that are the same
+ * record refused each other as a disagreement if their fields had been built in
+ * a different sequence (round-4 review, non-blocking note). That is fail-closed
+ * and so not dangerous, but it is wrong: it would make a legitimate replay —
+ * the very thing AC-17 asks to be free — look like two owners contradicting
+ * each other.
+ *
+ * Sorting the keys removes the ordering without weakening the comparison: the
+ * field boundaries stay escaped, so the delimiter collision that HIGH 3 of
+ * round 1 found stays closed.
+ */
+function canonical(value: unknown): string {
+  return JSON.stringify(value, (_key, nested: unknown) => {
+    if (nested === null || typeof nested !== "object" || Array.isArray(nested)) {
+      return nested;
+    }
+    const ordered: Record<string, unknown> = {};
+    for (const key of Object.keys(nested as Record<string, unknown>).sort()) {
+      ordered[key] = (nested as Record<string, unknown>)[key];
+    }
+    return ordered;
+  });
+}
+
 function settle<T>(
   current: T | undefined,
   incoming: T,
@@ -533,7 +560,7 @@ function settle<T>(
    * content can make two different records look alike. `describe` survives for
    * the MESSAGE, where readability is the only requirement.
    */
-  if (JSON.stringify(current) === JSON.stringify(incoming)) {
+  if (canonical(current) === canonical(incoming)) {
     return { kind: "noop" };
   }
   return {

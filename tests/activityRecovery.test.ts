@@ -421,6 +421,62 @@ describe("TASK-018 AC-11/AC-15: running an item records a durable activity", () 
     }
   });
 
+  /**
+   * ROUND-4 REVIEW, HIGH 1. The first fix required BOTH dependencies and
+   * treated anything else as "this installation does not record activities" —
+   * so a real probe with no lease source ran the work and marked the item DONE
+   * with zero activities. Fail-open one step further out.
+   */
+  for (const half of ["probe only", "lease only"] as const) {
+    it(`REFUSES to run when configured by halves (${half})`, async () => {
+      const queued: readonly RoadmapItem[] = [
+        { key: "A", title: "Work", dependsOn: [], status: "PENDING", workClass: "NORMAL_IMPLEMENTATION", order: 1 },
+      ];
+      const path = await seed(queued);
+      let executorCalls = 0;
+      const repository = createSqliteSupervisorRepository(path);
+      const base = Date.now();
+      let reading = 0;
+      const probe = scriptedProbe();
+      for (const entry of TEST_CATALOG) {
+        probe.set(entry.provider, entry.model, { state: "AVAILABLE", reason: "scripted", billingMode: "INCLUDED_SUBSCRIPTION" });
+      }
+      try {
+        const service = new SupervisorService({
+          repository,
+          roadmapCatalog: [...queued],
+          probe,
+          executor: {
+            execute: async () => {
+              executorCalls += 1;
+              return { kind: "COMPLETED", detail: "should not run" };
+            },
+          },
+          clock: { now: () => base + reading++ * 1_000 },
+          ids: createSequentialIdGenerator(),
+          routingPolicy: DEFAULT_ROUTING_POLICY,
+          resourceCatalog: TEST_CATALOG,
+          ...(half === "probe only"
+            ? { liveness: createProcLivenessProbe() }
+            : { activityLease: (at: number) => leaseForThisProcess(at) }),
+          log: () => {},
+        });
+        for (let attempt = 0; attempt < 5; attempt += 1) await service.tick();
+      } finally {
+        repository.close();
+      }
+
+      assert.equal(executorCalls, 0, `work ran with ${half} configured`);
+      assert.deepEqual(await readActivities(path), []);
+      const after = createSqliteSupervisorRepository(path);
+      try {
+        assert.notEqual((await after.load())?.roadmap.find((item) => item.key === "A")?.status, "DONE");
+      } finally {
+        after.close();
+      }
+    });
+  }
+
   it("refuses to start a second run while a live process holds the activity", async () => {
     const queued: readonly RoadmapItem[] = [
       { key: "A", title: "Work", dependsOn: [], status: "PENDING", workClass: "NORMAL_IMPLEMENTATION", order: 1 },
@@ -1003,6 +1059,163 @@ describe("TASK-018 AC-16: a supervisor that cannot check liveness schedules noth
       repository.close();
     }
     assert.ok(executorCalls > 0, "an installation that records no activities was stopped anyway");
+  });
+});
+
+// =====================================================================
+// AC-15 — a completion survives a rival advancing the state
+// =====================================================================
+
+describe("TASK-018 AC-15: a finished piece of work records its completion even under contention", () => {
+  /**
+   * ROUND-4 REVIEW, HIGH 2 — and losing the record of a SUCCESS is worse than
+   * losing the race.
+   *
+   * A rival supervisor that correctly stood down still advanced the state with
+   * its own reconciliation write, and the owner's completion then failed its CAS
+   * with `ConcurrencyError`. Work that had actually finished left no completion,
+   * and the activity sat RUNNING for reconciliation to later call crashed.
+   *
+   * A conflict is not an error here, it is a stale read: the transition is
+   * recomputed against what the state now says and written again. This drives
+   * exactly that — the state is advanced underneath the write, by a real second
+   * connection, between the owner computing its completion and persisting it.
+   */
+  it("re-reads and re-applies when another supervisor advanced the state first", async () => {
+    const path = await seed();
+    const repository = createSqliteSupervisorRepository(path);
+    try {
+      // An owner claims, exactly as production does.
+      const state = await repository.load();
+      assert.ok(state);
+      const lease = leaseForThisProcess(Date.now());
+      assert.ok(lease);
+      const claimed = claimActivity(
+        state.activities ?? [],
+        { id: "A:REVIEW:r1", kind: "REVIEW", roadmapKey: "A", lease, now: Date.now() },
+        createProcLivenessProbe(),
+      );
+      assert.equal(claimed.ok, true);
+      if (!claimed.ok) throw new Error("unreachable");
+      await repository.compareAndSave(
+        { ...state, version: state.version + 1, activities: claimed.activities },
+        state.version,
+      );
+
+      // The owner reads, and is about to complete.
+      const owned = await repository.load();
+      assert.ok(owned);
+
+      // A RIVAL advances the state underneath it, through its own connection.
+      const rival = createSqliteSupervisorRepository(path);
+      try {
+        const seen = await rival.load();
+        assert.ok(seen);
+        await rival.compareAndSave({ ...seen, version: seen.version + 1, updatedAt: seen.updatedAt + 1 }, seen.version);
+      } finally {
+        rival.close();
+      }
+
+      // The owner's stale write must fail...
+      const stale = completeActivity(owned.activities ?? [], "A:REVIEW:r1", {
+        state: "COMPLETED",
+        completion: { outcome: "PASS", detail: "finished", at: Date.now() },
+      });
+      assert.equal(stale.ok, true);
+      if (!stale.ok) throw new Error("unreachable");
+      await assert.rejects(
+        async () =>
+          repository.compareAndSave(
+            { ...owned, version: owned.version + 1, activities: stale.activities },
+            owned.version,
+          ),
+        "the premise is wrong: a stale CAS was accepted",
+      );
+
+      // ...and re-reading and re-applying must then succeed, which is what the
+      // service's retry does.
+      const fresh = await repository.load();
+      assert.ok(fresh);
+      const retried = completeActivity(fresh.activities ?? [], "A:REVIEW:r1", {
+        state: "COMPLETED",
+        completion: { outcome: "PASS", detail: "finished", at: Date.now() },
+      });
+      assert.equal(retried.ok, true);
+      if (!retried.ok) throw new Error("unreachable");
+      await repository.compareAndSave(
+        { ...fresh, version: fresh.version + 1, activities: retried.activities },
+        fresh.version,
+      );
+    } finally {
+      repository.close();
+    }
+
+    const activities = await readActivities(path);
+    assert.equal(activities[0]?.state, "COMPLETED", "the completion was lost to a rival's write");
+    assert.equal(activities[0]?.completion?.outcome, "PASS");
+  });
+
+  /**
+   * The same thing through the SERVICE, which is what HIGH 2 was actually
+   * about: the retry must live in production, not in a test that models it.
+   */
+  it("the supervisor records a completion even when a rival advances the state mid-run", async () => {
+    const queued: readonly RoadmapItem[] = [
+      { key: "A", title: "Work", dependsOn: [], status: "PENDING", workClass: "NORMAL_IMPLEMENTATION", order: 1 },
+    ];
+    const path = await seed(queued);
+
+    const repository = createSqliteSupervisorRepository(path);
+    const base = Date.now();
+    let reading = 0;
+    const probe = scriptedProbe();
+    for (const entry of TEST_CATALOG) {
+      probe.set(entry.provider, entry.model, { state: "AVAILABLE", reason: "scripted", billingMode: "INCLUDED_SUBSCRIPTION" });
+    }
+    try {
+      const service = new SupervisorService({
+        repository,
+        roadmapCatalog: [...queued],
+        probe,
+        executor: {
+          // WHILE the work is "running", a rival advances the state — the exact
+          // interleaving the reviewer reproduced.
+          execute: async () => {
+            const rival = createSqliteSupervisorRepository(path);
+            try {
+              const seen = await rival.load();
+              if (seen !== undefined) {
+                await rival.compareAndSave(
+                  { ...seen, version: seen.version + 1, updatedAt: seen.updatedAt + 1 },
+                  seen.version,
+                );
+              }
+            } finally {
+              rival.close();
+            }
+            return { kind: "COMPLETED", detail: "done" };
+          },
+        },
+        clock: { now: () => base + reading++ * 1_000 },
+        ids: createSequentialIdGenerator(),
+        routingPolicy: DEFAULT_ROUTING_POLICY,
+        resourceCatalog: TEST_CATALOG,
+        liveness: createProcLivenessProbe(),
+        activityLease: (at) => leaseForThisProcess(at),
+        log: () => {},
+      });
+      for (let attempt = 0; attempt < 6; attempt += 1) {
+        await service.tick();
+        if (((await repository.load())?.activities ?? []).some((entry) => entry.completion !== undefined)) break;
+      }
+    } finally {
+      repository.close();
+    }
+
+    const activities = await readActivities(path);
+    assert.equal(activities.length, 1, "no activity was recorded at all");
+    assert.ok(activities[0]?.completion, "a finished run left no completion behind");
+    assert.ok(["COMPLETED", "FAILED"].includes(activities[0]!.state));
   });
 });
 

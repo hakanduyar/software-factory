@@ -1117,6 +1117,31 @@ export const MUTATIONS = [
    * activity" fixture held no `activeClaim`, so nothing could have caught the
    * two records of one fact disagreeing.
    */
+  /**
+   * ROUND-4 REVIEW. Both guards are new, and the second one is the interesting
+   * case: losing the record of a SUCCESS is worse than losing the race, so the
+   * mutation makes the retry give up on the first conflict.
+   */
+  {
+    id: "a half-configured installation runs unobserved",
+    edits: [[SUP_SVC,
+      "    if (intendsActivities && !recordsActivities) {",
+      "    if (intendsActivities && !recordsActivities && Number.isNaN(0)) {"]],
+    tests: [T_ACTREC],
+    expect: "REFUSES to run when configured by halves",
+  },
+  {
+    id: "a completion lost to a rival's write is not retried",
+    // The LOOP BOUND is mutated, not the reload. Adding `|| true` to the
+    // undefined check stops TypeScript narrowing `fresh` afterwards and the
+    // file ceases to compile — the same folding trap as before. One attempt
+    // means a conflict is never retried, which is the defect exactly.
+    edits: [[SUP_SVC,
+      "    for (let attempt = 0; attempt < 5; attempt += 1) {\n      const next = mutate(current.activities ?? []);",
+      "    for (let attempt = 0; attempt < 1; attempt += 1) {\n      const next = mutate(current.activities ?? []);"]],
+    tests: [T_ACTREC],
+    expect: "the supervisor records a completion even when a rival advances the state mid-run",
+  },
   {
     id: "a live claim holder is still declared lost",
     edits: [[SUP_SVC,
@@ -1203,8 +1228,8 @@ export const MUTATIONS = [
   {
     id: "a second, DISAGREEING completion is silently treated as the same one",
     edits: [[ACTIVITY,
-      "  if (JSON.stringify(current) === JSON.stringify(incoming)) {",
-      "  if (JSON.stringify(current) !== JSON.stringify(incoming) || !Number.isNaN(0)) {"]],
+      "  if (canonical(current) === canonical(incoming)) {",
+      "  if (canonical(current) !== canonical(incoming) || !Number.isNaN(0)) {"]],
     tests: [T_ACT],
     expect: "REFUSES a second completion that DISAGREES",
   },

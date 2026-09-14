@@ -30,8 +30,10 @@ import {
   RECOVERY_TO_STATUS,
   reportProgress,
   unobservedCompletions,
+  type Activity,
   type ActivityLease,
   type LivenessProbe,
+  type TransitionVerdict,
 } from "./activity.js";
 import {
   CATALOG_UPGRADE_STEPS,
@@ -1717,7 +1719,39 @@ export class SupervisorService {
      * cannot. The first is a choice; the second is an unknown, and every
      * unknown here refuses.
      */
+    /**
+     * HALF-CONFIGURED IS ALSO AN UNKNOWN (round-4 review, HIGH 1).
+     *
+     * The first fix asked for BOTH dependencies and treated anything else as
+     * "this installation does not record activities" — so supplying a real
+     * liveness probe and no lease source ran the work, returned ADVANCED, and
+     * marked the item DONE with zero activities. Fail-open again, one step
+     * further out: I closed "configured and cannot" and left "configured by
+     * halves" wide open.
+     *
+     * EITHER dependency present means somebody INTENDED this installation to
+     * record activities. Neither is a choice; one is a misconfiguration, and a
+     * misconfiguration is not a licence to run unobserved.
+     */
+    const intendsActivities = probe !== undefined || leaseSource !== undefined;
     const recordsActivities = probe !== undefined && leaseSource !== undefined;
+    if (intendsActivities && !recordsActivities) {
+      const missing = probe === undefined ? "a liveness probe" : "a lease source";
+      const problem =
+        `this supervisor is configured to record activities but has no ${missing}, so work on ${item.key} could ` +
+        "not be reconciled by anything; refusing to run it";
+      this.log(`[supervisor] ${problem}`);
+      return {
+        kind: "CONCLUSION",
+        result: {
+          kind: "WAITING_FOR_HUMAN",
+          roadmapKey: item.key,
+          reason: "HUMAN_DECISION_REQUIRED",
+          humanActionRequired: boundedDiagnostic(problem),
+        },
+        wakeBasis: state,
+      };
+    }
     if (recordsActivities && lease === undefined) {
       const problem =
         `this supervisor cannot establish its own process identity, so it cannot take a lease on ${item.key}; ` +
@@ -1943,24 +1977,20 @@ export class SupervisorService {
      * having to be told. A FAILED outcome is recorded just as a passing one is,
      * because a failure nobody noticed is the same problem.
      */
+    const completion = {
+      outcome: outcome.kind,
+      detail: boundedDiagnostic(`${item.key} ${action.kind} attempt ${attempt}`),
+      at: this.deps.clock.now(),
+    };
     const finished =
       lease === undefined || probe === undefined
         ? running
-        : await (async () => {
-            const done = completeActivity(running.activities ?? [], activityId, {
+        : await this.commitActivityChange(running, `record the completion of ${activityId}`, (activities) =>
+            completeActivity(activities, activityId, {
               state: outcome.kind === "COMPLETED" ? "COMPLETED" : "FAILED",
-              completion: {
-                outcome: outcome.kind,
-                detail: boundedDiagnostic(`${item.key} ${action.kind} attempt ${attempt}`),
-                at: this.deps.clock.now(),
-              },
-            });
-            if (!done.ok) {
-              this.log(`[supervisor] could not record the completion: ${done.problem}`);
-              return running;
-            }
-            return this.commit(running, { ...running, activities: done.activities });
-          })();
+              completion,
+            }),
+          );
 
     return this.settle(
       finished,
@@ -3074,6 +3104,61 @@ export class SupervisorService {
    * reason to stop the Factory — it is the reason the Factory can carry on,
    * which is what separates this from the structural refusals above.
    */
+  /**
+   * Applies a change to the activity list and PERSISTS it, re-reading and
+   * re-applying when another supervisor moved the state first.
+   *
+   * ROUND-4 REVIEW, HIGH 2. A rival supervisor that correctly stood down still
+   * advanced the state with its own reconciliation write, and the owner's
+   * completion then failed its CAS with `ConcurrencyError` — so a piece of work
+   * that had actually FINISHED left no completion at all, and the activity sat
+   * RUNNING for reconciliation to later call crashed. Losing the record of a
+   * success is worse than losing the race.
+   *
+   * A conflict here is not an error, it is a stale read: the transition is
+   * recomputed against what the state now says and written again. `mutate`
+   * must therefore be a pure function of the CURRENT activities, and every
+   * transition in `activity.ts` is exactly that, which is why they take and
+   * return a list rather than editing one.
+   *
+   * Bounded, and it returns the unchanged state rather than throwing when it
+   * runs out of attempts: the caller is on its way to `settle`, and failing to
+   * record a completion must not also lose the outcome it was recording.
+   */
+  private async commitActivityChange(
+    state: SupervisorState,
+    what: string,
+    mutate: (activities: readonly Activity[]) => TransitionVerdict,
+  ): Promise<SupervisorState> {
+    let current = state;
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const next = mutate(current.activities ?? []);
+      if (!next.ok) {
+        this.log(`[supervisor] could not ${what}: ${next.problem}`);
+        return current;
+      }
+      if (!next.changed) {
+        return current;
+      }
+      try {
+        return await this.commit(current, { ...current, activities: next.activities });
+      } catch (error) {
+        if (!(error instanceof ConcurrencyError)) {
+          throw error;
+        }
+        const fresh = await this.deps.repository.load();
+        if (fresh === undefined) {
+          this.log(`[supervisor] could not ${what}: durable state disappeared`);
+          return current;
+        }
+        this.log(`[supervisor] re-reading to ${what}: another supervisor advanced the state`);
+        current = fresh;
+      }
+    }
+    this.log(`[supervisor] gave up trying to ${what} after repeated conflicts`);
+    return current;
+  }
+
   private async reconcileActivities(
     state: SupervisorState,
   ): Promise<{ readonly state: SupervisorState; readonly refusal?: string }> {
