@@ -1849,28 +1849,47 @@ export class SupervisorService {
     // Second durable write: from here the launch may have happened, and the
     // activity says so too — a heartbeat before the launch is what separates
     // "claimed and never started" from "started and stopped reporting".
-    const launching =
-      lease === undefined || probe === undefined
-        ? claimed.activities ?? []
-        : (() => {
-            const beat = reportProgress(
-              claimed.activities ?? [],
-              activityId,
-              { at: this.deps.clock.now(), progress: 1 },
-              lease,
-            );
-            if (!beat.ok) {
-              this.log(`[supervisor] could not record the launch heartbeat: ${beat.problem}`);
-              return claimed.activities ?? [];
-            }
-            return beat.activities;
-          })();
-
-    const running = await this.commit(claimed, {
-      ...claimed,
-      activeClaim: { ...claim, state: "RUNNING" },
-      activities: launching,
-    });
+    /**
+     * THE LAUNCH WRITE IS RETRIED TOO (round-6 review, HIGH 3).
+     *
+     * This used a raw commit, so another supervisor writing between the claim
+     * and the heartbeat made `tick()` THROW — leaving the activity CLAIMED, the
+     * claim CLAIMED and the item ACTIVE, with nothing having run and no
+     * decision recorded. The retry existed and was wired only to the
+     * completion; contention does not respect which write we happened to
+     * harden first.
+     *
+     * The heartbeat and the claim's CLAIMED -> RUNNING transition travel
+     * together: one without the other is a state that means nothing.
+     */
+    let running = claimed;
+    if (lease === undefined || probe === undefined) {
+      running = await this.commit(claimed, { ...claimed, activeClaim: { ...claim, state: "RUNNING" } });
+    } else {
+      const launched = await this.commitActivityChange(
+        claimed,
+        `record the launch of ${activityId}`,
+        (activities) => reportProgress(activities, activityId, { at: this.deps.clock.now(), progress: 1 }, lease),
+        () => ({ activeClaim: { ...claim, state: "RUNNING" } }),
+      );
+      if (!launched.recorded) {
+        const problem =
+          `${item.key} could not record that its work had started (${launched.problem ?? "unknown reason"}); ` +
+          "refusing to launch work whose start nothing would know about";
+        this.log(`[supervisor] ${problem}`);
+        return {
+          kind: "CONCLUSION",
+          result: {
+            kind: "WAITING_FOR_HUMAN",
+            roadmapKey: item.key,
+            reason: "HUMAN_DECISION_REQUIRED",
+            humanActionRequired: boundedDiagnostic(problem),
+          },
+          wakeBasis: launched.state,
+        };
+      }
+      running = launched.state;
+    }
 
     /**
      * Resuming a checkpoint (F5-RESUME-1).
@@ -3159,6 +3178,16 @@ export class SupervisorService {
     state: SupervisorState,
     what: string,
     mutate: (activities: readonly Activity[]) => TransitionVerdict,
+    /**
+     * Anything else that must move in the SAME write.
+     *
+     * The launch heartbeat travels with the claim's CLAIMED -> RUNNING
+     * transition, and splitting them would create a state where one landed and
+     * the other did not — the half-applied shape this task exists to refuse.
+     * Recomputed per attempt from the freshest state, for the same reason
+     * `mutate` is.
+     */
+    alongside?: (state: SupervisorState) => Partial<SupervisorState>,
   ): Promise<{ readonly state: SupervisorState; readonly recorded: boolean; readonly problem?: string }> {
     let current = state;
     for (let attempt = 0; attempt < 5; attempt += 1) {
@@ -3168,11 +3197,29 @@ export class SupervisorService {
         return { state: current, recorded: false, problem: next.problem };
       }
       if (!next.changed) {
-        return { state: current, recorded: true };
+        const patch = alongside?.(current) ?? {};
+        if (Object.keys(patch).length === 0) {
+          return { state: current, recorded: true };
+        }
+        try {
+          return { state: await this.commit(current, { ...current, ...patch }), recorded: true };
+        } catch (error) {
+          if (!(error instanceof ConcurrencyError)) throw error;
+          const again = await this.deps.repository.load();
+          if (again === undefined) {
+            return { state: current, recorded: false, problem: `durable state disappeared while trying to ${what}` };
+          }
+          current = again;
+          continue;
+        }
       }
       try {
         return {
-          state: await this.commit(current, { ...current, activities: next.activities }),
+          state: await this.commit(current, {
+            ...current,
+            ...(alongside?.(current) ?? {}),
+            activities: next.activities,
+          }),
           recorded: true,
         };
       } catch (error) {
@@ -3232,7 +3279,39 @@ export class SupervisorService {
         `${unfinished.length} activit${unfinished.length === 1 ? "y is" : "ies are"} unfinished and this supervisor ` +
         "has no way to check whether their owners are still running; refusing to schedule further work";
       this.log(`[supervisor] ${problem}`);
-      return { state, refusal: boundedDiagnostic(problem) };
+
+      /**
+       * THE CLASSIFICATION IS RECORDED, NOT ONLY THE REFUSAL (round-6 review,
+       * HIGH 2).
+       *
+       * AC-16 asks that every non-terminal activity be classified and the
+       * classification RECORDED; refusing to schedule is the other half. This
+       * path did the second and skipped the first, so a fresh process read the
+       * activity back with `reconciliation: undefined` and learned nothing
+       * about why the Factory had stopped. A refusal that leaves no durable
+       * reason is the same defect as a log line standing in for a record.
+       */
+      const blind = this.deps.clock.now();
+      let classified = activities;
+      let wrote = false;
+      for (const entry of unfinished) {
+        const recorded = recordReconciliation(classified, entry.id, {
+          verdict: "AMBIGUOUS",
+          at: blind,
+          detail: boundedDiagnostic(
+            `activity ${JSON.stringify(entry.id)} is ${entry.state} and this supervisor has no liveness probe, ` +
+              "so whether its owner is still running cannot be established",
+          ),
+        });
+        if (!recorded.ok) {
+          this.log(`[supervisor] could not record an ambiguity verdict: ${recorded.problem}`);
+          continue;
+        }
+        classified = recorded.activities;
+        wrote = wrote || recorded.changed;
+      }
+      const persisted = wrote ? await this.commit(state, { ...state, activities: classified }) : state;
+      return { state: persisted, refusal: boundedDiagnostic(problem) };
     }
 
     const now = this.deps.clock.now();

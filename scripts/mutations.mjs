@@ -1126,6 +1126,35 @@ export const MUTATIONS = [
    * ROUND-5 REVIEW. Both guards are new: `AMBIGUOUS` must stop the tick rather
    * than annotate it, and a write must prove it comes from the current holder.
    */
+  /**
+   * ROUND-6 REVIEW. Three guards the previous matrix could not measure, and the
+   * first is the one that mattered most: a heartbeat that refreshed its
+   * timestamp without the COUNT moving defeated stall detection entirely.
+   */
+  {
+    id: "an unchanged progress count still refreshes the stall clock",
+    edits: [[ACTIVITY,
+      "  if (previous !== undefined && previous.progress === heartbeat.progress) {",
+      "  if (previous !== undefined && previous.progress === heartbeat.progress && previous.at === heartbeat.at) {"]],
+    tests: [T_ACT],
+    expect: "does NOT refresh the stall clock when the count has not moved",
+  },
+  {
+    id: "a no-probe refusal records no classification",
+    edits: [[SUP_SVC,
+      "      const persisted = wrote ? await this.commit(state, { ...state, activities: classified }) : state;",
+      "      const persisted = state;\n      void classified;\n      void wrote;"]],
+    tests: [T_ACTREC],
+    expect: "REFUSES to run anything while an activity is unfinished and liveness is uncheckable",
+  },
+  {
+    id: "work is launched even though its start could not be recorded",
+    edits: [[SUP_SVC,
+      "      if (!launched.recorded) {",
+      "      if (!launched.recorded && Number.isNaN(0)) {"]],
+    tests: [T_ACTREC],
+    expect: "REFUSES to launch when the start of the work cannot be recorded",
+  },
   {
     id: "an ambiguous activity is annotated instead of refusing the tick",
     edits: [[SUP_SVC,

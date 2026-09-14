@@ -655,7 +655,22 @@ export function reportProgress(
         "progress does not go backwards",
     };
   }
-  if (previous !== undefined && previous.progress === heartbeat.progress && previous.at === heartbeat.at) {
+  /**
+   * A REPEAT OF THE SAME COUNT CHANGES NOTHING, WHATEVER ITS TIMESTAMP
+   * (round-6 review, HIGH 1).
+   *
+   * This used to refresh `at` whenever the timestamp moved, even with the count
+   * unchanged — so a process that heartbeated forever without getting anywhere
+   * never became STALLED. That defeats the whole of AC-14, and it contradicts
+   * the reason `progress` is a COUNT rather than a timestamp, which is written
+   * three fields above this line: "the owner is alive" and "the owner is
+   * getting somewhere" are different questions, and only the second one is
+   * being asked here.
+   *
+   * `heartbeat.at` therefore means "when progress last MOVED". A live owner
+   * that has stopped moving is exactly what STALLED is for.
+   */
+  if (previous !== undefined && previous.progress === heartbeat.progress) {
     return { ok: true, activities, changed: false };
   }
   return {

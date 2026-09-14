@@ -439,6 +439,56 @@ describe("TASK-018 AC-17: applying a transition twice is applying it once", () =
     );
   });
 
+  /**
+   * ROUND-6 REVIEW, HIGH 1 — the reviewer's own reproduction.
+   *
+   * `heartbeat.at` used to be refreshed whenever the TIMESTAMP moved, even
+   * with the count unchanged, so a process that heartbeated forever without
+   * getting anywhere never became STALLED. That defeats the whole of AC-14 and
+   * contradicts the reason `progress` is a count rather than a timestamp: "the
+   * owner is alive" and "the owner is getting somewhere" are different
+   * questions, and only the second is being asked.
+   */
+  it("does NOT refresh the stall clock when the count has not moved", () => {
+    const first = reportProgress([claimed()], claimed().id, { at: T0 + 10, progress: 1 }, lease());
+    assert.equal(first.ok, true);
+    if (!first.ok) throw new Error("unreachable");
+
+    const repeated = reportProgress(first.activities, claimed().id, { at: T0 + 40, progress: 1 }, lease());
+    assert.equal(repeated.ok, true);
+    if (!repeated.ok) throw new Error("unreachable");
+    assert.equal(repeated.changed, false, "an unchanged count moved the stall clock");
+    assert.equal(repeated.activities[0]?.heartbeat?.at, T0 + 10, "`at` must mean when progress last MOVED");
+
+    // ...and the activity is therefore STALLED, which is the point.
+    //
+    // `now` is well past the threshold rather than exactly on it: the check is
+    // strictly greater-than, and the first version of this test sat on the
+    // boundary and read LIVE for a reason that had nothing to do with the
+    // defect under test.
+    const verdict = classifyActivity(
+      repeated.activities[0]!,
+      { now: T0 + 100, stallAfterMs: 50 },
+      probeWhere("ALIVE"),
+    );
+    assert.equal(verdict?.verdict, "STALLED", "repeated identical heartbeats prevented a stall");
+  });
+
+  it("DOES move the stall clock when the count advances — the positive control", () => {
+    const first = reportProgress([claimed()], claimed().id, { at: T0 + 10, progress: 1 }, lease());
+    assert.equal(first.ok, true);
+    if (!first.ok) throw new Error("unreachable");
+    const moved = reportProgress(first.activities, claimed().id, { at: T0 + 40, progress: 2 }, lease());
+    assert.equal(moved.ok, true);
+    if (!moved.ok) throw new Error("unreachable");
+    assert.equal(moved.changed, true);
+    assert.equal(moved.activities[0]?.heartbeat?.at, T0 + 40);
+    assert.equal(
+      classifyActivity(moved.activities[0]!, { now: T0 + 60, stallAfterMs: 50 }, probeWhere("ALIVE"))?.verdict,
+      "LIVE",
+    );
+  });
+
   it("REFUSES progress on an activity that already finished", () => {
     const done = completeActivity([claimed()], claimed().id, { state: "FAILED", holder: lease(), completion });
     assert.equal(done.ok, true);

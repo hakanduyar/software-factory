@@ -1017,6 +1017,23 @@ describe("TASK-018 AC-16: a supervisor that cannot check liveness schedules noth
     try {
       const state = await after.load();
       assert.notEqual(state?.roadmap.find((item) => item.key === "B")?.status, "DONE", "an unrelated item was completed");
+      /**
+       * ROUND-6 REVIEW, HIGH 2. Refusing to schedule is half of AC-16; the
+       * other half is that every non-terminal activity is CLASSIFIED and the
+       * classification recorded. This path did the second and skipped the
+       * first, so a fresh process read the activity back knowing nothing about
+       * why the Factory had stopped.
+       */
+      assert.equal(
+        state?.activities?.[0]?.reconciliation?.verdict,
+        "AMBIGUOUS",
+        "the refusal left no durable classification behind",
+      );
+      assert.match(
+        state?.activities?.[0]?.reconciliation?.detail ?? "",
+        /no liveness probe/,
+        "the recorded reason does not say why",
+      );
     } finally {
       after.close();
     }
@@ -1293,6 +1310,159 @@ describe("TASK-018 AC-15: a finished piece of work records its completion even u
     assert.equal(activities.length, 1, "no activity was recorded at all");
     assert.ok(activities[0]?.completion, "a finished run left no completion behind");
     assert.ok(["COMPLETED", "FAILED"].includes(activities[0]!.state));
+  });
+});
+
+describe("TASK-018 AC-17: the launch write survives contention, or refuses", () => {
+  /**
+   * ROUND-6 REVIEW, HIGH 3. The launch heartbeat used a RAW commit, so another
+   * supervisor writing between the claim and the heartbeat made `tick()` THROW
+   * — leaving the activity CLAIMED, the claim CLAIMED and the item ACTIVE, with
+   * nothing having run and no decision recorded. The retry existed and was
+   * wired only to the completion; contention does not respect which write was
+   * hardened first.
+   */
+  it("records the launch even when another supervisor writes first", async () => {
+    const queued: readonly RoadmapItem[] = [
+      { key: "A", title: "Work", dependsOn: [], status: "PENDING", workClass: "NORMAL_IMPLEMENTATION", order: 1 },
+    ];
+    const path = await seed(queued);
+
+    const real = createSqliteSupervisorRepository(path);
+    let interfere = 1; // exactly one conflict: the retry must absorb it
+    const contended = {
+      load: () => real.load(),
+      create: (state: SupervisorState) => real.create(state),
+      readCatalogVersion: () => real.readCatalogVersion(),
+      applyCatalogUpgrade: (next: SupervisorState, expected: number, to: number) =>
+        real.applyCatalogUpgrade(next, expected, to),
+      compareAndSave: async (next: SupervisorState, expected: number) => {
+        if (interfere > 0 && (next.activities ?? []).some((entry) => entry.heartbeat !== undefined)) {
+          interfere -= 1;
+          const rival = createSqliteSupervisorRepository(path);
+          try {
+            const seen = await rival.load();
+            if (seen !== undefined) {
+              await rival.compareAndSave({ ...seen, version: seen.version + 1, updatedAt: seen.updatedAt + 1 }, seen.version);
+            }
+          } finally {
+            rival.close();
+          }
+        }
+        return real.compareAndSave(next, expected);
+      },
+    };
+
+    const base = Date.now();
+    let reading = 0;
+    const probe = scriptedProbe();
+    for (const entry of TEST_CATALOG) {
+      probe.set(entry.provider, entry.model, { state: "AVAILABLE", reason: "scripted", billingMode: "INCLUDED_SUBSCRIPTION" });
+    }
+    try {
+      const service = new SupervisorService({
+        repository: contended,
+        roadmapCatalog: [...queued],
+        probe,
+        executor: { execute: async () => ({ kind: "COMPLETED", detail: "ran" }) },
+        clock: { now: () => base + reading++ * 1_000 },
+        ids: createSequentialIdGenerator(),
+        routingPolicy: DEFAULT_ROUTING_POLICY,
+        resourceCatalog: TEST_CATALOG,
+        liveness: createProcLivenessProbe(),
+        activityLease: (at) => leaseForThisProcess(at),
+        log: () => {},
+      });
+      // It must not THROW, which is what the raw commit did.
+      for (let attempt = 0; attempt < 6; attempt += 1) {
+        await service.tick();
+        if (((await real.load())?.activities ?? []).some((entry) => entry.heartbeat !== undefined)) break;
+      }
+    } finally {
+      real.close();
+    }
+
+    const activities = await readActivities(path);
+    assert.equal(activities.length, 1, "no activity was recorded");
+    assert.ok(activities[0]?.heartbeat, "the launch heartbeat was lost to a conflicting write");
+  });
+
+  /**
+   * And when it genuinely cannot be recorded, the work is NOT launched: a start
+   * nothing knows about is indistinguishable afterwards from a claim that never
+   * ran, which is the ambiguity AC-14's NEVER_STARTED exists to remove.
+   */
+  it("REFUSES to launch when the start of the work cannot be recorded", async () => {
+    const queued: readonly RoadmapItem[] = [
+      { key: "A", title: "Work", dependsOn: [], status: "PENDING", workClass: "NORMAL_IMPLEMENTATION", order: 1 },
+    ];
+    const path = await seed(queued);
+
+    const real = createSqliteSupervisorRepository(path);
+    let executorCalls = 0;
+    const contended = {
+      load: () => real.load(),
+      create: (state: SupervisorState) => real.create(state),
+      readCatalogVersion: () => real.readCatalogVersion(),
+      applyCatalogUpgrade: (next: SupervisorState, expected: number, to: number) =>
+        real.applyCatalogUpgrade(next, expected, to),
+      compareAndSave: async (next: SupervisorState, expected: number) => {
+        // EVERY write that carries a heartbeat loses its race, forever.
+        if ((next.activities ?? []).some((entry) => entry.heartbeat !== undefined)) {
+          const rival = createSqliteSupervisorRepository(path);
+          try {
+            const seen = await rival.load();
+            if (seen !== undefined) {
+              await rival.compareAndSave({ ...seen, version: seen.version + 1, updatedAt: seen.updatedAt + 1 }, seen.version);
+            }
+          } finally {
+            rival.close();
+          }
+        }
+        return real.compareAndSave(next, expected);
+      },
+    };
+
+    const base = Date.now();
+    let reading = 0;
+    const probe = scriptedProbe();
+    for (const entry of TEST_CATALOG) {
+      probe.set(entry.provider, entry.model, { state: "AVAILABLE", reason: "scripted", billingMode: "INCLUDED_SUBSCRIPTION" });
+    }
+    let result;
+    try {
+      const service = new SupervisorService({
+        repository: contended,
+        roadmapCatalog: [...queued],
+        probe,
+        executor: {
+          execute: async () => {
+            executorCalls += 1;
+            return { kind: "COMPLETED", detail: "should never run" };
+          },
+        },
+        clock: { now: () => base + reading++ * 1_000 },
+        ids: createSequentialIdGenerator(),
+        routingPolicy: DEFAULT_ROUTING_POLICY,
+        resourceCatalog: TEST_CATALOG,
+        liveness: createProcLivenessProbe(),
+        activityLease: (at) => leaseForThisProcess(at),
+        log: () => {},
+      });
+      for (let attempt = 0; attempt < 6; attempt += 1) {
+        result = await service.tick();
+        if (JSON.stringify(result).includes("could not record that its work had started")) break;
+      }
+    } finally {
+      real.close();
+    }
+
+    assert.match(
+      JSON.stringify(result),
+      /could not record that its work had started/,
+      `expected a refusal, got ${JSON.stringify(result)}`,
+    );
+    assert.equal(executorCalls, 0, "work was launched with no durable record that it had started");
   });
 });
 
