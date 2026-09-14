@@ -1150,13 +1150,19 @@ export const MUTATIONS = [
     tests: [T_ACT],
     expect: "tells holders apart by START TIME, MACHINE and BOOT, not by pid alone",
   },
+  /**
+   * Aimed at the EXHAUSTION test, not the successful-retry one. The first
+   * spelling named the round-5 test, which always succeeds on the retry and so
+   * never reaches this branch — the mutation SURVIVED, and then reported WRONG
+   * TEST once the right fixture existed. The harness found both, in order.
+   */
   {
     id: "an unrecorded completion is settled as though it had been recorded",
     edits: [[SUP_SVC,
       "      if (!written.recorded) {",
       "      if (!written.recorded && Number.isNaN(0)) {"]],
     tests: [T_ACTREC],
-    expect: "the supervisor records a completion even when a rival advances the state mid-run",
+    expect: "REFUSES to settle an outcome whose completion could never be written",
   },
   {
     id: "a half-configured installation runs unobserved",

@@ -1062,8 +1062,20 @@ describe("TASK-018 AC-16: a supervisor that cannot check liveness schedules noth
         ids: createSequentialIdGenerator(),
         routingPolicy: DEFAULT_ROUTING_POLICY,
         resourceCatalog: TEST_CATALOG,
-        // A probe that cannot decide: the exact case AC-16 names.
-        liveness: { check: () => "UNKNOWN" },
+        /**
+         * UNKNOWN ONLY FOR THE DEAD CHILD'S LEASE, and ALIVE for this
+         * process's own.
+         *
+         * The first version answered UNKNOWN to everything, so `claimActivity`
+         * refused the INCOMING lease and the executor was never reached for
+         * that reason instead — the ambiguous refusal was never exercised and
+         * its mutation SURVIVED. Sibling masking, found by the harness rather
+         * than by a reviewer this time.
+         *
+         * Leaving exactly one guard able to fire means the claimant must be
+         * checkable and the incumbent must not.
+         */
+        liveness: { check: (held) => (held.pid === process.pid ? "ALIVE" : "UNKNOWN") },
         activityLease: (at) => leaseForThisProcess(at),
         log: () => {},
       });
@@ -1281,6 +1293,108 @@ describe("TASK-018 AC-15: a finished piece of work records its completion even u
     assert.equal(activities.length, 1, "no activity was recorded at all");
     assert.ok(activities[0]?.completion, "a finished run left no completion behind");
     assert.ok(["COMPLETED", "FAILED"].includes(activities[0]!.state));
+  });
+});
+
+describe("TASK-018 AC-15: an outcome that could not be recorded is not applied", () => {
+  /**
+   * ROUND-6 HARNESS FINDING, and it was my own mutation that exposed it: the
+   * round-5 test always SUCCEEDED on the retry, so the exhaustion branch was
+   * never reached and disabling it changed nothing.
+   *
+   * A rival that advances the state before EVERY write makes all five attempts
+   * conflict. It is a real second connection doing a real write, not a stub
+   * that throws — the point is that the supervisor meets genuine contention,
+   * not that it meets a fake error.
+   *
+   * What must then happen: the outcome is reported to a human and NOT applied.
+   * Settling it would mark the item DONE with the activity still RUNNING and no
+   * completion — a DONE nothing durable accounts for.
+   */
+  it("REFUSES to settle an outcome whose completion could never be written", async () => {
+    const queued: readonly RoadmapItem[] = [
+      { key: "A", title: "Work", dependsOn: [], status: "PENDING", workClass: "NORMAL_IMPLEMENTATION", order: 1 },
+    ];
+    const path = await seed(queued);
+
+    const real = createSqliteSupervisorRepository(path);
+    let sabotage = false;
+    /** Delegates everything, and lets a rival win every CAS once armed. */
+    const contended = {
+      load: () => real.load(),
+      create: (state: SupervisorState) => real.create(state),
+      readCatalogVersion: () => real.readCatalogVersion(),
+      applyCatalogUpgrade: (next: SupervisorState, expected: number, to: number) =>
+        real.applyCatalogUpgrade(next, expected, to),
+      compareAndSave: async (next: SupervisorState, expected: number) => {
+        if (sabotage) {
+          const rival = createSqliteSupervisorRepository(path);
+          try {
+            const seen = await rival.load();
+            if (seen !== undefined) {
+              await rival.compareAndSave({ ...seen, version: seen.version + 1, updatedAt: seen.updatedAt + 1 }, seen.version);
+            }
+          } finally {
+            rival.close();
+          }
+        }
+        return real.compareAndSave(next, expected);
+      },
+    };
+
+    const base = Date.now();
+    let reading = 0;
+    const probe = scriptedProbe();
+    for (const entry of TEST_CATALOG) {
+      probe.set(entry.provider, entry.model, { state: "AVAILABLE", reason: "scripted", billingMode: "INCLUDED_SUBSCRIPTION" });
+    }
+    let result;
+    try {
+      const service = new SupervisorService({
+        repository: contended,
+        roadmapCatalog: [...queued],
+        probe,
+        executor: {
+          // Armed only once the work is running, so the claim and heartbeat
+          // land normally and it is the COMPLETION that cannot be written.
+          execute: async () => {
+            sabotage = true;
+            return { kind: "COMPLETED", detail: "finished, but unrecordable" };
+          },
+        },
+        clock: { now: () => base + reading++ * 1_000 },
+        ids: createSequentialIdGenerator(),
+        routingPolicy: DEFAULT_ROUTING_POLICY,
+        resourceCatalog: TEST_CATALOG,
+        liveness: createProcLivenessProbe(),
+        activityLease: (at) => leaseForThisProcess(at),
+        log: () => {},
+      });
+      for (let attempt = 0; attempt < 6; attempt += 1) {
+        result = await service.tick();
+        if (JSON.stringify(result).includes("could not be recorded")) break;
+      }
+    } finally {
+      real.close();
+    }
+
+    assert.match(
+      JSON.stringify(result),
+      /could not be recorded/,
+      `the outcome was settled despite being unrecordable: ${JSON.stringify(result)}`,
+    );
+
+    const after = createSqliteSupervisorRepository(path);
+    try {
+      const state = await after.load();
+      assert.notEqual(
+        state?.roadmap.find((item) => item.key === "A")?.status,
+        "DONE",
+        "an item was marked DONE with no durable completion",
+      );
+    } finally {
+      after.close();
+    }
   });
 });
 
