@@ -198,7 +198,7 @@ ${
   options.progress === undefined
     ? ""
     : `{
-  const beat = reportProgress(state.activities ?? [], ${JSON.stringify(options.id)}, { at: Date.now(), progress: ${options.progress} });
+  const beat = reportProgress(state.activities ?? [], ${JSON.stringify(options.id)}, { at: Date.now(), progress: ${options.progress} }, lease);
   if (!beat.ok) { console.error("beat: " + beat.problem); process.exit(5); }
   await repo.compareAndSave({ ...state, version: state.version + 1, activities: beat.activities }, state.version);
   state = await repo.load();
@@ -207,7 +207,7 @@ ${
 ${
   options.ending === "complete"
     ? `{
-  const done = completeActivity(state.activities ?? [], ${JSON.stringify(options.id)}, { state: "COMPLETED", completion: { outcome: "PASS", detail: "finished", at: Date.now() } });
+  const done = completeActivity(state.activities ?? [], ${JSON.stringify(options.id)}, { state: "COMPLETED", holder: lease, completion: { outcome: "PASS", detail: "finished", at: Date.now() } });
   if (!done.ok) { console.error("done: " + done.problem); process.exit(6); }
   await repo.compareAndSave({ ...state, version: state.version + 1, activities: done.activities }, state.version);
 }`
@@ -217,7 +217,7 @@ ${
   options.ending === "interrupt"
     ? `{
   // The EFFECT is computed and the process dies before the RECORD is written.
-  const done = completeActivity(state.activities ?? [], ${JSON.stringify(options.id)}, { state: "COMPLETED", completion: { outcome: "PASS", detail: "never written", at: Date.now() } });
+  const done = completeActivity(state.activities ?? [], ${JSON.stringify(options.id)}, { state: "COMPLETED", holder: lease, completion: { outcome: "PASS", detail: "never written", at: Date.now() } });
   if (!done.ok) { console.error("done: " + done.problem); process.exit(6); }
   process.kill(process.pid, "SIGKILL");
 }`
@@ -780,7 +780,7 @@ process.exit(0);
       );
       assert.equal(claimed.ok, true);
       if (!claimed.ok) throw new Error("unreachable");
-      const beat = reportProgress(claimed.activities, "A:REVIEW:r1", { at: Date.now(), progress: 1 });
+      const beat = reportProgress(claimed.activities, "A:REVIEW:r1", { at: Date.now(), progress: 1 }, lease);
       assert.equal(beat.ok, true);
       if (!beat.ok) throw new Error("unreachable");
       await repository.compareAndSave(
@@ -822,7 +822,7 @@ process.exit(0);
       );
       assert.equal(claimed.ok, true);
       if (!claimed.ok) throw new Error("unreachable");
-      const beat = reportProgress(claimed.activities, "A:REVIEW:r1", { at: Date.now() - 10_000_000, progress: 1 });
+      const beat = reportProgress(claimed.activities, "A:REVIEW:r1", { at: Date.now() - 10_000_000, progress: 1 }, lease);
       assert.equal(beat.ok, true);
       if (!beat.ok) throw new Error("unreachable");
       await repository.compareAndSave(
@@ -1022,6 +1022,69 @@ describe("TASK-018 AC-16: a supervisor that cannot check liveness schedules noth
     }
   });
 
+  /**
+   * ROUND-5 REVIEW, HIGH 1. The round-3 fix made the NO-PROBE case refuse; with
+   * a probe that answers UNKNOWN the verdict was recorded and the tick carried
+   * on and ran a different item to DONE. AC-16 says ambiguous resolves to
+   * REFUSE, and recording it while proceeding is annotating, not refusing.
+   */
+  it("REFUSES to schedule while any activity's owner cannot be established", async () => {
+    const both: readonly RoadmapItem[] = [
+      { key: "A", title: "Work", dependsOn: [], status: "ACTIVE", workClass: "NORMAL_IMPLEMENTATION", order: 1 },
+      { key: "B", title: "Other", dependsOn: [], status: "PENDING", workClass: "NORMAL_IMPLEMENTATION", order: 2 },
+    ];
+    const path = await seed(both);
+    assert.equal(
+      runChild({ path, id: "A:REVIEW:r1", kind: "REVIEW", roadmapKey: "A", progress: 1, ending: "die" }).signal,
+      "SIGKILL",
+    );
+
+    let executorCalls = 0;
+    const repository = createSqliteSupervisorRepository(path);
+    const base = Date.now();
+    let reading = 0;
+    const probe = scriptedProbe();
+    for (const entry of TEST_CATALOG) {
+      probe.set(entry.provider, entry.model, { state: "AVAILABLE", reason: "scripted", billingMode: "INCLUDED_SUBSCRIPTION" });
+    }
+    try {
+      const service = new SupervisorService({
+        repository,
+        roadmapCatalog: [...both],
+        probe,
+        executor: {
+          execute: async () => {
+            executorCalls += 1;
+            return { kind: "COMPLETED", detail: "should not run" };
+          },
+        },
+        clock: { now: () => base + reading++ * 1_000 },
+        ids: createSequentialIdGenerator(),
+        routingPolicy: DEFAULT_ROUTING_POLICY,
+        resourceCatalog: TEST_CATALOG,
+        // A probe that cannot decide: the exact case AC-16 names.
+        liveness: { check: () => "UNKNOWN" },
+        activityLease: (at) => leaseForThisProcess(at),
+        log: () => {},
+      });
+      for (let attempt = 0; attempt < 3; attempt += 1) await service.tick();
+    } finally {
+      repository.close();
+    }
+
+    assert.equal(executorCalls, 0, "work was scheduled beside an activity nobody could account for");
+
+    const after = createSqliteSupervisorRepository(path);
+    try {
+      const state = await after.load();
+      assert.notEqual(state?.roadmap.find((item) => item.key === "B")?.status, "DONE");
+      // The verdict is still RECORDED: a refusal leaves a durable reason.
+      assert.equal(state?.activities?.[0]?.reconciliation?.verdict, "AMBIGUOUS");
+    } finally {
+      after.close();
+    }
+  });
+
   it("runs normally when there is nothing unfinished to be unsure about", async () => {
     // The positive control: no activities at all is a configuration, not an
     // unknown, and must not stop the Factory.
@@ -1119,6 +1182,7 @@ describe("TASK-018 AC-15: a finished piece of work records its completion even u
       // The owner's stale write must fail...
       const stale = completeActivity(owned.activities ?? [], "A:REVIEW:r1", {
         state: "COMPLETED",
+        holder: lease,
         completion: { outcome: "PASS", detail: "finished", at: Date.now() },
       });
       assert.equal(stale.ok, true);
@@ -1138,6 +1202,7 @@ describe("TASK-018 AC-15: a finished piece of work records its completion even u
       assert.ok(fresh);
       const retried = completeActivity(fresh.activities ?? [], "A:REVIEW:r1", {
         state: "COMPLETED",
+        holder: lease,
         completion: { outcome: "PASS", detail: "finished", at: Date.now() },
       });
       assert.equal(retried.ok, true);
@@ -1256,10 +1321,18 @@ describe("TASK-018 AC-17: an interrupted transition is never half-applied", () =
     assert.equal(activity.completion, undefined, "a half-applied completion is visible");
     assert.equal(activity.heartbeat?.progress, 2, "the progress the child DID record was lost");
 
-    // REPLAYABLE: the same transition still applies cleanly afterwards.
+    /**
+     * REPLAYABLE BY ITS HOLDER, which is what the word can mean now that a
+     * write must prove ownership. Anyone else must re-claim first — the dead
+     * owner's successor gets a fresh lease and decides for itself, rather than
+     * inheriting a completion someone else computed.
+     */
+    const holder = activity.lease;
+    assert.ok(holder);
     const replay = completeActivity(activities, "A:REVIEW:r1", {
       state: "COMPLETED",
-      completion: { outcome: "PASS", detail: "applied by someone else", at: 9_000 },
+      holder,
+      completion: { outcome: "PASS", detail: "replayed by the holder", at: 9_000 },
     });
     assert.equal(replay.ok, true, replay.ok ? "" : replay.problem);
     if (!replay.ok) throw new Error("unreachable");

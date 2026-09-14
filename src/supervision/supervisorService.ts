@@ -1853,10 +1853,12 @@ export class SupervisorService {
       lease === undefined || probe === undefined
         ? claimed.activities ?? []
         : (() => {
-            const beat = reportProgress(claimed.activities ?? [], activityId, {
-              at: this.deps.clock.now(),
-              progress: 1,
-            });
+            const beat = reportProgress(
+              claimed.activities ?? [],
+              activityId,
+              { at: this.deps.clock.now(), progress: 1 },
+              lease,
+            );
             if (!beat.ok) {
               this.log(`[supervisor] could not record the launch heartbeat: ${beat.problem}`);
               return claimed.activities ?? [];
@@ -1982,15 +1984,43 @@ export class SupervisorService {
       detail: boundedDiagnostic(`${item.key} ${action.kind} attempt ${attempt}`),
       at: this.deps.clock.now(),
     };
-    const finished =
-      lease === undefined || probe === undefined
-        ? running
-        : await this.commitActivityChange(running, `record the completion of ${activityId}`, (activities) =>
-            completeActivity(activities, activityId, {
-              state: outcome.kind === "COMPLETED" ? "COMPLETED" : "FAILED",
-              completion,
-            }),
-          );
+    let finished = running;
+    if (lease !== undefined && probe !== undefined) {
+      const written = await this.commitActivityChange(
+        running,
+        `record the completion of ${activityId}`,
+        (activities) =>
+          completeActivity(activities, activityId, {
+            state: outcome.kind === "COMPLETED" ? "COMPLETED" : "FAILED",
+            completion,
+            holder: lease,
+          }),
+      );
+      if (!written.recorded) {
+        /**
+         * THE OUTCOME IS NOT SETTLED IF IT COULD NOT BE RECORDED (round-5
+         * review, HIGH 2). Settling here would drive the item to DONE with an
+         * activity still RUNNING and no completion — a completion nothing
+         * durable accounts for. A human is told instead, and the outcome is
+         * reported rather than applied.
+         */
+        const problem =
+          `${item.key} ${action.kind} finished as ${outcome.kind}, and its completion could not be recorded ` +
+          `(${written.problem ?? "unknown reason"}); the outcome is NOT being applied`;
+        this.log(`[supervisor] ${problem}`);
+        return {
+          kind: "CONCLUSION",
+          result: {
+            kind: "WAITING_FOR_HUMAN",
+            roadmapKey: item.key,
+            reason: "HUMAN_DECISION_REQUIRED",
+            humanActionRequired: boundedDiagnostic(problem),
+          },
+          wakeBasis: written.state,
+        };
+      }
+      finished = written.state;
+    }
 
     return this.settle(
       finished,
@@ -3129,19 +3159,22 @@ export class SupervisorService {
     state: SupervisorState,
     what: string,
     mutate: (activities: readonly Activity[]) => TransitionVerdict,
-  ): Promise<SupervisorState> {
+  ): Promise<{ readonly state: SupervisorState; readonly recorded: boolean; readonly problem?: string }> {
     let current = state;
     for (let attempt = 0; attempt < 5; attempt += 1) {
       const next = mutate(current.activities ?? []);
       if (!next.ok) {
         this.log(`[supervisor] could not ${what}: ${next.problem}`);
-        return current;
+        return { state: current, recorded: false, problem: next.problem };
       }
       if (!next.changed) {
-        return current;
+        return { state: current, recorded: true };
       }
       try {
-        return await this.commit(current, { ...current, activities: next.activities });
+        return {
+          state: await this.commit(current, { ...current, activities: next.activities }),
+          recorded: true,
+        };
       } catch (error) {
         if (!(error instanceof ConcurrencyError)) {
           throw error;
@@ -3149,14 +3182,24 @@ export class SupervisorService {
         const fresh = await this.deps.repository.load();
         if (fresh === undefined) {
           this.log(`[supervisor] could not ${what}: durable state disappeared`);
-          return current;
+          return { state: current, recorded: false, problem: `durable state disappeared while trying to ${what}` };
         }
         this.log(`[supervisor] re-reading to ${what}: another supervisor advanced the state`);
         current = fresh;
       }
     }
-    this.log(`[supervisor] gave up trying to ${what} after repeated conflicts`);
-    return current;
+    /**
+     * EXHAUSTION IS REPORTED, NOT SWALLOWED (round-5 review, HIGH 2).
+     *
+     * The first version returned the unchanged state and the caller went on to
+     * settle the outcome, so a run that had SUCCEEDED marked its item DONE
+     * while the activity stayed RUNNING with no completion — a `DONE` nothing
+     * durable accounts for, which is the forged-completion shape TASK-012
+     * refuses on the roadmap arriving by yet another door.
+     */
+    const problem = `gave up trying to ${what} after repeated conflicts`;
+    this.log(`[supervisor] ${problem}`);
+    return { state: current, recorded: false, problem };
   }
 
   private async reconcileActivities(
@@ -3213,6 +3256,29 @@ export class SupervisorService {
       }
       next = recorded.activities;
       changed = changed || recorded.changed;
+    }
+
+    /**
+     * AMBIGUOUS REFUSES THE TICK (round-5 review, HIGH 1).
+     *
+     * AC-16 says so in as many words, and the round-3 fix only made the
+     * NO-PROBE case refuse: with a probe that answered UNKNOWN the verdict was
+     * recorded and the tick carried on and ran a different item to DONE. An
+     * activity whose owner cannot be checked is exactly the case where a second
+     * owner must not start, and recording that fact while proceeding is not
+     * refusing — it is annotating.
+     *
+     * Checked AFTER the verdicts are written, so the refusal leaves a durable
+     * record of WHY behind it rather than only a message in a log.
+     */
+    const ambiguous = next.filter((entry) => entry.reconciliation?.verdict === "AMBIGUOUS");
+    if (ambiguous.length > 0) {
+      const committed = changed ? await this.commit(state, { ...state, activities: next }) : state;
+      const problem =
+        `${ambiguous.length} activit${ambiguous.length === 1 ? "y" : "ies"} cannot be established as running or ` +
+        `finished (${ambiguous.map((entry) => entry.id).join(", ")}); refusing to schedule further work`;
+      this.log(`[supervisor] ${problem}`);
+      return { state: committed, refusal: boundedDiagnostic(problem) };
     }
 
     /**

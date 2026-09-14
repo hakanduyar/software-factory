@@ -286,12 +286,12 @@ describe("TASK-018 AC-17: applying a transition twice is applying it once", () =
   const completion = { outcome: "PASS", detail: "round 2", at: T0 + 50 };
 
   it("completing twice with the same record changes nothing the second time", () => {
-    const once = completeActivity([claimed()], claimed().id, { state: "COMPLETED", completion });
+    const once = completeActivity([claimed()], claimed().id, { state: "COMPLETED", holder: lease(), completion });
     assert.equal(once.ok, true);
     if (!once.ok) throw new Error("unreachable");
     assert.equal(once.changed, true);
 
-    const twice = completeActivity(once.activities, claimed().id, { state: "COMPLETED", completion });
+    const twice = completeActivity(once.activities, claimed().id, { state: "COMPLETED", holder: lease(), completion });
     assert.equal(twice.ok, true);
     if (!twice.ok) throw new Error("unreachable");
     assert.equal(twice.changed, false, "the second application changed something");
@@ -299,12 +299,13 @@ describe("TASK-018 AC-17: applying a transition twice is applying it once", () =
   });
 
   it("REFUSES a second completion that DISAGREES, rather than letting the later write win", () => {
-    const once = completeActivity([claimed()], claimed().id, { state: "COMPLETED", completion });
+    const once = completeActivity([claimed()], claimed().id, { state: "COMPLETED", holder: lease(), completion });
     assert.equal(once.ok, true);
     if (!once.ok) throw new Error("unreachable");
     const problem = problemOf(
       completeActivity(once.activities, claimed().id, {
         state: "COMPLETED",
+        holder: lease(),
         completion: { ...completion, outcome: "FAIL" },
       }),
     );
@@ -324,29 +325,83 @@ describe("TASK-018 AC-17: applying a transition twice is applying it once", () =
     const first = { outcome: "a/b", detail: "c", at: 1 };
     const second = { outcome: "a", detail: "b/c", at: 1 };
 
-    const once = completeActivity([claimed()], claimed().id, { state: "COMPLETED", completion: first });
+    const once = completeActivity([claimed()], claimed().id, { state: "COMPLETED", holder: lease(), completion: first });
     assert.equal(once.ok, true);
     if (!once.ok) throw new Error("unreachable");
 
     const problem = problemOf(
-      completeActivity(once.activities, claimed().id, { state: "COMPLETED", completion: second }),
+      completeActivity(once.activities, claimed().id, { state: "COMPLETED", holder: lease(), completion: second }),
     );
     assert.match(problem, /already recorded a completion/);
     assert.match(problem, /refusing to replace it/);
   });
 
+  /**
+   * ROUND-5 REVIEW, HIGH 2 — the reviewer's own reproduction.
+   *
+   * `completeActivity` was keyed only by the activity id, so a completion
+   * computed BEFORE a re-claim could be applied after it: a COMPLETED activity
+   * whose lease belonged to one process and whose outcome had been produced by
+   * another. The round-4 retry made it reachable, because re-applying against
+   * fresher state is exactly the moment the holder may have changed underneath.
+   *
+   * An id says WHICH activity. It has never said who may write to it.
+   */
+  it("REFUSES a completion from a process that no longer holds the activity", () => {
+    const successor = lease({ pid: 22, processStartedAt: 7 });
+    const problem = problemOf(
+      completeActivity([claimed({ state: "RUNNING", lease: successor })], claimed().id, {
+        state: "COMPLETED",
+        holder: lease(), // the ORIGINAL holder, whose work was superseded
+        completion: { outcome: "STALE", detail: "computed before the re-claim", at: T0 + 99 },
+      }),
+    );
+    assert.match(problem, /is held by pid 22/);
+    assert.match(problem, /refusing a write from pid 4242/);
+  });
+
+  it("REFUSES progress from a process that no longer holds the activity", () => {
+    const successor = lease({ pid: 22, processStartedAt: 7 });
+    const problem = problemOf(
+      reportProgress([claimed({ state: "RUNNING", lease: successor })], claimed().id, { at: T0, progress: 9 }, lease()),
+    );
+    assert.match(problem, /refusing a write from pid 4242/);
+  });
+
+  it("ALLOWS the holder's own writes — the positive control", () => {
+    const beat = reportProgress([claimed()], claimed().id, { at: T0 + 1, progress: 1 }, lease());
+    assert.equal(beat.ok, true, beat.ok ? "" : beat.problem);
+  });
+
+  it("tells holders apart by START TIME, MACHINE and BOOT, not by pid alone", () => {
+    for (const impostor of [
+      lease({ processStartedAt: 1 }),
+      lease({ machine: "another-host" }),
+      lease({ boot: "another-boot" }),
+    ]) {
+      const problem = problemOf(
+        completeActivity([claimed()], claimed().id, {
+          state: "COMPLETED",
+          holder: impostor,
+          completion: { outcome: "PASS", detail: "x", at: T0 },
+        }),
+      );
+      assert.match(problem, /refusing a write from pid/, JSON.stringify(impostor));
+    }
+  });
+
   it("REFUSES the same completion recorded under a different state", () => {
-    const once = completeActivity([claimed()], claimed().id, { state: "COMPLETED", completion });
+    const once = completeActivity([claimed()], claimed().id, { state: "COMPLETED", holder: lease(), completion });
     assert.equal(once.ok, true);
     if (!once.ok) throw new Error("unreachable");
     const problem = problemOf(
-      completeActivity(once.activities, claimed().id, { state: "FAILED", completion }),
+      completeActivity(once.activities, claimed().id, { state: "FAILED", holder: lease(), completion }),
     );
     assert.match(problem, /is COMPLETED but the same completion says FAILED/);
   });
 
   it("observing twice is a no-op, and observing an unfinished activity refuses", () => {
-    const done = completeActivity([claimed()], claimed().id, { state: "COMPLETED", completion });
+    const done = completeActivity([claimed()], claimed().id, { state: "COMPLETED", holder: lease(), completion });
     assert.equal(done.ok, true);
     if (!done.ok) throw new Error("unreachable");
 
@@ -365,46 +420,46 @@ describe("TASK-018 AC-17: applying a transition twice is applying it once", () =
   });
 
   it("REFUSES progress that goes backwards, and repeats of the same report are free", () => {
-    const first = reportProgress([claimed()], claimed().id, { at: T0 + 10, progress: 5 });
+    const first = reportProgress([claimed()], claimed().id, { at: T0 + 10, progress: 5 }, lease());
     assert.equal(first.ok, true);
     if (!first.ok) throw new Error("unreachable");
     assert.equal(first.activities[0]?.state, "RUNNING");
 
-    const repeat = reportProgress(first.activities, claimed().id, { at: T0 + 10, progress: 5 });
+    const repeat = reportProgress(first.activities, claimed().id, { at: T0 + 10, progress: 5 }, lease());
     assert.equal(repeat.ok, true);
     if (!repeat.ok) throw new Error("unreachable");
     assert.equal(repeat.changed, false);
 
-    const forward = reportProgress(first.activities, claimed().id, { at: T0 + 20, progress: 6 });
+    const forward = reportProgress(first.activities, claimed().id, { at: T0 + 20, progress: 6 }, lease());
     assert.equal(forward.ok, true, "progress must still be allowed to move");
 
     assert.match(
-      problemOf(reportProgress(first.activities, claimed().id, { at: T0 + 20, progress: 4 })),
+      problemOf(reportProgress(first.activities, claimed().id, { at: T0 + 20, progress: 4 }, lease())),
       /progress does not go backwards/,
     );
   });
 
   it("REFUSES progress on an activity that already finished", () => {
-    const done = completeActivity([claimed()], claimed().id, { state: "FAILED", completion });
+    const done = completeActivity([claimed()], claimed().id, { state: "FAILED", holder: lease(), completion });
     assert.equal(done.ok, true);
     if (!done.ok) throw new Error("unreachable");
     assert.match(
-      problemOf(reportProgress(done.activities, claimed().id, { at: T0 + 99, progress: 9 })),
+      problemOf(reportProgress(done.activities, claimed().id, { at: T0 + 99, progress: 9 }, lease())),
       /already finished as FAILED/,
     );
   });
 
   it("REFUSES every transition against an id durable state does not hold, or holds twice", () => {
     for (const verdict of [
-      reportProgress([], "nope", { at: T0, progress: 1 }),
-      completeActivity([], "nope", { state: "COMPLETED", completion }),
+      reportProgress([], "nope", { at: T0, progress: 1 }, lease()),
+      completeActivity([], "nope", { state: "COMPLETED", holder: lease(), completion }),
       observeCompletion([], "nope", T0),
       recordReconciliation([], "nope", { verdict: "LIVE", at: T0, detail: "x" }),
     ]) {
       assert.match(problemOf(verdict), /holds no activity "nope"/);
     }
     assert.match(
-      problemOf(reportProgress([claimed(), claimed()], claimed().id, { at: T0, progress: 1 })),
+      problemOf(reportProgress([claimed(), claimed()], claimed().id, { at: T0, progress: 1 }, lease())),
       /2 times/,
     );
   });
@@ -418,7 +473,7 @@ describe("TASK-018 AC-15/AC-19: a finished activity cannot sit unnoticed", () =>
   const completion = { outcome: "PASS", detail: "verdict", at: T0 + 50 };
 
   it("lists a completion nothing has acted on", () => {
-    const done = completeActivity([claimed()], claimed().id, { state: "COMPLETED", completion });
+    const done = completeActivity([claimed()], claimed().id, { state: "COMPLETED", holder: lease(), completion });
     assert.equal(done.ok, true);
     if (!done.ok) throw new Error("unreachable");
     assert.deepEqual(
@@ -428,7 +483,7 @@ describe("TASK-018 AC-15/AC-19: a finished activity cannot sit unnoticed", () =>
   });
 
   it("stops listing it once something has, and never listed unfinished work", () => {
-    const done = completeActivity([claimed()], claimed().id, { state: "COMPLETED", completion });
+    const done = completeActivity([claimed()], claimed().id, { state: "COMPLETED", holder: lease(), completion });
     assert.equal(done.ok, true);
     if (!done.ok) throw new Error("unreachable");
     const seen = observeCompletion(done.activities, claimed().id, T0 + 60);
@@ -441,6 +496,7 @@ describe("TASK-018 AC-15/AC-19: a finished activity cannot sit unnoticed", () =>
   it("lists a FAILED activity too, because a failure nobody noticed is the same problem", () => {
     const failed = completeActivity([claimed()], claimed().id, {
       state: "FAILED",
+      holder: lease(),
       completion: { outcome: "CRASHED", detail: "no verdict", at: T0 + 5 },
     });
     assert.equal(failed.ok, true);

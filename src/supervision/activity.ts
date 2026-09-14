@@ -497,6 +497,59 @@ function replace(activities: readonly Activity[], next: Activity): readonly Acti
 }
 
 /**
+ * Whether two leases name the same holder.
+ *
+ * All four fields, because each closes a different way of being a different
+ * process: the pid, the start tick that separates a reused pid, the machine,
+ * and the boot that separates a restart. `claimedAt` is deliberately NOT
+ * compared — it is when the lease was taken, not who took it.
+ */
+function sameHolder(a: ActivityLease, b: ActivityLease): boolean {
+  return (
+    a.pid === b.pid &&
+    a.processStartedAt === b.processStartedAt &&
+    a.machine === b.machine &&
+    a.boot === b.boot
+  );
+}
+
+/**
+ * REFUSES A WRITE FROM ANYONE BUT THE CURRENT HOLDER (round-5 review, HIGH 2).
+ *
+ * `completeActivity` was keyed only by activity id, so a completion computed
+ * before a re-claim could be applied after it: the reviewer drove exactly that
+ * and got a COMPLETED activity whose lease belonged to one process and whose
+ * outcome had been produced by another. The retry added in round 4 made it
+ * reachable, because re-applying against fresher state is precisely the moment
+ * the holder may have changed underneath.
+ *
+ * So progress and completion now carry the lease their writer believes it
+ * holds, and a disagreement refuses. An id says WHICH activity; it has never
+ * said who is entitled to write to it.
+ */
+function heldBy(
+  activity: Activity,
+  holder: ActivityLease,
+): { readonly ok: true } | { readonly ok: false; readonly problem: string } {
+  if (activity.lease === undefined) {
+    return {
+      ok: false,
+      problem: `activity ${JSON.stringify(activity.id)} records no lease, so no writer can be the holder`,
+    };
+  }
+  if (!sameHolder(activity.lease, holder)) {
+    return {
+      ok: false,
+      problem:
+        `activity ${JSON.stringify(activity.id)} is held by pid ${activity.lease.pid} on ` +
+        `${JSON.stringify(activity.lease.machine)}; refusing a write from pid ${holder.pid} on ` +
+        `${JSON.stringify(holder.machine)}`,
+    };
+  }
+  return { ok: true };
+}
+
+/**
  * IDEMPOTENCE, AS ONE RULE RATHER THAN FOUR (AC-17).
  *
  * Every transition below answers the same three-way question: is this already
@@ -576,10 +629,14 @@ export function reportProgress(
   activities: readonly Activity[],
   id: string,
   heartbeat: ActivityHeartbeat,
+  holder: ActivityLease,
 ): TransitionVerdict {
   const found = locate(activities, id);
   if (!found.ok) return found;
   const activity = found.activity;
+
+  const owned = heldBy(activity, holder);
+  if (!owned.ok) return owned;
 
   if (isTerminal(activity.state)) {
     return { ok: false, problem: `activity ${JSON.stringify(id)} already finished as ${activity.state}` };
@@ -612,11 +669,19 @@ export function reportProgress(
 export function completeActivity(
   activities: readonly Activity[],
   id: string,
-  input: { readonly state: "COMPLETED" | "FAILED"; readonly completion: ActivityCompletion },
+  input: {
+    readonly state: "COMPLETED" | "FAILED";
+    readonly completion: ActivityCompletion;
+    /** The lease the writer believes it holds. A disagreement refuses. */
+    readonly holder: ActivityLease;
+  },
 ): TransitionVerdict {
   const found = locate(activities, id);
   if (!found.ok) return found;
   const activity = found.activity;
+
+  const owned = heldBy(activity, input.holder);
+  if (!owned.ok) return owned;
 
   const settled = settle(
     activity.completion,

@@ -1122,6 +1122,42 @@ export const MUTATIONS = [
    * case: losing the record of a SUCCESS is worse than losing the race, so the
    * mutation makes the retry give up on the first conflict.
    */
+  /**
+   * ROUND-5 REVIEW. Both guards are new: `AMBIGUOUS` must stop the tick rather
+   * than annotate it, and a write must prove it comes from the current holder.
+   */
+  {
+    id: "an ambiguous activity is annotated instead of refusing the tick",
+    edits: [[SUP_SVC,
+      "    if (ambiguous.length > 0) {",
+      "    if (ambiguous.length > 0 && Number.isNaN(0)) {"]],
+    tests: [T_ACTREC],
+    expect: "REFUSES to schedule while any activity's owner cannot be established",
+  },
+  {
+    id: "a write from a process that no longer holds the activity is accepted",
+    edits: [[ACTIVITY,
+      "  if (!sameHolder(activity.lease, holder)) {",
+      "  if (!sameHolder(activity.lease, holder) && Number.isNaN(0)) {"]],
+    tests: [T_ACT],
+    expect: "REFUSES a completion from a process that no longer holds the activity",
+  },
+  {
+    id: "holders are told apart by pid alone",
+    edits: [[ACTIVITY,
+      "  return (\n    a.pid === b.pid &&\n    a.processStartedAt === b.processStartedAt &&\n    a.machine === b.machine &&\n    a.boot === b.boot\n  );",
+      "  return a.pid === b.pid;"]],
+    tests: [T_ACT],
+    expect: "tells holders apart by START TIME, MACHINE and BOOT, not by pid alone",
+  },
+  {
+    id: "an unrecorded completion is settled as though it had been recorded",
+    edits: [[SUP_SVC,
+      "      if (!written.recorded) {",
+      "      if (!written.recorded && Number.isNaN(0)) {"]],
+    tests: [T_ACTREC],
+    expect: "the supervisor records a completion even when a rival advances the state mid-run",
+  },
   {
     id: "a half-configured installation runs unobserved",
     edits: [[SUP_SVC,
