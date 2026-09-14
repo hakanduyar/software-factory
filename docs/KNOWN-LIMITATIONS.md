@@ -1432,3 +1432,50 @@ discovered later as a gap.
 that claims and dies — with the death they stand for in the test description
 rather than in the name; and by this entry, which is the only place the
 substitution is stated.
+
+## L-24 - One unattributed intermittent failure in `activityRecovery.test.ts`
+
+During TASK-018 Part B round-6 remediation, a targeted mutation run reported
+`restored: pass=36 fail=1` for `tests/activityRecovery.test.ts` on a tree that
+was byte-for-byte identical to the green baseline recorded minutes earlier in
+the same run. It happened once in seventeen runs of that file and has not
+recurred.
+
+### What is known
+
+The mutation itself was KILLED for the right reason. The restored tree compiled,
+and `all touched files verified byte-for-byte against the run-start baseline`
+passed, so the failure was not residue from the mutation. The baseline run of the
+same file in the same process reported `pass=37 fail=0`.
+
+### What is not known, and why
+
+Which test failed. `scripts/mutate.mjs` collected the failing names in
+`runTests` and printed only the counts, so the one occurrence left nothing to
+attribute it to — a flake, a real race and a harness bug were indistinguishable
+from the output. That gap is closed: the harness now prints
+`baseline failures: [...]` and `restored failures: [...]` with the test names
+whenever a run is not green, so the next occurrence names itself. The green
+lines keep their exact shape, because the chain matches
+`^restored: pass=[0-9]* fail=0$` on them.
+
+Reproduction was attempted and failed: 12 consecutive runs of the file, 4
+further complete mutation runs, and 30 runs under deliberate four-way CPU load.
+
+### Why it is written down instead of explained
+
+The file contains the only tests in the repository that spawn real processes and
+kill them, and two of them race two writers against one SQLite database through
+separate connections. A timing-sensitive failure there is plausible enough that
+an explanation would be a guess, and a guess recorded as a cause is worse than a
+recorded unknown. The suspicion is not evidence and is not being presented as
+any.
+
+The evidence rule is unchanged and was not weakened to accommodate this: a
+mutation run whose restored tree is not green is NOT valid evidence, and the
+chain stops on it. This entry exists because the run that produced the frozen
+candidate WAS green, and a green run does not erase an earlier red one.
+
+**Kept honest by:** `reportFailures` in `scripts/mutate.mjs`, which makes the
+next occurrence self-describing, and by this entry, which is the only record
+that it happened at all.
