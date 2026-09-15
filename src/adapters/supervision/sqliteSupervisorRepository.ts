@@ -22,6 +22,7 @@ import { DatabaseSync } from "node:sqlite";
 
 import {
   ConcurrencyError,
+  ProvenanceRegressionError,
   SchemaIntegrityError,
   SchemaVersionError,
   ValidationError,
@@ -184,7 +185,7 @@ function assertProvenanceExtends(
   next: readonly { readonly sequence: number; readonly digest: string }[],
 ): void {
   if (next.length < previous.length) {
-    throw new SchemaIntegrityError(
+    throw new ProvenanceRegressionError(
       `refusing to write supervisor state: provenance shrank from ${previous.length} to ${next.length} entries. ` +
         "Recorded history is append-only; deleting it is exactly what the chain exists to make impossible.",
     );

@@ -36,7 +36,8 @@ import {
   unobservedCompletions,
   type Activity,
 } from "../src/supervision/activity.js";
-import { anchorFor } from "../src/supervision/provenanceChain.js";
+import { anchorFor, appendProvenance } from "../src/supervision/provenanceChain.js";
+import { ProvenanceRegressionError } from "../src/domain/errors.js";
 import { SupervisorService } from "../src/supervision/supervisorService.js";
 import { createSequentialIdGenerator } from "../src/domain/ids.js";
 import { DEFAULT_ROUTING_POLICY } from "../src/supervision/modelRouting.js";
@@ -870,7 +871,17 @@ describe("TASK-018 AC-13/AC-16: an activeClaim and its activity, together", () =
    * drove the item to BLOCKED — while the activity beside it said LIVE. Two
    * records of the same fact, and the older one won.
    */
-  async function seedClaimAndActivity(options: { readonly holderAlive: boolean }): Promise<string> {
+  async function seedClaimAndActivity(options: {
+    readonly holderAlive: boolean;
+    /**
+     * ROUND-7 REVIEW, HIGH 1. The fixture only ever built RUNNING claims, so
+     * the CLAIMED branch — which clears the claim without asking who holds it —
+     * was never driven through here at all.
+     */
+    readonly claimState?: "RUNNING" | "CLAIMED";
+    /** A lease this process cannot resolve: UNKNOWN rather than GONE. */
+    readonly unknowable?: boolean;
+  }): Promise<string> {
     const path = await seed();
     const repository = createSqliteSupervisorRepository(path);
     try {
@@ -881,7 +892,11 @@ describe("TASK-018 AC-13/AC-16: an activeClaim and its activity, together", () =
       assert.ok(lease);
       // A dead holder is this process's own lease with a start time that cannot
       // be ours — the same shape the kernel produces for a recycled pid.
-      const held = options.holderAlive ? lease : { ...lease, processStartedAt: lease.processStartedAt - 1 };
+      const held = options.unknowable
+        ? { ...lease, machine: `${lease.machine}-somewhere-else` }
+        : options.holderAlive
+          ? lease
+          : { ...lease, processStartedAt: lease.processStartedAt - 1 };
 
       const claimed = claimActivity(
         state.activities ?? [],
@@ -901,7 +916,7 @@ describe("TASK-018 AC-13/AC-16: an activeClaim and its activity, together", () =
             actionId: "A:PLAN:a1",
             roadmapKey: "A",
             kind: "PLAN",
-            state: "RUNNING",
+            state: options.claimState ?? "RUNNING",
             ownerId: "some-other-supervisor",
             attempt: 1,
             claimedAt: 1_000,
@@ -937,6 +952,85 @@ describe("TASK-018 AC-13/AC-16: an activeClaim and its activity, together", () =
       // The claim belongs to the live holder and must be left exactly as it was.
       assert.equal(state?.activeClaim?.actionId, "A:PLAN:a1");
       assert.equal(state?.activeClaim?.state, "RUNNING");
+    } finally {
+      after.close();
+    }
+  });
+
+  /**
+   * ROUND-7 REVIEW, HIGH 1 — the reviewer's own reproduction, against a real
+   * database: a second supervisor cleared a live owner's CLAIMED claim and
+   * launched a second attempt at the same work.
+   *
+   * The round-3 fix reasoned that a CLAIMED claim "proves the external launch
+   * never happened", so retrying is safe. That is true of the ACTION and says
+   * nothing about the PROCESS: between taking a claim and recording a launch
+   * there is a live owner holding a live lease, and this cleared the claim out
+   * from under it.
+   */
+  it("REFUSES to clear a CLAIMED claim while its owner is still running", async () => {
+    const path = await seedClaimAndActivity({ holderAlive: true, claimState: "CLAIMED" });
+    const { service, repository } = supervisorOver(path);
+    let result;
+    try {
+      result = await service.tick();
+    } finally {
+      repository.close();
+    }
+
+    assert.match(JSON.stringify(result), new RegExp(`is held by pid ${process.pid}`), JSON.stringify(result));
+
+    const after = createSqliteSupervisorRepository(path);
+    try {
+      const state = await after.load();
+      assert.equal(state?.activeClaim?.actionId, "A:PLAN:a1", "a live owner's claim was cleared");
+      assert.equal(state?.activeClaim?.state, "CLAIMED", "a live owner's claim was advanced by someone else");
+      assert.notEqual(
+        state?.roadmap.find((item) => item.key === "A")?.status,
+        "ELIGIBLE",
+        "the item was re-queued while its owner was still holding it",
+      );
+    } finally {
+      after.close();
+    }
+  });
+
+  it("REFUSES to clear a CLAIMED claim whose owner cannot be checked at all", async () => {
+    const path = await seedClaimAndActivity({ holderAlive: true, claimState: "CLAIMED", unknowable: true });
+    const { service, repository } = supervisorOver(path);
+    let result;
+    try {
+      result = await service.tick();
+    } finally {
+      repository.close();
+    }
+
+    // Unknown refuses, here as everywhere else in this mechanism.
+    assert.match(JSON.stringify(result), /cannot be established/, JSON.stringify(result));
+
+    const after = createSqliteSupervisorRepository(path);
+    try {
+      assert.equal((await after.load())?.activeClaim?.actionId, "A:PLAN:a1", "an unknowable owner's claim was cleared");
+    } finally {
+      after.close();
+    }
+  });
+
+  it("still clears a CLAIMED claim whose owner is gone — the positive control", async () => {
+    const path = await seedClaimAndActivity({ holderAlive: false, claimState: "CLAIMED" });
+    const { service, repository } = supervisorOver(path);
+    try {
+      await service.tick();
+    } finally {
+      repository.close();
+    }
+
+    const after = createSqliteSupervisorRepository(path);
+    try {
+      const state = await after.load();
+      // The whole point of the CLAIMED branch survives: a dead owner that never
+      // launched anything does not park the item forever.
+      assert.equal(state?.activeClaim, undefined, "a dead owner's unlaunched claim was not cleared");
     } finally {
       after.close();
     }
@@ -1037,6 +1131,155 @@ describe("TASK-018 AC-16: a supervisor that cannot check liveness schedules noth
     } finally {
       after.close();
     }
+  });
+
+  /**
+   * ROUND-7 REVIEW, HIGH 3.
+   *
+   * Round 6 added the durable classification and wrote it with a RAW commit, so
+   * a rival advancing the state in that instant turned the whole refusal into a
+   * thrown `ConcurrencyError`: no AMBIGUOUS record, and no refusal either — the
+   * exception replaced the answer. A record that only survives when nothing else
+   * is running is not durable, and a refusal is worth least at exactly the
+   * moment it is hardest to write.
+   */
+  it("records the classification even when another supervisor writes first", async () => {
+    const both: readonly RoadmapItem[] = [
+      { key: "A", title: "Work", dependsOn: [], status: "ACTIVE", workClass: "NORMAL_IMPLEMENTATION", order: 1 },
+      { key: "B", title: "Other", dependsOn: [], status: "PENDING", workClass: "NORMAL_IMPLEMENTATION", order: 2 },
+    ];
+    const path = await seed(both);
+    assert.equal(
+      runChild({ path, id: "A:REVIEW:r1", kind: "REVIEW", roadmapKey: "A", progress: 1, ending: "die" }).signal,
+      "SIGKILL",
+    );
+
+    const real = createSqliteSupervisorRepository(path);
+    let interfere = 1;
+    const contended = {
+      load: () => real.load(),
+      create: (state: SupervisorState) => real.create(state),
+      readCatalogVersion: () => real.readCatalogVersion(),
+      applyCatalogUpgrade: (next: SupervisorState, expected: number, to: number) =>
+        real.applyCatalogUpgrade(next, expected, to),
+      compareAndSave: async (next: SupervisorState, expected: number) => {
+        if (interfere > 0 && (next.activities ?? []).some((entry) => entry.reconciliation !== undefined)) {
+          interfere -= 1;
+          const rival = createSqliteSupervisorRepository(path);
+          try {
+            const seen = await rival.load();
+            if (seen !== undefined) {
+              await rival.compareAndSave({ ...seen, version: seen.version + 1, updatedAt: seen.updatedAt + 1 }, seen.version);
+            }
+          } finally {
+            rival.close();
+          }
+        }
+        return real.compareAndSave(next, expected);
+      },
+    };
+
+    const probe = scriptedProbe();
+    for (const entry of TEST_CATALOG) {
+      probe.set(entry.provider, entry.model, { state: "AVAILABLE", reason: "scripted", billingMode: "INCLUDED_SUBSCRIPTION" });
+    }
+    const base = Date.now();
+    let reading = 0;
+    let result;
+    try {
+      const service = new SupervisorService({
+        repository: contended,
+        roadmapCatalog: [...both],
+        probe,
+        executor: { execute: async () => ({ kind: "COMPLETED", detail: "should not run" }) },
+        clock: { now: () => base + reading++ * 1_000 },
+        ids: createSequentialIdGenerator(),
+        routingPolicy: DEFAULT_ROUTING_POLICY,
+        resourceCatalog: TEST_CATALOG,
+        // Still no probe: this is the no-probe path, under contention.
+        log: () => {},
+      });
+      // It must not THROW, which is what the raw commit did.
+      result = await service.tick();
+    } finally {
+      real.close();
+    }
+
+    assert.match(JSON.stringify(result), /refusing to schedule further work/, JSON.stringify(result));
+
+    const after = createSqliteSupervisorRepository(path);
+    try {
+      assert.equal(
+        (await after.load())?.activities?.[0]?.reconciliation?.verdict,
+        "AMBIGUOUS",
+        "contention erased the durable classification",
+      );
+    } finally {
+      after.close();
+    }
+  });
+
+  it("SAYS SO when the classification cannot be made durable at all", async () => {
+    const both: readonly RoadmapItem[] = [
+      { key: "A", title: "Work", dependsOn: [], status: "ACTIVE", workClass: "NORMAL_IMPLEMENTATION", order: 1 },
+      { key: "B", title: "Other", dependsOn: [], status: "PENDING", workClass: "NORMAL_IMPLEMENTATION", order: 2 },
+    ];
+    const path = await seed(both);
+    assert.equal(
+      runChild({ path, id: "A:REVIEW:r1", kind: "REVIEW", roadmapKey: "A", progress: 1, ending: "die" }).signal,
+      "SIGKILL",
+    );
+
+    const real = createSqliteSupervisorRepository(path);
+    const alwaysContended = {
+      load: () => real.load(),
+      create: (state: SupervisorState) => real.create(state),
+      readCatalogVersion: () => real.readCatalogVersion(),
+      applyCatalogUpgrade: (next: SupervisorState, expected: number, to: number) =>
+        real.applyCatalogUpgrade(next, expected, to),
+      compareAndSave: async (next: SupervisorState, expected: number) => {
+        if ((next.activities ?? []).some((entry) => entry.reconciliation !== undefined)) {
+          const rival = createSqliteSupervisorRepository(path);
+          try {
+            const seen = await rival.load();
+            if (seen !== undefined) {
+              await rival.compareAndSave({ ...seen, version: seen.version + 1, updatedAt: seen.updatedAt + 1 }, seen.version);
+            }
+          } finally {
+            rival.close();
+          }
+        }
+        return real.compareAndSave(next, expected);
+      },
+    };
+
+    const probe = scriptedProbe();
+    for (const entry of TEST_CATALOG) {
+      probe.set(entry.provider, entry.model, { state: "AVAILABLE", reason: "scripted", billingMode: "INCLUDED_SUBSCRIPTION" });
+    }
+    const base = Date.now();
+    let reading = 0;
+    let result;
+    try {
+      const service = new SupervisorService({
+        repository: alwaysContended,
+        roadmapCatalog: [...both],
+        probe,
+        executor: { execute: async () => ({ kind: "COMPLETED", detail: "should not run" }) },
+        clock: { now: () => base + reading++ * 1_000 },
+        ids: createSequentialIdGenerator(),
+        routingPolicy: DEFAULT_ROUTING_POLICY,
+        resourceCatalog: TEST_CATALOG,
+        log: () => {},
+      });
+      result = await service.tick();
+    } finally {
+      real.close();
+    }
+
+    // Still a refusal, and now one that admits the operator will find nothing
+    // written against the activity it names.
+    assert.match(JSON.stringify(result), /could not be recorded durably/, JSON.stringify(result));
   });
 
   /**
@@ -1571,6 +1814,275 @@ describe("TASK-018 AC-15: an outcome that could not be recorded is not applied",
 // =====================================================================
 // AC-17 — a transition interrupted before it is recorded
 // =====================================================================
+
+describe("TASK-018 AC-13/AC-17: a stale patch never overwrites a newer claim", () => {
+  const QUEUED: readonly RoadmapItem[] = [
+    { key: "A", title: "Work", dependsOn: [], status: "PENDING", workClass: "NORMAL_IMPLEMENTATION", order: 1 },
+  ];
+
+  function readyProbe() {
+    const probe = scriptedProbe();
+    for (const entry of TEST_CATALOG) {
+      probe.set(entry.provider, entry.model, { state: "AVAILABLE", reason: "scripted", billingMode: "INCLUDED_SUBSCRIPTION" });
+    }
+    return probe;
+  }
+
+  /**
+   * ROUND-7 REVIEW, HIGH 1, second half.
+   *
+   * `alongside` took the fresh state as an argument and the launch site ignored
+   * it, returning the claim it had closed over at the top of the tick. So a
+   * retry — or a no-op transition, which applies the patch ALONE — wrote a
+   * stale claim over whatever the durable state now held. The reviewer used
+   * exactly that to put a dead claim back on top of a live one.
+   *
+   * Here a rival takes the claim in the instant between this supervisor's claim
+   * and its launch write. The rival's claim must survive, and this supervisor
+   * must not launch: being displaced is an answer, not something to write over.
+   */
+  it("REFUSES to launch on a claim that is no longer ours, and leaves the rival's claim alone", async () => {
+    const path = await seed(QUEUED);
+    const real = createSqliteSupervisorRepository(path);
+    let executorCalls = 0;
+    let stolen = false;
+
+    const contended = {
+      load: () => real.load(),
+      create: (state: SupervisorState) => real.create(state),
+      readCatalogVersion: () => real.readCatalogVersion(),
+      applyCatalogUpgrade: (next: SupervisorState, expected: number, to: number) =>
+        real.applyCatalogUpgrade(next, expected, to),
+      compareAndSave: async (next: SupervisorState, expected: number) => {
+        // The launch write is the first one carrying a heartbeat.
+        if (!stolen && (next.activities ?? []).some((entry) => entry.heartbeat !== undefined)) {
+          stolen = true;
+          const rival = createSqliteSupervisorRepository(path);
+          try {
+            const seen = await rival.load();
+            if (seen !== undefined) {
+              await rival.compareAndSave(
+                {
+                  ...seen,
+                  version: seen.version + 1,
+                  updatedAt: seen.updatedAt + 1,
+                  activeClaim: {
+                    actionId: "A:SOMETHING_ELSE:a9",
+                    roadmapKey: "A",
+                    kind: "SOMETHING_ELSE",
+                    state: "CLAIMED",
+                    ownerId: "the-rival",
+                    attempt: 9,
+                    claimedAt: seen.updatedAt + 1,
+                  },
+                },
+                seen.version,
+              );
+            }
+          } finally {
+            rival.close();
+          }
+        }
+        return real.compareAndSave(next, expected);
+      },
+    };
+
+    const base = Date.now();
+    let reading = 0;
+    let result;
+    try {
+      const service = new SupervisorService({
+        repository: contended,
+        roadmapCatalog: [...QUEUED],
+        probe: readyProbe(),
+        executor: {
+          execute: async () => {
+            executorCalls += 1;
+            return { kind: "COMPLETED", detail: "should never run" };
+          },
+        },
+        clock: { now: () => base + reading++ * 1_000 },
+        ids: createSequentialIdGenerator(),
+        routingPolicy: DEFAULT_ROUTING_POLICY,
+        resourceCatalog: TEST_CATALOG,
+        liveness: createProcLivenessProbe(),
+        activityLease: (at) => leaseForThisProcess(at),
+        log: () => {},
+      });
+      result = await service.tick();
+    } finally {
+      real.close();
+    }
+
+    assert.match(
+      JSON.stringify(result),
+      /durable state now holds claim "?A:SOMETHING_ELSE:a9"?/,
+      `expected a refusal naming the rival's claim, got ${JSON.stringify(result)}`,
+    );
+    assert.equal(executorCalls, 0, "work was launched on a claim this supervisor no longer held");
+
+    const after = createSqliteSupervisorRepository(path);
+    try {
+      assert.equal(
+        (await after.load())?.activeClaim?.actionId,
+        "A:SOMETHING_ELSE:a9",
+        "a stale claim was written over a newer one",
+      );
+    } finally {
+      after.close();
+    }
+  });
+
+  /**
+   * ROUND-7 REVIEW, HIGH 2.
+   *
+   * The retry caught `ConcurrencyError` only. SQLite validates append-only
+   * provenance BEFORE the compare-and-set, so a rival that appended provenance
+   * made the owner's write fail with a SchemaIntegrityError instead — same
+   * cause, same remedy, different exception — and it escaped as a throw rather
+   * than being recomputed or reported.
+   */
+  it("re-reads and re-applies when a rival APPENDED PROVENANCE rather than merely winning the CAS", async () => {
+    const path = await seed(QUEUED);
+    const real = createSqliteSupervisorRepository(path);
+    let interfere = 1;
+
+    const contended = {
+      load: () => real.load(),
+      create: (state: SupervisorState) => real.create(state),
+      readCatalogVersion: () => real.readCatalogVersion(),
+      applyCatalogUpgrade: (next: SupervisorState, expected: number, to: number) =>
+        real.applyCatalogUpgrade(next, expected, to),
+      compareAndSave: async (next: SupervisorState, expected: number) => {
+        if (interfere > 0 && (next.activities ?? []).some((entry) => entry.completion !== undefined)) {
+          interfere -= 1;
+          const rival = createSqliteSupervisorRepository(path);
+          try {
+            const seen = await rival.load();
+            if (seen !== undefined) {
+              const appended = appendProvenance(seen.provenance, {
+                kind: "IMPLEMENTED_BY",
+                roadmapKey: "A",
+                resourceKey: "claude-code:opus",
+                detail: "a rival recorded something",
+                recordedAt: seen.updatedAt + 1,
+              });
+              assert.equal(appended.ok, true);
+              if (appended.ok) {
+                await rival.compareAndSave(
+                  {
+                    ...seen,
+                    version: seen.version + 1,
+                    updatedAt: seen.updatedAt + 1,
+                    provenance: appended.chain,
+                    provenanceAnchor: anchorFor(appended.chain),
+                  },
+                  seen.version,
+                );
+              }
+            }
+          } finally {
+            rival.close();
+          }
+        }
+        return real.compareAndSave(next, expected);
+      },
+    };
+
+    const base = Date.now();
+    let reading = 0;
+    try {
+      const service = new SupervisorService({
+        repository: contended,
+        roadmapCatalog: [...QUEUED],
+        probe: readyProbe(),
+        executor: { execute: async () => ({ kind: "COMPLETED", detail: "done" }) },
+        clock: { now: () => base + reading++ * 1_000 },
+        ids: createSequentialIdGenerator(),
+        routingPolicy: DEFAULT_ROUTING_POLICY,
+        resourceCatalog: TEST_CATALOG,
+        liveness: createProcLivenessProbe(),
+        activityLease: (at) => leaseForThisProcess(at),
+        log: () => {},
+      });
+      for (let attempt = 0; attempt < 6; attempt += 1) {
+        // It must not THROW: a provenance append by someone else is contention.
+        await service.tick();
+        if ((await readActivities(path)).some((entry) => entry.completion !== undefined)) break;
+      }
+    } finally {
+      real.close();
+    }
+
+    const activities = await readActivities(path);
+    assert.ok(activities[0]?.completion, "a completion was lost to a rival's provenance append");
+  });
+
+  /**
+   * ...and the other half, which is what keeps this from being a licence to
+   * retry corruption: the SAME exception, with durable state that has NOT
+   * moved, is about this write and must not be retried into.
+   */
+  it("REFUSES rather than retrying when nothing actually raced the write", async () => {
+    const path = await seed(QUEUED);
+    const real = createSqliteSupervisorRepository(path);
+    let attempts = 0;
+
+    const truncating = {
+      load: () => real.load(),
+      create: (state: SupervisorState) => real.create(state),
+      readCatalogVersion: () => real.readCatalogVersion(),
+      applyCatalogUpgrade: (next: SupervisorState, expected: number, to: number) =>
+        real.applyCatalogUpgrade(next, expected, to),
+      compareAndSave: async (next: SupervisorState, expected: number) => {
+        if ((next.activities ?? []).some((entry) => entry.completion !== undefined)) {
+          attempts += 1;
+          // Nothing else writes; the durable version stays exactly where it is.
+          throw new ProvenanceRegressionError(
+            "refusing to write supervisor state: provenance shrank from 4 to 0 entries.",
+          );
+        }
+        return real.compareAndSave(next, expected);
+      },
+    };
+
+    const base = Date.now();
+    let reading = 0;
+    let result;
+    try {
+      const service = new SupervisorService({
+        repository: truncating,
+        roadmapCatalog: [...QUEUED],
+        probe: readyProbe(),
+        executor: { execute: async () => ({ kind: "COMPLETED", detail: "finished, but unwritable" }) },
+        clock: { now: () => base + reading++ * 1_000 },
+        ids: createSequentialIdGenerator(),
+        routingPolicy: DEFAULT_ROUTING_POLICY,
+        resourceCatalog: TEST_CATALOG,
+        liveness: createProcLivenessProbe(),
+        activityLease: (at) => leaseForThisProcess(at),
+        log: () => {},
+      });
+      result = await service.tick();
+    } finally {
+      real.close();
+    }
+
+    assert.match(JSON.stringify(result), /has not moved since it was read/, JSON.stringify(result));
+    assert.equal(attempts, 1, "a refusal about this write was retried anyway");
+
+    const after = createSqliteSupervisorRepository(path);
+    try {
+      assert.notEqual(
+        (await after.load())?.roadmap.find((item) => item.key === "A")?.status,
+        "DONE",
+        "an outcome that could not be written was applied",
+      );
+    } finally {
+      after.close();
+    }
+  });
+});
 
 describe("TASK-018 AC-17: an interrupted transition is never half-applied", () => {
   /**

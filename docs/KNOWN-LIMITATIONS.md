@@ -1479,3 +1479,45 @@ candidate WAS green, and a green run does not erase an earlier red one.
 **Kept honest by:** `reportFailures` in `scripts/mutate.mjs`, which makes the
 next occurrence self-describing, and by this entry, which is the only record
 that it happened at all.
+
+## L-25 - Verdict consumption is complete; nothing in production LAUNCHES a review yet
+
+The mechanism that turns a reviewer's verdict into durable state
+(`consumeAcceptanceVerdicts`, `Activity.review`, `createFileVerdictSource`) is
+implemented, wired into `supervise.ts` beside the liveness probe, and driven
+end-to-end by `tests/verdictConsumption.test.ts` against a real database. What
+is NOT yet true is that anything in this repository writes an `Activity.review`
+in production, because the supervisor does not launch independent reviews — a
+shell chain outside the repository does, and has since TASK-014.
+
+### Why this is stated rather than quietly satisfied
+
+The twenty-two-hour gap that produced this work happened in THAT chain: it
+launched the reviewer, validated the verdict, logged it and exited. Consuming
+the verdict is now possible and proven, and the launcher that would record the
+binding belongs to the executor work the roadmap already sequences after this
+item. Writing a half-launcher here — enough to make the mechanism look used —
+would put "how a review is started" in two places, which is the shape that
+produced two records of one fact in round 3.
+
+### What is therefore proven, and what is not
+
+PROVEN: a verdict that exists on disk is consumed from durable state by a cold
+supervisor with no notification, exactly once, refused when it names a different
+candidate, never turned into an approval when it is absent or unreadable, and
+idempotent across restarts and competing supervisors.
+
+NOT PROVEN: that the chain which launches today's reviews records a binding the
+supervisor can later find. It does not, yet. Until the supervisor launches its
+own reviews, the round-to-round acceptance loop for THIS task still depends on
+the chain — including its exit after a verdict.
+
+### What would close it
+
+The review-launching side of the executor: claim the activity, record the
+`ReviewBinding` (reviewId, source, candidate) in the same write that starts the
+reviewer, exactly as `runItem` already does for a heartbeat. That is a
+continuation of this mechanism rather than a change to it.
+
+**Kept honest by:** this entry, and by `supervise.ts`, where the verdict source
+is wired and visibly has nothing yet producing bindings for it to read.

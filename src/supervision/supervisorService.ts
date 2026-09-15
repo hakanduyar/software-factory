@@ -20,6 +20,13 @@
  */
 
 import {
+  bindingMismatch,
+  completionDetail,
+  isAccepted,
+  NO_VERDICT_OUTCOME,
+  type AcceptanceVerdictSource,
+} from "./acceptance.js";
+import {
   canonicalActivityId,
   claimActivity,
   classifyActivity,
@@ -29,6 +36,8 @@ import {
   recordReconciliation,
   RECOVERY_TO_STATUS,
   reportProgress,
+  reviewsAwaitingVerdict,
+  settleReview,
   unobservedCompletions,
   type Activity,
   type ActivityLease,
@@ -44,6 +53,7 @@ import {
 import { reconcileRoadmapWithCatalog, unprovenCompletion } from "./roadmapCatalog.js";
 import {
   ConcurrencyError,
+  ProvenanceRegressionError,
   PersistenceCorruptionError,
   SchemaIntegrityError,
   ValidationError,
@@ -171,8 +181,47 @@ export interface SupervisorServiceDeps {
    * check and the holder would look dead to itself.
    */
   readonly activityLease?: (claimedAt: Timestamp) => ActivityLease | undefined;
+  /**
+   * Where a launched review's verdict can be read back from (TASK-018 round-7
+   * gap).
+   *
+   * ABSENT means this installation launches no reviews. An activity that
+   * records one anyway is then unconsumable, and the consumer says so rather
+   * than passing over it in silence.
+   */
+  readonly acceptanceVerdicts?: AcceptanceVerdictSource;
   readonly log?: (line: string) => void;
   readonly ownerId?: string;
+}
+
+/**
+ * What a write may carry ALONGSIDE an activity transition — or why it may not.
+ *
+ * See `commitActivityChange`. The refusal case exists because "the state I was
+ * going to patch is no longer the state I read" must be an answer rather than
+ * an overwrite.
+ */
+export type AlongsideVerdict =
+  | { readonly ok: true; readonly patch: Partial<SupervisorState> }
+  | { readonly ok: false; readonly problem: string };
+
+/**
+ * Whether a failed write is worth re-reading and recomputing.
+ *
+ * `ConcurrencyError` is the CAS losing, which IS a stale read.
+ * `ProvenanceRegressionError` is raised BEFORE the CAS, when the provenance
+ * being written is shorter than the stored chain — which is what a rival's
+ * append makes an in-hand snapshot look like. It is only a REASON TO LOOK: the
+ * caller must still prove the durable state moved before treating it as a race,
+ * because a deliberate truncation raises exactly the same error.
+ *
+ * Deliberately narrow. Every other `SchemaIntegrityError` — a rewritten entry,
+ * a broken chain, a malformed table — is a refusal about the write itself, and
+ * retrying one of those is how a corruption guard turns into five attempts at
+ * corrupting.
+ */
+function isStaleSnapshot(error: unknown): boolean {
+  return error instanceof ConcurrencyError || error instanceof ProvenanceRegressionError;
 }
 
 export type TickResult =
@@ -471,14 +520,41 @@ export class SupervisorService {
       return { kind: "REFUSAL", result: catalogued.result };
     }
     /**
-     * 0c. WORK IN FLIGHT, before anything decides what to do next (TASK-018).
+     * 0c. RESULTS THAT ALREADY EXIST, before anything concludes anyone died
+     * (TASK-018, round-7 gap).
+     *
+     * Ordering is the whole point. A reviewer writes its verdict and exits
+     * immediately, so by the time any supervisor looks, its owner is legitimately
+     * gone — and reconciliation, asked first, would classify that activity
+     * CRASHED and requeue the item as work that never produced anything. The
+     * result exists; being asked in the wrong order is what loses it.
+     *
+     * So the artefact is read before the process is judged. This is the same
+     * lesson AC-19 states about completions, applied to the one kind of work
+     * whose author is guaranteed to be dead when its output is found.
+     */
+    const consumed = await this.consumeAcceptanceVerdicts(catalogued.state);
+    if (consumed.refusal !== undefined) {
+      return {
+        kind: "REFUSAL",
+        result: {
+          kind: "WAITING_FOR_HUMAN",
+          roadmapKey: consumed.refusal.roadmapKey,
+          reason: "HUMAN_DECISION_REQUIRED",
+          humanActionRequired: consumed.refusal.problem,
+        },
+      };
+    }
+
+    /**
+     * 0d. WORK IN FLIGHT, before anything decides what to do next (TASK-018).
      *
      * After the definition is trusted and before eligibility is computed: an
      * item whose owner crashed goes back to the queue here, so the selection
      * below sees the roadmap as it actually is rather than as a dead process
      * left it.
      */
-    const inFlight = await this.reconcileActivities(catalogued.state);
+    const inFlight = await this.reconcileActivities(consumed.state);
     if (inFlight.refusal !== undefined) {
       return {
         kind: "REFUSAL",
@@ -621,7 +697,81 @@ export class SupervisorService {
     const { activeClaim: _dropped, ...withoutClaim } = state;
     void _dropped;
 
+    /**
+     * A CLAIM IS NOT PROOF THAT ITS OWNER IS GONE — IN EITHER STATE
+     * (round-3 review HIGH 1, widened by round-7 review HIGH 1).
+     *
+     * This function was written when the supervisor was effectively
+     * single-process: a claim still outstanding at the start of a tick could
+     * only mean the process that made it had died, so every one was treated as
+     * abandoned. Part B made that assumption false.
+     *
+     * Round 3 fixed it for RUNNING and left CLAIMED exactly as it was, because
+     * a CLAIMED claim "proves the external launch never happened" and a retry
+     * is therefore safe. That reasoning is about the ACTION; it says nothing
+     * about the PROCESS. Between taking a claim and recording the launch there
+     * is a live owner holding a live lease, and this cleared the claim out from
+     * under it — after which a second supervisor launched a second attempt at
+     * the same work. The reviewer drove exactly that against a real database.
+     *
+     * The activity knows, in both states. It carries a lease whose liveness is
+     * checkable, so that is consulted BEFORE anything is concluded, and a live
+     * holder means this supervisor stands down: the claim is THEIRS and is left
+     * exactly where it is, and the refusal names who has it (AC-13).
+     */
+    const probe = this.deps.liveness;
+    const owner = (state.activities ?? []).find(
+      (entry) => entry.id === canonicalActivityId(claim.roadmapKey, claim.kind, claim.attempt),
+    );
+    const holding =
+      probe !== undefined && owner !== undefined && !isTerminal(owner.state) && owner.lease !== undefined
+        ? { lease: owner.lease, liveness: probe.check(owner.lease) }
+        : undefined;
+
+    if (holding?.liveness === "ALIVE") {
+      const held =
+        `action ${claim.actionId} is held by pid ${holding.lease.pid} on ` +
+        `${JSON.stringify(holding.lease.machine)}, which is still running; this supervisor is standing down`;
+      this.log(`[supervisor] ${held}`);
+      return {
+        // The claim is NOT dropped: it belongs to the process that is still
+        // working, and removing it would let a third supervisor start beside
+        // them both.
+        state,
+        result: {
+          kind: "WAITING_FOR_RESOURCE",
+          roadmapKey: claim.roadmapKey,
+          reason: boundedDiagnostic(held),
+        },
+      };
+    }
+
     if (claim.state === "CLAIMED") {
+      /**
+       * AND AN UNKNOWABLE OWNER IS NOT A GONE ONE.
+       *
+       * Clearing the claim is only safe because the launch demonstrably did not
+       * happen AND nobody is still in the window where it might. A lease this
+       * process cannot resolve — another machine, an unreadable `/proc` —
+       * settles neither, and "unknown refuses" is the rule everywhere else in
+       * this mechanism. It leaves the claim alone and says why.
+       */
+      if (holding?.liveness === "UNKNOWN") {
+        const unknown =
+          `action ${claim.actionId} is claimed by pid ${holding.lease.pid} on ` +
+          `${JSON.stringify(holding.lease.machine)}, and whether that process is still running cannot be ` +
+          "established from here; refusing to clear a claim that may still be someone's";
+        this.log(`[supervisor] ${unknown}`);
+        return {
+          state,
+          result: {
+            kind: "WAITING_FOR_HUMAN",
+            roadmapKey: claim.roadmapKey,
+            reason: "HUMAN_DECISION_REQUIRED",
+            humanActionRequired: boundedDiagnostic(unknown),
+          },
+        };
+      }
       /**
        * Proves the external launch never happened: a bounded retry is safe.
        *
@@ -660,51 +810,6 @@ export class SupervisorService {
         roadmap: countUnlaunchedAttempt(withUnlaunched, claim.roadmapKey),
       });
       return { state: cleared };
-    }
-
-    /**
-     * A RUNNING CLAIM IS NOT PROOF THAT ITS OWNER IS GONE (round-3 review,
-     * HIGH 1).
-     *
-     * This function was written when the supervisor was effectively
-     * single-process: a claim still RUNNING at the start of a tick could only
-     * mean the process that made it had died, so every one was treated as
-     * abandoned. Part B made that assumption false and did not update it, so a
-     * SECOND supervisor meeting a LIVE first one escalated RECOVERY_REQUIRED
-     * and drove the item to BLOCKED — while the activity beside it said LIVE.
-     * Two records of the same fact, and the older one won.
-     *
-     * The activity knows. It carries a lease whose liveness is checkable, so
-     * that is consulted before anything is concluded. A live holder means this
-     * supervisor stands down — the claim is THEIRS and is left exactly where it
-     * is — and says who has it, which is what AC-13 requires.
-     *
-     * GONE and UNKNOWN both still escalate. Whether the external action
-     * completed remains unknowable in both cases, and repeating it could
-     * duplicate real work; nothing here weakens that.
-     */
-    const probe = this.deps.liveness;
-    const running = (state.activities ?? []).find(
-      (entry) => entry.id === canonicalActivityId(claim.roadmapKey, claim.kind, claim.attempt),
-    );
-    if (probe !== undefined && running !== undefined && !isTerminal(running.state) && running.lease !== undefined) {
-      if (probe.check(running.lease) === "ALIVE") {
-        const holder =
-          `action ${claim.actionId} is held by pid ${running.lease.pid} on ` +
-          `${JSON.stringify(running.lease.machine)}, which is still running; this supervisor is standing down`;
-        this.log(`[supervisor] ${holder}`);
-        return {
-          // The claim is NOT dropped: it belongs to the process that is still
-          // working, and removing it would let a third supervisor start beside
-          // them both.
-          state,
-          result: {
-            kind: "WAITING_FOR_RESOURCE",
-            roadmapKey: claim.roadmapKey,
-            reason: boundedDiagnostic(holder),
-          },
-        };
-      }
     }
 
     // RUNNING under an owner that is gone. Whether the external action
@@ -1870,7 +1975,26 @@ export class SupervisorService {
         claimed,
         `record the launch of ${activityId}`,
         (activities) => reportProgress(activities, activityId, { at: this.deps.clock.now(), progress: 1 }, lease),
-        () => ({ activeClaim: { ...claim, state: "RUNNING" } }),
+        (fresh) => {
+          /**
+           * The claim that is DURABLE right now, not the one read at the top of
+           * the tick. If it is not ours any more, this supervisor has already
+           * been displaced and must not launch — writing the old claim back
+           * would displace whoever took it, which is the duplicate-owner state
+           * this whole mechanism refuses.
+           */
+          const durable = fresh.activeClaim;
+          if (durable === undefined) {
+            return { ok: false, problem: `the claim on ${item.key} is no longer in durable state` };
+          }
+          if (durable.actionId !== claim.actionId) {
+            return {
+              ok: false,
+              problem: `durable state now holds claim ${durable.actionId}, not ${claim.actionId}`,
+            };
+          }
+          return { ok: true, patch: { activeClaim: { ...durable, state: "RUNNING" } } };
+        },
       );
       if (!launched.recorded) {
         const problem =
@@ -3184,10 +3308,19 @@ export class SupervisorService {
      * The launch heartbeat travels with the claim's CLAIMED -> RUNNING
      * transition, and splitting them would create a state where one landed and
      * the other did not — the half-applied shape this task exists to refuse.
-     * Recomputed per attempt from the freshest state, for the same reason
-     * `mutate` is.
+     *
+     * IT IS A FUNCTION OF THE FRESH STATE, AND IT MAY REFUSE (round-7 review,
+     * HIGH 1). It was a function of the fresh state in signature only: the
+     * launch site closed over the claim it had read at the top of the tick and
+     * returned it verbatim, so a retry — or a no-op transition, which skips the
+     * transition entirely and applies the patch alone — wrote that stale claim
+     * over whatever the durable state now held. The reviewer used it to replace
+     * a rival's live claim with a dead one by reporting unchanged progress.
+     *
+     * Deriving from `state` is not enough on its own, because "what I expected
+     * is no longer there" has to be an ANSWER rather than a silent overwrite.
      */
-    alongside?: (state: SupervisorState) => Partial<SupervisorState>,
+    alongside?: (state: SupervisorState) => AlongsideVerdict,
   ): Promise<{ readonly state: SupervisorState; readonly recorded: boolean; readonly problem?: string }> {
     let current = state;
     for (let attempt = 0; attempt < 5; attempt += 1) {
@@ -3196,40 +3329,51 @@ export class SupervisorService {
         this.log(`[supervisor] could not ${what}: ${next.problem}`);
         return { state: current, recorded: false, problem: next.problem };
       }
-      if (!next.changed) {
-        const patch = alongside?.(current) ?? {};
-        if (Object.keys(patch).length === 0) {
-          return { state: current, recorded: true };
-        }
-        try {
-          return { state: await this.commit(current, { ...current, ...patch }), recorded: true };
-        } catch (error) {
-          if (!(error instanceof ConcurrencyError)) throw error;
-          const again = await this.deps.repository.load();
-          if (again === undefined) {
-            return { state: current, recorded: false, problem: `durable state disappeared while trying to ${what}` };
-          }
-          current = again;
-          continue;
-        }
+      const extra = alongside?.(current);
+      if (extra !== undefined && !extra.ok) {
+        this.log(`[supervisor] could not ${what}: ${extra.problem}`);
+        return { state: current, recorded: false, problem: extra.problem };
+      }
+      const patch = extra?.patch ?? {};
+      if (!next.changed && Object.keys(patch).length === 0) {
+        return { state: current, recorded: true };
       }
       try {
         return {
           state: await this.commit(current, {
             ...current,
-            ...(alongside?.(current) ?? {}),
-            activities: next.activities,
+            ...patch,
+            ...(next.changed ? { activities: next.activities } : {}),
           }),
           recorded: true,
         };
       } catch (error) {
-        if (!(error instanceof ConcurrencyError)) {
+        if (!isStaleSnapshot(error)) {
           throw error;
         }
         const fresh = await this.deps.repository.load();
         if (fresh === undefined) {
           this.log(`[supervisor] could not ${what}: durable state disappeared`);
           return { state: current, recorded: false, problem: `durable state disappeared while trying to ${what}` };
+        }
+        /**
+         * THE VERSION HAVING MOVED IS THE PROOF (round-7 review, HIGH 2).
+         *
+         * `ConcurrencyError` carries that proof in itself. The provenance
+         * refusal does not: "the history I am writing is shorter than the
+         * stored one" is what a rival's append looks like from here AND what a
+         * deliberate truncation looks like, and they are indistinguishable from
+         * the error alone. So the error only makes this WORTH re-reading, and
+         * the re-read decides: a durable state that has not moved means nothing
+         * raced us and the refusal was about our own write, which must not be
+         * retried into.
+         */
+        if (fresh.version === current.version) {
+          const problem =
+            `refused to ${what}: ${error instanceof Error ? error.message : String(error)} — and durable state ` +
+            `has not moved since it was read (version ${current.version}), so nothing raced this write`;
+          this.log(`[supervisor] ${problem}`);
+          return { state: current, recorded: false, problem };
         }
         this.log(`[supervisor] re-reading to ${what}: another supervisor advanced the state`);
         current = fresh;
@@ -3247,6 +3391,281 @@ export class SupervisorService {
     const problem = `gave up trying to ${what} after repeated conflicts`;
     this.log(`[supervisor] ${problem}`);
     return { state: current, recorded: false, problem };
+  }
+
+  /**
+   * Turns verdicts that already exist into durable state, exactly once.
+   *
+   * THE FAILURE THIS CLOSES, stated plainly because it is this task's own:
+   * round 7's reviewer produced a valid CHANGES_REQUIRED verdict, the chain
+   * validated it, logged it and exited — and the verdict sat on disk for
+   * twenty-two hours until a person sent a message. Nothing had crashed. There
+   * was simply nothing whose job it was to notice.
+   *
+   * Every rule below exists so that noticing cannot be lost:
+   *
+   *   - it runs inside the ordinary tick, so a COLD START consumes a verdict
+   *     that landed while nothing was running (no notification is required, and
+   *     losing one costs nothing);
+   *   - it reads the binding from DURABLE state, so the process that launched
+   *     the review need not exist any more;
+   *   - it refuses a verdict that names a different candidate, because a
+   *     verdict is only about the tree it judged;
+   *   - it settles through the same compare-and-set retry as every other
+   *     transition, so two supervisors converge on ONE consumption;
+   *   - and it never turns absence, silence or an unreadable file into
+   *     approval.
+   */
+  private async consumeAcceptanceVerdicts(
+    state: SupervisorState,
+  ): Promise<{
+    readonly state: SupervisorState;
+    readonly refusal?: { readonly roadmapKey: string; readonly problem: string };
+  }> {
+    const awaiting = reviewsAwaitingVerdict(state.activities ?? []);
+    if (awaiting.length === 0) {
+      return { state };
+    }
+
+    const source = this.deps.acceptanceVerdicts;
+    if (source === undefined) {
+      /**
+       * A RECORDED REVIEW WITH NOWHERE TO READ IT IS A MISCONFIGURATION.
+       *
+       * Passing over it would leave the review in flight forever while the
+       * Factory cheerfully did other work — the half-configured fail-open that
+       * round 4 already found once, in the lease and probe.
+       */
+      const problem =
+        `${awaiting.length} review${awaiting.length === 1 ? " is" : "s are"} recorded as in flight, and this ` +
+        "supervisor has no way to read a verdict back; refusing to decide anything while a review's result is " +
+        "unreachable";
+      this.log(`[supervisor] ${problem}`);
+      return {
+        state,
+        refusal: { roadmapKey: awaiting[0]!.roadmapKey, problem: boundedDiagnostic(problem) },
+      };
+    }
+
+    let current = state;
+    for (const activity of awaiting) {
+      const review = activity.review;
+      if (review === undefined) continue;
+      const reading = source.read(review);
+
+      /**
+       * A VERDICT OUTLIVES ITS AUTHOR; SILENCE DOES NOT.
+       *
+       * A verdict is applied whatever the reviewer is doing now — it wrote its
+       * conclusion, and that conclusion does not expire. Anything SHORT of a
+       * verdict is only conclusive once the reviewer is proven gone: a file
+       * being written this instant parses as no verdict at all, and calling
+       * that a failed review would abandon a review still in progress.
+       */
+      if (reading.kind !== "VERDICT") {
+        const probe = this.deps.liveness;
+        const gone =
+          probe !== undefined && activity.lease !== undefined && probe.check(activity.lease) === "GONE";
+        if (!gone) continue;
+
+        const why =
+          reading.kind === "ABSENT"
+            ? "it exited without writing one"
+            : `what it wrote is not a verdict (${reading.reason})`;
+        const settled = await this.commitActivityChange(
+          current,
+          `record that review ${review.reviewId} produced no verdict`,
+          (activities) =>
+            settleReview(activities, activity.id, {
+              state: "FAILED",
+              at: this.deps.clock.now(),
+              completion: {
+                outcome: NO_VERDICT_OUTCOME,
+                detail: boundedDiagnostic(`review ${review.reviewId} of ${review.candidate.commit}: ${why}`),
+                at: this.deps.clock.now(),
+              },
+            }),
+          (fresh) => this.releaseReviewed(fresh, activity, "ELIGIBLE", `review produced no verdict: ${why}`),
+        );
+        if (!settled.recorded) {
+          const problem =
+            `review ${review.reviewId} produced no verdict and that could not be recorded ` +
+            `(${settled.problem ?? "unknown reason"})`;
+          this.log(`[supervisor] ${problem}`);
+          return { state: settled.state, refusal: { roadmapKey: activity.roadmapKey, problem: boundedDiagnostic(problem) } };
+        }
+        /**
+         * NEVER A PASS. A review that produced nothing is a review that must be
+         * run again; the item returns to the queue and the next round schedules
+         * one. This is the single asymmetry worth hard-coding.
+         */
+        this.log(`[supervisor] review ${review.reviewId} produced no verdict; ${activity.roadmapKey} is claimable again`);
+        current = settled.state;
+        continue;
+      }
+
+      const mismatch = bindingMismatch(review.candidate, reading.outcome.candidate);
+      if (mismatch !== undefined) {
+        /**
+         * THE WRONG CANDIDATE'S VERDICT IS NOT A WEAKER VERDICT, IT IS NONE.
+         *
+         * A previous round's file left on disk, a reviewer pointed at the wrong
+         * tree, a candidate amended after launch: all produce a perfectly
+         * well-formed verdict about something else. Applying it would be the
+         * purest form of the thing C4 exists to prevent — an approval nobody
+         * gave for the code that would actually be integrated.
+         */
+        const problem = `refusing the verdict for review ${review.reviewId}: ${mismatch}`;
+        this.log(`[supervisor] ${problem}`);
+        /**
+         * AND THE REFUSAL IS RECORDED, not merely returned — the round-6 lesson,
+         * applied to the door it arrives at here.
+         *
+         * This refusal stops the tick, and it will stop every tick until someone
+         * looks. A fresh process reading the activity back must find the reason
+         * on it; otherwise the Factory is halted by a fact that exists only in
+         * one process's return value and one log line.
+         */
+        const noted = await this.commitActivityChange(
+          current,
+          `record why the verdict for ${review.reviewId} was refused`,
+          (activities) =>
+            recordReconciliation(activities, activity.id, {
+              verdict: "AMBIGUOUS",
+              at: this.deps.clock.now(),
+              detail: boundedDiagnostic(problem),
+            }),
+        );
+        return {
+          state: noted.state,
+          refusal: {
+            roadmapKey: activity.roadmapKey,
+            problem: boundedDiagnostic(
+              noted.recorded
+                ? problem
+                : `${problem}. The refusal could not be recorded durably either (${noted.problem ?? "unknown reason"})`,
+            ),
+          },
+        };
+      }
+
+      const accepted = isAccepted(reading.outcome);
+      const at = this.deps.clock.now();
+      const settled = await this.commitActivityChange(
+        current,
+        `consume the verdict of review ${review.reviewId}`,
+        (activities) =>
+          settleReview(activities, activity.id, {
+            state: "COMPLETED",
+            at,
+            completion: {
+              outcome: reading.outcome.verdict,
+              detail: boundedDiagnostic(completionDetail(reading.outcome)),
+              at,
+            },
+          }),
+        (fresh) =>
+          accepted
+            ? this.acceptedReviewed(fresh, activity, reading.outcome.candidate.commit)
+            : this.releaseReviewed(
+                fresh,
+                activity,
+                "ELIGIBLE",
+                `independent review returned ${completionDetail(reading.outcome)}`,
+              ),
+      );
+      if (!settled.recorded) {
+        const problem =
+          `the verdict of review ${review.reviewId} could not be recorded (${settled.problem ?? "unknown reason"}); ` +
+          "it is NOT being applied";
+        this.log(`[supervisor] ${problem}`);
+        return { state: settled.state, refusal: { roadmapKey: activity.roadmapKey, problem: boundedDiagnostic(problem) } };
+      }
+      this.log(
+        `[supervisor] consumed ${reading.outcome.verdict} for ${activity.roadmapKey} (review ${review.reviewId}); ` +
+          `${accepted ? "the candidate is at the integration gate" : "remediation is claimable"}`,
+      );
+      current = settled.state;
+    }
+
+    return { state: current };
+  }
+
+  /**
+   * The roadmap half of consuming a verdict, computed against the FRESH state.
+   *
+   * Travels with the settlement in one write: an item left ACTIVE beside a
+   * completed review is the half-applied shape AC-17 refuses, and a claim left
+   * behind would have the next tick conclude its owner vanished.
+   */
+  private releaseReviewed(
+    fresh: SupervisorState,
+    activity: Activity,
+    status: "ELIGIBLE",
+    detail: string,
+  ): AlongsideVerdict {
+    return {
+      ok: true,
+      patch: {
+        roadmap: setStatus(fresh.roadmap, activity.roadmapKey, status, boundedDiagnostic(detail)),
+        ...this.withoutClaimFor(fresh, activity),
+      },
+    };
+  }
+
+  /**
+   * An ACCEPTED candidate stops here, deliberately.
+   *
+   * ADR-0002 permits integration without a further human decision, and this
+   * supervisor still does not perform one: it has no integration executor, and
+   * inventing one inside a verdict consumer would put "may this be merged" and
+   * "what did the reviewer say" in the same place. What it records is the fact
+   * — reviewed, accepted, at the gate, naming the candidate — so the decision
+   * is made from durable state by whatever holds that authority.
+   */
+  private acceptedReviewed(fresh: SupervisorState, activity: Activity, commit: string): AlongsideVerdict {
+    const action =
+      `Independent review accepted candidate ${commit} for ${activity.roadmapKey}. Integrate it under ADR-0002 ` +
+      "after re-checking that the reviewed tree is the tree being integrated.";
+    const escalation: HumanEscalation = {
+      roadmapKey: activity.roadmapKey,
+      reason: "HUMAN_DECISION_REQUIRED",
+      humanActionRequired: boundedDiagnostic(action),
+      detail: boundedDiagnostic(`review ${activity.review?.reviewId ?? activity.id} accepted ${commit}`),
+      raisedAt: this.deps.clock.now(),
+      resolved: false,
+    };
+    return {
+      ok: true,
+      patch: {
+        roadmap: setStatus(
+          fresh.roadmap,
+          activity.roadmapKey,
+          "WAITING_FOR_HUMAN_REQUIRED",
+          boundedDiagnostic(`accepted by independent review; candidate ${commit} is at the integration gate`),
+          // The status PRESUPPOSES this, and the parser enforces it: an item
+          // waiting on a person that does not say what the person must do is
+          // refused as corrupt. Found by writing one.
+          boundedDiagnostic(action),
+        ),
+        escalations: [
+          ...fresh.escalations.filter((entry) => entry.resolved || entry.roadmapKey !== activity.roadmapKey),
+          escalation,
+        ],
+        ...this.withoutClaimFor(fresh, activity),
+      },
+    };
+  }
+
+  /** Drops the durable claim IF it is the one this activity belongs to. */
+  private withoutClaimFor(fresh: SupervisorState, activity: Activity): Partial<SupervisorState> {
+    const claim = fresh.activeClaim;
+    if (claim === undefined) {
+      return {};
+    }
+    return canonicalActivityId(claim.roadmapKey, claim.kind, claim.attempt) === activity.id
+      ? { activeClaim: undefined }
+      : {};
   }
 
   private async reconcileActivities(
@@ -3291,27 +3710,63 @@ export class SupervisorService {
        * about why the Factory had stopped. A refusal that leaves no durable
        * reason is the same defect as a log line standing in for a record.
        */
+      /**
+       * AND THE RECORD IS WRITTEN THE WAY EVERY OTHER ONE IS (round-7 review,
+       * HIGH 3).
+       *
+       * Round 6 added the classification and wrote it with a RAW commit, so a
+       * rival supervisor advancing the state in that instant turned the refusal
+       * into a thrown `ConcurrencyError`: no AMBIGUOUS record, and no refusal
+       * either — the exception replaced the answer. A durable classification
+       * that only survives when nothing else is running is not durable, and a
+       * refusal is worth least at exactly the moment it is hardest to write.
+       *
+       * It goes through `commitActivityChange`, which re-reads and recomputes
+       * against what the state now says. The classification is recomputed with
+       * it: which activities are unfinished is a property of the FRESH list, so
+       * a rival that finished one must not have it re-marked AMBIGUOUS.
+       */
       const blind = this.deps.clock.now();
-      let classified = activities;
-      let wrote = false;
-      for (const entry of unfinished) {
-        const recorded = recordReconciliation(classified, entry.id, {
-          verdict: "AMBIGUOUS",
-          at: blind,
-          detail: boundedDiagnostic(
-            `activity ${JSON.stringify(entry.id)} is ${entry.state} and this supervisor has no liveness probe, ` +
-              "so whether its owner is still running cannot be established",
-          ),
-        });
-        if (!recorded.ok) {
-          this.log(`[supervisor] could not record an ambiguity verdict: ${recorded.problem}`);
-          continue;
+      const written = await this.commitActivityChange(state, "record why liveness cannot be established", (current) => {
+        let classified = current;
+        let changed = false;
+        for (const entry of current.filter((candidate) => !isTerminal(candidate.state))) {
+          const recorded = recordReconciliation(classified, entry.id, {
+            verdict: "AMBIGUOUS",
+            at: blind,
+            detail: boundedDiagnostic(
+              `activity ${JSON.stringify(entry.id)} is ${entry.state} and this supervisor has no liveness probe, ` +
+                "so whether its owner is still running cannot be established",
+            ),
+          });
+          if (!recorded.ok) {
+            return recorded;
+          }
+          classified = recorded.activities;
+          changed = changed || recorded.changed;
         }
-        classified = recorded.activities;
-        wrote = wrote || recorded.changed;
+        return { ok: true, activities: classified, changed };
+      });
+
+      /**
+       * FAILING TO RECORD IT IS NOT A REASON TO SAY LESS.
+       *
+       * The tick still refuses — that was never in doubt — but the refusal now
+       * carries the fact that the classification could not be made durable, so
+       * an operator reading it is not left wondering why the activity they were
+       * pointed at has no verdict on it.
+       */
+      if (!written.recorded) {
+        return {
+          state: written.state,
+          refusal: boundedDiagnostic(
+            `${problem}. Worse: the reason could not be recorded durably either ` +
+              `(${written.problem ?? "unknown reason"}), so a fresh process will find these activities ` +
+              "unclassified",
+          ),
+        };
       }
-      const persisted = wrote ? await this.commit(state, { ...state, activities: classified }) : state;
-      return { state: persisted, refusal: boundedDiagnostic(problem) };
+      return { state: written.state, refusal: boundedDiagnostic(problem) };
     }
 
     const now = this.deps.clock.now();

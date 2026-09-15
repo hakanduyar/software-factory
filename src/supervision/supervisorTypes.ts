@@ -300,7 +300,17 @@ export interface SupervisorState {
    * assert nothing, which is churn a reviewer then has to read.
    */
   readonly activities?: readonly Activity[];
-  readonly activeClaim?: SupervisorActionClaim;
+  /**
+   * `| undefined` is deliberate under `exactOptionalPropertyTypes`.
+   *
+   * A partial patch must be able to say "and there is no longer a claim" —
+   * consuming a verdict releases the claim its review held, in the same write —
+   * and with a bare optional the only way to express that is to rebuild the
+   * whole state, which is exactly the read-modify-write a concurrent patch must
+   * not do. `JSON.stringify` drops the key, so an absent claim and a claim set
+   * to `undefined` persist identically.
+   */
+  readonly activeClaim?: SupervisorActionClaim | undefined;
   /** When the next tick is worth running. Absent means "nothing scheduled". */
   readonly nextWakeAt?: Timestamp;
   readonly escalations: readonly HumanEscalation[];

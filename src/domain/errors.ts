@@ -179,3 +179,23 @@ export class SchemaIntegrityError extends FactoryError {
     super(message, "SCHEMA_INTEGRITY_VIOLATION");
   }
 }
+
+/**
+ * The provenance being written is SHORTER than the provenance already stored.
+ *
+ * A subtype, because this one refusal has two completely different causes and
+ * the error alone cannot tell them apart:
+ *
+ *   - a caller truncating recorded history, which is the attack the append-only
+ *     rule exists to refuse, and
+ *   - an ordinary stale read — a rival appended provenance after this writer
+ *     loaded the state, so the snapshot in hand is simply short.
+ *
+ * It is still a `SchemaIntegrityError` and every existing handler still catches
+ * it; it refuses the write either way. What the subtype adds is that a caller
+ * MAY treat it as worth re-reading, and the proof of which cause it was comes
+ * from the re-read (did the durable version move?), never from this error.
+ * Provenance that was REWRITTEN rather than shortened is not this: nothing
+ * concurrent produces it, and it stays a plain `SchemaIntegrityError`.
+ */
+export class ProvenanceRegressionError extends SchemaIntegrityError {}

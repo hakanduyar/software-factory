@@ -21,6 +21,7 @@ import {
 } from "../adapters/supervision/sqliteSupervisorRepository.js";
 import { createNodeProcessRunner } from "../adapters/process/nodeProcessRunner.js";
 import { createProcLivenessProbe, leaseForThisProcess } from "../adapters/supervision/procLiveness.js";
+import { createFileVerdictSource } from "../adapters/supervision/fileVerdictSource.js";
 import { createSequentialIdGenerator } from "../domain/ids.js";
 import { DEFAULT_ROUTING_POLICY } from "../supervision/modelRouting.js";
 import { parseFinancialPolicy } from "../supervision/financialSafety.js";
@@ -370,6 +371,14 @@ function buildService(
      */
     liveness: createProcLivenessProbe(),
     activityLease: (claimedAt) => leaseForThisProcess(claimedAt),
+    /**
+     * ...and the same reasoning for verdicts. A review recorded in durable
+     * state with no way to read its result back is a review nothing can ever
+     * finish, and round 7 showed what that costs in hours. Wired HERE, beside
+     * the probe, because forgetting one of the three is the misconfiguration
+     * the service now refuses rather than works around.
+     */
+    acceptanceVerdicts: createFileVerdictSource(),
     log,
   });
 }

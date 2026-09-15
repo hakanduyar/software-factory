@@ -155,6 +155,27 @@ const PROVENANCE_FIELDS: Record<keyof Required<ProvenanceEntry>, true> = {
  * dropped in transit is exactly the failure this whole file exists for, and
  * `Activity.lease` being listed above says nothing about what is inside it.
  */
+/**
+ * The REVIEW BINDING's own fields, for the same reason as the lease's.
+ *
+ * This one decides whether a verdict may be applied at all: drop `fingerprint`
+ * in transit and a verdict for a different working tree starts matching.
+ */
+const ACTIVITY_REVIEW_FIELDS: Record<keyof Required<NonNullable<Activity["review"]>>, true> = {
+  reviewId: true,
+  source: true,
+  candidate: true,
+};
+
+const ACTIVITY_REVIEW_CANDIDATE_FIELDS: Record<
+  keyof Required<NonNullable<Activity["review"]>["candidate"]>,
+  true
+> = {
+  commit: true,
+  tree: true,
+  fingerprint: true,
+};
+
 const ACTIVITY_LEASE_FIELDS: Record<keyof Required<NonNullable<Activity["lease"]>>, true> = {
   pid: true,
   processStartedAt: true,
@@ -173,6 +194,7 @@ const ACTIVITY_FIELDS: Record<keyof Required<Activity>, true> = {
   completion: true,
   observedAt: true,
   reconciliation: true,
+  review: true,
   updatedAt: true,
 };
 
@@ -310,6 +332,11 @@ const MAXIMAL_ACTIVITY: Required<Activity> = {
   completion: { outcome: "PASS", detail: "verdict recorded", at: 1_190 },
   observedAt: 1_195,
   reconciliation: { verdict: "LIVE", at: 1_185, detail: "owner was running" },
+  review: {
+    reviewId: "r2",
+    source: "/home/factory/.sf/review-r2-lastmsg.txt",
+    candidate: { commit: "339ae83", tree: "3fd1ecb", fingerprint: "e3bb12ea62ef" },
+  },
   updatedAt: 1_190,
 };
 
@@ -348,6 +375,8 @@ describe("TASK-006: every durable supervisor field survives serialization", () =
       ESCALATION_FIELDS,
       PROVENANCE_FIELDS,
       ACTIVITY_LEASE_FIELDS,
+      ACTIVITY_REVIEW_FIELDS,
+      ACTIVITY_REVIEW_CANDIDATE_FIELDS,
       ACTIVITY_FIELDS,
       STATE_FIELDS,
     ]) {

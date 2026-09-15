@@ -74,6 +74,16 @@ export const T_ACT = "dist/tests/activity.test.js";
 export const T_PROCLIVE = "dist/tests/procLiveness.test.js";
 export const T_ACTREC = "dist/tests/activityRecovery.test.js";
 
+/**
+ * TASK-018 round 7: consuming a verdict is the part that was missing, and the
+ * part whose absence cost twenty-two hours.
+ */
+export const ACCEPT = "src/supervision/acceptance.ts";
+export const FILEVERDICT = "src/adapters/supervision/fileVerdictSource.ts";
+
+export const T_AV = "dist/tests/acceptanceVerdict.test.js";
+export const T_VC = "dist/tests/verdictConsumption.test.js";
+
 export const MUTATIONS = [
   // ---- AC-1: only runners this repository knows to be unmetered -------------
   {
@@ -1140,10 +1150,10 @@ export const MUTATIONS = [
     expect: "does NOT refresh the stall clock when the count has not moved",
   },
   {
-    id: "a no-probe refusal records no classification",
+    id: "a no-probe refusal records the wrong classification",
     edits: [[SUP_SVC,
-      "      const persisted = wrote ? await this.commit(state, { ...state, activities: classified }) : state;",
-      "      const persisted = state;\n      void classified;\n      void wrote;"]],
+      '          const recorded = recordReconciliation(classified, entry.id, {\n            verdict: "AMBIGUOUS",',
+      '          const recorded = recordReconciliation(classified, entry.id, {\n            verdict: "LIVE",']],
     tests: [T_ACTREC],
     expect: "REFUSES to run anything while an activity is unfinished and liveness is uncheckable",
   },
@@ -1188,8 +1198,8 @@ export const MUTATIONS = [
   {
     id: "an unrecorded completion is settled as though it had been recorded",
     edits: [[SUP_SVC,
-      "      if (!written.recorded) {",
-      "      if (!written.recorded && Number.isNaN(0)) {"]],
+      "      if (!written.recorded) {\n        /**\n         * THE OUTCOME IS NOT SETTLED IF IT COULD NOT BE RECORDED (round-5",
+      "      if (!written.recorded && Number.isNaN(0)) {\n        /**\n         * THE OUTCOME IS NOT SETTLED IF IT COULD NOT BE RECORDED (round-5"]],
     tests: [T_ACTREC],
     expect: "REFUSES to settle an outcome whose completion could never be written",
   },
@@ -1216,8 +1226,8 @@ export const MUTATIONS = [
   {
     id: "a live claim holder is still declared lost",
     edits: [[SUP_SVC,
-      '      if (probe.check(running.lease) === "ALIVE") {',
-      '      if (probe.check(running.lease) === "ALIVE" && Number.isNaN(0)) {']],
+      "        ? { lease: owner.lease, liveness: probe.check(owner.lease) }",
+      '        ? { lease: owner.lease, liveness: Number.isNaN(0) ? probe.check(owner.lease) : "GONE" }']],
     tests: [T_ACTREC],
     expect: "STANDS DOWN and names the holder when the claim's owner is still running",
   },
@@ -1356,6 +1366,166 @@ export const MUTATIONS = [
       "    if (item.status === RECOVERY_FROM_STATUS && Number.isNaN(0)) continue;"]],
     tests: [T_ACTREC],
     expect: "REFUSES to re-queue an item at WAITING_FOR_HUMAN_REQUIRED",
+  },
+
+  // ---- round 7, HIGH 1: a live owner is not displaced ----------------------
+  {
+    id: "a live owner's claim is cleared anyway",
+    edits: [[SUP_SVC,
+      '    if (holding?.liveness === "ALIVE") {',
+      '    if (holding?.liveness === "ALIVE" && Number.isNaN(0)) {']],
+    tests: [T_ACTREC],
+    expect: "REFUSES to clear a CLAIMED claim while its owner is still running",
+  },
+  {
+    id: "an unknowable owner's claim is treated as a gone one",
+    edits: [[SUP_SVC,
+      '      if (holding?.liveness === "UNKNOWN") {',
+      '      if (holding?.liveness === "UNKNOWN" && Number.isNaN(0)) {']],
+    tests: [T_ACTREC],
+    expect: "REFUSES to clear a CLAIMED claim whose owner cannot be checked at all",
+  },
+  {
+    id: "the launch patch uses the claim it read at the top of the tick",
+    edits: [[SUP_SVC,
+      '          return { ok: true, patch: { activeClaim: { ...durable, state: "RUNNING" } } };',
+      '          return { ok: true, patch: { activeClaim: { ...claim, state: "RUNNING" } } };']],
+    tests: [T_ACTREC],
+    expect: "REFUSES to launch on a claim that is no longer ours, and leaves the rival's claim alone",
+  },
+  {
+    id: "a displaced supervisor launches anyway",
+    edits: [[SUP_SVC,
+      "          if (durable.actionId !== claim.actionId) {",
+      "          if (durable.actionId !== claim.actionId && Number.isNaN(0)) {"]],
+    tests: [T_ACTREC],
+    expect: "REFUSES to launch on a claim that is no longer ours, and leaves the rival's claim alone",
+  },
+
+  // ---- round 7, HIGH 2: which failures are stale reads ---------------------
+  {
+    id: "a rival's provenance append is not treated as a stale read",
+    edits: [[SUP_SVC,
+      "  return error instanceof ConcurrencyError || error instanceof ProvenanceRegressionError;",
+      "  return error instanceof ConcurrencyError || (error instanceof ProvenanceRegressionError && Number.isNaN(0));"]],
+    tests: [T_ACTREC],
+    expect: "re-reads and re-applies when a rival APPENDED PROVENANCE rather than merely winning the CAS",
+  },
+  {
+    id: "a lost compare-and-set is not treated as a stale read",
+    edits: [[SUP_SVC,
+      "  return error instanceof ConcurrencyError || error instanceof ProvenanceRegressionError;",
+      "  return (error instanceof ConcurrencyError && Number.isNaN(0)) || error instanceof ProvenanceRegressionError;"]],
+    tests: [T_ACTREC],
+    expect: "records the classification even when another supervisor writes first",
+  },
+  {
+    id: "a refusal about this write is retried into",
+    edits: [[SUP_SVC,
+      "        if (fresh.version === current.version) {",
+      "        if (fresh.version === current.version && Number.isNaN(0)) {"]],
+    tests: [T_ACTREC],
+    expect: "REFUSES rather than retrying when nothing actually raced the write",
+  },
+  {
+    id: "the repository stops distinguishing a short chain from a rewritten one",
+    edits: [[SUP_REPO,
+      "    throw new ProvenanceRegressionError(",
+      "    void ProvenanceRegressionError;\n    throw new SchemaIntegrityError("]],
+    tests: [T_ACTREC],
+    expect: "re-reads and re-applies when a rival APPENDED PROVENANCE rather than merely winning the CAS",
+  },
+
+  // ---- round 7, HIGH 3: the classification is durable or it is named -------
+  {
+    id: "a classification that could not be written is reported as if it had been",
+    edits: [[SUP_SVC,
+      "      if (!written.recorded) {\n        return {\n          state: written.state,\n          refusal: boundedDiagnostic(",
+      "      if (!written.recorded && Number.isNaN(0)) {\n        return {\n          state: written.state,\n          refusal: boundedDiagnostic("]],
+    tests: [T_ACTREC],
+    expect: "SAYS SO when the classification cannot be made durable at all",
+  },
+
+  // ---- round 7 gap: a verdict that exists is consumed ----------------------
+  {
+    id: "a review with nowhere to read its verdict is passed over",
+    edits: [[SUP_SVC,
+      "      return {\n        state,\n        refusal: { roadmapKey: awaiting[0]!.roadmapKey, problem: boundedDiagnostic(problem) },\n      };",
+      "      return { state };"]],
+    tests: [T_VC],
+    expect: "H. a supervisor that has no way to read verdicts REFUSES rather than passing over one",
+  },
+  {
+    id: "a verdict for a different candidate is applied anyway",
+    edits: [[SUP_SVC,
+      "      if (mismatch !== undefined) {",
+      "      if (mismatch !== undefined && Number.isNaN(0)) {"]],
+    tests: [T_VC],
+    expect: "F. a verdict for a different candidate is REFUSED, not applied",
+  },
+  {
+    id: "a reviewer that is still working is declared to have produced nothing",
+    edits: [[SUP_SVC,
+      '          probe !== undefined && activity.lease !== undefined && probe.check(activity.lease) === "GONE";',
+      '          probe !== undefined && activity.lease !== undefined && probe.check(activity.lease) !== "GONE";']],
+    tests: [T_VC],
+    expect: "C2. ...and a reviewer still running is left alone, not declared failed",
+  },
+  {
+    id: "the review's claim outlives the review",
+    edits: [[SUP_SVC,
+      "    return canonicalActivityId(claim.roadmapKey, claim.kind, claim.attempt) === activity.id",
+      "    return canonicalActivityId(claim.roadmapKey, claim.kind, claim.attempt) !== activity.id"]],
+    tests: [T_VC],
+    expect: "A. consumes CHANGES_REQUIRED on a cold tick, with no notification at all",
+  },
+  {
+    id: "a settled review is read again on every tick",
+    edits: [[ACTIVITY,
+      "  return activities.filter((activity) => activity.review !== undefined && !isTerminal(activity.state));",
+      "  return activities.filter((activity) => activity.review !== undefined);"]],
+    tests: [T_VC],
+    expect: "G. re-reconciling an already-consumed verdict changes nothing",
+  },
+  {
+    id: "two verdict tags are treated as agreement",
+    edits: [[ACCEPT,
+      "  return second === null ? first : undefined;",
+      "  return second === null || !Number.isNaN(0) ? first : undefined;"]],
+    tests: [T_AV],
+    expect: "REFUSES a second VERDICT line even when both say the same thing",
+  },
+  {
+    id: "an accepted verdict stops caring about HIGH findings",
+    edits: [[ACCEPT,
+      "    outcome.high === 0 &&",
+      "    (outcome.high === 0 || !Number.isNaN(0)) &&"]],
+    tests: [T_AV],
+    expect: "refuses a PASS with any CRITICAL, any HIGH, or safe-to-commit NO",
+  },
+  {
+    id: "an accepted verdict stops caring about safe-to-commit",
+    edits: [[ACCEPT,
+      "    outcome.safeToCommit\n  );",
+      "    (outcome.safeToCommit || !Number.isNaN(0))\n  );"]],
+    tests: [T_AV],
+    expect: "refuses a PASS with any CRITICAL, any HIGH, or safe-to-commit NO",
+  },
+  {
+    id: "a relative verdict path is resolved instead of refused",
+    edits: [[FILEVERDICT,
+      "      if (!isAbsolute(path)) {",
+      "      if (!isAbsolute(path) && Number.isNaN(0)) {"]],
+    tests: [T_AV],
+    expect: "REFUSES a relative source path rather than resolving it",
+  },
+  {
+    id: "an empty verdict file is read as a verdict",
+    edits: [[FILEVERDICT,
+      "      if (size === 0) {",
+      "      if (size === 0 && Number.isNaN(0)) {"]],
+    tests: [T_AV],
+    expect: "reports an empty file as ABSENT — created is not written",
   },
 
   // ---- AC-9: the dependency is real ---------------------------------------

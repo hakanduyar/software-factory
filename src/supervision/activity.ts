@@ -52,6 +52,8 @@
 
 import type { Timestamp } from "../domain/time.js";
 
+import type { ReviewBinding } from "./acceptance.js";
+
 /**
  * The states an activity is RECORDED in.
  *
@@ -162,7 +164,30 @@ export interface Activity {
    */
   readonly observedAt?: Timestamp;
   readonly reconciliation?: ActivityReconciliation;
+  /**
+   * Present when this activity IS a review, and says what it reviews and where
+   * it will report (TASK-018 round-7 gap).
+   *
+   * Recorded when the review is launched, so the binding survives the process
+   * that launched it. A later supervisor — a cold start, hours afterwards, with
+   * no memory and no notification — has everything it needs to find the verdict
+   * and to refuse one that belongs to a different candidate.
+   */
+  readonly review?: ReviewBinding;
   readonly updatedAt: Timestamp;
+}
+
+/**
+ * The reviews whose verdicts are still worth reading.
+ *
+ * A review that has already reached a terminal state is finished business, and
+ * re-reading its source would let a verdict file that outlives its round be
+ * applied twice. Idempotence is expressed here, as "which activities do we even
+ * look at", rather than inside the consumer: the consumer runs on every tick
+ * forever, and the cheapest guard is the one that cannot be forgotten.
+ */
+export function reviewsAwaitingVerdict(activities: readonly Activity[]): readonly Activity[] {
+  return activities.filter((activity) => activity.review !== undefined && !isTerminal(activity.state));
 }
 
 /** THE only legitimate way an activity id comes into existence. */
@@ -722,6 +747,82 @@ export function completeActivity(
       ...activity,
       state: input.state,
       completion: input.completion,
+      updatedAt: input.completion.at,
+    }),
+  };
+}
+
+/**
+ * Settles a REVIEW from the artefact it produced, without being its owner.
+ *
+ * THE HOLDER RULE IS NOT BEING WEAKENED, so it is worth being exact about why
+ * this is allowed to exist. `completeActivity` requires the writer's lease
+ * because the outcome there is something the writer COMPUTED: a process that
+ * lost ownership while its work ran must not apply a conclusion only it
+ * believes, which is round-5's HIGH 2.
+ *
+ * A review verdict is not computed by anyone in the Factory. It is a durable
+ * artefact, written by an independent process, naming the exact candidate it
+ * judged — and the caller has already checked that naming against the binding
+ * recorded when the review was launched. Requiring the reviewer's own lease to
+ * apply it would mean a verdict is only usable while its author is still alive,
+ * which is precisely the twenty-two-hour failure this exists to remove: the
+ * reviewer exits the moment it writes.
+ *
+ * So the guard is different, not absent. The activity must BE a review, its
+ * owner must not still be working (the caller establishes that; a live owner is
+ * skipped, never overruled), and a settlement that DISAGREES with one already
+ * recorded refuses exactly as `completeActivity` does. The observation is
+ * written in the same breath, because whoever applies a verdict is by
+ * definition the thing that noticed it.
+ */
+export function settleReview(
+  activities: readonly Activity[],
+  id: string,
+  input: {
+    readonly state: "COMPLETED" | "FAILED";
+    readonly completion: ActivityCompletion;
+    readonly at: Timestamp;
+  },
+): TransitionVerdict {
+  const found = locate(activities, id);
+  if (!found.ok) return found;
+  const activity = found.activity;
+
+  if (activity.review === undefined) {
+    return {
+      ok: false,
+      problem: `activity ${JSON.stringify(id)} is not a review, so no verdict can settle it`,
+    };
+  }
+
+  const settled = settle(
+    activity.completion,
+    input.completion,
+    (value) => `${value.outcome}/${value.detail}@${value.at}`,
+    "a completion",
+    id,
+  );
+  if (settled.kind === "refuse") return { ok: false, problem: settled.problem };
+  if (settled.kind === "noop") {
+    if (activity.state !== input.state) {
+      return {
+        ok: false,
+        problem: `activity ${JSON.stringify(id)} is ${activity.state} but the same verdict says ${input.state}`,
+      };
+    }
+    return activity.observedAt === undefined
+      ? { ok: true, changed: true, activities: replace(activities, { ...activity, observedAt: input.at }) }
+      : { ok: true, activities, changed: false };
+  }
+  return {
+    ok: true,
+    changed: true,
+    activities: replace(activities, {
+      ...activity,
+      state: input.state,
+      completion: input.completion,
+      observedAt: input.at,
       updatedAt: input.completion.at,
     }),
   };

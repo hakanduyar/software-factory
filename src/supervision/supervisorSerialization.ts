@@ -440,6 +440,34 @@ function parseActivity(raw: unknown, index: number, context: string): Activity {
           };
         })();
 
+  /**
+   * What this review is OF, if it is one.
+   *
+   * Every field required, because the whole value of the binding is that a
+   * verdict can be refused for naming a different candidate — and a binding
+   * with a missing half refuses nothing. An activity that is not a review
+   * simply has no `review` at all.
+   */
+  const reviewRaw = row["review"];
+  const review =
+    reviewRaw === undefined
+      ? undefined
+      : (() => {
+          const reviewContext = `${itemContext}.review`;
+          const reviewRow = asObject(reviewRaw, reviewContext);
+          const candidateContext = `${reviewContext}.candidate`;
+          const candidateRow = asObject(reviewRow["candidate"], candidateContext);
+          return {
+            reviewId: str(reviewRow, "reviewId", reviewContext),
+            source: str(reviewRow, "source", reviewContext),
+            candidate: {
+              commit: str(candidateRow, "commit", candidateContext),
+              tree: str(candidateRow, "tree", candidateContext),
+              fingerprint: str(candidateRow, "fingerprint", candidateContext),
+            },
+          };
+        })();
+
   const observedAt = optionalNum(row, "observedAt", itemContext);
   const state = oneOf<ActivityState>(row, "state", ACTIVITY_STATES, itemContext);
 
@@ -476,6 +504,7 @@ function parseActivity(raw: unknown, index: number, context: string): Activity {
     ...(completion === undefined ? {} : { completion }),
     ...(observedAt === undefined ? {} : { observedAt }),
     ...(reconciliation === undefined ? {} : { reconciliation }),
+    ...(review === undefined ? {} : { review }),
     updatedAt: num(row, "updatedAt", itemContext),
   };
 }
