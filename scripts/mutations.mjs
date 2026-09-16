@@ -1378,20 +1378,12 @@ export const MUTATIONS = [
     expect: "REFUSES to clear a CLAIMED claim while its owner is still running",
   },
   {
-    id: "an unknowable owner's claim is treated as a gone one",
-    edits: [[SUP_SVC,
-      '      if (holding?.liveness === "UNKNOWN") {',
-      '      if (holding?.liveness === "UNKNOWN" && Number.isNaN(0)) {']],
-    tests: [T_ACTREC],
-    expect: "REFUSES to clear a CLAIMED claim whose owner cannot be checked at all",
-  },
-  {
     id: "the launch patch uses the claim it read at the top of the tick",
     edits: [[SUP_SVC,
       '          return { ok: true, patch: { activeClaim: { ...durable, state: "RUNNING" } } };',
       '          return { ok: true, patch: { activeClaim: { ...claim, state: "RUNNING" } } };']],
     tests: [T_ACTREC],
-    expect: "REFUSES to launch on a claim that is no longer ours, and leaves the rival's claim alone",
+    expect: "carries the rival's field through the launch write, not the copy it read first",
   },
   {
     id: "a displaced supervisor launches anyway",
@@ -1518,14 +1510,6 @@ export const MUTATIONS = [
       "      if (!isAbsolute(path) && Number.isNaN(0)) {"]],
     tests: [T_AV],
     expect: "REFUSES a relative source path rather than resolving it",
-  },
-  {
-    id: "an empty verdict file is read as a verdict",
-    edits: [[FILEVERDICT,
-      "      if (size === 0) {",
-      "      if (size === 0 && Number.isNaN(0)) {"]],
-    tests: [T_AV],
-    expect: "reports an empty file as ABSENT — created is not written",
   },
 
   // ---- AC-9: the dependency is real ---------------------------------------

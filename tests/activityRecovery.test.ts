@@ -995,7 +995,16 @@ describe("TASK-018 AC-13/AC-16: an activeClaim and its activity, together", () =
     }
   });
 
-  it("REFUSES to clear a CLAIMED claim whose owner cannot be checked at all", async () => {
+  /**
+   * ROUND-8 MUTATION RUN. This test was written believing it drove a branch in
+   * `reconcileClaim` that refuses to clear a claim whose holder is unresolvable.
+   * The mutation disabling that branch SURVIVED, which said plainly that the
+   * test proves something else — and it does: `reconcileActivities` refuses the
+   * whole tick first, for every activity whose liveness is AMBIGUOUS, so the
+   * claim is never reached. The branch was deleted; the PROPERTY is real and is
+   * what this now says it checks.
+   */
+  it("stops the tick before an unknowable owner's claim is even considered", async () => {
     const path = await seedClaimAndActivity({ holderAlive: true, claimState: "CLAIMED", unknowable: true });
     const { service, repository } = supervisorOver(path);
     let result;
@@ -1014,6 +1023,106 @@ describe("TASK-018 AC-13/AC-16: an activeClaim and its activity, together", () =
     } finally {
       after.close();
     }
+  });
+
+  /**
+   * ROUND-8 MUTATION RUN, the second survivor. The launch patch spreads the
+   * DURABLE claim rather than the one read at the top of the tick, and swapping
+   * them changed nothing any test could see: the identity check above had
+   * already established the two agree on `actionId`, and no test made them
+   * differ in anything else.
+   *
+   * They can differ. A rival that records which resource the action is using
+   * keeps the same `actionId` and changes the row beside it, and writing the
+   * stale copy back silently reverts that. So the write itself is inspected:
+   * the bytes handed to the repository must carry what durable state says now.
+   */
+  /** A resource the validator knows, and not the one the router chooses here. */
+  const RIVAL_RESOURCE = "codex-cli:gpt-5.6-luna";
+
+  it("carries the rival's field through the launch write, not the copy it read first", async () => {
+    const queued: readonly RoadmapItem[] = [
+      { key: "A", title: "Work", dependsOn: [], status: "PENDING", workClass: "NORMAL_IMPLEMENTATION", order: 1 },
+    ];
+    const path = await seed(queued);
+    const real = createSqliteSupervisorRepository(path);
+    const writes: SupervisorState[] = [];
+    let edited = false;
+
+    const contended = {
+      load: () => real.load(),
+      create: (state: SupervisorState) => real.create(state),
+      readCatalogVersion: () => real.readCatalogVersion(),
+      applyCatalogUpgrade: (next: SupervisorState, expected: number, to: number) =>
+        real.applyCatalogUpgrade(next, expected, to),
+      compareAndSave: async (next: SupervisorState, expected: number) => {
+        writes.push(next);
+        // Between the claim and the launch, a rival annotates the SAME claim.
+        if (!edited && (next.activities ?? []).some((entry) => entry.heartbeat !== undefined)) {
+          edited = true;
+          const rival = createSqliteSupervisorRepository(path);
+          try {
+            const seen = await rival.load();
+            if (seen?.activeClaim !== undefined) {
+              await rival.compareAndSave(
+                {
+                  ...seen,
+                  version: seen.version + 1,
+                  updatedAt: seen.updatedAt + 1,
+                  activeClaim: { ...seen.activeClaim, resourceKey: RIVAL_RESOURCE },
+                },
+                seen.version,
+              );
+            }
+          } finally {
+            rival.close();
+          }
+        }
+        return real.compareAndSave(next, expected);
+      },
+    };
+
+    const base = Date.now();
+    let reading = 0;
+    const probe = scriptedProbe();
+    for (const entry of TEST_CATALOG) {
+      probe.set(entry.provider, entry.model, { state: "AVAILABLE", reason: "scripted", billingMode: "INCLUDED_SUBSCRIPTION" });
+    }
+    try {
+      const service = new SupervisorService({
+        repository: contended,
+        roadmapCatalog: [...queued],
+        probe,
+        executor: { execute: async () => ({ kind: "COMPLETED", detail: "ran" }) },
+        clock: { now: () => base + reading++ * 1_000 },
+        ids: createSequentialIdGenerator(),
+        routingPolicy: DEFAULT_ROUTING_POLICY,
+        resourceCatalog: TEST_CATALOG,
+        liveness: createProcLivenessProbe(),
+        activityLease: (at) => leaseForThisProcess(at),
+        log: () => {},
+      });
+      await service.tick();
+    } finally {
+      real.close();
+    }
+
+    // The LAUNCH write carries a heartbeat and no completion; later writes in
+    // the same tick carry both, and by then the claim has moved on for reasons
+    // that have nothing to do with this guard.
+    const launched = writes.filter((entry) =>
+      (entry.activities ?? []).some(
+        (activity) => activity.heartbeat !== undefined && activity.completion === undefined,
+      ),
+    );
+    assert.ok(launched.length > 0, "no launch write was ever attempted");
+    const last = launched[launched.length - 1];
+    assert.equal(
+      last?.activeClaim?.resourceKey,
+      RIVAL_RESOURCE,
+      "the launch write carried the claim read at the top of the tick, overwriting a newer one",
+    );
+    assert.equal(last?.activeClaim?.state, "RUNNING");
   });
 
   it("still clears a CLAIMED claim whose owner is gone — the positive control", async () => {

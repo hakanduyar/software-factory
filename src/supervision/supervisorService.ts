@@ -748,30 +748,18 @@ export class SupervisorService {
 
     if (claim.state === "CLAIMED") {
       /**
-       * AND AN UNKNOWABLE OWNER IS NOT A GONE ONE.
+       * AN UNKNOWABLE OWNER NEVER ARRIVES HERE, AND THAT IS WHY THERE IS NO
+       * BRANCH FOR ONE (round-8 mutation run).
        *
-       * Clearing the claim is only safe because the launch demonstrably did not
-       * happen AND nobody is still in the window where it might. A lease this
-       * process cannot resolve — another machine, an unreadable `/proc` —
-       * settles neither, and "unknown refuses" is the rule everywhere else in
-       * this mechanism. It leaves the claim alone and says why.
+       * A branch was written for it, refusing to clear a claim whose holder
+       * could not be resolved. The mutation that disabled it SURVIVED: no test
+       * could tell the difference, because `reconcileActivities` runs earlier in
+       * the same tick and refuses outright for every activity whose liveness is
+       * AMBIGUOUS. An unknowable owner stops the tick before the claim is ever
+       * looked at; and with no probe at all, `holding` is `undefined` and the
+       * branch could not fire either way. It was deleted rather than left as
+       * code that reads like a guard and can never be one.
        */
-      if (holding?.liveness === "UNKNOWN") {
-        const unknown =
-          `action ${claim.actionId} is claimed by pid ${holding.lease.pid} on ` +
-          `${JSON.stringify(holding.lease.machine)}, and whether that process is still running cannot be ` +
-          "established from here; refusing to clear a claim that may still be someone's";
-        this.log(`[supervisor] ${unknown}`);
-        return {
-          state,
-          result: {
-            kind: "WAITING_FOR_HUMAN",
-            roadmapKey: claim.roadmapKey,
-            reason: "HUMAN_DECISION_REQUIRED",
-            humanActionRequired: boundedDiagnostic(unknown),
-          },
-        };
-      }
       /**
        * Proves the external launch never happened: a bounded retry is safe.
        *

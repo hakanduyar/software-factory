@@ -66,10 +66,14 @@ export function createFileVerdictSource(): AcceptanceVerdictSource {
         };
       }
 
-      if (size === 0) {
-        // Created but not yet written: still absent, and still not a failure.
-        return { kind: "ABSENT" };
-      }
+      /**
+       * A ZERO-BYTE FILE NEEDS NO BRANCH HERE (round-8 mutation run).
+       *
+       * One was written — "created but not yet written is still absent" — and
+       * the mutation disabling it SURVIVED, because `parseAcceptanceVerdict`
+       * already reads empty text as ABSENT. Two statements of one rule, and the
+       * second one cannot be wrong on its own, so it is gone.
+       */
       if (size > MAX_VERDICT_BYTES) {
         return {
           kind: "NO_VERDICT",

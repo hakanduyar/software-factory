@@ -154,7 +154,19 @@ async function durable(path: string): Promise<SupervisorState> {
  */
 function coldSupervisor(
   path: string,
-  options: { readonly liveness?: "ALIVE" | "GONE" | "UNKNOWN"; readonly onExecute?: () => void } = {},
+  options: {
+    readonly liveness?: "ALIVE" | "GONE" | "UNKNOWN";
+    readonly onExecute?: () => void;
+    /**
+     * A LATER PROCESS HAS A LATER CLOCK, and the default hid a real defect: two
+     * cold supervisors both starting at 10_000 stamped an identical `raisedAt`,
+     * so re-raising the integration gate was indistinguishable from not raising
+     * it, and the mutation that removed the idempotence filter SURVIVED.
+     */
+    readonly startedAt?: number;
+    /** Counts every read of a review's source. */
+    readonly reads?: { count: number };
+  } = {},
 ): { readonly service: SupervisorService; close(): void } {
   const repository = createSqliteSupervisorRepository(path);
   const probe = scriptedProbe();
@@ -165,7 +177,7 @@ function coldSupervisor(
       billingMode: "INCLUDED_SUBSCRIPTION",
     });
   }
-  const base = 10_000;
+  const base = options.startedAt ?? 10_000;
   let reading = 0;
   const service = new SupervisorService({
     repository,
@@ -189,7 +201,12 @@ function coldSupervisor(
      */
     liveness: { check: (lease) => (lease.pid === SUPERVISOR_PID ? "ALIVE" : (options.liveness ?? "GONE")) },
     activityLease: (claimedAt) => ({ ...REVIEWER_LEASE, pid: SUPERVISOR_PID, claimedAt }),
-    acceptanceVerdicts: createFileVerdictSource(),
+    acceptanceVerdicts: {
+      read: (review) => {
+        if (options.reads !== undefined) options.reads.count += 1;
+        return createFileVerdictSource().read(review);
+      },
+    },
     log: () => {},
   });
   return { service, close: () => repository.close() };
@@ -432,7 +449,10 @@ describe("TASK-018: a verdict nobody was told about is consumed from durable sta
     const once = await durable(path);
 
     // H, in the same breath: a brand-new process, after the write landed.
-    const secondRun = coldSupervisor(path);
+    // A different process, an hour later. Its reads are counted, because that is
+    // the question: does a settled review get looked at again at all?
+    const reads = { count: 0 };
+    const secondRun = coldSupervisor(path, { startedAt: 3_600_000, reads });
     try {
       await secondRun.service.tick();
       await secondRun.service.tick();
@@ -442,6 +462,30 @@ describe("TASK-018: a verdict nobody was told about is consumed from durable sta
     const twice = await durable(path);
 
     assert.deepEqual(reviewIn(twice), reviewIn(once), "re-consumption rewrote a settled review");
+    /**
+     * ROUND-8 MUTATION RUN. Dropping the terminal filter from
+     * `reviewsAwaitingVerdict` SURVIVED, because re-reading a settled verdict
+     * re-derives the same activity and the same roadmap patch — the shapes all
+     * match. What it does NOT re-derive is the moment: consuming again raises
+     * the integration gate again, with a new `raisedAt`. The state version is no
+     * use here (an ordinary tick writes its wake time anyway); the timestamp on
+     * the escalation is exactly the thing that only moves when the verdict is
+     * applied a second time.
+     */
+    assert.deepEqual(
+      twice.escalations,
+      once.escalations,
+      "a settled verdict was applied again: the integration gate was re-raised",
+    );
+    /**
+     * ROUND-8 MUTATION RUN. Dropping the terminal filter from
+     * `reviewsAwaitingVerdict` SURVIVED every assertion above, because
+     * re-consuming a settled verdict re-derives values that all compare equal.
+     * The observable difference is upstream of all of it: a review that is
+     * finished is not LOOKED AT again. Asked directly, there is nothing left for
+     * an equal-looking result to hide behind.
+     */
+    assert.equal(reads.count, 0, "a settled review's verdict source was read again");
     assert.equal(
       twice.escalations.filter((entry) => !entry.resolved).length,
       once.escalations.filter((entry) => !entry.resolved).length,
