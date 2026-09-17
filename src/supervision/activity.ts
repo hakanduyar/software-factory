@@ -796,15 +796,34 @@ export function settleReview(
     };
   }
 
-  const settled = settle(
-    activity.completion,
-    input.completion,
-    (value) => `${value.outcome}/${value.detail}@${value.at}`,
-    "a completion",
-    id,
-  );
-  if (settled.kind === "refuse") return { ok: false, problem: settled.problem };
-  if (settled.kind === "noop") {
+  /**
+   * THE MOMENT IS NOT PART OF THE VERDICT (round-8 review, HIGH 3).
+   *
+   * This used `settle`, which compares completions STRUCTURALLY — the round-1
+   * fix, and right for `completeActivity`, where `at` is part of what the owner
+   * OBSERVED. Here it is not. `at` is when a process happened to read a file, so
+   * two supervisors reading the SAME file at 10:00 and 10:02 were recorded as
+   * disagreeing about the verdict itself, and the second refused a settlement
+   * saying exactly what the first one said. Replayability across processes is
+   * what AC-17 asks for, and a clock reading is the one thing two processes can
+   * never agree on. (Changing only the message-formatting function, as the first
+   * attempt at this did, changes nothing: `settle` never used it to compare.)
+   *
+   * The fields are compared one at a time rather than through a joined string,
+   * for the reason round 1 gave: a delimiter inside a value makes two different
+   * records look alike. A different outcome or a different detail still refuses.
+   */
+  const existing = activity.completion;
+  if (existing !== undefined) {
+    if (existing.outcome !== input.completion.outcome || existing.detail !== input.completion.detail) {
+      return {
+        ok: false,
+        problem:
+          `activity ${JSON.stringify(id)} already recorded a completion as ` +
+          `${existing.outcome}/${existing.detail}; refusing to replace it with ` +
+          `${input.completion.outcome}/${input.completion.detail}`,
+      };
+    }
     if (activity.state !== input.state) {
       return {
         ok: false,

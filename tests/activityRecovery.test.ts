@@ -1328,6 +1328,96 @@ describe("TASK-018 AC-16: a supervisor that cannot check liveness schedules noth
     }
   });
 
+  /**
+   * ROUND-8 REVIEW, HIGH 1. Round 7 hardened the NO-PROBE path and left this
+   * one — the branch that actually runs in production — on a raw commit. A
+   * rival advancing the state while a probe-backed classification was being
+   * written turned the refusal into a thrown `ConcurrencyError`: no durable
+   * AMBIGUOUS record, and no refusal either.
+   *
+   * Fixing the case the reviewer reproduced and not its twin is how a defect
+   * comes back wearing different clothes, so both writes of this function now
+   * go through the same retry, recomputed against the fresh list.
+   */
+  it("records a PROBE-BACKED ambiguity even when another supervisor writes first", async () => {
+    const both: readonly RoadmapItem[] = [
+      { key: "A", title: "Work", dependsOn: [], status: "ACTIVE", workClass: "NORMAL_IMPLEMENTATION", order: 1 },
+      { key: "B", title: "Other", dependsOn: [], status: "PENDING", workClass: "NORMAL_IMPLEMENTATION", order: 2 },
+    ];
+    const path = await seed(both);
+    assert.equal(
+      runChild({ path, id: "A:REVIEW:r1", kind: "REVIEW", roadmapKey: "A", progress: 1, ending: "die" }).signal,
+      "SIGKILL",
+    );
+
+    const real = createSqliteSupervisorRepository(path);
+    let interfere = 1;
+    const contended = {
+      load: () => real.load(),
+      create: (state: SupervisorState) => real.create(state),
+      readCatalogVersion: () => real.readCatalogVersion(),
+      applyCatalogUpgrade: (next: SupervisorState, expected: number, to: number) =>
+        real.applyCatalogUpgrade(next, expected, to),
+      compareAndSave: async (next: SupervisorState, expected: number) => {
+        if (interfere > 0 && (next.activities ?? []).some((entry) => entry.reconciliation !== undefined)) {
+          interfere -= 1;
+          const rival = createSqliteSupervisorRepository(path);
+          try {
+            const seen = await rival.load();
+            if (seen !== undefined) {
+              await rival.compareAndSave({ ...seen, version: seen.version + 1, updatedAt: seen.updatedAt + 1 }, seen.version);
+            }
+          } finally {
+            rival.close();
+          }
+        }
+        return real.compareAndSave(next, expected);
+      },
+    };
+
+    const probe = scriptedProbe();
+    for (const entry of TEST_CATALOG) {
+      probe.set(entry.provider, entry.model, { state: "AVAILABLE", reason: "scripted", billingMode: "INCLUDED_SUBSCRIPTION" });
+    }
+    const base = Date.now();
+    let reading = 0;
+    let result;
+    try {
+      const service = new SupervisorService({
+        repository: contended,
+        roadmapCatalog: [...both],
+        probe,
+        executor: { execute: async () => ({ kind: "COMPLETED", detail: "should not run" }) },
+        clock: { now: () => base + reading++ * 1_000 },
+        ids: createSequentialIdGenerator(),
+        routingPolicy: DEFAULT_ROUTING_POLICY,
+        resourceCatalog: TEST_CATALOG,
+        // A probe that CAN be asked and cannot answer — the production shape of
+        // an unresolvable owner, and the branch round 7 left unhardened.
+        liveness: { check: () => "UNKNOWN" },
+        activityLease: (at) => leaseForThisProcess(at),
+        log: () => {},
+      });
+      // It must not THROW, which is what the raw commit did.
+      result = await service.tick();
+    } finally {
+      real.close();
+    }
+
+    assert.match(JSON.stringify(result), /cannot be established as running or finished/, JSON.stringify(result));
+
+    const after = createSqliteSupervisorRepository(path);
+    try {
+      assert.equal(
+        (await after.load())?.activities?.[0]?.reconciliation?.verdict,
+        "AMBIGUOUS",
+        "contention erased the probe-backed classification",
+      );
+    } finally {
+      after.close();
+    }
+  });
+
   it("SAYS SO when the classification cannot be made durable at all", async () => {
     const both: readonly RoadmapItem[] = [
       { key: "A", title: "Work", dependsOn: [], status: "ACTIVE", workClass: "NORMAL_IMPLEMENTATION", order: 1 },

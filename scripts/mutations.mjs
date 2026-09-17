@@ -1512,6 +1512,32 @@ export const MUTATIONS = [
     expect: "REFUSES a relative source path rather than resolving it",
   },
 
+  // ---- round 8: the other half of every guard round 7 half-fixed ----------
+  {
+    id: "a contended write is never retried",
+    edits: [[SUP_SVC,
+      "    for (let attempt = 0; attempt < 5; attempt += 1) {",
+      "    for (let attempt = 0; attempt < 1; attempt += 1) {"]],
+    tests: [T_ACTREC],
+    expect: "records a PROBE-BACKED ambiguity even when another supervisor writes first",
+  },
+  {
+    id: "a review the Factory stopped over is left unclassified",
+    edits: [[SUP_SVC,
+      "          for (const entry of current.filter((candidate) => candidate.review !== undefined && !isTerminal(candidate.state))) {",
+      "          for (const entry of current.filter((candidate) => candidate.review !== undefined && isTerminal(candidate.state))) {"]],
+    tests: [T_VC],
+    expect: "H. a supervisor that has no way to read verdicts REFUSES rather than passing over one",
+  },
+  {
+    id: "the clock that read a verdict becomes part of the verdict",
+    edits: [[ACTIVITY,
+      "    if (existing.outcome !== input.completion.outcome || existing.detail !== input.completion.detail) {",
+      "    if (existing.outcome !== input.completion.outcome || existing.detail !== input.completion.detail || existing.at !== input.completion.at) {"]],
+    tests: [T_VC],
+    expect: "E3. a retry that meets its own verdict already settled by another clock does not refuse",
+  },
+
   // ---- AC-9: the dependency is real ---------------------------------------
   {
     id: "the router stops depending on durable orchestration",

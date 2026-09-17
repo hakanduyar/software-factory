@@ -25,6 +25,7 @@ import { after, describe, it } from "node:test";
 
 import { createSqliteSupervisorRepository } from "../src/adapters/supervision/sqliteSupervisorRepository.js";
 import { createFileVerdictSource } from "../src/adapters/supervision/fileVerdictSource.js";
+import { completionDetail } from "../src/supervision/acceptance.js";
 import type { Activity } from "../src/supervision/activity.js";
 import { anchorFor } from "../src/supervision/provenanceChain.js";
 import { SupervisorService } from "../src/supervision/supervisorService.js";
@@ -374,6 +375,175 @@ describe("TASK-018: a verdict nobody was told about is consumed from durable sta
     );
   });
 
+  /**
+   * ROUND-8 REVIEW, HIGH 3. Test E used the SAME clock for both supervisors,
+   * which is the one thing two processes can never share — and it hid a real
+   * defect: the completion recorded the consuming supervisor's local time, so a
+   * second consumer's replay of the very same verdict was rejected as a
+   * DISAGREEMENT (`PASS@10000` versus `PASS@20000`). Replayability across
+   * processes is exactly what AC-17 asks for.
+   *
+   * The moment is not part of the verdict. A different outcome or a different
+   * detail still refuses; a different clock does not.
+   */
+  it("E2. two supervisors on DIFFERENT clocks still produce exactly one transition", async () => {
+    const source = verdictFile(verdictText({ verdict: "PASS", safe: "YES", critical: 0, high: 0 }));
+    const path = await seed([reviewActivity(source)]);
+
+    const first = coldSupervisor(path, { startedAt: 10_000 });
+    const second = coldSupervisor(path, { startedAt: 20_000 });
+    try {
+      await Promise.all([first.service.tick(), second.service.tick()]);
+    } catch (error) {
+      // A loser may fail its tick; it may not write a second transition, and it
+      // may certainly not refuse the verdict it agrees with.
+      void error;
+    } finally {
+      first.close();
+      second.close();
+    }
+
+    const state = await durable(path);
+    const review = reviewIn(state);
+    assert.equal(review.completion?.outcome, "PASS", "a verdict was lost between two clocks");
+    assert.equal(
+      state.escalations.filter((entry) => !entry.resolved).length,
+      1,
+      "one verdict produced more than one open escalation",
+    );
+
+    // ...and a third, later process replays it without refusing.
+    const third = coldSupervisor(path, { startedAt: 30_000 });
+    let replay;
+    try {
+      replay = await third.service.tick();
+    } finally {
+      third.close();
+    }
+    assert.doesNotMatch(
+      JSON.stringify(replay),
+      /disagrees|already/,
+      `a settled verdict was refused by a later clock: ${JSON.stringify(replay)}`,
+    );
+    assert.deepEqual(reviewIn(await durable(path)).completion, review.completion);
+  });
+
+  /**
+   * The same collision, made deterministic.
+   *
+   * E2's race only reaches the retry if the two ticks interleave just so, and a
+   * guard that is only sometimes exercised is not a guard: restoring the clock
+   * to the comparison SURVIVED E2. Here the rival settles the identical verdict
+   * with an earlier timestamp WHILE this supervisor is writing, so the retry is
+   * guaranteed to meet an already-settled review — and must recognise it as the
+   * same verdict rather than as a disagreement.
+   */
+  it("E3. a retry that meets its own verdict already settled by another clock does not refuse", async () => {
+    const source = verdictFile(verdictText({ verdict: "PASS", safe: "YES", critical: 0, high: 0 }));
+    const path = await seed([reviewActivity(source)]);
+
+    const real = createSqliteSupervisorRepository(path);
+    const RIVAL_AT = 5_000;
+    let interfered = false;
+    const contended = {
+      load: () => real.load(),
+      create: (state: SupervisorState) => real.create(state),
+      readCatalogVersion: () => real.readCatalogVersion(),
+      applyCatalogUpgrade: (next: SupervisorState, expected: number, to: number) =>
+        real.applyCatalogUpgrade(next, expected, to),
+      compareAndSave: async (next: SupervisorState, expected: number) => {
+        if (!interfered && (next.activities ?? []).some((entry) => entry.completion !== undefined)) {
+          interfered = true;
+          const rival = createSqliteSupervisorRepository(path);
+          try {
+            const seen = await rival.load();
+            if (seen !== undefined) {
+              await rival.compareAndSave(
+                {
+                  ...seen,
+                  version: seen.version + 1,
+                  updatedAt: seen.updatedAt + 1,
+                  activities: (seen.activities ?? []).map((entry) =>
+                    entry.id === ACTIVITY_ID
+                      ? {
+                          ...entry,
+                          state: "COMPLETED" as const,
+                          // The SAME verdict, read off the same file, by a
+                          // process whose clock is its own.
+                          completion: {
+                            outcome: "PASS",
+                            detail: completionDetail({
+                              verdict: "PASS",
+                              critical: 0,
+                              high: 0,
+                              safeToCommit: true,
+                              candidate: { ...CANDIDATE },
+                            }),
+                            at: RIVAL_AT,
+                          },
+                          observedAt: RIVAL_AT,
+                          updatedAt: RIVAL_AT,
+                        }
+                      : entry,
+                  ),
+                },
+                seen.version,
+              );
+            }
+          } finally {
+            rival.close();
+          }
+        }
+        return real.compareAndSave(next, expected);
+      },
+    };
+
+    const probe = scriptedProbe();
+    for (const entry of TEST_CATALOG) {
+      probe.set(entry.provider, entry.model, {
+        state: "AVAILABLE",
+        reason: "scripted",
+        billingMode: "INCLUDED_SUBSCRIPTION",
+      });
+    }
+    let reading = 0;
+    let result;
+    try {
+      const service = new SupervisorService({
+        repository: contended,
+        roadmapCatalog: [...ROADMAP],
+        probe,
+        executor: { execute: async () => ({ kind: "COMPLETED", detail: "should not run" }) },
+        clock: { now: () => 90_000 + reading++ * 1_000 },
+        ids: createSequentialIdGenerator(),
+        routingPolicy: DEFAULT_ROUTING_POLICY,
+        resourceCatalog: TEST_CATALOG,
+        liveness: { check: (lease) => (lease.pid === SUPERVISOR_PID ? "ALIVE" : "GONE") },
+        activityLease: (claimedAt) => ({ ...REVIEWER_LEASE, pid: SUPERVISOR_PID, claimedAt }),
+        acceptanceVerdicts: createFileVerdictSource(),
+        log: () => {},
+      });
+      result = await service.tick();
+    } finally {
+      real.close();
+    }
+
+    assert.equal(interfered, true, "the premise is wrong: no collision happened");
+    assert.doesNotMatch(
+      JSON.stringify(result),
+      /could not be recorded/,
+      `the same verdict, read by a different clock, was refused as a disagreement: ${JSON.stringify(result)}`,
+    );
+
+    const state = await durable(path);
+    assert.equal(reviewIn(state).completion?.at, RIVAL_AT, "the first settlement's moment was overwritten");
+    assert.equal(
+      state.roadmap[0]?.status,
+      "WAITING_FOR_HUMAN_REQUIRED",
+      "the accepted candidate never reached its gate",
+    );
+  });
+
   it("F. a verdict for a different candidate is REFUSED, not applied", async () => {
     const source = verdictFile(
       verdictText({
@@ -535,6 +705,20 @@ describe("TASK-018: a verdict nobody was told about is consumed from durable sta
 
     assert.match(JSON.stringify(result), /no way to read a verdict back/, JSON.stringify(result));
     assert.equal(executed, 0, "work was scheduled while a review's result was unreachable");
-    assert.equal(reviewIn(await durable(path)).completion, undefined);
+    const stopped = await durable(path);
+    assert.equal(reviewIn(stopped).completion, undefined);
+    /**
+     * ROUND-8 REVIEW, HIGH 2. This refusal returns BEFORE reconciliation, so it
+     * used to leave the review with no `reconciliation` at all — and AC-16 asks
+     * that every non-terminal activity carry a durable conclusion. "The tick
+     * stopped for execution reasons" does not exempt the activity it stopped
+     * over; a fresh process must find the reason on the record.
+     */
+    assert.equal(
+      reviewIn(stopped).reconciliation?.verdict,
+      "AMBIGUOUS",
+      "a review the Factory stopped over was left unclassified",
+    );
+    assert.match(reviewIn(stopped).reconciliation?.detail ?? "", /verdict back/);
   });
 });

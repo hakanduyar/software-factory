@@ -3429,9 +3429,47 @@ export class SupervisorService {
         "supervisor has no way to read a verdict back; refusing to decide anything while a review's result is " +
         "unreachable";
       this.log(`[supervisor] ${problem}`);
-      return {
+      /**
+       * AND IT IS CLASSIFIED, NOT ONLY REFUSED (round-8 review, HIGH 2).
+       *
+       * This refusal returns BEFORE reconciliation, so returning here left the
+       * reviews with no `reconciliation` at all — AC-16 asks that every
+       * non-terminal activity carry a durable conclusion, and "the tick stopped
+       * for execution reasons" does not exempt the activities it stopped over.
+       * It is the round-6 lesson again, arriving through the door round 7 built.
+       */
+      const noted = await this.commitActivityChange(
         state,
-        refusal: { roadmapKey: awaiting[0]!.roadmapKey, problem: boundedDiagnostic(problem) },
+        "record that a review's verdict is unreachable",
+        (current) => {
+          let classified = current;
+          let changed = false;
+          for (const entry of current.filter((candidate) => candidate.review !== undefined && !isTerminal(candidate.state))) {
+            const recorded = recordReconciliation(classified, entry.id, {
+              verdict: "AMBIGUOUS",
+              at: this.deps.clock.now(),
+              detail: boundedDiagnostic(
+                `review ${JSON.stringify(entry.id)} is ${entry.state} and this supervisor has no way to read a ` +
+                  "verdict back, so whether it has finished cannot be established",
+              ),
+            });
+            if (!recorded.ok) return recorded;
+            classified = recorded.activities;
+            changed = changed || recorded.changed;
+          }
+          return { ok: true, activities: classified, changed };
+        },
+      );
+      return {
+        state: noted.state,
+        refusal: {
+          roadmapKey: awaiting[0]!.roadmapKey,
+          problem: boundedDiagnostic(
+            noted.recorded
+              ? problem
+              : `${problem}. Worse: that could not be recorded durably either (${noted.problem ?? "unknown reason"})`,
+          ),
+        },
       };
     }
 
@@ -3656,6 +3694,82 @@ export class SupervisorService {
       : {};
   }
 
+  /**
+   * Every conclusion a later observer draws, applied to a list — and NOTHING
+   * else.
+   *
+   * Pure, and a function of the list it is given rather than of the one read at
+   * the top of the tick, because it is recomputed on every retry attempt. That
+   * is the whole reason it exists as a function: the two writes below used to
+   * carry a list computed once, which is fine until somebody else writes first.
+   */
+  private classifyAll(
+    activities: readonly Activity[],
+    now: Timestamp,
+    probe: LivenessProbe,
+  ): TransitionVerdict {
+    let next = activities;
+    let changed = false;
+    for (const activity of activities) {
+      const verdict = classifyActivity(activity, { now, stallAfterMs: this.stallAfterMs() }, probe);
+      if (verdict === undefined) continue;
+      const recorded = recordReconciliation(next, activity.id, {
+        verdict: verdict.verdict,
+        at: now,
+        detail: boundedDiagnostic(verdict.detail),
+      });
+      if (!recorded.ok) {
+        this.log(`[supervisor] could not record a reconciliation verdict: ${recorded.problem}`);
+        continue;
+      }
+      if (recorded.changed) {
+        this.log(`[supervisor] ${verdict.verdict}: ${verdict.detail}`);
+      }
+      next = recorded.activities;
+      changed = changed || recorded.changed;
+    }
+    return { ok: true, activities: next, changed };
+  }
+
+  /**
+   * AC-20's one recovery action, recomputed against whatever the state says NOW.
+   *
+   * An item with an unresolved claim is left alone: `reconcileClaim` owns that
+   * item and is stricter, and both mechanisms firing once produced a requeue
+   * that an escalation then overrode — the right answer reached by accident,
+   * through two writes that disagreed.
+   */
+  private requeueCrashed(
+    fresh: SupervisorState,
+    now: Timestamp,
+    probe: LivenessProbe,
+  ): Partial<SupervisorState> {
+    const classified = this.classifyAll(fresh.activities ?? [], now, probe);
+    const claimed = fresh.activeClaim?.roadmapKey;
+    const requeue = new Set(
+      crashedItemsToRequeue(classified.ok ? classified.activities : (fresh.activities ?? []), fresh.roadmap).filter(
+        (key) => key !== claimed,
+      ),
+    );
+    if (requeue.size === 0) {
+      // Nothing to move, and an empty patch is what keeps an idle tick from
+      // writing the roadmap back to itself forever.
+      return {};
+    }
+    return {
+      roadmap: fresh.roadmap.map((item) => {
+        if (!requeue.has(item.key)) return item;
+        this.log(`[supervisor] returning ${item.key} to the queue: its owner crashed`);
+        /**
+         * BACKWARDS, into the queue it came from, and never anywhere else. This
+         * is the whole of AC-20 in one expression: a crash is a reason to try
+         * again and never a reason to be further along than before.
+         */
+        return { ...item, status: RECOVERY_TO_STATUS };
+      }),
+    };
+  }
+
   private async reconcileActivities(
     state: SupervisorState,
   ): Promise<{ readonly state: SupervisorState; readonly refusal?: string }> {
@@ -3758,27 +3872,11 @@ export class SupervisorService {
     }
 
     const now = this.deps.clock.now();
-    let next = activities;
-    let changed = false;
-
-    for (const activity of activities) {
-      const verdict = classifyActivity(activity, { now, stallAfterMs: this.stallAfterMs() }, probe);
-      if (verdict === undefined) continue;
-      const recorded = recordReconciliation(next, activity.id, {
-        verdict: verdict.verdict,
-        at: now,
-        detail: boundedDiagnostic(verdict.detail),
-      });
-      if (!recorded.ok) {
-        this.log(`[supervisor] could not record a reconciliation verdict: ${recorded.problem}`);
-        continue;
-      }
-      if (recorded.changed) {
-        this.log(`[supervisor] ${verdict.verdict}: ${verdict.detail}`);
-      }
-      next = recorded.activities;
-      changed = changed || recorded.changed;
-    }
+    const classified = this.classifyAll(activities, now, probe);
+    // Only the LIST is read here, to decide whether anything is AMBIGUOUS.
+    // Whether it CHANGED is decided by the write below, which recomputes the
+    // classification against whatever the state says at that moment.
+    const next = classified.ok ? classified.activities : activities;
 
     /**
      * AMBIGUOUS REFUSES THE TICK (round-5 review, HIGH 1).
@@ -3795,12 +3893,34 @@ export class SupervisorService {
      */
     const ambiguous = next.filter((entry) => entry.reconciliation?.verdict === "AMBIGUOUS");
     if (ambiguous.length > 0) {
-      const committed = changed ? await this.commit(state, { ...state, activities: next }) : state;
+      /**
+       * AND THIS WRITE IS RETRIED TOO (round-8 review, HIGH 1).
+       *
+       * Round 7 hardened the NO-PROBE path and left this one on a raw commit —
+       * the same defect, one branch over, in the branch that actually runs in
+       * production. A rival advancing the state here turned the refusal into a
+       * thrown `ConcurrencyError`: no durable AMBIGUOUS record, and no refusal.
+       * Fixing the case you reproduced and not its twin is how a defect comes
+       * back wearing different clothes.
+       */
+      const written = await this.commitActivityChange(
+        state,
+        "record why work in flight cannot be established",
+        (current) => this.classifyAll(current, now, probe),
+      );
       const problem =
         `${ambiguous.length} activit${ambiguous.length === 1 ? "y" : "ies"} cannot be established as running or ` +
         `finished (${ambiguous.map((entry) => entry.id).join(", ")}); refusing to schedule further work`;
       this.log(`[supervisor] ${problem}`);
-      return { state: committed, refusal: boundedDiagnostic(problem) };
+      return {
+        state: written.state,
+        refusal: boundedDiagnostic(
+          written.recorded
+            ? problem
+            : `${problem}. Worse: the reason could not be recorded durably either ` +
+                `(${written.problem ?? "unknown reason"})`,
+        ),
+      };
     }
 
     /**
@@ -3831,29 +3951,20 @@ export class SupervisorService {
      * Precedence is explicit now: the claim decides for its own item, and this
      * re-queues everything else.
      */
-    const claimed = state.activeClaim?.roadmapKey;
-    const requeue = new Set(
-      crashedItemsToRequeue(next, state.roadmap).filter((key) => key !== claimed),
+    const written = await this.commitActivityChange(
+      state,
+      "reconcile the work in flight",
+      (current) => this.classifyAll(current, now, probe),
+      (fresh) => ({ ok: true, patch: this.requeueCrashed(fresh, now, probe) }),
     );
-    const roadmap =
-      requeue.size === 0
-        ? state.roadmap
-        : state.roadmap.map((item) => {
-            if (!requeue.has(item.key)) return item;
-            this.log(`[supervisor] returning ${item.key} to the queue: its owner crashed`);
-            /**
-             * BACKWARDS, into the queue it came from, and never anywhere else.
-             * This is the whole of AC-20 in one expression: a crash is a reason
-             * to try again and never a reason to be further along than before.
-             */
-            return { ...item, status: RECOVERY_TO_STATUS };
-          });
-    changed = changed || requeue.size > 0;
-
-    if (!changed) {
-      return { state };
+    if (!written.recorded) {
+      const problem =
+        `work in flight could not be reconciled (${written.problem ?? "unknown reason"}); refusing to schedule ` +
+        "further work while what is running is unrecorded";
+      this.log(`[supervisor] ${problem}`);
+      return { state: written.state, refusal: boundedDiagnostic(problem) };
     }
-    return { state: await this.commit(state, { ...state, activities: next, roadmap }) };
+    return { state: written.state };
   }
 
   /**
