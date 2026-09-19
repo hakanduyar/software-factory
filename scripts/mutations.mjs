@@ -1442,8 +1442,8 @@ export const MUTATIONS = [
   {
     id: "a review with nowhere to read its verdict is passed over",
     edits: [[SUP_SVC,
-      "      return {\n        state,\n        refusal: { roadmapKey: awaiting[0]!.roadmapKey, problem: boundedDiagnostic(problem) },\n      };",
-      "      return { state };"]],
+      "      return { state: noted.state, refusal: unreachable };",
+      "      void unreachable;\n      return { state: noted.state };"]],
     tests: [T_VC],
     expect: "H. a supervisor that has no way to read verdicts REFUSES rather than passing over one",
   },

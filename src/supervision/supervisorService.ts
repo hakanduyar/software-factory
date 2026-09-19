@@ -3460,17 +3460,15 @@ export class SupervisorService {
           return { ok: true, activities: classified, changed };
         },
       );
-      return {
-        state: noted.state,
-        refusal: {
-          roadmapKey: awaiting[0]!.roadmapKey,
-          problem: boundedDiagnostic(
-            noted.recorded
-              ? problem
-              : `${problem}. Worse: that could not be recorded durably either (${noted.problem ?? "unknown reason"})`,
-          ),
-        },
+      const unreachable = {
+        roadmapKey: awaiting[0]!.roadmapKey,
+        problem: boundedDiagnostic(
+          noted.recorded
+            ? problem
+            : `${problem}. Worse: that could not be recorded durably either (${noted.problem ?? "unknown reason"})`,
+        ),
       };
+      return { state: noted.state, refusal: unreachable };
     }
 
     let current = state;
