@@ -2340,6 +2340,231 @@ describe("TASK-018 AC-17: an interrupted transition is never half-applied", () =
 // AC-19 — a lost notification changes nothing
 // =====================================================================
 
+describe("TASK-018 AC-16/AC-17: one tick draws one conclusion", () => {
+  const both: readonly RoadmapItem[] = [
+    { key: "A", title: "Work", dependsOn: [], status: "ACTIVE", workClass: "NORMAL_IMPLEMENTATION", order: 1 },
+    { key: "B", title: "Other", dependsOn: [], status: "PENDING", workClass: "NORMAL_IMPLEMENTATION", order: 2 },
+  ];
+
+  function readyProbe() {
+    const probe = scriptedProbe();
+    for (const entry of TEST_CATALOG) {
+      probe.set(entry.provider, entry.model, { state: "AVAILABLE", reason: "scripted", billingMode: "INCLUDED_SUBSCRIPTION" });
+    }
+    return probe;
+  }
+
+  /**
+   * ROUND-9 REVIEW, HIGH 1 — the reviewer's own reproduction.
+   *
+   * `classifyAll` and `requeueCrashed` each asked the liveness probe, so a
+   * process that exited between the two calls was LIVE to one and GONE to the
+   * other. The write then carried a durable `LIVE` classification beside a
+   * roadmap item requeued as crashed: two records of one fact, written
+   * together, contradicting each other.
+   *
+   * Recomputing per attempt was the round-8 fix and is still right. What was
+   * wrong is that recomputing also re-OBSERVED.
+   */
+  it("asks about a lease exactly ONCE, so two readers of one tick cannot disagree", async () => {
+    const path = await seed(both);
+    assert.equal(
+      runChild({ path, id: "A:REVIEW:r1", kind: "REVIEW", roadmapKey: "A", progress: 1, ending: "die" }).signal,
+      "SIGKILL",
+    );
+
+    /**
+     * THE COUNT IS THE TEST, and deliberately so.
+     *
+     * The first version of this test flapped the probe — ALIVE, then GONE — and
+     * asserted that the classification and the requeue agreed. It passed with
+     * the fix REMOVED, because which of the two readers sees the flip depends on
+     * how many times each happens to look: a test that reproduces a race only
+     * when the call counts line up proves nothing on the day they change.
+     *
+     * The invariant itself is countable. One tick draws one conclusion about one
+     * lease, so the probe is asked once — and a second reader cannot disagree
+     * with the first about something it never asked.
+     */
+    const asked = new Map<number, number>();
+    const flapping = {
+      check: (lease: { readonly pid: number }) => {
+        asked.set(lease.pid, (asked.get(lease.pid) ?? 0) + 1);
+        return "GONE" as const;
+      },
+    };
+
+    const repository = createSqliteSupervisorRepository(path);
+    const base = Date.now();
+    let reading = 0;
+    try {
+      const service = new SupervisorService({
+        repository,
+        roadmapCatalog: [...both],
+        probe: readyProbe(),
+        executor: { execute: async () => ({ kind: "COMPLETED", detail: "ran" }) },
+        clock: { now: () => base + reading++ * 1_000 },
+        ids: createSequentialIdGenerator(),
+        routingPolicy: DEFAULT_ROUTING_POLICY,
+        resourceCatalog: TEST_CATALOG,
+        liveness: flapping,
+        activityLease: (at) => leaseForThisProcess(at),
+        log: () => {},
+      });
+      await service.tick();
+    } finally {
+      repository.close();
+    }
+
+    const after = createSqliteSupervisorRepository(path);
+    try {
+      const state = await after.load();
+      const verdict = state?.activities?.[0]?.reconciliation?.verdict;
+      const status = state?.roadmap.find((item) => item.key === "A")?.status;
+      assert.ok(verdict !== undefined, "nothing was classified at all");
+      assert.ok(asked.size >= 1, "the premise is wrong: liveness was never consulted");
+      /**
+       * PER LEASE, not per tick: one tick legitimately asks about several
+       * different leases (its own, when it claims work). What it must not do is
+       * ask about the SAME one twice and get two answers.
+       */
+      const repeated = [...asked.entries()].filter(([, times]) => times > 1);
+      assert.deepEqual(
+        repeated,
+        [],
+        `these leases were asked about more than once in a single tick: ${JSON.stringify(repeated)}`,
+      );
+      // ...and the conclusion the single answer implies is the one written.
+      assert.equal(verdict, "CRASHED", `expected a settled conclusion, got ${verdict}`);
+      // Back in the queue: recovery writes PENDING, and the same tick's ordinary
+      // eligibility pass may then promote it, which is not recovery advancing it.
+      assert.ok(
+        status === "PENDING" || status === "ELIGIBLE",
+        `a crashed owner's item was not returned to the queue; it is ${status}`,
+      );
+    } finally {
+      after.close();
+    }
+  });
+
+  /**
+   * ROUND-9 REVIEW, HIGH 2. The ambiguity check read the classification computed
+   * from the state as it was READ; the write beneath it recomputes against the
+   * state as it turned out to BE. So a retry could persist an AMBIGUOUS verdict
+   * that nothing then looked at, and the tick ran a different item to DONE in
+   * the same breath that recorded it.
+   *
+   * Here a rival adds an activity whose owner this supervisor cannot resolve,
+   * in the instant between the read and the write.
+   */
+  it("REFUSES when the write it just made recorded an ambiguity", async () => {
+    const path = await seed(both);
+    assert.equal(
+      runChild({ path, id: "A:REVIEW:r1", kind: "REVIEW", roadmapKey: "A", progress: 1, ending: "die" }).signal,
+      "SIGKILL",
+    );
+
+    const real = createSqliteSupervisorRepository(path);
+    const STRANGER = 4_242_042;
+    let interfere = 1;
+    const contended = {
+      load: () => real.load(),
+      create: (state: SupervisorState) => real.create(state),
+      readCatalogVersion: () => real.readCatalogVersion(),
+      applyCatalogUpgrade: (next: SupervisorState, expected: number, to: number) =>
+        real.applyCatalogUpgrade(next, expected, to),
+      compareAndSave: async (next: SupervisorState, expected: number) => {
+        if (interfere > 0 && (next.activities ?? []).some((entry) => entry.reconciliation !== undefined)) {
+          interfere -= 1;
+          const rival = createSqliteSupervisorRepository(path);
+          try {
+            const seen = await rival.load();
+            if (seen !== undefined) {
+              await rival.compareAndSave(
+                {
+                  ...seen,
+                  version: seen.version + 1,
+                  updatedAt: seen.updatedAt + 1,
+                  activities: [
+                    ...(seen.activities ?? []),
+                    {
+                      id: "B:REVIEW:r1",
+                      kind: "REVIEW",
+                      roadmapKey: "B",
+                      state: "RUNNING" as const,
+                      lease: {
+                        pid: STRANGER,
+                        processStartedAt: 1,
+                        machine: "somewhere-else",
+                        boot: "another-boot",
+                        claimedAt: 1_000,
+                      },
+                      heartbeat: { at: 1_000, progress: 1 },
+                      updatedAt: 1_000,
+                    },
+                  ],
+                },
+                seen.version,
+              );
+            }
+          } finally {
+            rival.close();
+          }
+        }
+        return real.compareAndSave(next, expected);
+      },
+    };
+
+    let executorCalls = 0;
+    const base = Date.now();
+    let reading = 0;
+    let result;
+    try {
+      const service = new SupervisorService({
+        repository: contended,
+        roadmapCatalog: [...both],
+        probe: readyProbe(),
+        executor: {
+          execute: async () => {
+            executorCalls += 1;
+            return { kind: "COMPLETED", detail: "should not run" };
+          },
+        },
+        clock: { now: () => base + reading++ * 1_000 },
+        ids: createSequentialIdGenerator(),
+        routingPolicy: DEFAULT_ROUTING_POLICY,
+        resourceCatalog: TEST_CATALOG,
+        // The dead child is GONE; the stranger's machine is not ours.
+        liveness: { check: (lease) => (lease.pid === STRANGER ? "UNKNOWN" : "GONE") },
+        activityLease: (at) => leaseForThisProcess(at),
+        log: () => {},
+      });
+      result = await service.tick();
+    } finally {
+      real.close();
+    }
+
+    assert.match(
+      JSON.stringify(result),
+      /cannot be established as running or finished/,
+      `an ambiguity was recorded and the tick carried on: ${JSON.stringify(result)}`,
+    );
+    assert.equal(executorCalls, 0, "work was scheduled in the same tick that recorded an ambiguity");
+
+    const after = createSqliteSupervisorRepository(path);
+    try {
+      const state = await after.load();
+      assert.notEqual(state?.roadmap.find((item) => item.key === "B")?.status, "DONE");
+      assert.ok(
+        (state?.activities ?? []).some((entry) => entry.reconciliation?.verdict === "AMBIGUOUS"),
+        "the ambiguity it refused over was not recorded",
+      );
+    } finally {
+      after.close();
+    }
+  });
+});
+
 describe("TASK-018 AC-19: a completion nobody was told about is still found", () => {
   it("is discoverable from the database by a process that was never notified", async () => {
     const path = await seed();

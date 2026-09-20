@@ -458,11 +458,34 @@ describe("TASK-018: a verdict nobody was told about is consumed from durable sta
           try {
             const seen = await rival.load();
             if (seen !== undefined) {
+              /**
+               * A REAL RIVAL WRITES BOTH HALVES.
+               *
+               * The first version of this fixture settled only the activity,
+               * which no supervisor can actually produce: the settlement and the
+               * roadmap move travel in ONE write. Round 9's HIGH 3 fix made that
+               * difference visible — an activity settled with the roadmap left
+               * behind is a half-applied state, and the item ended BLOCKED
+               * because its claim outlived the review. The fixture models what a
+               * rival really writes.
+               */
+              const { activeClaim: _released, ...withoutClaim } = seen;
+              void _released;
               await rival.compareAndSave(
                 {
-                  ...seen,
+                  ...withoutClaim,
                   version: seen.version + 1,
                   updatedAt: seen.updatedAt + 1,
+                  roadmap: seen.roadmap.map((item) =>
+                    item.key === "A"
+                      ? {
+                          ...item,
+                          status: "WAITING_FOR_HUMAN_REQUIRED" as const,
+                          detail: "accepted by independent review",
+                          humanActionRequired: `Integrate candidate ${CANDIDATE.commit} under ADR-0002.`,
+                        }
+                      : item,
+                  ),
                   activities: (seen.activities ?? []).map((entry) =>
                     entry.id === ACTIVITY_ID
                       ? {
@@ -542,6 +565,129 @@ describe("TASK-018: a verdict nobody was told about is consumed from durable sta
       "WAITING_FOR_HUMAN_REQUIRED",
       "the accepted candidate never reached its gate",
     );
+  });
+
+  /**
+   * ROUND-9 REVIEW, HIGH 3 — and the sharp half of it.
+   *
+   * `settleReview` correctly made a second settlement a no-op, and the ROADMAP
+   * patch travelling beside it was applied anyway. So a second consumer reset an
+   * item the first consumer had already released AND already started work on —
+   * back to ELIGIBLE, to be claimed and launched a second time. Two real
+   * supervisors consuming one CHANGES_REQUIRED each ran remediation.
+   *
+   * Idempotence has to cover the WHOLE transition, not the half of it that
+   * happens to live in the activity list.
+   */
+  it("E4. does not re-release an item a previous consumer already released and started", async () => {
+    const source = verdictFile(verdictText({ verdict: "CHANGES_REQUIRED", safe: "NO", critical: 0, high: 2 }));
+    const path = await seed([reviewActivity(source)]);
+
+    const real = createSqliteSupervisorRepository(path);
+    const RIVAL_AT = 5_000;
+    let interfered = false;
+    const contended = {
+      load: () => real.load(),
+      create: (state: SupervisorState) => real.create(state),
+      readCatalogVersion: () => real.readCatalogVersion(),
+      applyCatalogUpgrade: (next: SupervisorState, expected: number, to: number) =>
+        real.applyCatalogUpgrade(next, expected, to),
+      compareAndSave: async (next: SupervisorState, expected: number) => {
+        if (!interfered && (next.activities ?? []).some((entry) => entry.completion !== undefined)) {
+          interfered = true;
+          const rival = createSqliteSupervisorRepository(path);
+          try {
+            const seen = await rival.load();
+            if (seen !== undefined) {
+              const { activeClaim: _released, ...withoutClaim } = seen;
+              void _released;
+              await rival.compareAndSave(
+                {
+                  ...withoutClaim,
+                  version: seen.version + 1,
+                  updatedAt: seen.updatedAt + 1,
+                  // The rival consumed it AND has already started remediation.
+                  roadmap: seen.roadmap.map((item) =>
+                    item.key === "A" ? { ...item, status: "ACTIVE" as const, detail: "remediation running" } : item,
+                  ),
+                  activities: (seen.activities ?? []).map((entry) =>
+                    entry.id === ACTIVITY_ID
+                      ? {
+                          ...entry,
+                          state: "COMPLETED" as const,
+                          completion: {
+                            outcome: "CHANGES_REQUIRED",
+                            detail: completionDetail({
+                              verdict: "CHANGES_REQUIRED",
+                              critical: 0,
+                              high: 2,
+                              safeToCommit: false,
+                              candidate: { ...CANDIDATE },
+                            }),
+                            at: RIVAL_AT,
+                          },
+                          observedAt: RIVAL_AT,
+                          updatedAt: RIVAL_AT,
+                        }
+                      : entry,
+                  ),
+                },
+                seen.version,
+              );
+            }
+          } finally {
+            rival.close();
+          }
+        }
+        return real.compareAndSave(next, expected);
+      },
+    };
+
+    const probe = scriptedProbe();
+    for (const entry of TEST_CATALOG) {
+      probe.set(entry.provider, entry.model, {
+        state: "AVAILABLE",
+        reason: "scripted",
+        billingMode: "INCLUDED_SUBSCRIPTION",
+      });
+    }
+    let reading = 0;
+    let executed = 0;
+    try {
+      const service = new SupervisorService({
+        repository: contended,
+        roadmapCatalog: [...ROADMAP],
+        probe,
+        executor: {
+          execute: async () => {
+            executed += 1;
+            return { kind: "COMPLETED", detail: "remediation" };
+          },
+        },
+        clock: { now: () => 90_000 + reading++ * 1_000 },
+        ids: createSequentialIdGenerator(),
+        routingPolicy: DEFAULT_ROUTING_POLICY,
+        resourceCatalog: TEST_CATALOG,
+        liveness: { check: (lease) => (lease.pid === SUPERVISOR_PID ? "ALIVE" : "GONE") },
+        activityLease: (claimedAt) => ({ ...REVIEWER_LEASE, pid: SUPERVISOR_PID, claimedAt }),
+        acceptanceVerdicts: createFileVerdictSource(),
+        log: () => {},
+      });
+      await service.tick();
+    } finally {
+      real.close();
+    }
+
+    assert.equal(interfered, true, "the premise is wrong: no collision happened");
+
+    const state = await durable(path);
+    assert.equal(
+      state.roadmap[0]?.status,
+      "ACTIVE",
+      "an item another consumer had already released and started was put back in the queue",
+    );
+    assert.equal(executed, 0, "remediation was launched a second time for one verdict");
+    assert.equal(reviewIn(state).completion?.at, RIVAL_AT, "the first consumption was overwritten");
   });
 
   it("F. a verdict for a different candidate is REFUSED, not applied", async () => {

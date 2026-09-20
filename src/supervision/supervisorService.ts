@@ -41,6 +41,7 @@ import {
   unobservedCompletions,
   type Activity,
   type ActivityLease,
+  type Liveness,
   type LivenessProbe,
   type TransitionVerdict,
 } from "./activity.js";
@@ -220,6 +221,47 @@ export type AlongsideVerdict =
  * retrying one of those is how a corruption guard turns into five attempts at
  * corrupting.
  */
+/**
+ * Whether somebody has ALREADY consumed this review.
+ *
+ * ROUND-9 REVIEW, HIGH 3. `settleReview` made a second settlement a correct
+ * no-op, and the patch travelling beside it was applied anyway — so two
+ * supervisors consuming one CHANGES_REQUIRED each released the item and each
+ * launched remediation. Idempotence has to cover the WHOLE transition, not the
+ * half of it that happens to live in the activity list.
+ *
+ * Observed-and-terminal is the mark, because the observation is written by
+ * whoever applied the verdict, in the same write as the roadmap move it
+ * accompanies. If it is there, the move has already happened.
+ */
+function alreadySettled(state: SupervisorState, activityId: string): boolean {
+  const activity = (state.activities ?? []).find((entry) => entry.id === activityId);
+  return activity !== undefined && isTerminal(activity.state) && activity.observedAt !== undefined;
+}
+
+/**
+ * One answer per lease, for the life of one tick.
+ *
+ * Wrapping rather than caching inside the probe, because the probe is a PORT: a
+ * `/proc` read that answers differently a second later is not wrong, it is
+ * honest. What must not differ is two answers used inside ONE decision.
+ */
+function memoisedLiveness(probe: LivenessProbe): LivenessProbe {
+  const seen = new Map<string, Liveness>();
+  return {
+    check(lease) {
+      const key = JSON.stringify([lease.pid, lease.processStartedAt, lease.machine, lease.boot]);
+      const already = seen.get(key);
+      if (already !== undefined) {
+        return already;
+      }
+      const answer = probe.check(lease);
+      seen.set(key, answer);
+      return answer;
+    },
+  };
+}
+
 function isStaleSnapshot(error: unknown): boolean {
   return error instanceof ConcurrencyError || error instanceof ProvenanceRegressionError;
 }
@@ -349,11 +391,32 @@ export class SupervisorService {
    * `REFUSAL` has no field a basis could ride in, no matter what legitimate
    * housekeeping was committed before the refusal fired.
    */
+  /** Set for the duration of one tick; see `tick`. */
+  private tickProbe: LivenessProbe | undefined;
+
   async tick(): Promise<TickResult> {
     let outcome: TickOutcome;
+    /**
+     * ONE TICK, ONE ANSWER ABOUT ONE LEASE (round-9 review, HIGH 1).
+     *
+     * The first version of this fix memoised inside `reconcileActivities`, and
+     * a test that simply COUNTED the calls showed the probe still being asked
+     * twice: `reconcileClaim` and the claim path ask as well, and they are the
+     * readers whose disagreement decides whether a live owner keeps its claim.
+     * Scoped to one function, the fix would have closed the case the reviewer
+     * reproduced and left the neighbouring ones open — which is the exact
+     * pattern the last three rounds have been about.
+     *
+     * The memo lasts for the tick and is dropped with it, because a `/proc`
+     * read that answers differently a minute later is not wrong; two answers
+     * used inside ONE decision are.
+     */
+    this.tickProbe = this.deps.liveness === undefined ? undefined : memoisedLiveness(this.deps.liveness);
     try {
       outcome = await this.runTick();
+      this.tickProbe = undefined;
     } catch (error) {
+      this.tickProbe = undefined;
       /**
        * A CORRUPT RECORD IS AN ANSWER, NOT AN EXCEPTION (round-8 HIGH).
        *
@@ -719,7 +782,7 @@ export class SupervisorService {
      * holder means this supervisor stands down: the claim is THEIRS and is left
      * exactly where it is, and the refusal names who has it (AC-13).
      */
-    const probe = this.deps.liveness;
+    const probe = this.livenessProbe();
     const owner = (state.activities ?? []).find(
       (entry) => entry.id === canonicalActivityId(claim.roadmapKey, claim.kind, claim.attempt),
     );
@@ -1790,7 +1853,7 @@ export class SupervisorService {
      * replaces the other, and `activeClaim` is untouched.
      */
     const activityId = canonicalActivityId(item.key, action.kind, attempt);
-    const probe = this.deps.liveness;
+    const probe = this.livenessProbe();
     const leaseSource = this.deps.activityLease;
     const lease = leaseSource?.(this.deps.clock.now());
 
@@ -3487,7 +3550,7 @@ export class SupervisorService {
        * that a failed review would abandon a review still in progress.
        */
       if (reading.kind !== "VERDICT") {
-        const probe = this.deps.liveness;
+        const probe = this.livenessProbe();
         const gone =
           probe !== undefined && activity.lease !== undefined && probe.check(activity.lease) === "GONE";
         if (!gone) continue;
@@ -3628,6 +3691,9 @@ export class SupervisorService {
     status: "ELIGIBLE",
     detail: string,
   ): AlongsideVerdict {
+    if (alreadySettled(fresh, activity.id)) {
+      return { ok: true, patch: {} };
+    }
     return {
       ok: true,
       patch: {
@@ -3648,6 +3714,9 @@ export class SupervisorService {
    * is made from durable state by whatever holds that authority.
    */
   private acceptedReviewed(fresh: SupervisorState, activity: Activity, commit: string): AlongsideVerdict {
+    if (alreadySettled(fresh, activity.id)) {
+      return { ok: true, patch: {} };
+    }
     const action =
       `Independent review accepted candidate ${commit} for ${activity.roadmapKey}. Integrate it under ADR-0002 ` +
       "after re-checking that the reviewed tree is the tree being integrated.";
@@ -3768,6 +3837,15 @@ export class SupervisorService {
     };
   }
 
+  /**
+   * The liveness probe for THIS tick: memoised, so every reader of one tick
+   * sees the same answer about the same lease. Outside a tick it is the raw
+   * dependency, which is what a direct caller should get.
+   */
+  private livenessProbe(): LivenessProbe | undefined {
+    return this.tickProbe ?? this.deps.liveness;
+  }
+
   private async reconcileActivities(
     state: SupervisorState,
   ): Promise<{ readonly state: SupervisorState; readonly refusal?: string }> {
@@ -3775,7 +3853,7 @@ export class SupervisorService {
     if (activities.length === 0) {
       return { state };
     }
-    const probe = this.deps.liveness;
+    const probe = this.livenessProbe();
     if (probe === undefined) {
       /**
        * NO PROBE, WITH WORK IN FLIGHT, IS A REFUSAL (round-3 review, HIGH 2).
@@ -3870,6 +3948,21 @@ export class SupervisorService {
     }
 
     const now = this.deps.clock.now();
+    /**
+     * ONE TICK, ONE ANSWER ABOUT ONE LEASE (round-9 review, HIGH 1).
+     *
+     * `classifyAll` and `requeueCrashed` each asked the probe, so a process that
+     * exited between the two calls was LIVE to one and GONE to the other — and
+     * the reviewer drove exactly that: a durable `LIVE` activity beside a
+     * roadmap item requeued as crashed, written together, contradicting each
+     * other. Recomputing per attempt was the round-8 fix and remains right; what
+     * was wrong is that recomputing also re-OBSERVED.
+     *
+     * A lease is asked about once per tick and the answer is reused. It is the
+     * same rule the rest of this mechanism already follows — decide from one
+     * observation, and never let two readings of the same fact disagree inside a
+     * single decision.
+     */
     const classified = this.classifyAll(activities, now, probe);
     // Only the LIST is read here, to decide whether anything is AMBIGUOUS.
     // Whether it CHANGED is decided by the write below, which recomputes the
@@ -3959,6 +4052,29 @@ export class SupervisorService {
       const problem =
         `work in flight could not be reconciled (${written.problem ?? "unknown reason"}); refusing to schedule ` +
         "further work while what is running is unrecorded";
+      this.log(`[supervisor] ${problem}`);
+      return { state: written.state, refusal: boundedDiagnostic(problem) };
+    }
+
+    /**
+     * AND THE AMBIGUITY CHECK IS MADE ON WHAT WAS ACTUALLY WRITTEN (round-9
+     * review, HIGH 2).
+     *
+     * The check above reads the classification computed from the state as it
+     * was READ. The write below it recomputes against the state as it turned
+     * out to be, and a retry can therefore persist an AMBIGUOUS verdict that
+     * nothing then looks at — the reviewer ran a different item to DONE in the
+     * same tick that durably recorded one. Asking the question once, of the
+     * snapshot, is the same "decided before it was written" mistake this
+     * function keeps producing; it is now asked of the result.
+     */
+    const unresolved = (written.state.activities ?? []).filter(
+      (entry) => entry.reconciliation?.verdict === "AMBIGUOUS" && !isTerminal(entry.state),
+    );
+    if (unresolved.length > 0) {
+      const problem =
+        `${unresolved.length} activit${unresolved.length === 1 ? "y" : "ies"} cannot be established as running or ` +
+        `finished (${unresolved.map((entry) => entry.id).join(", ")}); refusing to schedule further work`;
       this.log(`[supervisor] ${problem}`);
       return { state: written.state, refusal: boundedDiagnostic(problem) };
     }

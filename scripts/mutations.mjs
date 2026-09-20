@@ -1538,6 +1538,32 @@ export const MUTATIONS = [
     expect: "E3. a retry that meets its own verdict already settled by another clock does not refuse",
   },
 
+  // ---- round 9: one tick draws one conclusion ------------------------------
+  {
+    id: "the same lease is asked about twice in one tick",
+    edits: [[SUP_SVC,
+      "      const already = seen.get(key);\n      if (already !== undefined) {",
+      "      const already = seen.get(key);\n      if (already !== undefined && Number.isNaN(0)) {"]],
+    tests: [T_ACTREC],
+    expect: "asks about a lease exactly ONCE, so two readers of one tick cannot disagree",
+  },
+  {
+    id: "an ambiguity recorded by the write itself is not looked at",
+    edits: [[SUP_SVC,
+      "    if (unresolved.length > 0) {",
+      "    if (unresolved.length > 0 && Number.isNaN(0)) {"]],
+    tests: [T_ACTREC],
+    expect: "REFUSES when the write it just made recorded an ambiguity",
+  },
+  {
+    id: "a verdict another supervisor already consumed is released again",
+    edits: [[SUP_SVC,
+      "  return activity !== undefined && isTerminal(activity.state) && activity.observedAt !== undefined;",
+      "  return activity !== undefined && isTerminal(activity.state) && activity.observedAt !== undefined && Number.isNaN(0);"]],
+    tests: [T_VC],
+    expect: "E4. does not re-release an item a previous consumer already released and started",
+  },
+
   // ---- AC-9: the dependency is real ---------------------------------------
   {
     id: "the router stops depending on durable orchestration",
