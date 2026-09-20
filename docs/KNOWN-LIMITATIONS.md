@@ -1512,12 +1512,33 @@ supervisor can later find. It does not, yet. Until the supervisor launches its
 own reviews, the round-to-round acceptance loop for THIS task still depends on
 the chain — including its exit after a verdict.
 
+### OWNER DECISION, 2026-09-20: this is now BLOCKING
+
+This entry was written as a passive limitation. It is not one any more.
+
+Three acceptance rounds of TASK-018 itself reproduced the failure it describes:
+round 7's verdict sat twenty-two hours before anything consumed it, round 8's
+about twenty, round 9's about twenty-five. Nothing crashed in any of them. Each
+time, a correct result sat on disk while the Factory had no owner whose job it
+was to notice, because the thing that launches reviews is a shell script whose
+lifetime is a terminal session.
+
+The owner has promoted this from a recorded limitation to a blocking autonomy
+requirement, tracked as **TASK-019 (AUTONOMOUS_SUPERVISOR)** with its own frozen
+acceptance criteria. Until TASK-019 is accepted:
+
+- this limitation stands, unchanged and unclosed;
+- no claim may be made that the Software Factory has an end-to-end autonomous
+  review loop;
+- the shell chain remains a temporary compatibility/bootstrap mechanism and is
+  explicitly NOT the fix.
+
 ### What would close it
 
-The review-launching side of the executor: claim the activity, record the
-`ReviewBinding` (reviewId, source, candidate) in the same write that starts the
-reviewer, exactly as `runItem` already does for a heartbeat. That is a
-continuation of this mechanism rather than a change to it.
+`docs/tasks/TASK-019-autonomous-supervisor.md`, AC-2 and nothing less: the
+supervisor itself creates and owns the review record — run identity, candidate
+binding, ownership lease, launch state — in the same write that precedes
+launching the reviewer, and runs as a process that outlives every session.
 
 **Kept honest by:** this entry, and by `supervise.ts`, where the verdict source
 is wired and visibly has nothing yet producing bindings for it to read.
