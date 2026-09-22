@@ -12,6 +12,7 @@ import type { AiRunConfigRecord } from "./modelEnforcement.js";
 import type { Classification } from "./resourceClassifier.js";
 import type { BillingMode, SupervisedAction } from "./financialSafety.js";
 import type { RoadmapItem, SessionCheckpoint, SupervisorState } from "./supervisorTypes.js";
+import type { CandidateBinding, LaunchAcknowledgement } from "./acceptance.js";
 
 export interface SupervisorRepository {
   load(): Promise<SupervisorState | undefined>;
@@ -175,6 +176,51 @@ export type WorkOutcome =
     }
   /** The work needs something only a human can do. */
   | { readonly kind: "HUMAN_REQUIRED"; readonly action: SupervisedAction; readonly detail: string };
+
+/**
+ * Starting an independent review, and proving it started (TASK-019 AC-2, AC-4).
+ *
+ * A PORT, and deliberately a narrow one. The supervisor decides THAT a review
+ * should happen, who should do it and against which candidate; it must not know
+ * that today that means a CLI, a file of prompt text and a subprocess. What it
+ * needs back is exactly two things: whether the attempt to start was made, and
+ * — separately, later — whether the thing that started is the run it asked for.
+ *
+ * The two are separate calls because they are separate facts, and every
+ * generation of this machinery that collapsed them ended up recording "running"
+ * for a process that did not exist.
+ */
+export interface ReviewLaunchRequest {
+  readonly reviewId: string;
+  readonly roadmapKey: string;
+  readonly activityId: string;
+  readonly provider: string;
+  readonly model: string;
+  readonly effort: string;
+  readonly candidate: CandidateBinding;
+  /** Where the verdict is expected to appear. */
+  readonly source: string;
+  /** Where the worker must acknowledge, naming `reviewId`. */
+  readonly ack: string;
+}
+
+export type ReviewLaunchResult =
+  | { readonly ok: true; readonly detail: string }
+  | { readonly ok: false; readonly problem: string; readonly exhausted?: boolean };
+
+export interface ReviewLauncher {
+  /**
+   * Starts the reviewer. Returning `ok` means the attempt was MADE — never that
+   * the reviewer is running, which only `acknowledgement` can establish.
+   *
+   * `exhausted` distinguishes the provider refusing for quota reasons from
+   * anything else: a quota refusal is a durable waiting state and a retry
+   * later, not a failure of the review (AC-15).
+   */
+  launch(request: ReviewLaunchRequest): Promise<ReviewLaunchResult>;
+  /** What the worker itself wrote, if anything. Absent means no proof yet. */
+  acknowledgement(request: ReviewLaunchRequest): LaunchAcknowledgement | undefined;
+}
 
 export interface WorkExecutor {
   /**

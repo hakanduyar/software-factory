@@ -13,6 +13,8 @@
  */
 
 import type { Activity } from "./activity.js";
+import type { SupervisorOwner } from "./supervisorLease.js";
+import type { CandidateBinding } from "./acceptance.js";
 import type { Timestamp } from "../domain/time.js";
 import type { AiRunConfigRecord } from "./modelEnforcement.js";
 import type { WorkClass } from "./modelRouting.js";
@@ -199,6 +201,19 @@ export type ActionState = (typeof ACTION_STATES)[number];
  * proves nothing external happened and a retry is safe, while `RUNNING` under a
  * dead owner is unknowable and must fail closed rather than be repeated.
  */
+/** A candidate someone has declared ready for independent review. */
+export interface ReviewRequest {
+  readonly roadmapKey: string;
+  readonly candidate: CandidateBinding;
+  /** Which attempt at reviewing this item this is; 1 for the first. */
+  readonly attempt: number;
+  readonly requestedAt: Timestamp;
+  /** Who is to be asked, so the record says what was intended, not what was cheap. */
+  readonly provider: string;
+  readonly model: string;
+  readonly effort: string;
+}
+
 export interface SupervisorActionClaim {
   /** Canonical, derived — never random (the TASK-004 round-2 lesson). */
   readonly actionId: string;
@@ -300,6 +315,31 @@ export interface SupervisorState {
    * assert nothing, which is churn a reviewer then has to read.
    */
   readonly activities?: readonly Activity[];
+  /**
+   * Who is SUPERVISING this Factory right now (TASK-019 AC-17).
+   *
+   * Distinct from `activeClaim`, which says who is doing a piece of work: this
+   * says who is allowed to decide what happens next at all. Optional and absent
+   * means nobody — a database written before this field existed still loads,
+   * and a Factory with no supervisor running is an ordinary state rather than a
+   * corrupt one.
+   */
+  readonly supervisor?: SupervisorOwner | undefined;
+  /**
+   * Candidates whose independent review has been ASKED FOR but not yet settled
+   * (TASK-019 AC-2).
+   *
+   * Deciding that a candidate is ready to review is a judgement about the work —
+   * gates green, tree frozen — and belongs to whoever did the work. Everything
+   * AFTER that decision belongs to the supervisor: creating the review record,
+   * launching a reviewer, adopting it, noticing it died, consuming its verdict.
+   * That split is what lets the shell chain disappear without the Factory
+   * losing the ability to review anything, and it keeps this task from
+   * inventing a policy about when work is finished.
+   *
+   * Absent means none.
+   */
+  readonly reviewRequests?: readonly ReviewRequest[] | undefined;
   /**
    * `| undefined` is deliberate under `exactOptionalPropertyTypes`.
    *

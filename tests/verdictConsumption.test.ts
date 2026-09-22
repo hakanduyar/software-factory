@@ -97,7 +97,16 @@ function reviewActivity(source: string, overrides: Partial<Activity> = {}): Acti
     state: "RUNNING",
     lease: { ...REVIEWER_LEASE },
     heartbeat: { at: 1_100, progress: 1 },
-    review: { reviewId: REVIEW_ID, source, candidate: { ...CANDIDATE } },
+    review: {
+      reviewId: REVIEW_ID,
+      source,
+      candidate: { ...CANDIDATE },
+      provider: "codex-cli",
+      model: "gpt-5.6-luna",
+      effort: "xhigh",
+      attempt: 1,
+      ack: join(scratch, `${REVIEW_ID}-ack.json`),
+    },
     updatedAt: 1_100,
     ...overrides,
   };

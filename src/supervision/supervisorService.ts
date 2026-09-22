@@ -19,6 +19,8 @@
  *   - ambiguity fails closed rather than being retried.
  */
 
+import type { LaunchAcknowledgement } from "./acceptance.js";
+import type { ReviewLauncher, ReviewLaunchRequest } from "./supervisorPorts.js";
 import {
   bindingMismatch,
   completionDetail,
@@ -27,6 +29,7 @@ import {
   type AcceptanceVerdictSource,
 } from "./acceptance.js";
 import {
+  adoptLaunchedReview,
   canonicalActivityId,
   claimActivity,
   classifyActivity,
@@ -113,6 +116,7 @@ import {
   DEFAULT_ROADMAP,
   type EscalationReason,
   type HumanEscalation,
+  type ReviewRequest,
   type RoadmapItem,
   type SessionCheckpoint,
   type SupervisorActionClaim,
@@ -191,6 +195,16 @@ export interface SupervisorServiceDeps {
    * than passing over it in silence.
    */
   readonly acceptanceVerdicts?: AcceptanceVerdictSource;
+  /**
+   * How this installation STARTS an independent review (TASK-019 AC-2).
+   *
+   * Absent means this supervisor does not launch reviews, and a durable request
+   * for one is then unservable — which the consumer refuses rather than
+   * ignores, the same rule the probe and the lease follow. The shell chain that
+   * used to do this is not a fallback: a request nobody can service must be
+   * visible, not quietly deferred to something outside the repository.
+   */
+  readonly reviewLauncher?: ReviewLauncher;
   readonly log?: (line: string) => void;
   readonly ownerId?: string;
 }
@@ -259,6 +273,43 @@ function memoisedLiveness(probe: LivenessProbe): LivenessProbe {
       seen.set(key, answer);
       return answer;
     },
+  };
+}
+
+/**
+ * Where a review reports, derived rather than chosen.
+ *
+ * Derived from the run id, so two reviews cannot collide on one path and a
+ * previous round's file cannot be mistaken for this round's answer — the
+ * wrong-candidate refusal exists for the case where it happens anyway, and this
+ * is the cheaper half of that guard.
+ */
+function reviewSourcePath(request: ReviewRequest, activityId: string): string {
+  return `${reviewDirectory(request)}/${safeName(activityId)}-verdict.txt`;
+}
+
+function reviewAckPath(request: ReviewRequest, activityId: string): string {
+  return `${reviewDirectory(request)}/${safeName(activityId)}-ack.json`;
+}
+
+function reviewDirectory(request: ReviewRequest): string {
+  return `${REVIEW_ROOT}/${safeName(request.roadmapKey)}`;
+}
+
+/** Absolute, because a relative path means different files to different processes. */
+const REVIEW_ROOT = process.env["SF_REVIEW_DIR"] ?? `${process.env["HOME"] ?? "/tmp"}/.software-factory/reviews`;
+
+function safeName(value: string): string {
+  return value.replace(/[^A-Za-z0-9_.-]+/g, "_");
+}
+
+function leaseFromAcknowledgement(ack: LaunchAcknowledgement): ActivityLease {
+  return {
+    pid: ack.pid,
+    processStartedAt: ack.processStartedAt,
+    machine: ack.machine,
+    boot: ack.boot,
+    claimedAt: ack.at,
   };
 }
 
@@ -596,7 +647,29 @@ export class SupervisorService {
      * lesson AC-19 states about completions, applied to the one kind of work
      * whose author is guaranteed to be dead when its output is found.
      */
-    const consumed = await this.consumeAcceptanceVerdicts(catalogued.state);
+    /**
+     * 0b-bis. REVIEWS THIS FACTORY OWNS (TASK-019).
+     *
+     * Before verdicts are consumed and before anything is concluded about who
+     * is alive: a requested review is started if it has not been, and a started
+     * one is adopted once its worker has proved it exists. Both are pure state
+     * transitions over durable rows, and both are safe to repeat — which is
+     * what lets a supervisor die anywhere in here and a fresh one carry on.
+     */
+    const reviewed = await this.reconcileReviews(catalogued.state);
+    if (reviewed.refusal !== undefined) {
+      return {
+        kind: "REFUSAL",
+        result: {
+          kind: "WAITING_FOR_HUMAN",
+          roadmapKey: reviewed.refusal.roadmapKey,
+          reason: "HUMAN_DECISION_REQUIRED",
+          humanActionRequired: reviewed.refusal.problem,
+        },
+      };
+    }
+
+    const consumed = await this.consumeAcceptanceVerdicts(reviewed.state);
     if (consumed.refusal !== undefined) {
       return {
         kind: "REFUSAL",
@@ -3467,6 +3540,235 @@ export class SupervisorService {
    *   - and it never turns absence, silence or an unreadable file into
    *     approval.
    */
+  /**
+   * Starts the reviews this Factory has been asked for, and adopts the ones
+   * that have proved they are running (TASK-019 AC-2, AC-4, AC-5).
+   *
+   * THE HANDSHAKE, and why it is two writes rather than one:
+   *
+   *   1. the review record is committed FIRST, carrying its own identity, the
+   *      candidate it is bound to, who is being asked and where the answer will
+   *      appear. Only then is anything spawned. A supervisor that dies here
+   *      leaves a CLAIMED review with no acknowledgement, which the next one
+   *      reads as "the launch may not have happened" and resolves deliberately.
+   *   2. the transition to RUNNING happens only when the WORKER says so, naming
+   *      the run id that was committed before it existed. "The spawn call
+   *      returned" is not evidence and is never recorded as running.
+   *
+   * Repeating either step is harmless: the record is derived from the request,
+   * not generated, and adoption of an already-adopted worker is a no-op.
+   */
+  private async reconcileReviews(
+    state: SupervisorState,
+  ): Promise<{
+    readonly state: SupervisorState;
+    readonly refusal?: { readonly roadmapKey: string; readonly problem: string };
+  }> {
+    const requests = state.reviewRequests ?? [];
+    if (requests.length === 0) {
+      return { state };
+    }
+
+    const launcher = this.deps.reviewLauncher;
+    if (launcher === undefined) {
+      const problem =
+        `${requests.length} review${requests.length === 1 ? " has" : "s have"} been requested and this supervisor ` +
+        "has no way to launch one; refusing to decide anything while work waits on a review nothing can start";
+      this.log(`[supervisor] ${problem}`);
+      return { state, refusal: { roadmapKey: requests[0]!.roadmapKey, problem: boundedDiagnostic(problem) } };
+    }
+
+    let current = state;
+    for (const request of requests) {
+      const activityId = canonicalActivityId(request.roadmapKey, "REVIEW", request.attempt);
+      const existing = (current.activities ?? []).find((entry) => entry.id === activityId);
+
+      if (existing !== undefined && isTerminal(existing.state)) {
+        // Settled: the verdict consumer owns what happens next.
+        continue;
+      }
+
+      const plan: ReviewLaunchRequest = {
+        reviewId: activityId,
+        roadmapKey: request.roadmapKey,
+        activityId,
+        provider: request.provider,
+        model: request.model,
+        effort: request.effort,
+        candidate: request.candidate,
+        source: reviewSourcePath(request, activityId),
+        ack: reviewAckPath(request, activityId),
+      };
+
+      /**
+       * THE ACKNOWLEDGEMENT IS READ FIRST, ALWAYS — but only for a review that
+       * has a RECORD.
+       *
+       * A worker that has proved it exists outranks every conclusion that could
+       * be drawn about whether it was launched, including this supervisor's own
+       * memory of having launched it, which after a restart it does not have.
+       * What it cannot outrank is the absence of a record: an acknowledgement
+       * sitting beside a review nobody ever started belongs to something else —
+       * a previous attempt, a leftover file — and adopting it would mean
+       * "running" for a process this Factory never launched.
+       */
+      const ack = existing === undefined ? undefined : launcher.acknowledgement(plan);
+
+      if (ack === undefined && this.launchIsOutstanding(existing)) {
+        if (existing === undefined) {
+          const recorded = await this.recordReviewLaunch(current, request, plan);
+          if (recorded.refusal !== undefined) {
+            return recorded;
+          }
+          current = recorded.state;
+        }
+
+        /**
+         * SPAWN AFTER THE RECORD IS DURABLE, never before. If this process dies
+         * between the two, the record exists and says "claimed, not
+         * acknowledged" — which is recoverable. The other order leaves a
+         * reviewer running that nothing knows about, which is not.
+         */
+        const started = await launcher.launch(plan);
+        if (!started.ok) {
+          const problem =
+            `review ${plan.reviewId} could not be started (${started.problem})` +
+            (started.exhausted === true ? "; the provider is out of capacity" : "");
+          this.log(`[supervisor] ${problem}`);
+          /**
+           * A failed START is not a failed REVIEW. The record stays CLAIMED with
+           * no acknowledgement, and a later tick tries again once the launching
+           * process is demonstrably gone — which is the same path a supervisor
+           * that died mid-spawn takes, so there is one recovery path rather
+           * than two.
+           */
+          continue;
+        }
+        this.log(`[supervisor] launched review ${plan.reviewId} (${request.model} at ${request.effort})`);
+        continue;
+      }
+
+      if (ack === undefined) {
+        continue;
+      }
+      const adopted = await this.commitActivityChange(current, `adopt review ${plan.reviewId}`, (activities) =>
+        adoptLaunchedReview(activities, activityId, {
+          runId: ack.runId,
+          lease: leaseFromAcknowledgement(ack),
+          at: this.deps.clock.now(),
+        }),
+      );
+      if (!adopted.recorded) {
+        const problem = `review ${plan.reviewId} proved it started and that could not be recorded (${adopted.problem ?? "unknown reason"})`;
+        this.log(`[supervisor] ${problem}`);
+        return { state: adopted.state, refusal: { roadmapKey: request.roadmapKey, problem: boundedDiagnostic(problem) } };
+      }
+      current = adopted.state;
+    }
+
+    return { state: current };
+  }
+
+  /**
+   * Whether a launch still needs to be attempted (TASK-019 AC-5, AC-16).
+   *
+   * THE DANGEROUS CASE IS THE MIDDLE ONE. Between spawning a reviewer and that
+   * reviewer writing its acknowledgement there is a real window — a second or
+   * two, and longer on a loaded machine. A supervisor that retried on every
+   * tick because it saw no acknowledgement yet would start a second reviewer
+   * for a worker that was about to announce itself, which is the duplicate
+   * launch AC-16 forbids and is also simply expensive.
+   *
+   * So "no acknowledgement" alone never justifies a relaunch. What does:
+   *
+   *   - no record at all, which means nothing has been started; or
+   *   - a record whose LAUNCHING PROCESS is demonstrably gone. That process
+   *     holds the activity's lease until a worker adopts it, so a dead lease
+   *     means the launch was interrupted and no reviewer can be about to
+   *     acknowledge — nothing is left that could.
+   *
+   * An UNKNOWN holder is neither, and refuses by doing nothing: waiting costs a
+   * tick, and launching a second reviewer against a possibly-live first one
+   * costs a duplicate review and a contradictory verdict.
+   */
+  private launchIsOutstanding(existing: Activity | undefined): boolean {
+    if (existing === undefined) {
+      return true;
+    }
+    if (existing.state !== "CLAIMED" || existing.lease === undefined) {
+      return false;
+    }
+    const probe = this.livenessProbe();
+    return probe !== undefined && probe.check(existing.lease) === "GONE";
+  }
+
+  /**
+   * Writes the review record, and nothing else, in one compare-and-set.
+   *
+   * The activity is CLAIMED under the SUPERVISOR's lease, because at this
+   * moment the supervisor is the only thing that exists: the reviewer has not
+   * been spawned. Adoption replaces that lease with the worker's, which is what
+   * makes "is it still running" a question about the reviewer afterwards.
+   */
+  private async recordReviewLaunch(
+    state: SupervisorState,
+    request: ReviewRequest,
+    plan: ReviewLaunchRequest,
+  ): Promise<{
+    readonly state: SupervisorState;
+    readonly refusal?: { readonly roadmapKey: string; readonly problem: string };
+  }> {
+    const now = this.deps.clock.now();
+    const lease = this.deps.activityLease?.(now);
+    const probe = this.livenessProbe();
+    if (lease === undefined || probe === undefined) {
+      const problem =
+        `review ${plan.reviewId} cannot be recorded: this supervisor cannot ${lease === undefined ? "establish its own identity" : "check liveness"}, ` +
+        "so nothing could later reconcile the reviewer it started";
+      this.log(`[supervisor] ${problem}`);
+      return { state, refusal: { roadmapKey: request.roadmapKey, problem: boundedDiagnostic(problem) } };
+    }
+
+    const written = await this.commitActivityChange(state, `record review ${plan.reviewId}`, (activities) => {
+      const claimed = claimActivity(
+        activities,
+        { id: plan.activityId, kind: "REVIEW", roadmapKey: request.roadmapKey, lease, now },
+        probe,
+      );
+      if (!claimed.ok) {
+        return claimed;
+      }
+      return {
+        ok: true,
+        changed: true,
+        activities: claimed.activities.map((entry) =>
+          entry.id === plan.activityId
+            ? {
+                ...entry,
+                review: {
+                  reviewId: plan.reviewId,
+                  source: plan.source,
+                  candidate: plan.candidate,
+                  provider: plan.provider,
+                  model: plan.model,
+                  effort: plan.effort,
+                  attempt: request.attempt,
+                  ack: plan.ack,
+                },
+              }
+            : entry,
+        ),
+      };
+    });
+
+    if (!written.recorded) {
+      const problem = `review ${plan.reviewId} could not be recorded (${written.problem ?? "unknown reason"}); nothing was started`;
+      this.log(`[supervisor] ${problem}`);
+      return { state: written.state, refusal: { roadmapKey: request.roadmapKey, problem: boundedDiagnostic(problem) } };
+    }
+    return { state: written.state };
+  }
+
   private async consumeAcceptanceVerdicts(
     state: SupervisorState,
   ): Promise<{

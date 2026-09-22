@@ -138,7 +138,16 @@ describe("TASK-018: a verdict is only about the tree it judged", () => {
 });
 
 describe("TASK-018: reading a verdict off the filesystem", () => {
-  const review = (source: string) => ({ reviewId: "r1", source, candidate: { ...CANDIDATE } });
+  const review = (source: string) => ({
+    reviewId: "r1",
+    source,
+    candidate: { ...CANDIDATE },
+    provider: "codex-cli",
+    model: "gpt-5.6-luna",
+    effort: "xhigh",
+    attempt: 1,
+    ack: "/tmp/does-not-matter-here.json",
+  });
 
   it("reports a file that does not exist as ABSENT", () => {
     const source = createFileVerdictSource();

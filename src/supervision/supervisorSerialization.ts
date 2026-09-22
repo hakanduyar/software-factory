@@ -465,6 +465,13 @@ function parseActivity(raw: unknown, index: number, context: string): Activity {
               tree: str(candidateRow, "tree", candidateContext),
               fingerprint: str(candidateRow, "fingerprint", candidateContext),
             },
+            // Required, like the candidate: a review that does not say who was
+            // asked cannot be checked against who was supposed to be.
+            provider: str(reviewRow, "provider", reviewContext),
+            model: str(reviewRow, "model", reviewContext),
+            effort: str(reviewRow, "effort", reviewContext),
+            attempt: nonNegativeInt(reviewRow, "attempt", reviewContext),
+            ack: str(reviewRow, "ack", reviewContext),
           };
         })();
 
@@ -745,6 +752,65 @@ export function parseSupervisorState(json: string, expected: { readonly version:
    * rule provenance follows above. Every database written before TASK-018 has
    * no such field and is not damaged.
    */
+  /**
+   * The supervisor's own lease, parsed as strictly as every other lease.
+   *
+   * A supervisor row that does not parse is not "no supervisor": it is a
+   * database saying something about ownership that this build cannot read, and
+   * treating that as "free to take" is how two supervisors start.
+   */
+  const supervisorRaw = row["supervisor"];
+  const supervisor =
+    supervisorRaw === undefined
+      ? undefined
+      : (() => {
+          const ownerContext = `${context}.supervisor`;
+          const ownerRow = asObject(supervisorRaw, ownerContext);
+          const leaseContext = `${ownerContext}.lease`;
+          const leaseRow = asObject(ownerRow["lease"], leaseContext);
+          return {
+            lease: {
+              pid: nonNegativeInt(leaseRow, "pid", leaseContext),
+              processStartedAt: nonNegativeInt(leaseRow, "processStartedAt", leaseContext),
+              machine: str(leaseRow, "machine", leaseContext),
+              boot: str(leaseRow, "boot", leaseContext),
+              claimedAt: num(leaseRow, "claimedAt", leaseContext),
+            },
+            ownerId: str(ownerRow, "ownerId", ownerContext),
+            acquiredAt: num(ownerRow, "acquiredAt", ownerContext),
+            renewedAt: num(ownerRow, "renewedAt", ownerContext),
+          };
+        })();
+
+  /**
+   * A review request that does not parse is not "no request": it is durable
+   * state asking for something this build cannot read, and quietly dropping it
+   * would silently cancel a review somebody is waiting on.
+   */
+  const requestsRaw = row["reviewRequests"];
+  const reviewRequests =
+    requestsRaw === undefined
+      ? []
+      : asArray(requestsRaw, `${context}.reviewRequests`).map((entry, index) => {
+          const itemContext = `${context}.reviewRequests[${index}]`;
+          const requestRow = asObject(entry, itemContext);
+          const candidateContext = `${itemContext}.candidate`;
+          const candidateRow = asObject(requestRow["candidate"], candidateContext);
+          return {
+            roadmapKey: str(requestRow, "roadmapKey", itemContext),
+            candidate: {
+              commit: str(candidateRow, "commit", candidateContext),
+              tree: str(candidateRow, "tree", candidateContext),
+              fingerprint: str(candidateRow, "fingerprint", candidateContext),
+            },
+            attempt: nonNegativeInt(requestRow, "attempt", itemContext),
+            requestedAt: num(requestRow, "requestedAt", itemContext),
+            provider: str(requestRow, "provider", itemContext),
+            model: str(requestRow, "model", itemContext),
+            effort: str(requestRow, "effort", itemContext),
+          };
+        });
+
   const activities =
     row["activities"] === undefined
       ? []
@@ -774,6 +840,8 @@ export function parseSupervisorState(json: string, expected: { readonly version:
     // Emitted only when there is something to say, so a database that has never
     // held an activity keeps the bytes it already had.
     ...(activities.length === 0 ? {} : { activities }),
+    ...(supervisor === undefined ? {} : { supervisor }),
+    ...(reviewRequests.length === 0 ? {} : { reviewRequests }),
     ...(activeClaim === undefined ? {} : { activeClaim }),
     ...(nextWakeAt === undefined ? {} : { nextWakeAt }),
     escalations,

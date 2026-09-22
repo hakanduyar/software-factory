@@ -57,6 +57,47 @@ export interface ReviewBinding {
    */
   readonly source: string;
   readonly candidate: CandidateBinding;
+  /**
+   * WHO was asked, and how hard (TASK-019 AC-2).
+   *
+   * Recorded because a verdict is only independent if the thing that produced
+   * it was the thing that was supposed to: "reviewed by gpt-5.6-luna at xhigh"
+   * is a claim, and a claim with nothing durable behind it is how a cheaper
+   * model's opinion quietly becomes an acceptance. It also makes the routing
+   * policy auditable after the fact rather than inferable from a shell script.
+   */
+  readonly provider: string;
+  readonly model: string;
+  readonly effort: string;
+  /** Which attempt at reviewing this item this is. */
+  readonly attempt: number;
+  /**
+   * Where the WORKER proves it started, naming this run (AC-4).
+   *
+   * Separate from `source` because they answer different questions and fail at
+   * different times: the acknowledgement says "a process exists and it is
+   * mine", the source says "it reached a conclusion". Conflating them is how
+   * "I intended to launch" became "it is running".
+   */
+  readonly ack: string;
+}
+
+/**
+ * What a worker writes to prove it is the run that was launched.
+ *
+ * A pid alone is not identity — pids are recycled, and a pid written by the
+ * LAUNCHER proves only that the launcher believed something. The worker names
+ * the run id it was given and the lease it can be checked by, so adoption
+ * compares a fact the worker itself asserted against the record that predates
+ * it.
+ */
+export interface LaunchAcknowledgement {
+  readonly runId: string;
+  readonly pid: number;
+  readonly processStartedAt: number;
+  readonly machine: string;
+  readonly boot: string;
+  readonly at: number;
 }
 
 export interface AcceptanceOutcome {

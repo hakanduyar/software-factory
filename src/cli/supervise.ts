@@ -46,7 +46,7 @@ import type { WorkExecutor } from "../supervision/supervisorPorts.js";
 import { ESCALATION_REASONS, type EscalationReason, type SupervisorState } from "../supervision/supervisorTypes.js";
 import { systemClock } from "../ports/clock.js";
 
-const DEFAULT_SUPERVISOR_DB_PATH = ".factory/supervisor.db";
+export const DEFAULT_SUPERVISOR_DB_PATH = ".factory/supervisor.db";
 
 export interface SuperviseCliOptions {
   readonly supervisorDbPath?: string;
@@ -122,6 +122,37 @@ function resolveDbPath(options: SuperviseCliOptions): string {
   return resolve(
     options.supervisorDbPath ?? process.env["FACTORY_SUPERVISOR_DB_PATH"] ?? DEFAULT_SUPERVISOR_DB_PATH,
   );
+}
+
+export function openSupervisorRepository(options: SuperviseCliOptions): SqliteSupervisorRepository {
+  return openRepository(options);
+}
+
+/**
+ * The supervisor `sf supervisor run` drives (TASK-019).
+ *
+ * Deliberately the SAME construction as `sf supervise tick`: one way to build a
+ * supervisor, so the long-running service and the one-shot command cannot drift
+ * into disagreeing about what this installation is allowed to do. The executor
+ * is the same refusing one a tick gets without `--drive-plans`, because driving
+ * plans is a separate authority and holding it for longer does not grant it.
+ */
+export function buildSupervisorService(
+  repository: SqliteSupervisorRepository,
+  log: (line: string) => void,
+): SupervisorService {
+  /**
+   * The SAME refusing executor a read-only command gets. Driving plans is a
+   * separate authority (`--drive-plans`), and holding the Factory open for
+   * longer does not grant it: a service that ran work its invocation never
+   * authorised would be exactly the ambient-capability failure TASK-011 closed.
+   */
+  const refuses: WorkExecutor = {
+    async execute() {
+      throw new Error("the supervisor service is not authorised to execute work");
+    },
+  };
+  return buildService(repository, log, refuses);
 }
 
 function openRepository(options: SuperviseCliOptions): SqliteSupervisorRepository {

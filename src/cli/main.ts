@@ -52,6 +52,9 @@ Usage:
                                        sf plan resume in a child process. Off by
                                        default: launching spends.
   sf supervise status     Show supervisor state, spending policy and open escalations
+  sf supervisor run       Run the Factory: reconcile, launch, consume, forever
+  sf supervisor status    Read durable state (no model, no writes)
+  sf supervisor review    Ask for an independent review of a frozen candidate
   sf supervise resources  Show per-resource availability, retry times and backoff
   sf supervise roadmap    Show the durable roadmap queue and what it is waiting on
   sf github publish --roadmap-key <KEY> --head <SHA> --base <SHA>
@@ -432,6 +435,72 @@ async function main(argv: readonly string[]): Promise<number> {
         return runSuperviseBlock({ ...parsed.value, log });
       }
       console.error(`Usage: sf supervise <tick|status|resources|roadmap|block>`);
+      return 1;
+    }
+    case "supervisor": {
+      /**
+       * THE LONG-RUNNING FACTORY (TASK-019), kept apart from `sf supervise`.
+       *
+       * `supervise` is a set of one-shot commands a person runs. `supervisor`
+       * is the service that runs whether or not a person is there, which is the
+       * whole difference this task exists to make — and the separation keeps an
+       * operator from starting a daemon when they meant to look at a state.
+       */
+      const sub = argv[1];
+      const { runSupervisorService, runSupervisorStatus, requestReview } = await import("./supervisor.js");
+      const log = (line: string): void => console.log(line);
+
+      if (sub === "run") {
+        const outcome = await runSupervisorService({ log });
+        log(JSON.stringify(outcome));
+        return outcome.kind === "STOPPED" ? 0 : 1;
+      }
+      if (sub === "status") {
+        const view = await runSupervisorStatus({ log });
+        if (view === undefined) {
+          log("no supervisor state exists yet");
+          return 1;
+        }
+        log(JSON.stringify(view, null, 2));
+        return 0;
+      }
+      if (sub === "review") {
+        const flags = new Map<string, string>();
+        for (let index = 2; index < argv.length; index += 2) {
+          const name = argv[index];
+          const value = argv[index + 1];
+          if (name === undefined || value === undefined || !name.startsWith("--")) {
+            console.error(
+              "Usage: sf supervisor review --key <ROADMAP_KEY> --commit <SHA> --tree <SHA> --fingerprint <HEX>",
+            );
+            return 1;
+          }
+          flags.set(name.slice(2), value);
+        }
+        const key = flags.get("key");
+        const commit = flags.get("commit");
+        const tree = flags.get("tree");
+        const fingerprint = flags.get("fingerprint");
+        if (key === undefined || commit === undefined || tree === undefined || fingerprint === undefined) {
+          console.error(
+            "Usage: sf supervisor review --key <ROADMAP_KEY> --commit <SHA> --tree <SHA> --fingerprint <HEX>",
+          );
+          return 1;
+        }
+        const request = await requestReview({
+          roadmapKey: key,
+          commit,
+          tree,
+          fingerprint,
+          ...(flags.has("provider") ? { provider: flags.get("provider")! } : {}),
+          ...(flags.has("model") ? { model: flags.get("model")! } : {}),
+          ...(flags.has("effort") ? { effort: flags.get("effort")! } : {}),
+          log,
+        });
+        log(JSON.stringify(request, null, 2));
+        return 0;
+      }
+      console.error(`Usage: sf supervisor <run|status|review>`);
       return 1;
     }
     case "github": {

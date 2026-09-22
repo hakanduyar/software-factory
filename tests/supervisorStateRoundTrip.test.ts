@@ -165,6 +165,11 @@ const ACTIVITY_REVIEW_FIELDS: Record<keyof Required<NonNullable<Activity["review
   reviewId: true,
   source: true,
   candidate: true,
+  provider: true,
+  model: true,
+  effort: true,
+  attempt: true,
+  ack: true,
 };
 
 const ACTIVITY_REVIEW_CANDIDATE_FIELDS: Record<
@@ -205,6 +210,8 @@ const STATE_FIELDS: Record<keyof Required<SupervisorState>, true> = {
   roadmap: true,
   checkpoints: true,
   activities: true,
+  supervisor: true,
+  reviewRequests: true,
   activeClaim: true,
   nextWakeAt: true,
   escalations: true,
@@ -318,6 +325,18 @@ const MAXIMAL_PROVENANCE: Required<ProvenanceEntry> = (() => {
 })();
 
 /**
+ * The supervisor's own lease, listed separately for the same reason the
+ * activity's is: a nested field dropped in transit is how two supervisors end
+ * up believing nobody owns the Factory.
+ */
+const SUPERVISOR_FIELDS: Record<keyof Required<NonNullable<SupervisorState["supervisor"]>>, true> = {
+  lease: true,
+  ownerId: true,
+  acquiredAt: true,
+  renewedAt: true,
+};
+
+/**
  * A TERMINAL activity, because that is the only shape carrying every field at
  * once: a completion and an observation exist only once the work has finished,
  * and the parser refuses both on an unfinished one.
@@ -336,6 +355,11 @@ const MAXIMAL_ACTIVITY: Required<Activity> = {
     reviewId: "r2",
     source: "/home/factory/.sf/review-r2-lastmsg.txt",
     candidate: { commit: "339ae83", tree: "3fd1ecb", fingerprint: "e3bb12ea62ef" },
+    provider: "codex-cli",
+    model: "gpt-5.6-luna",
+    effort: "xhigh",
+    attempt: 2,
+    ack: "/home/factory/.sf/review-r2-ack.json",
   },
   updatedAt: 1_190,
 };
@@ -352,6 +376,23 @@ const MAXIMAL_STATE: Required<SupervisorState> = {
   escalations: [MAXIMAL_ESCALATION],
   provenance: [MAXIMAL_PROVENANCE],
   provenanceAnchor: { length: 1, headDigest: MAXIMAL_PROVENANCE.digest },
+  reviewRequests: [
+    {
+      roadmapKey: "LOCAL_24_7_RUNTIME",
+      candidate: { commit: "339ae83", tree: "3fd1ecb", fingerprint: "e3bb12ea62ef" },
+      attempt: 3,
+      requestedAt: 1_160,
+      provider: "codex-cli",
+      model: "gpt-5.6-luna",
+      effort: "xhigh",
+    },
+  ],
+  supervisor: {
+    lease: { pid: 8181, processStartedAt: 120_000, machine: "wsl-ubuntu", boot: "boot-1234", claimedAt: 1_150 },
+    ownerId: "sf-supervisor",
+    acquiredAt: 1_150,
+    renewedAt: 1_190,
+  },
   updatedAt: 1_200,
 };
 
@@ -378,6 +419,7 @@ describe("TASK-006: every durable supervisor field survives serialization", () =
       ACTIVITY_REVIEW_FIELDS,
       ACTIVITY_REVIEW_CANDIDATE_FIELDS,
       ACTIVITY_FIELDS,
+      SUPERVISOR_FIELDS,
       STATE_FIELDS,
     ]) {
       assert.ok(Object.keys(map).length > 0);

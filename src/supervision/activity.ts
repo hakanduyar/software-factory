@@ -753,6 +753,77 @@ export function completeActivity(
 }
 
 /**
+ * The second half of the launch handshake: a worker proved it is running
+ * (TASK-019 AC-4, AC-5, AC-6).
+ *
+ * WHAT THIS IS FOR. Recording "running" because a spawn call returned is the
+ * oldest lie this machinery tells: the process may have exited before its first
+ * instruction, may be a different program entirely, or may never have existed
+ * because the supervisor died between the write and the fork. So the durable
+ * record says CLAIMED until the WORKER itself says otherwise, naming the run it
+ * was given.
+ *
+ * THE PROOF IS THE RUN ID, not the pid. A pid is recycled; a pid written by the
+ * launcher proves only that the launcher believed something. The worker echoes
+ * the identity that was committed BEFORE it existed, so an acknowledgement that
+ * matches cannot have come from an unrelated process that happened to inherit
+ * the number.
+ *
+ * Any supervisor may adopt, not only the one that launched. That is the point:
+ * the launching process is exactly the thing that may have died, and requiring
+ * it to be alive to acknowledge its own worker would make every crash in that
+ * window unrecoverable.
+ */
+export function adoptLaunchedReview(
+  activities: readonly Activity[],
+  id: string,
+  input: { readonly runId: string; readonly lease: ActivityLease; readonly at: Timestamp },
+): TransitionVerdict {
+  const found = locate(activities, id);
+  if (!found.ok) return found;
+  const activity = found.activity;
+
+  if (activity.review === undefined) {
+    return { ok: false, problem: `activity ${JSON.stringify(id)} is not a review, so there is no launch to adopt` };
+  }
+  if (activity.review.reviewId !== input.runId) {
+    return {
+      ok: false,
+      problem:
+        `activity ${JSON.stringify(id)} was launched as ${JSON.stringify(activity.review.reviewId)}, but the ` +
+        `acknowledgement names ${JSON.stringify(input.runId)}`,
+    };
+  }
+  if (isTerminal(activity.state)) {
+    return { ok: false, problem: `activity ${JSON.stringify(id)} is ${activity.state} and cannot start running` };
+  }
+  /**
+   * ALREADY ADOPTED IS A NO-OP, not a second adoption. Reconciliation reads the
+   * same acknowledgement on every tick for as long as the worker runs, and an
+   * adoption that rewrote the lease each time would move the heartbeat's
+   * meaning back to "the file still exists".
+   */
+  if (activity.state === "RUNNING" && activity.lease !== undefined && sameHolder(activity.lease, input.lease)) {
+    return { ok: true, activities, changed: false };
+  }
+
+  return {
+    ok: true,
+    changed: true,
+    activities: replace(activities, {
+      ...activity,
+      state: "RUNNING",
+      // The WORKER's lease replaces the launcher's: from here, "is it still
+      // running" is a question about the reviewer, which is what anyone
+      // reconciling this activity actually wants to know.
+      lease: input.lease,
+      heartbeat: { at: input.at, progress: activity.heartbeat?.progress ?? 1 },
+      updatedAt: input.at,
+    }),
+  };
+}
+
+/**
  * Settles a REVIEW from the artefact it produced, without being its owner.
  *
  * THE HOLDER RULE IS NOT BEING WEAKENED, so it is worth being exact about why
