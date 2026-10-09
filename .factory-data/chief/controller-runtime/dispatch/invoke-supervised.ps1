@@ -17,8 +17,79 @@ function Invoke-SupervisedTerminal {
         [Parameter(Mandatory)][string]$ReceiptPath,
         [Parameter(Mandatory)][string]$PlanPath,
         [Parameter(Mandatory)][string]$StateDir,
-        [Parameter(Mandatory)][string]$Owner
+        [Parameter(Mandatory)][string]$Owner,
+        [hashtable]$HostLifecycleContext
     )
+
+    if ($PSBoundParameters.ContainsKey('HostLifecycleContext')) {
+        $hc = $HostLifecycleContext
+        $refuse = {
+            param([string]$Why)
+            [PSCustomObject]@{ status = 'RECONCILIATION_REQUIRED'; reason = 'HOST_CONTEXT_INVALID'; detail = $Why; claimResult = $null }
+        }
+        $coreKeys = @('PreviousSelectedClaim', 'Dispatch', 'CheckpointPath', 'VaultPath', 'EvidenceRoot', 'QueuePath', 'NormalQuotaPath')
+        $optKeys = @('CloudQuotaPath', 'PostCoreStateProducer', 'LocalSyncConfig', 'GitHubSyncConfig', 'CompletedNativeEvidence')
+        $knownKeys = @($coreKeys + $optKeys)
+        if ($hc -isnot [hashtable]) { return (& $refuse 'invalid HostLifecycleContext') }
+        foreach ($key in @($hc.Keys)) {
+            if ($key -isnot [string] -or $knownKeys -notcontains $key) { return (& $refuse 'unknown key') }
+        }
+        foreach ($key in $coreKeys) {
+            if (-not $hc.ContainsKey($key)) { return (& $refuse ('missing ' + $key)) }
+        }
+        if ($hc['PreviousSelectedClaim'] -isnot [PSCustomObject]) { return (& $refuse 'invalid PreviousSelectedClaim') }
+        if ($hc['Dispatch'] -isnot [scriptblock]) { return (& $refuse 'invalid Dispatch') }
+        foreach ($key in @('CheckpointPath', 'VaultPath', 'EvidenceRoot', 'QueuePath', 'NormalQuotaPath')) {
+            $v = $hc[$key]
+            if ($v -isnot [string] -or [string]::IsNullOrWhiteSpace($v)) { return (& $refuse ('invalid ' + $key)) }
+        }
+        if ($hc.ContainsKey('CloudQuotaPath')) {
+            $v = $hc['CloudQuotaPath']
+            if ($null -ne $v -and $v -isnot [string]) { return (& $refuse 'invalid CloudQuotaPath') }
+        }
+        if ($hc.ContainsKey('PostCoreStateProducer') -and $null -ne $hc['PostCoreStateProducer'] -and $hc['PostCoreStateProducer'] -isnot [scriptblock]) { return (& $refuse 'invalid PostCoreStateProducer') }
+        if ($hc.ContainsKey('LocalSyncConfig') -and $null -ne $hc['LocalSyncConfig'] -and $hc['LocalSyncConfig'] -isnot [hashtable]) { return (& $refuse 'invalid LocalSyncConfig') }
+        if ($hc.ContainsKey('GitHubSyncConfig') -and $null -ne $hc['GitHubSyncConfig'] -and $hc['GitHubSyncConfig'] -isnot [hashtable]) { return (& $refuse 'invalid GitHubSyncConfig') }
+        if ($hc.ContainsKey('CompletedNativeEvidence') -and $hc['CompletedNativeEvidence'] -isnot [PSCustomObject]) { return (& $refuse 'invalid CompletedNativeEvidence') }
+
+        $terminalArguments = @{
+            RawPath        = $RawPath
+            TicketPath     = $TicketPath
+            UsagePath      = $UsagePath
+            RunId          = $RunId
+            Attempt        = $Attempt
+            MaxAttempts    = $MaxAttempts
+            PriorElapsedMs = $PriorElapsedMs
+            MaxElapsedMs   = $MaxElapsedMs
+            ReceiptPath    = $ReceiptPath
+            PlanPath       = $PlanPath
+        }
+        if ($hc.ContainsKey('CompletedNativeEvidence')) { $terminalArguments['CompletedNativeEvidence'] = $hc['CompletedNativeEvidence'] }
+
+        $callParams = @{
+            TerminalArguments     = $terminalArguments
+            PreviousSelectedClaim = $hc['PreviousSelectedClaim']
+            Dispatch              = $hc['Dispatch']
+            CheckpointPath        = $hc['CheckpointPath']
+            VaultPath             = $hc['VaultPath']
+            EvidenceRoot          = $hc['EvidenceRoot']
+            QueuePath             = $hc['QueuePath']
+            StateDir              = $StateDir
+            NormalQuotaPath       = $hc['NormalQuotaPath']
+            Owner                 = $Owner
+        }
+        foreach ($key in @('CloudQuotaPath', 'PostCoreStateProducer', 'LocalSyncConfig', 'GitHubSyncConfig')) {
+            if ($hc.ContainsKey($key)) { $callParams[$key] = $hc[$key] }
+        }
+
+        try {
+            . (Join-Path (Split-Path -Parent $PSScriptRoot) 'host-continuation/select-next-ready.ps1')
+        } catch {
+            return [PSCustomObject]@{ status = 'RECONCILIATION_REQUIRED'; reason = 'HOST_CONTINUATION_UNAVAILABLE'; claimResult = $null }
+        }
+
+        return (Invoke-PublishedSettledHostContinuation @callParams)
+    }
 
     if (-not (Test-Path -LiteralPath $StateDir)) {
         New-Item -ItemType Directory -Path $StateDir -Force | Out-Null
