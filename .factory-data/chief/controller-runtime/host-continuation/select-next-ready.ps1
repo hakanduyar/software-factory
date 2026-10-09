@@ -716,8 +716,59 @@ function Invoke-PublishedSettledHostContinuation {
         [Parameter(Mandatory)][string]$StateDir,
         [Parameter(Mandatory)][string]$NormalQuotaPath,
         [string]$CloudQuotaPath,
-        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Owner
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Owner,
+        [scriptblock]$PostCoreStateProducer,
+        [hashtable]$LocalSyncConfig,
+        [hashtable]$GitHubSyncConfig
     )
+
+    # Optional post-core publication. All absent => exact legacy behavior and return shape.
+    # Producer identity and configs are validated and frozen to primitives BEFORE core/Dispatch runs.
+    # Presence is captured from the OUTER function's bound parameters; the dot-sourced block below sees a reset $PSBoundParameters.
+    $capProducer = $PSBoundParameters.ContainsKey('PostCoreStateProducer')
+    $capLocal = $PSBoundParameters.ContainsKey('LocalSyncConfig')
+    $capGh = $PSBoundParameters.ContainsKey('GitHubSyncConfig')
+    $optIn = $capProducer -or $capLocal -or $capGh
+    $producer = $null; $hasLocal = $false; $hasGh = $false; $fLocalDir = $null; $fGh = $null
+    $pubCheckpoint = $null; $pubVault = $null; $pubEvidence = $null; $preRefusal = $null
+    if ($optIn) {
+        # Preflight is dot-sourced so its 'return' only exits the validation block, never the outer caller.
+        # A refusal is captured as a bounded code and appended to the genuine core result after core runs.
+        $refuse = { param([string]$Code) $Code }
+        $preCode = $null
+        try { $preCode = . {
+        if (-not $capProducer -or $null -eq $PostCoreStateProducer) { return (& $refuse 'STATE_PRODUCER_REQUIRED') }
+        $producer = $PostCoreStateProducer
+        if ($capLocal) {
+            $lc = $LocalSyncConfig
+            if ($null -eq $lc -or $lc.Keys.Count -ne 1 -or -not $lc.ContainsKey('StateDir') -or $lc['StateDir'] -isnot [string] -or [string]::IsNullOrWhiteSpace($lc['StateDir'])) { return (& $refuse 'SYNC_CONFIG_INVALID') }
+            $fLocalDir = [string]$lc['StateDir']; $hasLocal = $true
+        }
+        if ($capGh) {
+            $g = $GitHubSyncConfig
+            if ($null -eq $g) { return (& $refuse 'SYNC_CONFIG_INVALID') }
+            foreach ($k in @($g.Keys)) { if ($k -isnot [string] -or $k -cnotin @('Mapping', 'StateDir', 'PublicStatus', 'NextAction', 'Transport')) { return (& $refuse 'SYNC_CONFIG_INVALID') } }
+            foreach ($k in @('Mapping', 'StateDir', 'PublicStatus', 'NextAction')) { if (-not $g.ContainsKey($k)) { return (& $refuse 'SYNC_CONFIG_INVALID') } }
+            $m = $g['Mapping']
+            if ($m -isnot [hashtable] -or $m.Keys.Count -ne 4) { return (& $refuse 'SYNC_CONFIG_INVALID') }
+            foreach ($k in @('taskId', 'repo', 'stableMarker')) { if (-not $m.ContainsKey($k) -or $m[$k] -isnot [string]) { return (& $refuse 'SYNC_CONFIG_INVALID') } }
+            if (-not $m.ContainsKey('issueNumber') -or ($m['issueNumber'] -isnot [int] -and $m['issueNumber'] -isnot [long])) { return (& $refuse 'SYNC_CONFIG_INVALID') }
+            if ($m['taskId'] -notmatch '^[A-Za-z0-9._:-]{1,128}$' -or $m['repo'] -notmatch '^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]{1,100}$' -or $m['stableMarker'] -notmatch '^[A-Za-z0-9._-]{1,128}$' -or $m['issueNumber'] -lt 1 -or $m['issueNumber'] -gt 2147483647) { return (& $refuse 'SYNC_CONFIG_INVALID') }
+            if ($g['StateDir'] -isnot [string] -or [string]::IsNullOrWhiteSpace($g['StateDir'])) { return (& $refuse 'SYNC_CONFIG_INVALID') }
+            if ($g['PublicStatus'] -isnot [string] -or $g['PublicStatus'] -cnotin @('IN_PROGRESS', 'WAITING_FOR_REVIEW', 'BLOCKED', 'ACCEPTED_SCOPED')) { return (& $refuse 'SYNC_CONFIG_INVALID') }
+            if ($g['NextAction'] -isnot [string] -or $g['NextAction'] -cnotin @('RUN_FOCUSED_CHECKS', 'INDEPENDENT_REVIEW', 'RESUME_AUTHORIZED_WORK', 'WAIT_FOR_DEPENDENCY')) { return (& $refuse 'SYNC_CONFIG_INVALID') }
+            $ghTransport = $null
+            if ($g.ContainsKey('Transport') -and $null -ne $g['Transport']) {
+                if ($g['Transport'] -isnot [scriptblock]) { return (& $refuse 'SYNC_CONFIG_INVALID') }
+                $ghTransport = $g['Transport']
+            }
+            $fGh = @{ taskId = [string]$m['taskId']; repo = [string]$m['repo']; issueNumber = [long]$m['issueNumber']; stableMarker = [string]$m['stableMarker']; StateDir = [string]$g['StateDir']; PublicStatus = [string]$g['PublicStatus']; NextAction = [string]$g['NextAction']; Transport = $ghTransport }
+            $hasGh = $true
+        }
+        $pubCheckpoint = [string]$CheckpointPath; $pubVault = [string]$VaultPath; $pubEvidence = [string]$EvidenceRoot
+        } } catch { $preCode = 'SYNC_CONFIG_INVALID' }
+        if ($null -ne $preCode) { $preRefusal = [string]$preCode; $producer = $null; $hasLocal = $false; $hasGh = $false }
+    }
 
     $mandatoryKeys = @('RawPath', 'TicketPath', 'UsagePath', 'RunId', 'Attempt', 'MaxAttempts', 'PriorElapsedMs', 'MaxElapsedMs', 'ReceiptPath')
     $adapterArgs = @{}
@@ -760,11 +811,60 @@ function Invoke-PublishedSettledHostContinuation {
         -TerminalReceiptPath $adapterResult.receiptPath -TerminalSha256 $adapterResult.receiptSha256 `
         -QueuePath $QueuePath -NormalQuotaPath $NormalQuotaPath -CloudQuotaPath $CloudQuotaPath -Owner $Owner -Dispatch $Dispatch
 
-    try {
-        if (Test-Path -LiteralPath $CheckpointPath -PathType Leaf) {
-            Invoke-RuntimeProjection -CheckpointPath $CheckpointPath -VaultPath $VaultPath -EvidenceRoot $EvidenceRoot | Out-Null
-        }
-    } catch { }
+    if (-not $optIn) {
+        try {
+            if (Test-Path -LiteralPath $CheckpointPath -PathType Leaf) {
+                Invoke-RuntimeProjection -CheckpointPath $CheckpointPath -VaultPath $VaultPath -EvidenceRoot $EvidenceRoot | Out-Null
+            }
+        } catch { }
 
+        return $coreResult
+    }
+
+    # Opt-in: the explicit trusted producer runs once with the ACTUAL core result; the accepted publisher
+    # then runs once with only the present sink configs. No additional direct projector call.
+    $bs = { param($v) try { $t = [string]$v; if ($t.Length -gt 64) { $t.Substring(0, 64) } else { $t } } catch { '' } }
+    $pv = { param($o, $n) try { $p = $o.PSObject.Properties[$n]; if ($null -ne $p) { & $bs $p.Value } else { $null } } catch { $null } }
+    $sink = {
+        param($s)
+        if ($null -eq $s) { return $null }
+        try { [PSCustomObject]@{ status = (& $pv $s 'status'); code = (& $pv $s 'code'); delivered = [bool](& $pv $s 'delivered' | ForEach-Object { $_ -eq 'True' }); replay = [bool](& $pv $s 'replay' | ForEach-Object { $_ -eq 'True' }) } } catch { $null }
+    }
+    $po = { param($o, $n) try { $p = $o.PSObject.Properties[$n]; if ($null -ne $p) { $p.Value } else { $null } } catch { $null } }
+    $pub = $null
+    $produced = $null
+    $stateOk = $false
+    if ($null -ne $preRefusal) {
+        $pub = [PSCustomObject]@{ status = 'REFUSED'; code = $preRefusal }
+    } else {
+        try {
+            $out = @(& $producer $coreResult)
+            if ($out.Count -eq 1 -and ($out[0] -is [System.Collections.IDictionary] -or $out[0] -is [PSCustomObject])) { $produced = $out[0]; $stateOk = $true }
+        } catch { $pub = [PSCustomObject]@{ status = 'REFUSED'; code = 'STATE_PRODUCER_FAILED' } }
+        if ($null -eq $pub -and -not $stateOk) { $pub = [PSCustomObject]@{ status = 'REFUSED'; code = 'STATE_INVALID' } }
+    }
+    if ($null -eq $pub) {
+        try {
+            if (-not (Get-Command Publish-RuntimeCheckpoint -ErrorAction SilentlyContinue)) {
+                . (Join-Path (Join-Path (Split-Path -Parent $PSScriptRoot) 'projection') 'publish-runtime.ps1')
+            }
+            $pubArgs = @{ State = $produced; CheckpointPath = $pubCheckpoint; VaultPath = $pubVault; EvidenceRoot = $pubEvidence }
+            if ($hasLocal) { $pubArgs['LocalSyncConfig'] = @{ StateDir = $fLocalDir } }
+            if ($hasGh) {
+                $ghCfg = @{
+                    Mapping = @{ taskId = $fGh['taskId']; repo = $fGh['repo']; issueNumber = $fGh['issueNumber']; stableMarker = $fGh['stableMarker'] }
+                    StateDir = $fGh['StateDir']; PublicStatus = $fGh['PublicStatus']; NextAction = $fGh['NextAction']
+                }
+                if ($null -ne $fGh['Transport']) { $ghCfg['Transport'] = $fGh['Transport'] }
+                $pubArgs['GitHubSyncConfig'] = $ghCfg
+            }
+            $r = Publish-RuntimeCheckpoint @pubArgs
+            $pub = [PSCustomObject]@{
+                status = (& $pv $r 'status'); code = (& $pv $r 'code'); version = (& $pv $r 'version'); checkpointSha = (& $pv $r 'checkpointSha')
+                local = (& $sink (& $po $r 'local')); github = (& $sink (& $po $r 'github'))
+            }
+        } catch { $pub = [PSCustomObject]@{ status = 'ERROR'; code = 'PUBLISH_ERROR' } }
+    }
+    try { $coreResult | Add-Member -NotePropertyName publication -NotePropertyValue $pub -Force } catch { }
     return $coreResult
 }
