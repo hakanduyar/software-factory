@@ -18,6 +18,17 @@ export interface RegisterWorkerOptions {
    * declared capabilities *at registration time*, captured immutably.
    */
   readonly roles?: readonly FactoryRole[];
+  /**
+   * Host-authoritative (caller-supplied at registration time) declaration
+   * that this principal must satisfy the direct provider-admission ticket
+   * gate before a protected direct run. Never derived from the Worker
+   * object's own self-reported capabilities. D1-85: every NONMOCK worker
+   * requires admission regardless of this flag's presence or value (false
+   * or absent does not exempt it); only the identity-backed A80
+   * `isTrustedMockWorker` predicate exempts a worker, and only because it is
+   * a deterministic mock, never because of this option.
+   */
+  readonly requiresDirectAdmission?: boolean;
 }
 
 export interface WorkerRegistry {

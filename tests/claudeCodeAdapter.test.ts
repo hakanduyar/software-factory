@@ -19,6 +19,7 @@ import {
   createClaudeCodeWorker,
   extractClaudeFinalMessage,
   interpretClaudeOutput,
+  parseClaudeStructuredResult,
   permissionModeForRole,
   resolveClaudeEffort,
 } from "../src/adapters/workers/claudeCodeAdapter.js";
@@ -153,6 +154,76 @@ describe("claudeCodeAdapter: output parsing (informational only)", () => {
     };
     assert.deepEqual(interpretClaudeOutput(processResult), {});
   });
+
+  it("flags streamCorrupted when the JSONL fallback scan hits a malformed line after a valid `result` line", () => {
+    // Claude's primary output is a single JSON object, so this exercises the
+    // defensive JSONL-fallback scan path (triggered because the whole stdout
+    // does not parse as one object) with the same malformed-tail shape as the
+    // Codex regression: a valid result line, then a malformed trailing line.
+    const stdout = `${JSON.stringify({ type: "result", subtype: "success", result: "the answer" })}\n{`;
+    const processResult: ProcessResult = {
+      terminationReason: "EXITED",
+      exitCode: 0,
+      signal: null,
+      stdout,
+      stderr: "",
+      stdoutTruncated: false,
+      stderrTruncated: false,
+      startedAt: 0,
+      finishedAt: 1,
+      durationMs: 1,
+    };
+    assert.equal(extractClaudeFinalMessage(stdout), "the answer");
+    const reported = interpretClaudeOutput(processResult);
+    assert.equal(reported.finalMessage, "the answer");
+    assert.equal(reported.streamCorrupted, true);
+  });
+
+  it("flags streamCorrupted when the JSONL fallback scan finds two independently well-formed `result` lines (DEFECT-PLANNER-MULTIRESULT)", () => {
+    // Claude's documented contract is exactly ONE JSON object per invocation
+    // (see this file's header). Reaching the JSONL fallback with two
+    // COMPLETE, individually valid result lines — no malformed line at all —
+    // is a distinct contract violation from the malformed-tail case above:
+    // both lines parse cleanly, so the old scan silently kept the last one
+    // instead of surfacing the ambiguity.
+    const stdout =
+      JSON.stringify({ type: "result", is_error: false, result: "first answer" }) +
+      "\n" +
+      JSON.stringify({ type: "result", is_error: false, result: "second answer" });
+    const processResult: ProcessResult = {
+      terminationReason: "EXITED",
+      exitCode: 0,
+      signal: null,
+      stdout,
+      stderr: "",
+      stdoutTruncated: false,
+      stderrTruncated: false,
+      startedAt: 0,
+      finishedAt: 1,
+      durationMs: 1,
+    };
+    const reported = interpretClaudeOutput(processResult);
+    assert.equal(reported.streamCorrupted, true);
+  });
+
+  it("does not flag streamCorrupted for the confirmed clean single-JSON-object shape", () => {
+    const stdout = JSON.stringify({ type: "result", subtype: "success", result: "the answer" });
+    const processResult: ProcessResult = {
+      terminationReason: "EXITED",
+      exitCode: 0,
+      signal: null,
+      stdout,
+      stderr: "",
+      stdoutTruncated: false,
+      stderrTruncated: false,
+      startedAt: 0,
+      finishedAt: 1,
+      durationMs: 1,
+    };
+    const reported = interpretClaudeOutput(processResult);
+    assert.equal(reported.finalMessage, "the answer");
+    assert.equal(reported.streamCorrupted, undefined);
+  });
 });
 
 describe("claudeCodeAdapter: end-to-end execute() against a fake CLI matching the confirmed real contract", () => {
@@ -190,5 +261,59 @@ describe("claudeCodeAdapter: end-to-end execute() against a fake CLI matching th
     const outcome = await worker.execute(request());
     assert.equal(outcome.status, "FAILED");
     assert.ok(outcome.evidence.some((e) => /SPAWN_ERROR/.test(e.summary)));
+  });
+});
+
+/**
+ * DEFECT-DURABLE-WORKER-RUN-ENVELOPE AC-6: `parseClaudeStructuredResult`.
+ *
+ * Deliberately strict, unlike `scanClaudeOutput`'s informational, lenient
+ * JSONL-fallback scan above: a durable MAX_TURNS record is a stronger claim,
+ * so anything other than a single well-formed `type: "result"` object naming
+ * `terminal_reason: "max_turns"` verbatim must produce nothing rather than a
+ * guess. Free text can never fabricate this state.
+ */
+describe("DEFECT-DURABLE-WORKER-RUN-ENVELOPE: parseClaudeStructuredResult", () => {
+  it("extracts session_id and a verified MAX_TURNS terminal reason", () => {
+    const stdout = JSON.stringify({
+      type: "result",
+      is_error: false,
+      result: "ran out of turns",
+      session_id: "sess-abc123",
+      terminal_reason: "max_turns",
+    });
+    const parsed = parseClaudeStructuredResult(stdout);
+    assert.equal(parsed.sessionId, "sess-abc123");
+    assert.equal(parsed.terminalReason, "MAX_TURNS");
+  });
+
+  it("extracts session_id alone when there is no terminal_reason at all", () => {
+    const stdout = JSON.stringify({ type: "result", is_error: false, result: "done", session_id: "sess-ok" });
+    const parsed = parseClaudeStructuredResult(stdout);
+    assert.equal(parsed.sessionId, "sess-ok");
+    assert.equal(parsed.terminalReason, undefined);
+  });
+
+  it("never fabricates MAX_TURNS from a DIFFERENT structured terminal_reason", () => {
+    const stdout = JSON.stringify({ type: "result", is_error: true, result: "boom", terminal_reason: "api_error" });
+    assert.equal(parseClaudeStructuredResult(stdout).terminalReason, undefined);
+  });
+
+  it("never fabricates MAX_TURNS from FREE TEXT that merely mentions max turns", () => {
+    const stdout = "the assistant said: I am out of max turns, sorry!";
+    const parsed = parseClaudeStructuredResult(stdout);
+    assert.equal(parsed.terminalReason, undefined);
+    assert.equal(parsed.sessionId, undefined);
+  });
+
+  it("never fabricates MAX_TURNS from free text embedded inside an otherwise-valid object's result field", () => {
+    const stdout = JSON.stringify({ type: "result", is_error: false, result: "terminal_reason: max_turns (just a string)" });
+    assert.equal(parseClaudeStructuredResult(stdout).terminalReason, undefined);
+  });
+
+  it("finds nothing in a non-result object, malformed JSON, or empty output", () => {
+    assert.deepEqual(parseClaudeStructuredResult(JSON.stringify({ type: "system" })), {});
+    assert.deepEqual(parseClaudeStructuredResult("{not json"), {});
+    assert.deepEqual(parseClaudeStructuredResult(""), {});
   });
 });

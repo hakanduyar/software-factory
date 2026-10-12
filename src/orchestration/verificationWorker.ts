@@ -19,12 +19,20 @@ import { realpathSync, statSync } from "node:fs";
 import { resolve, sep } from "node:path";
 
 import { ValidationError } from "../domain/errors.js";
+import { realpathSync as realpathOfPath } from "node:fs";
 import type { EvidenceDraft } from "../domain/evidence.js";
 import type { ProcessRunner } from "../ports/processRunner.js";
 import type { Worker, WorkerOutcome, WorkerRequest } from "../ports/worker.js";
 import { buildWorkerEnvironment, redactSecrets, type EnvironmentPolicy } from "../adapters/workers/environmentPolicy.js";
 import { DEFAULT_WORKER_ENVIRONMENT_POLICY } from "../adapters/workers/environmentPolicy.js";
 import type { Workspace } from "../adapters/workers/workspace.js";
+import type {
+  DirectHostExecutionAdmissionSurface,
+  DirectLaunchCommandExpectation,
+  DirectLaunchDeterministicBudgetExpectation,
+  DirectLaunchExecutionPolicyExpectation,
+  DirectLaunchScopeExpectation,
+} from "../supervision/directWorkerAdmission.js";
 import type { VerificationCommandConfig, VerificationCommandResult } from "./loopTypes.js";
 
 export const DEFAULT_VERIFICATION_TIMEOUT_MS = 5 * 60 * 1000;
@@ -94,12 +102,70 @@ export interface VerificationWorkerOptions {
   readonly defaultTimeoutMs?: number;
   readonly maxOutputBytes?: number;
   readonly maxEvidenceChars?: number;
+  /** Same Factory admission channel that issued the opaque handle in the prepared bundle. */
+  readonly directAdmissionChannel?: Pick<
+    DirectHostExecutionAdmissionSurface,
+    "checkReadiness" | "consume" | "checkConsumedContinuation"
+  >;
+  /** Supplied by the loop after guarded Worker preparation; never derived from WorkerRequest, model or input. */
+  readonly readPreparedExecution?: () => DeterministicVerificationPreparation | undefined;
   /** Invoked synchronously, once per command, as its result is produced — the orchestrator's channel for structured per-command results (see engineeringLoopService.ts). */
   readonly onCommandResult?: (result: VerificationCommandResult) => void;
 }
 
 function truncate(text: string, maxChars: number): string {
   return text.length <= maxChars ? text : `${text.slice(0, maxChars)}\n…[truncated]`;
+}
+
+/** Private one-time frozen bundle describing exactly what the admission handle authorises. */
+export interface DeterministicVerificationPreparation {
+  readonly expectedExecutionKind: "deterministic-execution";
+  readonly expectedScope: DirectLaunchScopeExpectation;
+  readonly expectedCommands: DirectLaunchCommandExpectation;
+  readonly expectedWorkspace: string;
+  readonly expectedDeterministicBudgets: DirectLaunchDeterministicBudgetExpectation;
+  readonly expectedExecutionPolicy: DirectLaunchExecutionPolicyExpectation;
+}
+
+function isPositiveSafeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+function sameValue(a: unknown, b: unknown): boolean {
+  if (a === b) {
+    return true;
+  }
+  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) {
+    return false;
+  }
+  if (Array.isArray(a) !== Array.isArray(b)) {
+    return false;
+  }
+  const left = a as Record<string, unknown>;
+  const right = b as Record<string, unknown>;
+  const leftKeys = Object.keys(left);
+  if (leftKeys.length !== Object.keys(right).length) {
+    return false;
+  }
+  return leftKeys.every((key) => Object.prototype.hasOwnProperty.call(right, key) && sameValue(left[key], right[key]));
+}
+
+function assertCommandMatchesExpectation(
+  command: { readonly executable: string; readonly argv: readonly string[] },
+  resolvedCwd: string,
+  expected: DirectLaunchCommandExpectation[number] | undefined,
+  expectedResolvedCwd: string | undefined,
+): void {
+  if (
+    expected === undefined ||
+    command.executable !== expected.executable ||
+    command.argv.length !== expected.argv.length ||
+    command.argv.some((arg, index) => arg !== expected.argv[index]) ||
+    expectedResolvedCwd === undefined ||
+    resolvedCwd !== expectedResolvedCwd
+  ) {
+    throw new Error("verification command does not match the prepared admission bundle");
+  }
 }
 
 export function createVerificationWorker(options: VerificationWorkerOptions): Worker {
@@ -111,12 +177,89 @@ export function createVerificationWorker(options: VerificationWorkerOptions): Wo
       const maxEvidenceChars = options.maxEvidenceChars ?? DEFAULT_MAX_EVIDENCE_CHARS;
       const evidence: EvidenceDraft[] = [];
       const results: VerificationCommandResult[] = [];
+      const startedAtMs = Date.now();
+      const channel = options.directAdmissionChannel;
+      const prepared = options.readPreparedExecution?.();
+      if (
+        prepared === undefined ||
+        channel === undefined ||
+        prepared.expectedExecutionKind !== "deterministic-execution" ||
+        typeof channel.checkReadiness !== "function" ||
+        typeof channel.consume !== "function" ||
+        typeof channel.checkConsumedContinuation !== "function" ||
+        prepared.expectedScope === undefined ||
+        prepared.expectedExecutionPolicy === undefined
+      ) {
+        throw new Error("verification refused: prepared deterministic admission is absent or unsupported");
+      }
+      if (
+        prepared.expectedCommands.length !== options.commands.length ||
+        !sameValue(realpathOfPath(prepared.expectedWorkspace), realpathOfPath(options.workspace.root))
+      ) {
+        throw new Error("verification refused: commands or workspace differ from the prepared bundle");
+      }
+      options.commands.forEach((command, index) => {
+        const expectedCommand = prepared.expectedCommands[index];
+        assertCommandMatchesExpectation(
+          command,
+          resolveContainedCwd(options.workspace, command.cwd),
+          expectedCommand,
+          expectedCommand === undefined ? undefined : resolveContainedCwd(options.workspace, expectedCommand.cwd),
+        );
+      });
+      const budgets = prepared.expectedDeterministicBudgets;
+      const policy = prepared.expectedExecutionPolicy;
+      if (
+        typeof budgets.elapsedSeconds !== "number" ||
+        !Number.isFinite(budgets.elapsedSeconds) ||
+        budgets.elapsedSeconds <= 0 ||
+        !isPositiveSafeInteger(budgets.outputBytes) ||
+        !isPositiveSafeInteger(budgets.maxAttempts)
+      ) {
+        throw new Error("verification refused: prepared deterministic budgets are invalid");
+      }
+      if (typeof policy.rationale !== "string" || policy.rationale.trim() === "") {
+        throw new Error("verification refused: prepared execution policy rationale is invalid");
+      }
+      const deadlineMs = startedAtMs + budgets.elapsedSeconds * 1000;
+      const outputBudgetBytes = budgets.outputBytes;
+      let measuredOutputBytes = 0;
+      const handle = request.directAdmissionHandle;
+      if (handle === undefined || handle === null) {
+        throw new Error("verification refused: Factory-issued admission handle is absent");
+      }
+      if (!(await channel.checkReadiness(handle))) {
+        throw new Error("verification refused: admission handle is not ready");
+      }
+      const receipt = await channel.consume(handle);
 
-      for (const command of options.commands) {
+      for (const [commandIndex, command] of options.commands.entries()) {
         // Re-validated per command at execution time, not just at loop start:
         // a symlink created after start must not open the workspace boundary.
         const cwd = resolveContainedCwd(options.workspace, command.cwd);
-        const timeoutMs = command.timeoutMs ?? options.defaultTimeoutMs ?? DEFAULT_VERIFICATION_TIMEOUT_MS;
+        const expectedLoopCommand = prepared.expectedCommands[commandIndex];
+        assertCommandMatchesExpectation(
+          command,
+          cwd,
+          expectedLoopCommand,
+          expectedLoopCommand === undefined ? undefined : resolveContainedCwd(options.workspace, expectedLoopCommand.cwd),
+        );
+        if ((await channel.checkConsumedContinuation(receipt)) !== true) {
+          throw new Error("verification incomplete: consumed admission continuation is no longer valid");
+        }
+        const remainingMs = Math.floor(deadlineMs - Date.now());
+        if (remainingMs <= 0) {
+          throw new Error("verification incomplete: approved elapsed budget exhausted");
+        }
+        const remainingBytes = outputBudgetBytes - measuredOutputBytes;
+        if (remainingBytes <= 0) {
+          throw new Error("verification incomplete: approved output budget exhausted");
+        }
+        const configuredTimeoutMs = command.timeoutMs ?? options.defaultTimeoutMs ?? DEFAULT_VERIFICATION_TIMEOUT_MS;
+        const timeoutMs = Math.min(configuredTimeoutMs, remainingMs);
+        const streamLimit = Math.min(options.maxOutputBytes ?? remainingBytes, remainingBytes);
+        const abortController = new AbortController();
+        let outputBudgetExceeded = false;
 
         const processResult = await options.processRunner.run({
           executable: command.executable,
@@ -124,10 +267,23 @@ export function createVerificationWorker(options: VerificationWorkerOptions): Wo
           cwd,
           env,
           timeoutMs,
-          ...(options.maxOutputBytes === undefined ? {} : { maxOutputBytes: options.maxOutputBytes }),
+          maxOutputBytes: streamLimit,
+          signal: abortController.signal,
+          onOutput: (bytes: number) => {
+            measuredOutputBytes += bytes;
+            if (measuredOutputBytes > outputBudgetBytes && !outputBudgetExceeded) {
+              outputBudgetExceeded = true;
+              abortController.abort();
+            }
+          },
         });
 
-        const passed = processResult.terminationReason === "EXITED" && processResult.exitCode === 0;
+        const passed =
+          processResult.terminationReason === "EXITED" &&
+          processResult.exitCode === 0 &&
+          !outputBudgetExceeded &&
+          !processResult.stdoutTruncated &&
+          !processResult.stderrTruncated;
         const result: VerificationCommandResult = {
           commandId: command.id,
           passed,
@@ -139,6 +295,9 @@ export function createVerificationWorker(options: VerificationWorkerOptions): Wo
         };
         results.push(result);
         options.onCommandResult?.(result);
+        if (outputBudgetExceeded) {
+          throw new Error("verification incomplete: approved output budget exceeded; later commands not run");
+        }
 
         const commandLabel = `${command.executable} ${command.argv.join(" ")}`.trim();
         const outputTail = processResult.stdout.length > 0 ? processResult.stdout : processResult.stderr;

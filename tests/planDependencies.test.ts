@@ -18,7 +18,16 @@ import { describe, it } from "node:test";
 
 import { renderPlannerResponse } from "../src/planning/scriptedPlannerWorkers.js";
 import { createScriptedDispatcher } from "../src/planning/scriptedPlannerWorkers.js";
-import { approvedPlan, finishWorkItem, newPlanning, type TestPlanning } from "./support/planFixtures.js";
+import { planTicketExecutability } from "../src/planning/planValidation.js";
+import {
+  approvedPlan,
+  DIAMOND_TICKET_TEMPLATES,
+  finishWorkItem,
+  newPlanning,
+  SCHEMA_THEN_API_TICKET_TEMPLATES,
+  testExecutionConfig,
+  type TestPlanning,
+} from "./support/planFixtures.js";
 
 const A_THEN_B = renderPlannerResponse({
   summary: "Schema first, then the API that needs it.",
@@ -47,17 +56,26 @@ function mappingFor(plan: Awaited<ReturnType<typeof approvedPlan>>, key: string)
 describe("TASK-005 AC-9: a dependent item waits for its prerequisites", () => {
   it("dispatches only the root item while its dependent waits", async () => {
     const context = await newPlanning({ plannerOutputs: [A_THEN_B] });
-    const plan = await approvedPlan(context);
+    const plan = await approvedPlan(context, "Build the thing.", {
+      execution: testExecutionConfig(undefined, SCHEMA_THEN_API_TICKET_TEMPLATES),
+    });
 
     assert.equal(plan.materialized.length, 2, "both items are materialized up front");
     assert.equal(plan.dispatches.length, 1, "only the unblocked item is dispatched");
     assert.equal(plan.dispatches[0]!.planItemKey, "WI-A");
     assert.equal(context.dispatcher.startCount(), 1);
+
+    const approvedRevision = plan.revisions.find((revision) => revision.revision === plan.approvedRevision);
+    assert.ok(approvedRevision !== undefined, "the approved revision must be found among the plan's revisions");
+    const executability = planTicketExecutability(approvedRevision.items, plan.execution.ticketTemplates);
+    assert.equal(executability.status, "EXECUTABLE", "a fully templated, approved plan must be dispatchable");
   });
 
   it("dispatches the dependent once the prerequisite has genuinely finished", async () => {
     const context = await newPlanning({ plannerOutputs: [A_THEN_B] });
-    const plan = await approvedPlan(context);
+    const plan = await approvedPlan(context, "Build the thing.", {
+      execution: testExecutionConfig(undefined, SCHEMA_THEN_API_TICKET_TEMPLATES),
+    });
 
     await finishWorkItem(context.factory, mappingFor(plan, "WI-A").workItemId, "dep-a");
     const resumed = await context.service.resume(plan.id);
@@ -68,7 +86,9 @@ describe("TASK-005 AC-9: a dependent item waits for its prerequisites", () => {
 
   it("a status field alone does not satisfy a dependency — live authority is required", async () => {
     const context = await newPlanning({ plannerOutputs: [A_THEN_B] });
-    const plan = await approvedPlan(context);
+    const plan = await approvedPlan(context, "Build the thing.", {
+      execution: testExecutionConfig(undefined, SCHEMA_THEN_API_TICKET_TEMPLATES),
+    });
     const itemA = mappingFor(plan, "WI-A").workItemId;
 
     // Force the row to CLAIM it finished, with no review lineage behind it —
@@ -90,7 +110,9 @@ describe("TASK-005 AC-9: a dependent item waits for its prerequisites", () => {
 
   it("respects a diamond graph, releasing the join only after both branches finish", async () => {
     const context = await newPlanning({ plannerOutputs: [DIAMOND] });
-    let plan = await approvedPlan(context);
+    let plan = await approvedPlan(context, "Build the thing.", {
+      execution: testExecutionConfig(undefined, DIAMOND_TICKET_TEMPLATES),
+    });
 
     assert.equal(plan.dispatches.length, 1);
     assert.equal(plan.dispatches[0]!.planItemKey, "WI-A");
@@ -112,7 +134,9 @@ describe("TASK-005 AC-9: a dependent item waits for its prerequisites", () => {
 
   it("dependency progress survives a restart", async () => {
     const context = await newPlanning({ plannerOutputs: [A_THEN_B] });
-    const plan = await approvedPlan(context);
+    const plan = await approvedPlan(context, "Build the thing.", {
+      execution: testExecutionConfig(undefined, SCHEMA_THEN_API_TICKET_TEMPLATES),
+    });
     await finishWorkItem(context.factory, mappingFor(plan, "WI-A").workItemId, "restart-a");
     const advanced = await context.service.resume(plan.id);
     assert.equal(advanced.dispatches.length, 2);
@@ -136,7 +160,9 @@ describe("TASK-005 AC-9: a failed prerequisite stops everything downstream", () 
     it(`blocks the plan when a dispatched loop ends in ${phase}`, async () => {
       const dispatcher = createScriptedDispatcher();
       const context = await newPlanning({ plannerOutputs: [A_THEN_B], dispatcher });
-      const plan = await approvedPlan(context);
+      const plan = await approvedPlan(context, "Build the thing.", {
+        execution: testExecutionConfig(undefined, SCHEMA_THEN_API_TICKET_TEMPLATES),
+      });
       const itemA = mappingFor(plan, "WI-A").workItemId;
 
       dispatcher.setPhase(itemA, { phase, outcome: phase, failureReason: `loop ended ${phase}` });
@@ -153,7 +179,9 @@ describe("TASK-005 AC-9: a failed prerequisite stops everything downstream", () 
   it("a blocked plan can recover once the human resolves the failure", async () => {
     const dispatcher = createScriptedDispatcher();
     const context = await newPlanning({ plannerOutputs: [A_THEN_B], dispatcher });
-    const plan = await approvedPlan(context);
+    const plan = await approvedPlan(context, "Build the thing.", {
+      execution: testExecutionConfig(undefined, SCHEMA_THEN_API_TICKET_TEMPLATES),
+    });
     const itemA = mappingFor(plan, "WI-A").workItemId;
 
     dispatcher.setPhase(itemA, { phase: "EXHAUSTED", outcome: "EXHAUSTED" });
@@ -224,7 +252,9 @@ describe("TASK-005 AC-10: work reaches TASK-004, and only through TASK-004", () 
   it("adopts an externally-started loop rather than competing with it", async () => {
     const dispatcher = createScriptedDispatcher();
     const context = await newPlanning({ plannerOutputs: [A_THEN_B], dispatcher });
-    const plan = await approvedPlan(context);
+    const plan = await approvedPlan(context, "Build the thing.", {
+      execution: testExecutionConfig(undefined, SCHEMA_THEN_API_TICKET_TEMPLATES),
+    });
 
     // Forget the dispatch, then resume: the loop is already there.
     const current = (await context.plans.findById(plan.id))!;

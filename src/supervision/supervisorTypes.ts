@@ -12,11 +12,15 @@
  * recomputed on read rather than trusted; and ambiguity fails closed.
  */
 
+import type { Activity } from "./activity.js";
+import type { SupervisorOwner } from "./supervisorLease.js";
+import type { CandidateBinding } from "./acceptance.js";
 import type { Timestamp } from "../domain/time.js";
 import type { AiRunConfigRecord } from "./modelEnforcement.js";
 import type { WorkClass } from "./modelRouting.js";
 import type { ProvenanceEntry } from "./provenanceChain.js";
 import type { ResourceRecord } from "./resourceTypes.js";
+import type { WorkerRunEnvelope, WorkerRunNotification } from "./workerRunEnvelope.js";
 
 // =====================================================================
 // Roadmap queue
@@ -198,6 +202,19 @@ export type ActionState = (typeof ACTION_STATES)[number];
  * proves nothing external happened and a retry is safe, while `RUNNING` under a
  * dead owner is unknowable and must fail closed rather than be repeated.
  */
+/** A candidate someone has declared ready for independent review. */
+export interface ReviewRequest {
+  readonly roadmapKey: string;
+  readonly candidate: CandidateBinding;
+  /** Which attempt at reviewing this item this is; 1 for the first. */
+  readonly attempt: number;
+  readonly requestedAt: Timestamp;
+  /** Who is to be asked, so the record says what was intended, not what was cheap. */
+  readonly provider: string;
+  readonly model: string;
+  readonly effort: string;
+}
+
 export interface SupervisorActionClaim {
   /** Canonical, derived — never random (the TASK-004 round-2 lesson). */
   readonly actionId: string;
@@ -285,7 +302,80 @@ export interface SupervisorState {
   readonly resources: readonly ResourceRecord[];
   readonly roadmap: readonly RoadmapItem[];
   readonly checkpoints: readonly SessionCheckpoint[];
-  readonly activeClaim?: SupervisorActionClaim;
+  /**
+   * Long-running work IN FLIGHT (TASK-018 Part B).
+   *
+   * The durable state this repository defends was never the problem; the state
+   * of work in flight was, and it lived in process memory and scratchpad files
+   * until it died with whatever was holding it.
+   *
+   * OPTIONAL, and absent means none — the same forward-compatibility rule
+   * `provenance` follows, and for the same reason recorded as L-1: an operator
+   * whose supervisor stops loading because a newer build added a field. Making
+   * it required would also have rewritten twenty unrelated test fixtures to
+   * assert nothing, which is churn a reviewer then has to read.
+   */
+  readonly activities?: readonly Activity[];
+  /**
+   * Durable run records for external Claude/Codex processes launched by
+   * production plan-resume supervision (DEFECT-DURABLE-WORKER-RUN-ENVELOPE).
+   *
+   * `Activity` records THAT something is in flight; this records WHAT a
+   * specific AI CLI launch was configured as, its real OS identity once it
+   * ACKs, and the bounded terminal artifact it left behind. The two are not
+   * merged for the reason `workerRunEnvelope.ts`'s own header gives: an
+   * activity is generic, and this is provider-specific.
+   *
+   * OPTIONAL, absent-means-empty — the same forward-compatibility rule
+   * `activities` follows, so a database written before this field existed
+   * still loads.
+   */
+  readonly workerRuns?: readonly WorkerRunEnvelope[];
+  /**
+   * The idempotent notification outbox for worker-run terminal events
+   * (MAX_TURNS, LOST, STALLED, AMBIGUOUS) that a human or controller has not
+   * yet been shown (DEFECT-DURABLE-WORKER-RUN-ENVELOPE AC-8, AC-9).
+   *
+   * Absent-means-empty, for the same reason every other optional collection
+   * here is.
+   */
+  readonly workerRunNotifications?: readonly WorkerRunNotification[];
+  /**
+   * Who is SUPERVISING this Factory right now (TASK-019 AC-17).
+   *
+   * Distinct from `activeClaim`, which says who is doing a piece of work: this
+   * says who is allowed to decide what happens next at all. Optional and absent
+   * means nobody — a database written before this field existed still loads,
+   * and a Factory with no supervisor running is an ordinary state rather than a
+   * corrupt one.
+   */
+  readonly supervisor?: SupervisorOwner | undefined;
+  /**
+   * Candidates whose independent review has been ASKED FOR but not yet settled
+   * (TASK-019 AC-2).
+   *
+   * Deciding that a candidate is ready to review is a judgement about the work —
+   * gates green, tree frozen — and belongs to whoever did the work. Everything
+   * AFTER that decision belongs to the supervisor: creating the review record,
+   * launching a reviewer, adopting it, noticing it died, consuming its verdict.
+   * That split is what lets the shell chain disappear without the Factory
+   * losing the ability to review anything, and it keeps this task from
+   * inventing a policy about when work is finished.
+   *
+   * Absent means none.
+   */
+  readonly reviewRequests?: readonly ReviewRequest[] | undefined;
+  /**
+   * `| undefined` is deliberate under `exactOptionalPropertyTypes`.
+   *
+   * A partial patch must be able to say "and there is no longer a claim" —
+   * consuming a verdict releases the claim its review held, in the same write —
+   * and with a bare optional the only way to express that is to rebuild the
+   * whole state, which is exactly the read-modify-write a concurrent patch must
+   * not do. `JSON.stringify` drops the key, so an absent claim and a claim set
+   * to `undefined` persist identically.
+   */
+  readonly activeClaim?: SupervisorActionClaim | undefined;
   /** When the next tick is worth running. Absent means "nothing scheduled". */
   readonly nextWakeAt?: Timestamp;
   readonly escalations: readonly HumanEscalation[];

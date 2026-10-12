@@ -25,6 +25,26 @@
 
 import { PersistenceCorruptionError } from "../domain/errors.js";
 import {
+  ACTIVITY_STATES,
+  RECONCILIATION_VERDICTS,
+  TERMINAL_ACTIVITY_STATES,
+  type Activity,
+  type ActivityState,
+  type ReconciliationVerdict,
+} from "./activity.js";
+import {
+  WORKER_RUN_NOTIFICATION_KINDS,
+  WORKER_RUN_STATES,
+  WORKER_RUN_TERMINAL_REASONS,
+  canonicalWorkerRunId,
+  workerRunNotificationKey,
+  type WorkerRunEnvelope,
+  type WorkerRunNotification,
+  type WorkerRunNotificationKind,
+  type WorkerRunState,
+  type WorkerRunTerminalReason,
+} from "./workerRunEnvelope.js";
+import {
   ACTION_STATES,
   ESCALATION_REASONS,
   ROADMAP_STATUSES,
@@ -360,6 +380,383 @@ function parseClaim(raw: unknown, context: string): SupervisorActionClaim {
   };
 }
 
+/**
+ * One in-flight activity (TASK-018 Part B).
+ *
+ * Parsed as strictly as everything else here, and for the same reason: this
+ * record is what a NEW process reads to decide whether an old one is still
+ * working. A row it half-understood would be worse than a row it refused,
+ * because the conclusion drawn from it is "nobody owns this, take it".
+ */
+function parseActivity(raw: unknown, index: number, context: string): Activity {
+  const itemContext = `${context}.activities[${index}]`;
+  const row = asObject(raw, itemContext);
+
+  const leaseRaw = row["lease"];
+  const lease =
+    leaseRaw === undefined
+      ? undefined
+      : (() => {
+          const leaseContext = `${itemContext}.lease`;
+          const leaseRow = asObject(leaseRaw, leaseContext);
+          return {
+            pid: nonNegativeInt(leaseRow, "pid", leaseContext),
+            processStartedAt: nonNegativeInt(leaseRow, "processStartedAt", leaseContext),
+            machine: str(leaseRow, "machine", leaseContext),
+            // REQUIRED, not optional. A lease with no boot identity cannot be
+            // told from one written before a restart, and an absent field would
+            // silently reintroduce exactly the collision it was added to close.
+            boot: str(leaseRow, "boot", leaseContext),
+            claimedAt: num(leaseRow, "claimedAt", leaseContext),
+          };
+        })();
+
+  const heartbeatRaw = row["heartbeat"];
+  const heartbeat =
+    heartbeatRaw === undefined
+      ? undefined
+      : (() => {
+          const beatContext = `${itemContext}.heartbeat`;
+          const beatRow = asObject(heartbeatRaw, beatContext);
+          return {
+            at: num(beatRow, "at", beatContext),
+            progress: nonNegativeInt(beatRow, "progress", beatContext),
+          };
+        })();
+
+  const completionRaw = row["completion"];
+  const completion =
+    completionRaw === undefined
+      ? undefined
+      : (() => {
+          const doneContext = `${itemContext}.completion`;
+          const doneRow = asObject(completionRaw, doneContext);
+          return {
+            outcome: str(doneRow, "outcome", doneContext),
+            detail: str(doneRow, "detail", doneContext),
+            at: num(doneRow, "at", doneContext),
+          };
+        })();
+
+  const reconciliationRaw = row["reconciliation"];
+  const reconciliation =
+    reconciliationRaw === undefined
+      ? undefined
+      : (() => {
+          const seenContext = `${itemContext}.reconciliation`;
+          const seenRow = asObject(reconciliationRaw, seenContext);
+          return {
+            verdict: oneOf<ReconciliationVerdict>(seenRow, "verdict", RECONCILIATION_VERDICTS, seenContext),
+            at: num(seenRow, "at", seenContext),
+            detail: str(seenRow, "detail", seenContext),
+          };
+        })();
+
+  /**
+   * What this review is OF, if it is one.
+   *
+   * Every field required, because the whole value of the binding is that a
+   * verdict can be refused for naming a different candidate — and a binding
+   * with a missing half refuses nothing. An activity that is not a review
+   * simply has no `review` at all.
+   */
+  const reviewRaw = row["review"];
+  const review =
+    reviewRaw === undefined
+      ? undefined
+      : (() => {
+          const reviewContext = `${itemContext}.review`;
+          const reviewRow = asObject(reviewRaw, reviewContext);
+          const candidateContext = `${reviewContext}.candidate`;
+          const candidateRow = asObject(reviewRow["candidate"], candidateContext);
+          return {
+            reviewId: str(reviewRow, "reviewId", reviewContext),
+            source: str(reviewRow, "source", reviewContext),
+            candidate: {
+              commit: str(candidateRow, "commit", candidateContext),
+              tree: str(candidateRow, "tree", candidateContext),
+              fingerprint: str(candidateRow, "fingerprint", candidateContext),
+            },
+            // Required, like the candidate: a review that does not say who was
+            // asked cannot be checked against who was supposed to be.
+            provider: str(reviewRow, "provider", reviewContext),
+            model: str(reviewRow, "model", reviewContext),
+            effort: str(reviewRow, "effort", reviewContext),
+            attempt: nonNegativeInt(reviewRow, "attempt", reviewContext),
+            ack: str(reviewRow, "ack", reviewContext),
+          };
+        })();
+
+  const observedAt = optionalNum(row, "observedAt", itemContext);
+  const state = oneOf<ActivityState>(row, "state", ACTIVITY_STATES, itemContext);
+
+  /**
+   * A TERMINAL activity must carry the outcome its owner recorded.
+   *
+   * Otherwise a row saying COMPLETED with nothing to show for it would satisfy
+   * `unobservedCompletions` and be reported as a result — which is exactly the
+   * forged-DONE shape TASK-012 refuses on the roadmap, arriving by another door.
+   */
+  if (TERMINAL_ACTIVITY_STATES.includes(state) && completion === undefined) {
+    corrupt(itemContext, `state is ${state} but no completion was recorded`);
+  }
+  /**
+   * ...and the converse (round-1 review, HIGH 3). An UNFINISHED activity
+   * carrying a completion is a record contradicting itself: a re-claim
+   * deliberately drops a dead owner's completion, so a row that has one while
+   * still RUNNING did not come from this code.
+   */
+  if (!TERMINAL_ACTIVITY_STATES.includes(state) && completion !== undefined) {
+    corrupt(itemContext, `state is ${state} but a completion was recorded`);
+  }
+  if (observedAt !== undefined && !TERMINAL_ACTIVITY_STATES.includes(state)) {
+    corrupt(itemContext, `state is ${state} but an observation was recorded`);
+  }
+
+  return {
+    id: str(row, "id", itemContext),
+    kind: str(row, "kind", itemContext),
+    roadmapKey: str(row, "roadmapKey", itemContext),
+    state,
+    ...(lease === undefined ? {} : { lease }),
+    ...(heartbeat === undefined ? {} : { heartbeat }),
+    ...(completion === undefined ? {} : { completion }),
+    ...(observedAt === undefined ? {} : { observedAt }),
+    ...(reconciliation === undefined ? {} : { reconciliation }),
+    ...(review === undefined ? {} : { review }),
+    updatedAt: num(row, "updatedAt", itemContext),
+  };
+}
+
+/** Optional field that MAY be explicitly `null` (an established fact) vs absent (never recorded). */
+function optionalNullableInt(row: Record<string, unknown>, field: string, context: string): number | null | undefined {
+  const value = row[field];
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  if (typeof value !== "number" || !Number.isInteger(value)) {
+    corrupt(context, `field "${field}" must be an integer or null when present, got ${JSON.stringify(value)}`);
+  }
+  return value;
+}
+
+function optionalNullableStr(row: Record<string, unknown>, field: string, context: string): string | null | undefined {
+  const value = row[field];
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  if (typeof value !== "string") {
+    corrupt(context, `field "${field}" must be a string or null when present, got ${JSON.stringify(value)}`);
+  }
+  return value;
+}
+
+/**
+ * One durable worker-run record (DEFECT-DURABLE-WORKER-RUN-ENVELOPE).
+ *
+ * Parsed with the same discipline `parseActivity` uses, and for the same
+ * reason: this is what a NEW process reads to decide whether a launched
+ * Claude/Codex process is still owed a launch, still running, or finished —
+ * and a row it half-understood would read as "nobody owns this" exactly like
+ * a mis-parsed activity would.
+ */
+function parseWorkerRun(raw: unknown, index: number, context: string): WorkerRunEnvelope {
+  const itemContext = `${context}.workerRuns[${index}]`;
+  const row = asObject(raw, itemContext);
+
+  const actionId = str(row, "actionId", itemContext);
+  const runId = str(row, "runId", itemContext);
+  const expectedRunId = canonicalWorkerRunId(actionId);
+  if (runId !== expectedRunId) {
+    corrupt(itemContext, `runId ${JSON.stringify(runId)} is not the canonical ${JSON.stringify(expectedRunId)}`);
+  }
+
+  const state = oneOf<WorkerRunState>(row, "state", WORKER_RUN_STATES, itemContext);
+
+  const leaseRaw = row["wrapperLease"];
+  const wrapperLease =
+    leaseRaw === undefined
+      ? undefined
+      : (() => {
+          const leaseContext = `${itemContext}.wrapperLease`;
+          const leaseRow = asObject(leaseRaw, leaseContext);
+          return {
+            pid: nonNegativeInt(leaseRow, "pid", leaseContext),
+            processStartedAt: nonNegativeInt(leaseRow, "processStartedAt", leaseContext),
+            machine: str(leaseRow, "machine", leaseContext),
+            boot: str(leaseRow, "boot", leaseContext),
+            claimedAt: num(leaseRow, "claimedAt", leaseContext),
+          };
+        })();
+
+  // THE TWO-PHASE HANDSHAKE, CHECKED ON READ (AC-1, AC-2): a persisted PREPARED
+  // row carrying a lease already would mean launcher intent had been recorded
+  // as proof, and a RUNNING row with no lease would mean the opposite — an
+  // adoption this build cannot verify actually happened.
+  if (state === "PREPARED" && wrapperLease !== undefined) {
+    corrupt(itemContext, "state is PREPARED but a wrapperLease was recorded; PREPARED precedes adoption");
+  }
+  if (state === "RUNNING" && wrapperLease === undefined) {
+    corrupt(itemContext, "state is RUNNING but no wrapperLease was recorded; RUNNING requires an adopted lease");
+  }
+
+  const heartbeatRaw = row["heartbeat"];
+  const heartbeat =
+    heartbeatRaw === undefined
+      ? undefined
+      : (() => {
+          const beatContext = `${itemContext}.heartbeat`;
+          const beatRow = asObject(heartbeatRaw, beatContext);
+          const lastProgressAt = optionalNum(beatRow, "lastProgressAt", beatContext);
+          return { at: num(beatRow, "at", beatContext), progress: nonNegativeInt(beatRow, "progress", beatContext),
+            ...(lastProgressAt === undefined ? {} : { lastProgressAt }) };
+        })();
+  if (state === "PREPARED" && heartbeat !== undefined) {
+    corrupt(itemContext, "state is PREPARED but a heartbeat was recorded; a heartbeat requires an adopted lease");
+  }
+
+  const artifactRaw = row["artifact"];
+  const artifact =
+    artifactRaw === undefined
+      ? undefined
+      : (() => {
+          const artifactContext = `${itemContext}.artifact`;
+          const artifactRow = asObject(artifactRaw, artifactContext);
+          return { path: str(artifactRow, "path", artifactContext), hash: str(artifactRow, "hash", artifactContext) };
+        })();
+
+  const terminalReason =
+    row["terminalReason"] === undefined
+      ? undefined
+      : (oneOf<WorkerRunTerminalReason>(row, "terminalReason", WORKER_RUN_TERMINAL_REASONS, itemContext));
+
+  const COMPLETION_STATES: readonly WorkerRunState[] = ["COMPLETED", "FAILED", "AWAITING_CONTROLLER"];
+  const exitCode = optionalNullableInt(row, "exitCode", itemContext);
+  const signal = optionalNullableStr(row, "signal", itemContext);
+  const finishedAt = optionalNum(row, "finishedAt", itemContext);
+  if (COMPLETION_STATES.includes(state)) {
+    if (exitCode === undefined || signal === undefined || finishedAt === undefined) {
+      corrupt(itemContext, `state is ${state} but no completion (exitCode/signal/finishedAt) was recorded`);
+    }
+  } else if (exitCode !== undefined || signal !== undefined) {
+    corrupt(itemContext, `state is ${state} but a completion was recorded; only a settled run may carry one`);
+  }
+
+  // MAX_TURNS IS THE ONLY LEGAL TERMINAL REASON FOR AWAITING_CONTROLLER, AND
+  // THE CONVERSE (AC-6): a terminalReason recorded anywhere else, or an
+  // AWAITING_CONTROLLER with none, is exactly the "free text fabricated this"
+  // shape this task exists to refuse.
+  if (state === "AWAITING_CONTROLLER" && terminalReason === undefined) {
+    corrupt(itemContext, "state is AWAITING_CONTROLLER but no verified terminalReason was recorded");
+  }
+  if (state !== "AWAITING_CONTROLLER" && terminalReason !== undefined) {
+    corrupt(itemContext, `state is ${state} but a terminalReason was recorded; only AWAITING_CONTROLLER may carry one`);
+  }
+
+  const RECONCILED_STATES: readonly WorkerRunState[] = ["LOST", "STALLED", "AMBIGUOUS"];
+  const reconciledAt = optionalNum(row, "reconciledAt", itemContext);
+  if (RECONCILED_STATES.includes(state) && reconciledAt === undefined) {
+    corrupt(itemContext, `state is ${state} but no reconciledAt was recorded`);
+  }
+
+  const optionals = {
+    effort: optionalStr(row, "effort", itemContext),
+    maxTurns: optionalNum(row, "maxTurns", itemContext),
+    childPid: optionalNum(row, "childPid", itemContext),
+    factorySessionId: optionalStr(row, "factorySessionId", itemContext),
+    providerSessionId: optionalStr(row, "providerSessionId", itemContext),
+    startedAt: optionalNum(row, "startedAt", itemContext),
+    detail: optionalStr(row, "detail", itemContext),
+  };
+
+  const invocations = row["invocations"] === undefined ? undefined :
+    asArray(row["invocations"], `${itemContext}.invocations`).map((value, childIndex) => {
+      const ctx = `${itemContext}.invocations[${childIndex}]`;
+      const child = asObject(value, ctx);
+      const sequence = nonNegativeInt(child, "sequence", ctx);
+      if (sequence !== childIndex + 1) corrupt(ctx, "noncanonical invocation sequence");
+      const leaseRow = child["lease"] === undefined ? undefined : asObject(child["lease"], ctx);
+      const lease = leaseRow === undefined ? undefined : {
+        pid: nonNegativeInt(leaseRow, "pid", ctx), processStartedAt: nonNegativeInt(leaseRow, "processStartedAt", ctx),
+        machine: str(leaseRow, "machine", ctx), boot: str(leaseRow, "boot", ctx), claimedAt: num(leaseRow, "claimedAt", ctx),
+      };
+      const maxTurns = optionalNum(child, "maxTurns", ctx);
+      if (maxTurns !== undefined && (!Number.isSafeInteger(maxTurns) || maxTurns < 1)) corrupt(ctx, "invalid maxTurns");
+      const finishedAt = optionalNum(child, "finishedAt", ctx);
+      const exitCode = optionalNullableInt(child, "exitCode", ctx);
+      const signal = optionalNullableStr(child, "signal", ctx);
+      const terminationReason = optionalStr(child, "terminationReason", ctx);
+      const providerSessionId = optionalStr(child, "providerSessionId", ctx);
+      const terminalReason = child["terminalReason"] === undefined ? undefined :
+        oneOf<WorkerRunTerminalReason>(child, "terminalReason", WORKER_RUN_TERMINAL_REASONS, ctx);
+      if (finishedAt !== undefined && (exitCode === undefined || signal === undefined || terminationReason === undefined))
+        corrupt(ctx, "incomplete provider result");
+      if (finishedAt === undefined && (exitCode !== undefined || signal !== undefined || terminalReason !== undefined))
+        corrupt(ctx, "provider result without finish time");
+      return { sequence, provider: str(child, "provider", ctx), model: str(child, "model", ctx),
+        preparedAt: num(child, "preparedAt", ctx),
+        ...(maxTurns === undefined ? {} : { maxTurns }), ...(lease === undefined ? {} : { lease }),
+        ...(finishedAt === undefined ? {} : { finishedAt }), ...(exitCode === undefined ? {} : { exitCode }),
+        ...(signal === undefined ? {} : { signal }), ...(terminationReason === undefined ? {} : { terminationReason }),
+        ...(providerSessionId === undefined ? {} : { providerSessionId }),
+        ...(terminalReason === undefined ? {} : { terminalReason }) };
+    });
+  if (invocations !== undefined) {
+    for (const [index, child] of invocations.entries()) {
+      if (index < invocations.length - 1 && (child.finishedAt === undefined || child.terminalReason === "MAX_TURNS"))
+        corrupt(itemContext, "provider invocation crossed unsettled/controller gate");
+    }
+    if (state === "RUNNING" && !invocations.some((child) => child.lease !== undefined))
+      corrupt(itemContext, "RUNNING without provider ACK");
+  }
+
+  return {
+    runId,
+    actionId,
+    ...(invocations === undefined ? {} : { invocations }),
+    roadmapKey: str(row, "roadmapKey", itemContext),
+    attempt: nonNegativeInt(row, "attempt", itemContext),
+    provider: str(row, "provider", itemContext),
+    model: str(row, "model", itemContext),
+    ...(optionals.effort === undefined ? {} : { effort: optionals.effort }),
+    ...(optionals.maxTurns === undefined ? {} : { maxTurns: optionals.maxTurns }),
+    state,
+    ...(wrapperLease === undefined ? {} : { wrapperLease }),
+    ...(optionals.childPid === undefined ? {} : { childPid: optionals.childPid }),
+    ...(optionals.factorySessionId === undefined ? {} : { factorySessionId: optionals.factorySessionId }),
+    ...(optionals.providerSessionId === undefined ? {} : { providerSessionId: optionals.providerSessionId }),
+    ...(terminalReason === undefined ? {} : { terminalReason }),
+    preparedAt: num(row, "preparedAt", itemContext),
+    ...(heartbeat === undefined ? {} : { heartbeat }),
+    ...(optionals.startedAt === undefined ? {} : { startedAt: optionals.startedAt }),
+    ...(finishedAt === undefined ? {} : { finishedAt }),
+    ...(reconciledAt === undefined ? {} : { reconciledAt }),
+    ...(exitCode === undefined ? {} : { exitCode }),
+    ...(signal === undefined ? {} : { signal }),
+    ...(artifact === undefined ? {} : { artifact }),
+    ...(optionals.detail === undefined ? {} : { detail: optionals.detail }),
+    updatedAt: num(row, "updatedAt", itemContext),
+  };
+}
+
+function parseWorkerRunNotification(raw: unknown, index: number, context: string): WorkerRunNotification {
+  const itemContext = `${context}.workerRunNotifications[${index}]`;
+  const row = asObject(raw, itemContext);
+  const runId = str(row, "runId", itemContext);
+  const kind = oneOf<WorkerRunNotificationKind>(row, "kind", WORKER_RUN_NOTIFICATION_KINDS, itemContext);
+  const key = str(row, "key", itemContext);
+  const expected = workerRunNotificationKey(runId, kind);
+  if (key !== expected) {
+    corrupt(itemContext, `key ${JSON.stringify(key)} is not the canonical ${JSON.stringify(expected)}`);
+  }
+  return {
+    key,
+    runId,
+    roadmapKey: str(row, "roadmapKey", itemContext),
+    kind,
+    detail: str(row, "detail", itemContext),
+    createdAt: num(row, "createdAt", itemContext),
+  };
+}
+
 function parseEscalation(raw: unknown, index: number, context: string): HumanEscalation {
   const itemContext = `${context}.escalations[${index}]`;
   const row = asObject(raw, itemContext);
@@ -591,6 +988,133 @@ export function parseSupervisorState(json: string, expected: { readonly version:
           };
         })();
 
+  /**
+   * ABSENT means no activities, not corruption — the same forward-compatibility
+   * rule provenance follows above. Every database written before TASK-018 has
+   * no such field and is not damaged.
+   */
+  /**
+   * The supervisor's own lease, parsed as strictly as every other lease.
+   *
+   * A supervisor row that does not parse is not "no supervisor": it is a
+   * database saying something about ownership that this build cannot read, and
+   * treating that as "free to take" is how two supervisors start.
+   */
+  const supervisorRaw = row["supervisor"];
+  const supervisor =
+    supervisorRaw === undefined
+      ? undefined
+      : (() => {
+          const ownerContext = `${context}.supervisor`;
+          const ownerRow = asObject(supervisorRaw, ownerContext);
+          const leaseContext = `${ownerContext}.lease`;
+          const leaseRow = asObject(ownerRow["lease"], leaseContext);
+          return {
+            lease: {
+              pid: nonNegativeInt(leaseRow, "pid", leaseContext),
+              processStartedAt: nonNegativeInt(leaseRow, "processStartedAt", leaseContext),
+              machine: str(leaseRow, "machine", leaseContext),
+              boot: str(leaseRow, "boot", leaseContext),
+              claimedAt: num(leaseRow, "claimedAt", leaseContext),
+            },
+            ownerId: str(ownerRow, "ownerId", ownerContext),
+            acquiredAt: num(ownerRow, "acquiredAt", ownerContext),
+            renewedAt: num(ownerRow, "renewedAt", ownerContext),
+          };
+        })();
+
+  /**
+   * A review request that does not parse is not "no request": it is durable
+   * state asking for something this build cannot read, and quietly dropping it
+   * would silently cancel a review somebody is waiting on.
+   */
+  const requestsRaw = row["reviewRequests"];
+  const reviewRequests =
+    requestsRaw === undefined
+      ? []
+      : asArray(requestsRaw, `${context}.reviewRequests`).map((entry, index) => {
+          const itemContext = `${context}.reviewRequests[${index}]`;
+          const requestRow = asObject(entry, itemContext);
+          const candidateContext = `${itemContext}.candidate`;
+          const candidateRow = asObject(requestRow["candidate"], candidateContext);
+          return {
+            roadmapKey: str(requestRow, "roadmapKey", itemContext),
+            candidate: {
+              commit: str(candidateRow, "commit", candidateContext),
+              tree: str(candidateRow, "tree", candidateContext),
+              fingerprint: str(candidateRow, "fingerprint", candidateContext),
+            },
+            attempt: nonNegativeInt(requestRow, "attempt", itemContext),
+            requestedAt: num(requestRow, "requestedAt", itemContext),
+            provider: str(requestRow, "provider", itemContext),
+            model: str(requestRow, "model", itemContext),
+            effort: str(requestRow, "effort", itemContext),
+          };
+        });
+
+  const activities =
+    row["activities"] === undefined
+      ? []
+      : asArray(row["activities"], `${context}.activities`).map((entry, index) =>
+          parseActivity(entry, index, context),
+        );
+  const activityIds = new Set<string>();
+  for (const activity of activities) {
+    if (activityIds.has(activity.id)) {
+      // Two rows for one id is the duplicate-owner state in durable form, and
+      // every later decision about "who holds this" would be a coin toss.
+      corrupt(context, `activities hold ${JSON.stringify(activity.id)} more than once`);
+    }
+    activityIds.add(activity.id);
+    if (!roadmapKeys.has(activity.roadmapKey)) {
+      corrupt(context, `activity ${JSON.stringify(activity.id)} references unknown roadmap item "${activity.roadmapKey}"`);
+    }
+  }
+
+  /**
+   * ABSENT means no worker runs, not corruption — the same forward-
+   * compatibility rule `activities` follows, so a database written before
+   * DEFECT-DURABLE-WORKER-RUN-ENVELOPE still loads.
+   */
+  const workerRuns =
+    row["workerRuns"] === undefined
+      ? []
+      : asArray(row["workerRuns"], `${context}.workerRuns`).map((entry, index) =>
+          parseWorkerRun(entry, index, context),
+        );
+  const workerRunIds = new Set<string>();
+  for (const run of workerRuns) {
+    if (workerRunIds.has(run.runId)) {
+      // Two rows for one run id is the duplicate-launch state in durable form.
+      corrupt(context, `workerRuns hold ${JSON.stringify(run.runId)} more than once`);
+    }
+    workerRunIds.add(run.runId);
+    if (!roadmapKeys.has(run.roadmapKey)) {
+      corrupt(context, `worker run ${JSON.stringify(run.runId)} references unknown roadmap item "${run.roadmapKey}"`);
+    }
+  }
+
+  const workerRunNotifications =
+    row["workerRunNotifications"] === undefined
+      ? []
+      : asArray(row["workerRunNotifications"], `${context}.workerRunNotifications`).map((entry, index) =>
+          parseWorkerRunNotification(entry, index, context),
+        );
+  const notificationKeys = new Set<string>();
+  for (const notification of workerRunNotifications) {
+    if (notificationKeys.has(notification.key)) {
+      // Two rows for one dedupe key is exactly what AC-8 forbids.
+      corrupt(context, `workerRunNotifications hold ${JSON.stringify(notification.key)} more than once`);
+    }
+    notificationKeys.add(notification.key);
+    if (!roadmapKeys.has(notification.roadmapKey)) {
+      corrupt(
+        context,
+        `worker run notification ${JSON.stringify(notification.key)} references unknown roadmap item "${notification.roadmapKey}"`,
+      );
+    }
+  }
+
   const nextWakeAt = optionalNum(row, "nextWakeAt", context);
   return {
     version,
@@ -598,6 +1122,13 @@ export function parseSupervisorState(json: string, expected: { readonly version:
     resources,
     roadmap,
     checkpoints,
+    // Emitted only when there is something to say, so a database that has never
+    // held an activity keeps the bytes it already had.
+    ...(activities.length === 0 ? {} : { activities }),
+    ...(workerRuns.length === 0 ? {} : { workerRuns }),
+    ...(workerRunNotifications.length === 0 ? {} : { workerRunNotifications }),
+    ...(supervisor === undefined ? {} : { supervisor }),
+    ...(reviewRequests.length === 0 ? {} : { reviewRequests }),
     ...(activeClaim === undefined ? {} : { activeClaim }),
     ...(nextWakeAt === undefined ? {} : { nextWakeAt }),
     escalations,

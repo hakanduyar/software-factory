@@ -28,6 +28,8 @@ import { buildWorkerEnvironment, redactSecrets, type EnvironmentPolicy } from ".
 import { buildWorkerPrompt } from "./promptTemplates.js";
 import type { EffortApplication, WorkerTool } from "./workerModelConfig.js";
 import type { Workspace } from "./workspace.js";
+import { currentProviderLifecycle, type ProviderMetadata } from "../supervision/workerRunLifecycle.js";
+import type { DirectHostAdmissionSurface } from "../../supervision/directWorkerAdmission.js";
 
 export interface CliInvocationPlan {
   readonly argv: readonly string[];
@@ -43,9 +45,26 @@ export interface BuildInvocationArgs {
   readonly effort: string | undefined;
 }
 
-export interface CliReportedResult {
+export interface CliReportedResult extends ProviderMetadata {
   /** The tool's own final answer text, if one could be parsed. Informational only. */
   readonly finalMessage?: string;
+  /**
+   * True when the adapter's own structured-output scan found that tool's own
+   * output contract violated in a way that makes `finalMessage` untrustworthy
+   * as THE one authoritative answer — either a non-blank line that failed
+   * that tool's line-delimited JSON contract (e.g. Codex's `--json` JSONL, or
+   * Claude's JSONL fallback scan), or, for a tool whose contract permits at
+   * most one final result (Claude's single-JSON-object contract), more than
+   * one independently well-formed candidate result — see
+   * `extractCodexFinalMessage`/`extractClaudeFinalMessage`. Either way, a
+   * later or competing authoritative message may be hidden behind the
+   * violation; `finalMessage` above may still be a real (but not necessarily
+   * final/sole) line that happened to parse. Informational only here —
+   * TASK-005's planner is the consumer that must fail closed on this signal
+   * (see cliPlannerWorker.ts); implementer/reviewer behavior is unchanged
+   * because neither reads this evidence channel.
+   */
+  readonly streamCorrupted?: boolean;
 }
 
 export interface CliWorkerAdapterConfig {
@@ -57,15 +76,35 @@ export interface CliWorkerAdapterConfig {
   readonly executable: string;
   readonly model: string;
   readonly effort?: string;
+  readonly maxTurns?: number;
   readonly timeoutMs: number;
   readonly workspace: Workspace;
   readonly processRunner: ProcessRunner;
   readonly environmentPolicy: EnvironmentPolicy;
   readonly maxOutputBytes?: number;
+  /**
+   * Optional trusted-host-configured ceiling on combined raw stdout+stderr
+   * bytes, forwarded unchanged to ProcessRunner (see
+   * src/ports/processRunner.ts ProcessRequest.maxTotalOutputBytes). Absence
+   * preserves existing unbounded-aggregate ProcessRequest behavior. Must be
+   * a positive safe integer when supplied; validated once at worker
+   * construction time, before any request can reach same-channel admission
+   * consume or process spawn.
+   */
+  readonly maxTotalOutputBytes?: number;
   /** Evidence transcript text is bounded independently of raw process-output bounding. Default 4000. */
   readonly maxEvidenceChars?: number;
   readonly buildInvocation: (args: BuildInvocationArgs) => CliInvocationPlan;
   readonly interpretOutput: (processResult: ProcessResult) => CliReportedResult;
+  /**
+   * D1-85: the SAME trusted host-constructed channel FactoryService was
+   * injected with. Absent by default (no default authority). When a request
+   * carries `directAdmissionHandle`, this is the only path that may consume
+   * it — immediately before the real process spawn below — and a missing
+   * channel here fails that consume closed rather than falling through to
+   * an unrestricted launch.
+   */
+  readonly directAdmissionChannel?: DirectHostAdmissionSurface;
 }
 
 function truncate(text: string, maxChars: number): { text: string; truncated: boolean } {
@@ -98,16 +137,24 @@ function safeFinalMessage(reported: CliReportedResult): string | undefined {
 }
 
 function describeTermination(processResult: ProcessResult): string {
-  switch (processResult.terminationReason) {
-    case "EXITED":
-      return `exit=${String(processResult.exitCode)}`;
-    case "TIMEOUT":
-      return "TIMEOUT (process was terminated)";
-    case "CANCELLED":
-      return "CANCELLED (process was terminated)";
-    case "SPAWN_ERROR":
-      return `SPAWN_ERROR: ${processResult.spawnError ?? "unknown"}`;
-  }
+  const underlying = (() => {
+    switch (processResult.terminationReason) {
+      case "EXITED":
+        return `exit=${String(processResult.exitCode)}`;
+      case "TIMEOUT":
+        return "TIMEOUT (process was terminated)";
+      case "CANCELLED":
+        return "CANCELLED (process was terminated)";
+      case "SPAWN_ERROR":
+        return `SPAWN_ERROR: ${processResult.spawnError ?? "unknown"}`;
+    }
+  })();
+  // ProcessRunner never introduces a new termination union member for the
+  // aggregate ceiling (see src/ports/processRunner.ts) — overflow still
+  // reports CANCELLED (or whatever reason won first). This is the one place
+  // that layers an OUTPUT_LIMIT diagnostic on top of that underlying reason,
+  // without inventing a new terminationReason value anywhere.
+  return processResult.outputLimitExceeded === true ? `OUTPUT_LIMIT ${underlying}` : underlying;
 }
 
 function buildEvidence(
@@ -118,6 +165,7 @@ function buildEvidence(
   processResult: ProcessResult,
   safeMessage: string | undefined,
   maxEvidenceChars: number,
+  streamCorrupted: boolean,
 ): EvidenceDraft[] {
   const evidence: EvidenceDraft[] = [
     {
@@ -159,6 +207,21 @@ function buildEvidence(
       summary: truncated ? `${text}\n(evidence text truncated to ${maxEvidenceChars} chars)` : text,
       reference: `cli://${tool}/run/${request.runId}/transcript`,
     });
+    if (truncated) {
+      // A STRUCTURED truncation signal, never inferred from the diagnostic
+      // "…[truncated]" prose above: a consumer that must treat a cut
+      // transcript as untrustworthy (e.g. the planner contract, TASK-005 AC-2)
+      // can check for this reference instead of pattern-matching text a model
+      // could itself have written. Whatever followed the cut point — a
+      // complete duplicate fenced block, an ambiguity marker, anything — was
+      // discarded here and can never be recovered downstream, so the signal
+      // must fire regardless of where in the document the cut landed.
+      evidence.push({
+        kind: "NOTE",
+        summary: `evidence transcript exceeded the ${maxEvidenceChars}-char bound and was truncated`,
+        reference: `cli://${tool}/run/${request.runId}/transcript-truncated`,
+      });
+    }
   } else {
     const rawFallback = processResult.stdout.length > 0 ? processResult.stdout : processResult.stderr;
     if (rawFallback.length > 0) {
@@ -170,7 +233,27 @@ function buildEvidence(
           (truncated ? `${text}\n(evidence text truncated to ${maxEvidenceChars} chars)` : text),
         reference: `cli://${tool}/run/${request.runId}/raw-output`,
       });
+      if (truncated) {
+        evidence.push({
+          kind: "NOTE",
+          summary: `raw fallback output exceeded the ${maxEvidenceChars}-char bound and was truncated`,
+          reference: `cli://${tool}/run/${request.runId}/raw-output-truncated`,
+        });
+      }
     }
+  }
+
+  if (streamCorrupted) {
+    // See CliReportedResult.streamCorrupted's doc comment: a contract-violating
+    // line partway through the tool's own structured stream may hide a later,
+    // authoritative message behind it. Structured signal, not inferred from
+    // `safeMessage` text, for the same reason `/transcript-truncated` above is
+    // structured rather than text-sniffed.
+    evidence.push({
+      kind: "NOTE",
+      summary: `tool's structured output stream contained at least one line that failed that tool's own output contract; a later authoritative message may be hidden behind it`,
+      reference: `cli://${tool}/run/${request.runId}/stream-corrupted`,
+    });
   }
 
   if (processResult.stdoutTruncated || processResult.stderrTruncated) {
@@ -199,7 +282,17 @@ function buildSummary(
   return `${head}: worker did not complete successfully`;
 }
 
+function isInvalidPositiveSafeInteger(value: number): boolean {
+  return !Number.isFinite(value) || !Number.isSafeInteger(value) || value <= 0;
+}
+
 export function createCliWorker(config: CliWorkerAdapterConfig): Worker {
+  // Validated once here, at construction, so an invalid cap can never reach
+  // same-channel admission consume or process spawn for any request this
+  // worker ever executes.
+  if (config.maxTotalOutputBytes !== undefined && isInvalidPositiveSafeInteger(config.maxTotalOutputBytes)) {
+    throw new Error("maxTotalOutputBytes must be a positive safe integer when supplied");
+  }
   return {
     id: config.id,
     capabilities: {
@@ -225,7 +318,7 @@ export function createCliWorker(config: CliWorkerAdapterConfig): Worker {
 
       const env = buildWorkerEnvironment(config.environmentPolicy);
 
-      const processResult = await config.processRunner.run({
+      const processRequest = {
         executable: config.executable,
         argv: plan.argv,
         cwd: config.workspace.root,
@@ -233,19 +326,49 @@ export function createCliWorker(config: CliWorkerAdapterConfig): Worker {
         timeoutMs: config.timeoutMs,
         ...(plan.input === undefined ? {} : { input: plan.input }),
         ...(config.maxOutputBytes === undefined ? {} : { maxOutputBytes: config.maxOutputBytes }),
-      });
+        ...(config.maxTotalOutputBytes === undefined ? {} : { maxTotalOutputBytes: config.maxTotalOutputBytes }),
+      };
+      // D1-85 mandatory same-channel admission: immediately before the real
+      // spawn, consume the opaque handle through the identical trusted host
+      // channel FactoryService issued it from. Unconditional: a missing
+      // captured channel or a missing handle both refuse closed here — no
+      // legacy structural revalidate or unrestricted-launch fallback for any
+      // run, handled or not.
+      if (config.directAdmissionChannel === undefined || request.directAdmissionHandle === undefined) {
+        throw new Error(
+          "direct provider-backed run requires both the trusted admission channel injected into this CLI worker and an admission handle on the request; neither may be substituted or skipped",
+        );
+      }
+      await config.directAdmissionChannel.consume(request.directAdmissionHandle);
+
+      const lifecycle = currentProviderLifecycle();
+      const processResult = lifecycle === undefined
+        ? await config.processRunner.run(processRequest)
+        : await lifecycle.run({ provider: config.tool, model: config.model,
+            ...(config.maxTurns === undefined ? {} : { maxTurns: config.maxTurns }) },
+            config.processRunner, processRequest, config.interpretOutput);
 
       const reported = config.interpretOutput(processResult);
       // Redacted once, here — see safeFinalMessage's own comment for why
       // buildSummary/buildEvidence never read reported.finalMessage directly.
       const safeMessage = safeFinalMessage(reported);
-      const succeeded = processResult.terminationReason === "EXITED" && processResult.exitCode === 0;
+      const succeeded = processResult.terminationReason === "EXITED" && processResult.exitCode === 0 &&
+        reported.terminalReason !== "MAX_TURNS";
       const maxEvidenceChars = config.maxEvidenceChars ?? 4000;
 
       return {
         status: succeeded ? "SUCCEEDED" : "FAILED",
         summary: buildSummary(config.tool, config.model, request, processResult, safeMessage, succeeded),
-        evidence: buildEvidence(config.tool, config.model, plan.effortApplication, request, processResult, safeMessage, maxEvidenceChars),
+        evidence: buildEvidence(
+          config.tool,
+          config.model,
+          plan.effortApplication,
+          request,
+          processResult,
+          safeMessage,
+          maxEvidenceChars,
+          reported.streamCorrupted === true,
+        ),
         // TASK-003 explicitly defers PASS/CHANGES_REQUIRED text parsing to TASK-004;
         // free-form model text is never trusted as a claim in the meantime.
         claimsAcceptanceMet: false,

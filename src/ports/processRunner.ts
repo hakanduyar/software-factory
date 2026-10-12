@@ -33,6 +33,33 @@ export interface ProcessRequest {
   readonly signal?: AbortSignal;
   /** Caps captured bytes per stream; excess bytes are discarded (stream is still drained). */
   readonly maxOutputBytes?: number;
+  /**
+   * Independent ceiling on combined raw stdout+stderr bytes observed across
+   * both streams, enforced against raw bytes as they arrive, before either
+   * stream's own per-stream cap decides what to retain. Must be a positive
+   * safe integer when supplied; an invalid value (including NaN, Infinity,
+   * non-integer or <= 0) is refused before the child is spawned. Exceeding
+   * it requests the same group termination as cancellation (CANCELLED)
+   * unless a timeout or cancellation already claimed the termination reason
+   * first.
+   */
+  readonly maxTotalOutputBytes?: number;
+  /**
+   * Fired once, synchronously, the moment the OS confirms the child exists
+   * (DEFECT-DURABLE-WORKER-RUN-ENVELOPE AC-2).
+   *
+   * `run()` resolves only once, at the very end — exactly right for callers
+   * who only need the final facts, but too late for a caller that must record
+   * a durable "this real process ACKed" fact BEFORE a long-running child
+   * finishes. `pid` is the OS process id at spawn time; nothing else is
+   * handed back here, because everything else (start tick, machine, boot) is
+   * this port's caller's business to look up from the pid, not this port's to
+   * guess. A throwing callback must never break the runner: it is caught and
+   * discarded, exactly like a stream error is.
+   */
+  readonly onSpawn?: (info: { readonly pid: number }) => void;
+  /** Measured output bytes, independent of capture truncation. */
+  readonly onOutput?: (bytes: number) => void;
 }
 
 export const PROCESS_TERMINATION_REASONS = ["EXITED", "TIMEOUT", "CANCELLED", "SPAWN_ERROR"] as const;
@@ -60,6 +87,8 @@ export interface ProcessResult {
   readonly durationMs: number;
   /** Set only when `terminationReason === "SPAWN_ERROR"`. A safe message — never raw env/paths beyond what Node already reports. */
   readonly spawnError?: string;
+  /** Set only when the combined raw stdout+stderr byte count reached `maxTotalOutputBytes` and that overflow initiated termination. */
+  readonly outputLimitExceeded?: boolean;
 }
 
 export interface ProcessRunner {

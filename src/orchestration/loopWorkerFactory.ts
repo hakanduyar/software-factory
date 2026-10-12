@@ -18,6 +18,7 @@ import { ValidationError } from "../domain/errors.js";
 import type { FactoryRole } from "../domain/role.js";
 import type { ProcessRunner } from "../ports/processRunner.js";
 import type { Worker } from "../ports/worker.js";
+import type { DirectHostAdmissionSurface } from "../supervision/directWorkerAdmission.js";
 import type { LoopWorkerConfig } from "./loopTypes.js";
 
 export interface LoopWorkerFactoryOptions {
@@ -26,6 +27,28 @@ export interface LoopWorkerFactoryOptions {
   readonly roles: readonly FactoryRole[];
   readonly defaultTimeoutMs?: number;
   readonly executable?: string;
+  /**
+   * Overrides `cliWorker`'s default 4000-char evidence bound for the transcript
+   * channel. Absent for the accepted TASK-003/004 implementer/reviewer paths —
+   * their behavior is unchanged. A caller whose structured output contract can
+   * legitimately exceed 4000 chars (see cliPlannerWorker.ts) must pass its own
+   * explicit, finite bound rather than rely on this default.
+   */
+  readonly maxEvidenceChars?: number;
+  /**
+   * D1-85 same-channel passthrough: the exact `DirectHostAdmissionSurface`
+   * the caller captured from `FactoryService.sharedDirectAdmissionChannel`.
+   * Forwarded unchanged to whichever adapter `config.tool` selects; never
+   * inferred from `Worker.id`/registry and never a caller-asserted ticket.
+   */
+  readonly directAdmissionChannel?: DirectHostAdmissionSurface;
+  /**
+   * Forwarded unchanged to whichever adapter `config.tool` selects. Omitted
+   * preserves each adapter's existing unbounded-aggregate behavior; see
+   * ClaudeCodeWorkerOptions.maxTotalOutputBytes / CodexCliWorkerOptions
+   * equivalent for the actual enforcement.
+   */
+  readonly maxTotalOutputBytes?: number;
 }
 
 export function createLoopWorker(config: LoopWorkerConfig, options: LoopWorkerFactoryOptions): Worker {
@@ -37,6 +60,9 @@ export function createLoopWorker(config: LoopWorkerConfig, options: LoopWorkerFa
     workspace: options.workspace,
     processRunner: options.processRunner,
     roles: options.roles,
+    ...(options.maxEvidenceChars === undefined ? {} : { maxEvidenceChars: options.maxEvidenceChars }),
+    ...(options.directAdmissionChannel === undefined ? {} : { directAdmissionChannel: options.directAdmissionChannel }),
+    ...(options.maxTotalOutputBytes === undefined ? {} : { maxTotalOutputBytes: options.maxTotalOutputBytes }),
   };
 
   switch (config.tool) {

@@ -52,6 +52,35 @@ import {
   runPlanStatus,
 } from "../src/cli/plan.js";
 import { cleanupTempDbs, tempDbPath } from "./support/factoryFixtures.js";
+import * as nodeFs from "node:fs";
+import { delimiter as pathDelimiter } from "node:path";
+import { DatabaseSync as OwnedDatabaseSync } from "node:sqlite";
+import nodeAssert from "node:assert/strict";
+import { it as nodeIt } from "node:test";
+import * as fakeCli from "./support/fakeCli.js";
+import * as planFx from "./support/planFixtures.js";
+import * as planCli from "../src/cli/plan.js";
+import * as factoryServiceMod from "../src/app/factoryService.js";
+import * as idsMod from "../src/domain/ids.js";
+import * as securityMod from "../src/adapters/security/localHumanIdentityGate.js";
+import * as registryMod from "../src/adapters/security/localWorkerRegistry.js";
+import * as planningMod from "../src/planning/planningService.js";
+import * as clockMod from "../src/ports/clock.js";
+import * as sqliteStoreMod from "../src/adapters/sqlite/sqliteStore.js";
+import { cleanupTempWorkspaces, createTempWorkspace } from "./support/tempWorkspace.js";
+import type { PlanExecutionConfig as SeamStartedExecution } from "../src/planning/planTypes.js";
+
+after(cleanupTempWorkspaces);
+
+async function readPlanSnapshot(plansDbPath: string, planId: string) {
+  const repo = createSqlitePlanRepository(plansDbPath);
+  try {
+    const stored = await repo.findById(planId);
+    return { execution: stored?.execution, approvedDigest: stored?.approvedDigest };
+  } finally {
+    repo.close();
+  }
+}
 
 after(cleanupTempDbs);
 
@@ -305,6 +334,244 @@ describe("sf plan status|answer|approve|reject|resume|cancel — an unknown plan
     const answers = writeAnswers([{ questionId: "q1", answer: "Archive them. Never delete." }]);
     await assert.rejects(runPlanAnswer(UNKNOWN_PLAN_ID, answers, options), { code: "NOT_FOUND" });
     await assertNothingCreated(options);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PHASE7-103: approved-resume constructor seam (offline; NOT live capacity, NOT a
+// whole-loop or E2E claim). The capability callback below is a synthetic
+// process-local trusted input. Children are private PATH wrappers around the
+// existing fake CLI fixtures; no provider binary is ever invoked.
+// ---------------------------------------------------------------------------
+type SeamCliOptions = import("../src/cli/plan.js").PlanCliOptions;
+type SeamMode = "positive" | "foreign" | "missing";
+
+function writeOfflineCli(binDir: string, name: string, fixture: string, marker: string): void {
+  const file = join(binDir, name);
+  nodeFs.writeFileSync(
+    file,
+    `#!${process.execPath}\nconst fs = require("fs");\nconst cp = require("child_process");\n` +
+      `fs.appendFileSync(${JSON.stringify(marker)}, "x");\n` +
+      `const r = cp.spawnSync(process.execPath, [${JSON.stringify(fixture)}, ...process.argv.slice(2)], { stdio: "inherit" });\n` +
+      `process.exit(r.status === null ? 1 : r.status);\n`,
+  );
+  nodeFs.chmodSync(file, 0o755);
+}
+
+function readHostRows(hostDb: string): Record<string, unknown>[] {
+  if (!existsSync(hostDb)) {
+    return [];
+  }
+  const db = new OwnedDatabaseSync(hostDb);
+  try {
+    return db
+      .prepare("SELECT reservation_id, run_id, state, consumed_binding_json FROM host_reservations")
+      .all() as Record<string, unknown>[];
+  } finally {
+    db.close();
+  }
+}
+
+async function runApprovedResumeScenario(mode: SeamMode) {
+  const opts = dbOptions();
+  const dir = dirname(opts.factoryDbPath);
+  const workspace = createTempWorkspace();
+  const binDir = nodeFs.mkdtempSync(join(dir, "bin-"));
+  const marker = join(dir, "children.log");
+  const hostDb = join(dir, "host.db");
+  writeOfflineCli(binDir, "codex", fakeCli.fakeCliPath("fake-codex.mjs"), marker);
+  writeOfflineCli(binDir, "claude", fakeCli.fakeCliPath("fake-claude.mjs"), marker);
+
+  const base = planFx.validTicketTemplate("WI-A", "Do the thing behaves as specified");
+  const template = { ...base, model: { ...base.model, eligibleModels: ["gpt-impl", "claude-rev"] } };
+  const execution = {
+    implementer: { tool: "codex-cli" as const, model: "gpt-impl", effort: "medium" as const },
+    reviewer: { tool: "claude-code" as const, model: "claude-rev", effort: "medium" as const },
+    workspaceRoot: workspace,
+    verificationCommands: [{ id: "check", executable: process.execPath, argv: ["-e", "process.exit(0)"] }],
+    loopBudget: { maxIterations: 1 },
+    ticketTemplates: [template],
+  };
+
+  const producerStore = sqliteStoreMod.createSqliteStore(opts.factoryDbPath);
+  const producerPlans = createSqlitePlanRepository(opts.plansDbPath);
+  let planId: string;
+  let startedExecution: SeamStartedExecution | undefined;
+  try {
+    const { service, projectId } = await planFx.newPlanning({
+      store: producerStore,
+      plans: producerPlans,
+      clock: clockMod.systemClock,
+    });
+    const started = await service.start({
+      projectId,
+      actor: planFx.PLAN_HUMAN,
+      intent: "Do the thing",
+      planner: { tool: "codex-cli", model: "planner-model", effort: "medium" },
+      execution,
+    });
+    planId = started.id;
+    startedExecution = started.execution;
+  } finally {
+    producerStore.close();
+    producerPlans.close();
+  }
+
+  const bindings: { reservationId: string }[] = [];
+  const capability: NonNullable<SeamCliOptions["approvedResumeCapability"]> = async ({ ticket, binding }) => {
+    bindings.push(binding);
+    const evidence = {
+      ...binding,
+      scope: ticket.scope,
+      model: ticket.model,
+      budgets: ticket.budgets,
+      observedAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + 120000).toISOString(),
+      evidenceReference: "synthetic://103/offline",
+      evidenceDigest: "synthetic-" + binding.reservationId,
+      quota: {
+        availableContextTokens: ticket.budgets.contextTokens,
+        availableOutputTokens: ticket.budgets.outputTokens,
+        availableElapsedSeconds: ticket.budgets.elapsedSeconds,
+        availableAttempts: ticket.budgets.maxAttempts,
+        verified: true,
+      },
+      context: {
+        supportedModels: ticket.model.eligibleModels,
+        supportedReasoningEfforts: [ticket.model.reasoningEffort],
+        verified: true,
+      },
+      confinement: {
+        supportedScopeOwned: ticket.scope.owned,
+        supportedScopeForbidden: ticket.scope.forbidden,
+        verified: true,
+      },
+    };
+    return mode === "foreign" ? { ...evidence, reservationId: "foreign-" + binding.reservationId } : evidence;
+  };
+  const cliOptions: SeamCliOptions =
+    mode === "missing"
+      ? { ...opts }
+      : {
+          ...opts,
+          approvedResumeReservationDbPath: hostDb,
+          approvedResumeAuthorityNamespace: "phase103-offline",
+          approvedResumeCapability: capability,
+        };
+
+  const oldPath = process.env["PATH"];
+  process.env["PATH"] = `${binDir}${pathDelimiter}${oldPath ?? ""}`;
+  let statusOk = true;
+  const publicErrors: string[] = [];
+  let planBefore: Awaited<ReturnType<typeof readPlanSnapshot>> | undefined;
+  let planAfter: Awaited<ReturnType<typeof readPlanSnapshot>> | undefined;
+  try {
+    try {
+      // A stopped/partial loop (VERIFY has no approved execution policy) may surface as a throw.
+      await planCli.runPlanApprove(planId, cliOptions);
+    } catch (error) {
+      publicErrors.push(`approve: ${String(error)}`);
+    }
+    planBefore = await readPlanSnapshot(opts.plansDbPath, planId);
+    try {
+      // Later PLANNER/VERIFY refusals are an honest partial outcome, not a full-loop claim.
+      await planCli.runPlanResume(planId, cliOptions);
+    } catch (error) {
+      publicErrors.push(`resume: ${String(error)}`);
+    }
+    planAfter = await readPlanSnapshot(opts.plansDbPath, planId);
+    try {
+      await planCli.runPlanStatus(planId, { ...opts });
+    } catch (error) {
+      statusOk = false;
+      publicErrors.push(`status: ${String(error)}`);
+    }
+  } finally {
+    if (oldPath === undefined) {
+      delete process.env["PATH"];
+    } else {
+      process.env["PATH"] = oldPath;
+    }
+  }
+
+  const readStore = sqliteStoreMod.createSqliteStore(opts.factoryDbPath);
+  const readPlans = createSqlitePlanRepository(opts.plansDbPath);
+  let runs: readonly { id: string; status: string; role: string }[] = [];
+  let hasWorkItem = false;
+  try {
+    const plan = await readPlans.findById(planId);
+    const workItemId = plan?.materialized?.[0]?.workItemId;
+    if (workItemId !== undefined) {
+      hasWorkItem = true;
+      const factory = new factoryServiceMod.FactoryService({
+        store: readStore,
+        clock: clockMod.systemClock,
+        ids: idsMod.createSequentialIdGenerator(),
+        identityGate: securityMod.createLocalHumanIdentityGate({
+          credential: planFx.PLAN_CREDENTIAL,
+          clock: clockMod.systemClock,
+        }),
+        workerRegistry: registryMod.createLocalWorkerRegistry(clockMod.systemClock),
+        planBindingResolver: planningMod.createPlanBindingResolver(readPlans),
+      });
+      runs = await factory.listRuns(workItemId);
+    }
+  } finally {
+    readStore.close();
+    readPlans.close();
+  }
+
+  const childCount = existsSync(marker) ? nodeFs.readFileSync(marker, "utf8").length : 0;
+  const errors = publicErrors.join(" | ");
+  nodeAssert.ok(startedExecution !== undefined, "producer must expose the started execution");
+  nodeAssert.ok(planBefore !== undefined && planAfter !== undefined, "plan snapshots must be captured: " + errors);
+  nodeAssert.equal(typeof planBefore.approvedDigest, "string", "human approval must exist before execution: " + errors);
+  nodeAssert.deepEqual(planBefore.execution, startedExecution);
+  nodeAssert.deepEqual(planAfter.execution, startedExecution);
+  nodeAssert.equal(planAfter.approvedDigest, planBefore.approvedDigest);
+  return { bindings, childCount, hostDb, hostRows: readHostRows(hostDb), runs, hasWorkItem, statusOk, publicErrors };
+}
+
+describe("sf plan approved-resume constructor seam (offline, partial loop)", () => {
+  nodeIt("positive: trusted constructor deps launch one genuine IMPLEMENT child and durably CONSUME the full tuple", { timeout: 120000 }, async () => {
+    const r = await runApprovedResumeScenario("positive");
+    nodeAssert.ok(r.hasWorkItem, "approve must materialize a work item: " + r.publicErrors.join(" | "));
+    nodeAssert.ok(r.bindings.length >= 1, "capability callback must receive a binding: " + r.publicErrors.join(" | "));
+    nodeAssert.ok(r.childCount >= 1, "an offline child must have been launched: " + r.publicErrors.join(" | "));
+    const consumed = r.hostRows.find((row) => row["state"] === "CONSUMED");
+    nodeAssert.ok(consumed !== undefined, "a durable CONSUMED reservation row is required");
+    nodeAssert.equal(consumed["reservation_id"], r.bindings[0]?.reservationId);
+    nodeAssert.deepEqual(
+      JSON.parse(String(consumed["consumed_binding_json"])),
+      JSON.parse(JSON.stringify(r.bindings[0])),
+    );
+    nodeAssert.ok(
+      r.runs.some(
+        (run) => run.id === consumed["run_id"] && run.role === "IMPLEMENTER" && run.status === "SUCCEEDED",
+      ),
+      "consumed run must be the real SUCCEEDED IMPLEMENTER Factory run: " + r.publicErrors.join(" | "),
+    );
+    nodeAssert.ok(r.runs.every((run) => run.status !== "RUNNING"), "no orphan RUNNING run");
+    nodeAssert.ok(r.statusOk);
+  });
+
+  nodeIt("foreign capability evidence is refused: zero children, nothing consumed, no orphan RUNNING", { timeout: 120000 }, async () => {
+    const r = await runApprovedResumeScenario("foreign");
+    nodeAssert.ok(r.hasWorkItem);
+    nodeAssert.ok(r.bindings.length >= 1, "refusal must come from capability mismatch, not missing approval");
+    nodeAssert.equal(r.childCount, 0);
+    nodeAssert.ok(r.hostRows.every((row) => row["state"] !== "CONSUMED"));
+    nodeAssert.ok(r.runs.every((run) => run.status !== "RUNNING"));
+  });
+
+  nodeIt("missing trusted deps: execution denied before any child, status still readable", { timeout: 120000 }, async () => {
+    const r = await runApprovedResumeScenario("missing");
+    nodeAssert.ok(r.hasWorkItem, "missing-trust baseline: genuine approval must have materialized a work item: " + r.publicErrors.join(" | "));
+    nodeAssert.equal(r.bindings.length, 0);
+    nodeAssert.equal(r.childCount, 0);
+    nodeAssert.equal(existsSync(r.hostDb), false, "no owned reservation DB without trusted input");
+    nodeAssert.ok(r.statusOk, "status/read must work without execution trust");
+    nodeAssert.ok(r.runs.every((run) => run.status !== "RUNNING"));
   });
 });
 

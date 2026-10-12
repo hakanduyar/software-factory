@@ -21,6 +21,16 @@ import type { ApprovalId, ProjectId, WorkItemId } from "../domain/ids.js";
 import type { Timestamp } from "../domain/time.js";
 import type { Priority, WorkItemType } from "../domain/workItem.js";
 import type { MaterializedItemShape } from "../ports/planBindingResolver.js";
+import type {
+  AcceptanceCriterion,
+  DeterministicBudgets,
+  DeterministicExecutionPolicy,
+  WorkerBudgets,
+  WorkerControlPolicy,
+  WorkerModelPolicy,
+  WorkerResultSchema,
+  WorkerScope,
+} from "../supervision/workerContract.js";
 
 export const PLAN_PHASES = [
   "DRAFT",
@@ -112,6 +122,149 @@ export interface PlannerConfig {
 }
 
 /**
+ * The frozen WorkerTicket wire version a plan-captured template must target.
+ *
+ * This literal is a CONVENIENCE for writers, never the authority: template
+ * validation feeds the composed ticket through the accepted
+ * `parseWorkerTicket`, so the supported version set stays defined in exactly
+ * one place (`src/supervision/workerContract.ts`) and a template naming an
+ * unsupported version is rejected there rather than here.
+ */
+export const PLAN_TICKET_SCHEMA_VERSION = "1.0.0";
+
+/**
+ * The structured WorkerTicket template a plan captures FOR ONE work item
+ * (NC-RUNTIME-01 / NC-10 / NC-11).
+ *
+ * The hazard this closes: a plan that describes work only in prose leaves the
+ * dispatcher to invent a ticket, and an invented ticket is where broad
+ * ownership and unbounded budgets come from. So the authority a worker will
+ * ever hold — its scope, its eligible models, its budgets, its stop
+ * conditions, its result schema and its VERSIONED acceptance criteria — is
+ * captured here, inside the approved execution configuration, and hashed into
+ * the approval digest. Plan notes, summaries, specs, assumptions, constraints
+ * and risks remain prose: they grant zero authority, and no code path
+ * synthesizes a template from them.
+ *
+ * `ticketId` is deliberately absent. It is a dispatch-time identity derived
+ * from plan coordinates; a template that carried its own id could name another
+ * item's ticket. `planItemKey` binds the template to a plan-local
+ * `PlannedWorkItem.key` and nothing else.
+ */
+export interface WorkItemTicketTemplate {
+  /** Plan-local key of the `PlannedWorkItem` this template authorizes. */
+  readonly planItemKey: string;
+  readonly schemaVersion: string;
+  readonly objective: string;
+  readonly acceptanceCriteria: readonly AcceptanceCriterion[];
+  readonly scope: WorkerScope;
+  readonly model: WorkerModelPolicy;
+  readonly budgets: WorkerBudgets;
+  readonly policy: WorkerControlPolicy;
+  readonly resultSchema: WorkerResultSchema;
+}
+
+/** The complete, frozen set of top-level ticket template fields. */
+export const TICKET_TEMPLATE_FIELDS: readonly string[] = [
+  "planItemKey",
+  "schemaVersion",
+  "objective",
+  "acceptanceCriteria",
+  "scope",
+  "model",
+  "budgets",
+  "policy",
+  "resultSchema",
+];
+
+/**
+ * The accepted `parseWorkerTicket` (src/supervision/workerContract.ts) builds
+ * each nested object by explicitly naming its known fields, so an unknown
+ * nested key (e.g. `scope.grantAll`) is never rejected there — it is simply
+ * absent from the narrowed value the parser returns. Left alone, that means
+ * `ok: true` for a template that actually smuggled an unrecognized grant, and
+ * the grant would vanish from the returned template and the digest without
+ * ever having been refused. This table is what closes that gap: it is
+ * consulted BEFORE the accepted parser runs, so an unknown nested key fails
+ * the whole template rather than being quietly narrowed away.
+ */
+const TICKET_TEMPLATE_NESTED_FIELDS: { readonly [field: string]: readonly string[] } = {
+  scope: ["owned", "forbidden", "read", "dependencies", "validation"],
+  model: ["eligibleModels", "reasoningEffort", "rationale"],
+  budgets: ["contextTokens", "outputTokens", "elapsedSeconds", "maxAttempts"],
+  policy: ["checkpoint", "stopConditions", "escalation"],
+  resultSchema: ["requiredFields", "maxResultBytes"],
+};
+
+const TICKET_TEMPLATE_CRITERION_FIELDS: readonly string[] = ["id", "version", "description"];
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * Returns a human-readable list of every unrecognized field found anywhere in
+ * a candidate ticket template — top-level, inside `scope`/`model`/`budgets`/
+ * `policy`/`resultSchema`, and inside each `acceptanceCriteria` entry — or
+ * `undefined` if the template carries only known fields at every level.
+ * Pure and total: it never narrows or drops anything, it only reports.
+ */
+export function findUnknownTicketTemplateFields(candidate: Record<string, unknown>): string | undefined {
+  const unexpected: string[] = [];
+
+  for (const key of Object.keys(candidate)) {
+    if (!TICKET_TEMPLATE_FIELDS.includes(key)) {
+      unexpected.push(key);
+    }
+  }
+
+  for (const [field, allowed] of Object.entries(TICKET_TEMPLATE_NESTED_FIELDS)) {
+    const nested = candidate[field];
+    if (isPlainObject(nested)) {
+      for (const key of Object.keys(nested)) {
+        if (!allowed.includes(key)) {
+          unexpected.push(`${field}.${key}`);
+        }
+      }
+    }
+  }
+
+  const criteria = candidate.acceptanceCriteria;
+  if (Array.isArray(criteria)) {
+    criteria.forEach((entry, index) => {
+      if (isPlainObject(entry)) {
+        for (const key of Object.keys(entry)) {
+          if (!TICKET_TEMPLATE_CRITERION_FIELDS.includes(key)) {
+            unexpected.push(`acceptanceCriteria[${index}].${key}`);
+          }
+        }
+      }
+    });
+  }
+
+  return unexpected.length > 0 ? unexpected.join(", ") : undefined;
+}
+
+/**
+ * Composes the candidate WorkerTicket a template stands for, so validation can
+ * be delegated to the accepted parser instead of being restated (and drifting)
+ * here. Pure; the result is UNVALIDATED input by construction.
+ */
+export function candidateTicketFromTemplate(template: WorkItemTicketTemplate, ticketId: string): unknown {
+  return {
+    schemaVersion: template.schemaVersion,
+    ticketId,
+    objective: template.objective,
+    acceptanceCriteria: template.acceptanceCriteria,
+    scope: template.scope,
+    model: template.model,
+    budgets: template.budgets,
+    policy: template.policy,
+    resultSchema: template.resultSchema,
+  };
+}
+
+/**
  * How approved work items are to be executed. Captured at plan start and
  * persisted, so a restart dispatches with byte-identical configuration rather
  * than whatever the current process defaults happen to be.
@@ -126,7 +279,29 @@ export interface PlanExecutionConfig {
     readonly cwd?: string;
     readonly timeoutMs?: number;
   }[];
+  /**
+   * Per-work-item ticket templates, keyed by plan-local item key.
+   *
+   * OPTIONAL only for legacy persisted plans written before templates existed.
+   * Such a plan stays READABLE — refusing to decode it would strand history —
+   * but it is NON-EXECUTABLE pending replan (see
+   * `planTicketExecutability`), because the alternative is synthesizing the
+   * authority it never recorded.
+   */
+  readonly ticketTemplates?: readonly WorkItemTicketTemplate[];
   readonly workspaceRoot: string;
+  /**
+   * OPTIONAL explicit deterministic verification budgets/policy, captured at
+   * plan start alongside `verificationCommands`. Absence is the legacy shape
+   * and grants no VERIFY authority on its own: `verificationCommands` and
+   * `workspaceRoot` remain the authoritative fields they already were.
+   * Elapsed/output/attempt limits are never derived from token or result-byte
+   * defaults — they are an independent, explicitly supplied budget.
+   */
+  readonly verificationExecutionPolicy?: {
+    readonly budgets: DeterministicBudgets;
+    readonly executionPolicy: DeterministicExecutionPolicy;
+  };
   readonly loopBudget?: {
     readonly maxIterations?: number;
     readonly maxTotalRuns?: number;
@@ -455,6 +630,91 @@ export function expectedMaterializedItemShape(
  */
 export function canonicalRequestKey(projectId: ProjectId, intent: string, hash: (input: string) => string): string {
   return `req-${hash(`${projectId}|${intent}`).slice(0, 16)}`;
+}
+
+const VERIFICATION_EXECUTION_POLICY_FIELDS: readonly string[] = ["budgets", "executionPolicy"];
+const VERIFICATION_EXECUTION_BUDGETS_FIELDS: readonly string[] = ["elapsedSeconds", "outputBytes", "maxAttempts"];
+const VERIFICATION_EXECUTION_POLICY_NESTED_FIELDS: readonly string[] = ["rationale"];
+
+/** Minimum length, in characters, a `verificationExecutionPolicy.executionPolicy.rationale` must have to count as meaningful rather than filler. */
+export const VERIFICATION_EXECUTION_POLICY_MIN_RATIONALE_LENGTH = 10;
+
+export type VerificationExecutionPolicy = NonNullable<PlanExecutionConfig["verificationExecutionPolicy"]>;
+
+/**
+ * THE single strict check for an explicit `verificationExecutionPolicy`
+ * candidate, shared by live `PlanningService.start`, persisted
+ * `parseExecutionConfig`, CLI config loading and approval-digest validation —
+ * so "what counts as a valid deterministic verification policy" cannot drift
+ * between any of those paths.
+ *
+ * Only `budgets`/`executionPolicy` are accepted at the top level; only
+ * `elapsedSeconds`/`outputBytes`/`maxAttempts` inside `budgets`; only
+ * `rationale` inside `executionPolicy`. Any other field anywhere in the
+ * candidate is refused outright rather than being silently narrowed away, so
+ * an unknown field can never digest identically to the same candidate with
+ * that field stripped. A malformed PRESENT field is refused — never
+ * normalized to absence — because silently dropping it would let a mutated
+ * policy keep matching an approval computed before the mutation.
+ */
+export function validateVerificationExecutionPolicy(
+  candidate: unknown,
+): { readonly ok: true; readonly value: VerificationExecutionPolicy } | { readonly ok: false; readonly reason: string } {
+  if (!isPlainObject(candidate)) {
+    return { ok: false, reason: "must be an object" };
+  }
+  for (const key of Object.keys(candidate)) {
+    if (!VERIFICATION_EXECUTION_POLICY_FIELDS.includes(key)) {
+      return { ok: false, reason: `unexpected field "${key}"` };
+    }
+  }
+
+  const budgetsRaw = candidate.budgets;
+  if (!isPlainObject(budgetsRaw)) {
+    return { ok: false, reason: '"budgets" must be an object' };
+  }
+  for (const key of Object.keys(budgetsRaw)) {
+    if (!VERIFICATION_EXECUTION_BUDGETS_FIELDS.includes(key)) {
+      return { ok: false, reason: `unexpected field "budgets.${key}"` };
+    }
+  }
+  const elapsedSeconds = budgetsRaw.elapsedSeconds;
+  if (typeof elapsedSeconds !== "number" || !Number.isFinite(elapsedSeconds) || elapsedSeconds <= 0) {
+    return { ok: false, reason: '"budgets.elapsedSeconds" must be a positive finite number' };
+  }
+  const outputBytes = budgetsRaw.outputBytes;
+  if (typeof outputBytes !== "number" || !Number.isInteger(outputBytes) || outputBytes <= 0) {
+    return { ok: false, reason: '"budgets.outputBytes" must be a positive finite integer' };
+  }
+  const maxAttempts = budgetsRaw.maxAttempts;
+  if (typeof maxAttempts !== "number" || !Number.isInteger(maxAttempts) || maxAttempts <= 0) {
+    return { ok: false, reason: '"budgets.maxAttempts" must be a positive finite integer' };
+  }
+
+  const policyRaw = candidate.executionPolicy;
+  if (!isPlainObject(policyRaw)) {
+    return { ok: false, reason: '"executionPolicy" must be an object' };
+  }
+  for (const key of Object.keys(policyRaw)) {
+    if (!VERIFICATION_EXECUTION_POLICY_NESTED_FIELDS.includes(key)) {
+      return { ok: false, reason: `unexpected field "executionPolicy.${key}"` };
+    }
+  }
+  const rationale = policyRaw.rationale;
+  if (typeof rationale !== "string" || rationale.trim().length < VERIFICATION_EXECUTION_POLICY_MIN_RATIONALE_LENGTH) {
+    return {
+      ok: false,
+      reason: `"executionPolicy.rationale" must be a string with at least ${VERIFICATION_EXECUTION_POLICY_MIN_RATIONALE_LENGTH} meaningful characters`,
+    };
+  }
+
+  return {
+    ok: true,
+    value: {
+      budgets: { elapsedSeconds, outputBytes, maxAttempts },
+      executionPolicy: { rationale },
+    },
+  };
 }
 
 /** Safe, minimal projection for `sf plan status` — no raw planner transcripts, no secrets. */

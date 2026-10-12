@@ -19,4 +19,18 @@ export interface PlanRepository {
   findById(id: string): Promise<Plan | undefined>;
   findActiveByRequestKey(requestKey: string): Promise<Plan | undefined>;
   listByProject(projectId: ProjectId): Promise<readonly Plan[]>;
+  /**
+   * Optional atomic "create or adopt" keyed by a (botId, updateId) request
+   * binding. The binding and digest are deduplication context only — never
+   * approval or authority. Atomically either returns the Plan already linked
+   * to this binding (ConcurrencyError if the stored digest differs), adopts the
+   * existing active Plan for `candidate.requestKey`, or inserts `candidate`
+   * (a genuine initial DRAFT, version 1); in the latter two cases the link is
+   * recorded in the same transaction. Only supported by repositories on the
+   * explicitly upgraded link schema; others refuse.
+   */
+  createOrAdoptLinkedRequest?(
+    candidate: Plan,
+    binding: { botId: number; updateId: number; requestDigest: string },
+  ): Promise<Plan>;
 }

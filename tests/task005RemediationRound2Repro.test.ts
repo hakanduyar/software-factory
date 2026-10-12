@@ -28,15 +28,23 @@ import { encodePlan, parsePlan } from "../src/planning/planSerialization.js";
 import { renderPlannerResponse } from "../src/planning/scriptedPlannerWorkers.js";
 import { cleanupTempDbs, tempDbPath } from "./support/factoryFixtures.js";
 import {
+  A_THEN_B_TICKET_TEMPLATES,
   PLAN_HUMAN,
   approvedPlan,
   authorizePlanHuman,
   finishWorkItem,
   newPlanning,
+  testExecutionConfig,
+  validTicketTemplate,
   type TestPlanning,
 } from "./support/planFixtures.js";
 
 after(cleanupTempDbs);
+
+const TWO_INDEPENDENT_TICKET_TEMPLATES = [
+  validTicketTemplate("WI-A", "First thing behaves as specified"),
+  validTicketTemplate("WI-B", "Second thing behaves as specified"),
+];
 
 function twoIndependentItems(): string {
   return renderPlannerResponse({
@@ -68,7 +76,9 @@ async function planWithMissingLoop(phase: PlanPhase = "EXECUTING"): Promise<{ co
 /** Two dispatches whose loop ids are swapped: both real, both wired to the other item. */
 async function planWithSwappedLoops(): Promise<{ context: TestPlanning; planId: string }> {
   const context = await newPlanning({ plannerOutputs: [twoIndependentItems()] });
-  const plan = await approvedPlan(context);
+  const plan = await approvedPlan(context, "Build the thing.", {
+    execution: testExecutionConfig(undefined, TWO_INDEPENDENT_TICKET_TEMPLATES),
+  });
   assert.equal(plan.dispatches.length, 2, "both independent items dispatched");
   const [a, b] = [plan.dispatches[0]!, plan.dispatches[1]!];
   assert.notEqual(a.loopId, b.loopId);
@@ -163,7 +173,9 @@ describe("ROUND 2: a dispatch pointing at another work item's loop fails closed"
 
   it("refuses a dispatch whose work item disagrees with its materialization mapping", async () => {
     const context = await newPlanning({ plannerOutputs: [twoIndependentItems()] });
-    const plan = await approvedPlan(context);
+    const plan = await approvedPlan(context, "Build the thing.", {
+      execution: testExecutionConfig(undefined, TWO_INDEPENDENT_TICKET_TEMPLATES),
+    });
     const [a, b] = [plan.dispatches[0]!, plan.dispatches[1]!];
 
     const crossed: Plan = {
@@ -180,7 +192,9 @@ describe("ROUND 2: a dispatch pointing at another work item's loop fails closed"
 
   it("refuses two plan items claiming one loop", async () => {
     const context = await newPlanning({ plannerOutputs: [twoIndependentItems()] });
-    const plan = await approvedPlan(context);
+    const plan = await approvedPlan(context, "Build the thing.", {
+      execution: testExecutionConfig(undefined, TWO_INDEPENDENT_TICKET_TEMPLATES),
+    });
     const [a, b] = [plan.dispatches[0]!, plan.dispatches[1]!];
 
     const duplicated: Plan = {
@@ -294,7 +308,9 @@ describe("ROUND 2: the same conclusion survives a SQLite restart", () => {
     const dbPath = tempDbPath("r2-dispatch-");
     const plans = createSqlitePlanRepository(dbPath);
     const context = await newPlanning({ plans, plannerOutputs: [twoIndependentItems()] });
-    const plan = await approvedPlan(context);
+    const plan = await approvedPlan(context, "Build the thing.", {
+      execution: testExecutionConfig(undefined, TWO_INDEPENDENT_TICKET_TEMPLATES),
+    });
     await plans.compareAndSave(mutate({ ...plan, version: plan.version + 1 }), plan.version);
     plans.close();
 
@@ -515,7 +531,9 @@ describe("ROUND 2: sound dispatch lineage still works normally", () => {
         }),
       ],
     });
-    const plan = await approvedPlan(context);
+    const plan = await approvedPlan(context, "Build the thing.", {
+      execution: testExecutionConfig(undefined, A_THEN_B_TICKET_TEMPLATES),
+    });
     assert.equal(plan.dispatches.length, 1, "the dependent item waits");
 
     await finishWorkItem(context.factory, plan.materialized[0]!.workItemId, "r2-dep");

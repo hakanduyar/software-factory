@@ -43,6 +43,7 @@ import {
   type Plan,
   type PlanEvent,
   type PlanEventKind,
+  type PlanExecutionConfig,
   type PlannedWorkItem,
   type PlanPhase,
   type PlanRevision,
@@ -767,5 +768,153 @@ describe("parsePlan — phase presuppositions", () => {
       basePlan({ outcome: "COMPLETED" }),
       /phase PLAN_REVIEW is not terminal but an outcome COMPLETED is recorded/,
     );
+  });
+});
+
+// =====================================================================
+// PHASE7-101: approved deterministic verification policy
+// =====================================================================
+
+describe("PHASE7-101: approved deterministic verification policy", () => {
+  const VALID_POLICY: NonNullable<PlanExecutionConfig["verificationExecutionPolicy"]> = {
+    budgets: { elapsedSeconds: 600, outputBytes: 32768, maxAttempts: 2 },
+    executionPolicy: { rationale: "Bounded deterministic verification only." },
+  };
+
+  /** A valid approved plan whose execution carries a genuine verificationExecutionPolicy. */
+  function executingPlanWithPolicy(policy: NonNullable<PlanExecutionConfig["verificationExecutionPolicy"]> = VALID_POLICY): Plan {
+    return executingPlan({
+      execution: {
+        implementer: { tool: "scripted", model: "test-implementer" },
+        reviewer: { tool: "scripted", model: "test-reviewer" },
+        verificationCommands: [{ id: "check", executable: "node", argv: ["-e", "process.exit(0)"] }],
+        workspaceRoot: "/tmp/sf-plan-serialization-test",
+        loopBudget: { maxIterations: 2 },
+        verificationExecutionPolicy: policy,
+      },
+    });
+  }
+
+  it("round-trips a valid policy through encodePlan/parsePlan without loss", () => {
+    const plan = executingPlanWithPolicy();
+    const parsed = parsePlan(encodePlan(plan), columnsOf(plan));
+
+    assert.deepEqual(parsed, plan, "encode -> parse preserves the policy exactly");
+    assert.deepEqual(parsed.execution.verificationExecutionPolicy, VALID_POLICY);
+    assert.equal(parsed.approvedDigest, approvalDigestOfPlan(plan, REV1));
+  });
+
+  it("the approved row's digest genuinely matches its policy baseline before any corruption", () => {
+    const plan = executingPlanWithPolicy();
+    // Proves the fixture itself is honest: nothing below is masked by a
+    // fixture-level approval mismatch that would fire before the parser does.
+    assert.equal(plan.approvedDigest, approvalDigestOfPlan(plan, REV1));
+    const parsed = parsePlan(encodePlan(plan), columnsOf(plan));
+    assert.equal(parsed.approvedDigest, plan.approvedDigest);
+  });
+
+  it("refuses a numeric policy field corrupted after approval (elapsedSeconds <= 0)", () => {
+    const plan = executingPlanWithPolicy();
+    assertCorrupt(
+      plan,
+      (row) => {
+        (entry(row, 0), undefined);
+        (row.execution as Row).verificationExecutionPolicy = {
+          budgets: { elapsedSeconds: 0, outputBytes: 32768, maxAttempts: 2 },
+          executionPolicy: { rationale: "Bounded deterministic verification only." },
+        };
+      },
+      /verificationExecutionPolicy.*budgets\.elapsedSeconds.*must be a positive finite number/,
+    );
+  });
+
+  it("refuses an unknown top-level field in the persisted policy", () => {
+    const plan = executingPlanWithPolicy();
+    assertCorrupt(
+      plan,
+      (row) => {
+        (row.execution as Row).verificationExecutionPolicy = {
+          ...VALID_POLICY,
+          providerOverride: "untrusted-mixed-provider",
+        };
+      },
+      /verificationExecutionPolicy.*unexpected field "providerOverride"/,
+    );
+  });
+
+  it("refuses an unknown mixed/nested field inside executionPolicy", () => {
+    const plan = executingPlanWithPolicy();
+    assertCorrupt(
+      plan,
+      (row) => {
+        (row.execution as Row).verificationExecutionPolicy = {
+          budgets: VALID_POLICY.budgets,
+          executionPolicy: { rationale: VALID_POLICY.executionPolicy.rationale, tokenPolicy: "mixed" },
+        };
+      },
+      /verificationExecutionPolicy.*unexpected field "executionPolicy\.tokenPolicy"/,
+    );
+  });
+
+  it("refuses a rationale that is present but too short to be meaningful", () => {
+    const plan = executingPlanWithPolicy();
+    assertCorrupt(
+      plan,
+      (row) => {
+        (row.execution as Row).verificationExecutionPolicy = {
+          budgets: VALID_POLICY.budgets,
+          executionPolicy: { rationale: "short" },
+        };
+      },
+      /verificationExecutionPolicy.*executionPolicy\.rationale.*must be a string with at least 10 meaningful characters/,
+    );
+  });
+
+  it("refuses an explicitly null policy rather than treating it as absent", () => {
+    const plan = executingPlanWithPolicy();
+    assertCorrupt(
+      plan,
+      (row) => {
+        (row.execution as Row).verificationExecutionPolicy = null;
+      },
+      /verificationExecutionPolicy.*must be an object/,
+    );
+  });
+
+  it("proves explicit undefined is distinct from genuine absence using only the live digest, not an invented JSON shape", () => {
+    // JSON cannot carry a key whose value is `undefined` — `JSON.stringify`
+    // drops such keys entirely — so "explicit undefined" is proved at the
+    // value level via the approval digest, never by fabricating impossible JSON.
+    const present = executingPlanWithPolicy();
+    const { execution: _droppedExecution, ...restOfPresent } = present;
+    void _droppedExecution;
+    const absent: Plan = {
+      ...restOfPresent,
+      execution: {
+        implementer: present.execution.implementer,
+        reviewer: present.execution.reviewer,
+        verificationCommands: present.execution.verificationCommands,
+        workspaceRoot: present.execution.workspaceRoot,
+        // `loopBudget` is optional under `exactOptionalPropertyTypes`: an
+        // absent one must stay absent rather than become an explicit
+        // `undefined`, since this case's whole point is that explicit
+        // undefined and genuine absence are different.
+        ...(present.execution.loopBudget === undefined ? {} : { loopBudget: present.execution.loopBudget }),
+      },
+    };
+    const absentWithDigest: Plan = { ...absent, approvedDigest: approvalDigestOfPlan(absent, REV1) };
+
+    assert.notEqual(present.approvedDigest, absentWithDigest.approvedDigest);
+
+    const parsedAbsent = parsePlan(encodePlan(absentWithDigest), columnsOf(absentWithDigest));
+    assert.equal("verificationExecutionPolicy" in parsedAbsent.execution, false);
+  });
+
+  it("genuine absence of legacy policy remains valid and round-trips unchanged", () => {
+    const plan = executingPlan();
+    assert.equal("verificationExecutionPolicy" in plan.execution, false);
+    const parsed = parsePlan(encodePlan(plan), columnsOf(plan));
+    assert.deepEqual(parsed, plan);
+    assert.equal(parsed.approvedDigest, plan.approvedDigest);
   });
 });

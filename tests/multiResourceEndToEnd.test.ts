@@ -21,7 +21,7 @@ import { cleanupTempDbs } from "./support/factoryFixtures.js";
 import { newSupervisor, scriptedProbe, seedRoadmap } from "./support/supervisorFixtures.js";
 import { approvedPlan, newPlanning } from "./support/planFixtures.js";
 import { createPlanBackedExecutor, type PlanAdvancer } from "../src/supervision/planBackedExecutor.js";
-import type { Plan, PlannerConfig } from "../src/planning/planTypes.js";
+import type { Plan, PlannerConfig, WorkItemTicketTemplate } from "../src/planning/planTypes.js";
 import type { RequiredResource, WorkExecutionInput, WorkOutcome } from "../src/supervision/supervisorPorts.js";
 import type { ScriptedExecutor } from "./support/supervisorFixtures.js";
 import type { RoadmapItem } from "../src/supervision/supervisorTypes.js";
@@ -70,6 +70,49 @@ function healthyProbe() {
  * `PlanningService.status`, which runs `projectFailClosed` against the Factory's
  * own records.
  */
+/**
+ * e954: `approvedPlan`'s default scripted planner response names one item,
+ * `WI-A`, whose default-generated acceptance criterion is
+ * `"Do the thing behaves as specified"` (see `renderPlannerResponse`). The
+ * ticket template below binds EXACTLY that text — `planTicketExecutability`
+ * refuses a template whose criteria do not match the approved revision's own.
+ */
+function validTicketTemplate(planItemKey: string, criterionText: string): WorkItemTicketTemplate {
+  return {
+    planItemKey,
+    schemaVersion: "1.0.0",
+    objective: "Implement the roadmap item to a reviewable, verifiable state.",
+    acceptanceCriteria: [{ id: "AC-1", version: "1.0.0", description: criterionText }],
+    scope: {
+      owned: ["src/example.ts"],
+      forbidden: [],
+      read: [],
+      dependencies: [],
+      validation: ["npm test"],
+    },
+    model: {
+      eligibleModels: ["claude-code/opus"],
+      reasoningEffort: "medium",
+      rationale: "Needs multi-file reasoning across the module.",
+    },
+    budgets: {
+      contextTokens: 100000,
+      outputTokens: 4000,
+      elapsedSeconds: 1800,
+      maxAttempts: 2,
+    },
+    policy: {
+      checkpoint: "after each verification pass",
+      stopConditions: ["acceptance criteria met"],
+      escalation: "escalate to a human on repeated failure",
+    },
+    resultSchema: {
+      requiredFields: ["status", "summary"],
+      maxResultBytes: 2048,
+    },
+  };
+}
+
 async function realExecutor(reviewer: PlannerConfig) {
   const context = await newPlanning();
   const plan = await approvedPlan(context, "Build the thing.", {
@@ -81,6 +124,7 @@ async function realExecutor(reviewer: PlannerConfig) {
       verificationCommands: [{ id: "check", executable: "node", argv: ["-e", "process.exit(0)"] }],
       workspaceRoot: "/tmp/sf-plan-test",
       loopBudget: { maxIterations: 2 },
+      ticketTemplates: [validTicketTemplate("WI-A", "Do the thing behaves as specified")],
     },
   });
 

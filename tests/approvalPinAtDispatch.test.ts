@@ -20,6 +20,7 @@ import { after, describe, it } from "node:test";
 
 import { cleanupTempDbs } from "./support/factoryFixtures.js";
 import {
+  A_THEN_B_TICKET_TEMPLATES,
   approvedPlan,
   dependentPlanResponse,
   finishWorkItem,
@@ -96,7 +97,7 @@ describe("TASK-015: the approval pin holds at the moment a worker starts", () =>
     const plan = await approvedPlan(context, "Build two things.", {
       constraints: CONSTRAINTS,
       planner: TEST_PLANNER_CONFIG,
-      execution: testExecutionConfig(),
+      execution: testExecutionConfig(undefined, A_THEN_B_TICKET_TEMPLATES),
     });
     const pinned = (await context.plans.findById(plan.id))?.approvedDigest;
     assert.ok(pinned !== undefined);
@@ -216,6 +217,99 @@ describe("TASK-015: the approval pin holds at the moment a worker starts", () =>
       "a worker started even though the plan changed between the pin check and the claim",
     );
     assert.equal(startsBefore, base.context.dispatcher.startCount(), "the original dispatcher also started work");
+  });
+
+  /**
+   * Isolate the fresh ticket guard by returning a ticket-deficient snapshot only
+   * at the actual claim read. The backing row retains its approved content and
+   * version, so the existing approval verification, digest pin and CAS all stay
+   * valid. A persisted compareAndSave mutation would instead let those older
+   * guards refuse the dispatch even if the fresh ticket guard were removed.
+   */
+  it("does not claim or start a dispatch when its ticket template is removed at the claim itself", async () => {
+    const context = await newPlanning({ plannerOutputs: [dependentPlanResponse()] });
+    const plan = await approvedPlan(context, "Build two things.", {
+      constraints: CONSTRAINTS,
+      planner: TEST_PLANNER_CONFIG,
+      execution: testExecutionConfig(undefined, A_THEN_B_TICKET_TEMPLATES),
+    });
+    const pinned = (await context.plans.findById(plan.id))?.approvedDigest;
+    assert.ok(pinned !== undefined, "the real approval path produced no digest");
+
+    const first = plan.materialized[0];
+    const second = plan.materialized.find((entry) => entry.planItemKey === "WI-B");
+    assert.ok(first !== undefined, "the two-item fixture materialized nothing");
+    assert.ok(second !== undefined, "the fixture must materialize the selected WI-B");
+    context.dispatcher.setPhase(first.workItemId, { phase: "COMPLETED", outcome: "COMPLETED" });
+    await finishWorkItem(context.factory, first.workItemId, "b");
+
+    const startsBefore = context.dispatcher.startCount();
+    let intercepted = false;
+    let claimWrites = 0;
+    const realFindById = context.plans.findById.bind(context.plans);
+    const realCompareAndSave = context.plans.compareAndSave.bind(context.plans);
+    Object.assign(context.plans, {
+      findById: async (id: string) => {
+        const found = await realFindById(id);
+        const insideClaim = new Error().stack?.includes("claimAndDispatch") === true;
+        if (id === plan.id && found !== undefined && !intercepted && insideClaim) {
+          intercepted = true;
+          assert.equal(found.dispatchClaim, undefined, "WI-B must reach the new-claim branch");
+          assert.equal(found.dispatches.some((entry) => entry.planItemKey === "WI-B"), false);
+          assert.equal(await context.dispatcher.find(second.workItemId), undefined);
+          const atClaim = {
+            ...found,
+            execution: { ...found.execution, ticketTemplates: [A_THEN_B_TICKET_TEMPLATES[0]!] },
+          };
+          const backing = await realFindById(id);
+          assert.ok(backing !== undefined);
+          assert.equal(atClaim.version, backing.version, "the old CAS must remain eligible");
+          assert.equal(atClaim.approvedDigest, pinned, "the old digest pin must remain valid");
+          assert.equal(atClaim.approvalId, backing.approvalId, "approval authority must remain unchanged");
+          assert.equal(backing.approvedDigest, pinned);
+          assert.ok(backing.execution.ticketTemplates?.some((entry) => entry.planItemKey === "WI-B"));
+          assert.equal(
+            atClaim.execution.ticketTemplates.some((entry) => entry.planItemKey === "WI-B"),
+            false,
+            "the actual atClaim read must lack the selected item's executable ticket",
+          );
+          return atClaim;
+        }
+        return found;
+      },
+      compareAndSave: async (candidate: Parameters<typeof realCompareAndSave>[0], version: number) => {
+        if (candidate.dispatchClaim?.planItemKey === "WI-B") {
+          claimWrites += 1;
+          const backing = await realFindById(candidate.id);
+          assert.equal(version, backing?.version, "a guard-only mutant must not fail on a stale CAS");
+          assert.equal(candidate.approvedDigest, pinned, "a guard-only mutant must not fail the pin");
+        }
+        return realCompareAndSave(candidate, version);
+      },
+    });
+
+    await assert.rejects(
+      context.service.resume(plan.id, pinned),
+      /cannot dispatch "WI-B": no ticket template is recorded for plan item\(s\): WI-B/,
+    );
+
+    assert.equal(intercepted, true, "the interception must run on the actual claim read");
+    assert.equal(claimWrites, 0, "the fresh ticket guard must refuse before a WI-B claim CAS");
+    assert.equal(
+      context.dispatcher.startCount(),
+      startsBefore,
+      "a worker was started for a plan item whose ticket template no longer covered it at the claim",
+    );
+    assert.equal(await context.dispatcher.find(second.workItemId), undefined, "no WI-B worker may start");
+    const stored = await realFindById(plan.id);
+    assert.ok(stored !== undefined);
+    assert.equal(stored.dispatchClaim, undefined, "no dispatch claim may persist after ticket refusal");
+    assert.equal(stored.approvedDigest, pinned, "the original approval must still be current");
+    assert.equal(
+      stored.dispatches.some((entry) => entry.planItemKey === "WI-B"),
+      false,
+      "no dispatch was recorded for the item that lost its ticket template",
+    );
   });
 
   /**

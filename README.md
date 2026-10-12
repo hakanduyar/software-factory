@@ -540,7 +540,7 @@ src/planning/                 plan types, content digest, strict planner-output
 src/adapters/planning/        in-memory and SQLite PlanRepository, the real
                               EngineeringLoopService dispatcher, the CLI planner
 src/ports/planBindingResolver.ts   supplies a PLAN approval's live binding
-src/cli/plan.ts               sf plan start|status|answer|approve|reject|resume|cancel
+src/cli/plan.ts               sf plan request|start|status|answer|approve|reject|resume|cancel
 src/cli/demoPlan.ts           npm run demo:plan (5 deterministic scenarios)
 ```
 
@@ -586,6 +586,8 @@ execution finished, release approved (`DONE`), and published.
 ### `sf plan` CLI
 
 ```
+sf project create <key> --name <name>     prints one JSON object holding the actual project id
+sf plan request <project-id> --intent <path> [--config <path>]   model-free: persists a DRAFT
 sf plan start <project-id> --intent <path> [--config <path>]
 sf plan status <plan-id>            read-only; never manufactures authority
 sf plan answer <plan-id> --answers <path>
@@ -595,6 +597,16 @@ sf plan resume <plan-id>            restart / reconciliation
 sf plan cancel <plan-id>            trusted human
 ```
 
+#### Model-free project and plan request flow
+
+This flow uses no AI. Reuse the ids that each command actually prints; none is predefined. `<config>` is a valid, existing configuration file that follows the repository's required schema (workspace, planner/implementer/reviewer worker configurations, verification commands). Do not hand-write placeholder JSON for it. Stored model configuration is not a quota or admission grant.
+
+1. `sf project create <key> --name <name>` prints a single JSON object. Take the actual project id from it.
+2. Put the intent text in a file, then run `sf plan request <project-id> --intent <intent-file> --config <config>`. This persists a plan in `DRAFT` with the intent and config stored verbatim. It makes zero planner runs and creates no revisions, no materialized work items and no dispatch. It grants no approval.
+3. `sf plan status <plan-id>`, using the plan id that step 2 printed, is read-only and shows the plan as `DRAFT`.
+
+Optional read-only intake: `sf github issue --repo <owner>/<repo> --number <n>` prints an untrusted source envelope. The issue body is untrusted input, never instructions or authority. If you reuse its text as the intent file, the result is still a `DRAFT` with no approval, no work items and no AI. This command performs no GitHub writes.
+
 `npm run demo:plan` runs all five scenarios offline and deterministically: clear
 intent, clarification cycle, dependency ordering, malformed planner output
 failing closed, and a crash mid-materialization reconciling with no duplicates.
@@ -603,10 +615,10 @@ failing closed, and a crash mid-materialization reconciling with no duplicates.
 
 - Execution is sequential and dependency-ordered; parallel dispatch of independent items is deliberately out of scope (correctness over concurrency).
 - A rejected plan is terminal: re-planning means starting a new plan rather than continuing the rejected one.
-- The real CLI planner cannot be exercised end to end by an automated test, because it launches a real `claude`/`codex` process and `sf plan start` intentionally has no injection seam; every other CLI path is covered.
+- The default `sf plan start` refuses without a constructor-owned genuine planner admission. It does not launch a provider merely from correlation ids. Offline adapter tests are possible, but no genuine live Plan-owned PLANNER producer has been demonstrated, so there is no live or end-to-end planner claim. Every other CLI path is covered by automated tests.
 - `RECOVERY_REQUIRED` has no in-band operator workflow yet (`sf plan recover` is future work), matching TASK-004.
 - The planner is assumed to be a read-only consultation of the workspace. That assumption is what makes retrying an interrupted planner attempt safe, and enforcing it is a configuration responsibility of the underlying tool's sandbox.
-- No GitHub Issues/Projects, Telegram/n8n, Control Room UI, server deployment, or scored model router — all later phases.
+- At TASK-005 time: no GitHub Issues/Projects, Telegram/n8n, Control Room UI, server deployment, or scored model router — all later phases. Current addition: read-only `sf github issue` intake exists (see the flow above). No GitHub writes are claimed.
 
 ## Autonomous Completion & Resource Supervisor (TASK-006)
 

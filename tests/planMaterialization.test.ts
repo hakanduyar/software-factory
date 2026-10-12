@@ -43,6 +43,7 @@ import {
   simplePlanResponse,
   TEST_PLANNER_CONFIG,
   testExecutionConfig,
+  TWO_ITEMS_TICKET_TEMPLATES,
 } from "./support/planFixtures.js";
 
 const TWO_ITEMS = renderPlannerResponse({
@@ -113,7 +114,9 @@ function serviceOver(harness: Harness, factory: FactoryService): PlanningService
 describe("TASK-005 AC-7: materialization creates exactly the approved work items", () => {
   it("creates one work item per approved plan item, with the approved content", async () => {
     const context = await newPlanning({ plannerOutputs: [TWO_ITEMS] });
-    const plan = await approvedPlan(context);
+    const plan = await approvedPlan(context, "Build the thing.", {
+      execution: testExecutionConfig(undefined, TWO_ITEMS_TICKET_TEMPLATES),
+    });
 
     const items = await context.factory.listWorkItemsByProject(context.projectId);
     assert.equal(items.length, 2);
@@ -140,7 +143,9 @@ describe("TASK-005 AC-7: materialization creates exactly the approved work items
 
   it("drives every materialized item to READY through the real gates", async () => {
     const context = await newPlanning({ plannerOutputs: [TWO_ITEMS] });
-    const plan = await approvedPlan(context);
+    const plan = await approvedPlan(context, "Build the thing.", {
+      execution: testExecutionConfig(undefined, TWO_ITEMS_TICKET_TEMPLATES),
+    });
 
     for (const mapping of plan.materialized) {
       const item = await context.factory.getWorkItem(mapping.workItemId);
@@ -152,7 +157,9 @@ describe("TASK-005 AC-7: materialization creates exactly the approved work items
 
   it("is idempotent: resuming an already-materialized plan creates nothing new", async () => {
     const context = await newPlanning({ plannerOutputs: [TWO_ITEMS] });
-    const plan = await approvedPlan(context);
+    const plan = await approvedPlan(context, "Build the thing.", {
+      execution: testExecutionConfig(undefined, TWO_ITEMS_TICKET_TEMPLATES),
+    });
     const before = await context.factory.listWorkItemsByProject(context.projectId);
     const startsBefore = context.dispatcher.startCount();
 
@@ -166,7 +173,9 @@ describe("TASK-005 AC-7: materialization creates exactly the approved work items
 
   it("fails closed when a mapped work item's plan tag no longer matches the approved one", async () => {
     const context = await newPlanning({ plannerOutputs: [TWO_ITEMS] });
-    const plan = await approvedPlan(context);
+    const plan = await approvedPlan(context, "Build the thing.", {
+      execution: testExecutionConfig(undefined, TWO_ITEMS_TICKET_TEMPLATES),
+    });
 
     // Rewrite one mapping to point at a work item whose planVersion is not the
     // approved correlation tag: that item is not this plan's item, whatever the
@@ -298,7 +307,9 @@ describe("TASK-005 AC-11: every crash boundary reconciles without duplicating wo
 
   it("boundary 6: approval recorded but materialization not started -> resume materializes", async () => {
     const context = await newPlanning({ plannerOutputs: [TWO_ITEMS] });
-    const plan = await approvedPlan(context);
+    const plan = await approvedPlan(context, "Build the thing.", {
+      execution: testExecutionConfig(undefined, TWO_ITEMS_TICKET_TEMPLATES),
+    });
 
     // Rewind to APPROVED with nothing materialized.
     const current = (await context.plans.findById(plan.id))!;
@@ -321,7 +332,7 @@ describe("TASK-005 AC-11: every crash boundary reconciles without duplicating wo
       actor: PLAN_HUMAN,
       intent: "Two things",
       planner: TEST_PLANNER_CONFIG,
-      execution: testExecutionConfig(),
+      execution: testExecutionConfig(undefined, TWO_ITEMS_TICKET_TEMPLATES),
     });
     await assert.rejects(
       crashedService.approve(draft.id, PLAN_HUMAN, crashing.authorizeHuman(PLAN_HUMAN, PLAN_CREDENTIAL)),
@@ -346,7 +357,9 @@ describe("TASK-005 AC-11: every crash boundary reconciles without duplicating wo
 
   it("boundary 7b: a dangling claim whose work item DID commit is adopted, not recreated", async () => {
     const context = await newPlanning({ plannerOutputs: [TWO_ITEMS] });
-    const plan = await approvedPlan(context);
+    const plan = await approvedPlan(context, "Build the thing.", {
+      execution: testExecutionConfig(undefined, TWO_ITEMS_TICKET_TEMPLATES),
+    });
     const revision = plan.revisions.at(-1)!;
     const victim = plan.materialized[0]!;
 
@@ -464,7 +477,7 @@ describe("TASK-005 AC-11: every crash boundary reconciles without duplicating wo
       actor: PLAN_HUMAN,
       intent: "Two things",
       planner: TEST_PLANNER_CONFIG,
-      execution: testExecutionConfig(),
+      execution: testExecutionConfig(undefined, TWO_ITEMS_TICKET_TEMPLATES),
     });
     const approved = await first.approve(draft.id, PLAN_HUMAN, factory.authorizeHuman(PLAN_HUMAN, PLAN_CREDENTIAL));
     const itemsBefore = (await factory.listWorkItemsByProject(project.id)).length;

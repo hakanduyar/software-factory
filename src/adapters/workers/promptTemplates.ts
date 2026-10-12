@@ -52,10 +52,34 @@ function criteriaBlock(criteria: readonly AcceptanceCriterion[]): string {
   );
 }
 
+function behaviorPolicyGuidance(): string {
+  return [
+    "Behavior-based verification policy (applies to every role):",
+    "- Follow any workspace-local instructions/conventions where present; otherwise use sound default judgment.",
+    "- Map each acceptance criterion/invariant to an observable failure it would catch, and run the smallest sufficient group of checks that covers it.",
+    "- For code changes, verify via executable checks (build/tests/lint as applicable). Add or update a test only when it covers a distinct behavior or regression not already protected; reuse existing coverage otherwise.",
+    "- Do not add tests that merely mirror private-helper internals or incidental call order unless that behavior is part of the contract.",
+    "- When correcting a failure, re-run the focused affected checks; stop dependent checks once a known compile/build failure blocks them.",
+    "- Reuse prior evidence only when the relevant source, tests, dependencies, config and environment fingerprints still match.",
+    "- Never delete or weaken a required final/security/approval gate or an independent review step merely to reach a green result; there is no mandatory test-count or coverage target.",
+  ].join("\n");
+}
+
 function render(header: string, ctx: PromptContext, body: string): string {
-  return [header, "", scopeStatement(ctx), "", criteriaBlock(ctx.acceptanceCriteria), "", body, "", "Task instructions:", ctx.instructions].join(
-    "\n",
-  );
+  return [
+    header,
+    "",
+    scopeStatement(ctx),
+    "",
+    criteriaBlock(ctx.acceptanceCriteria),
+    "",
+    behaviorPolicyGuidance(),
+    "",
+    body,
+    "",
+    "Task instructions:",
+    ctx.instructions,
+  ].join("\n");
 }
 
 function buildAnalystPrompt(ctx: PromptContext): string {
@@ -78,7 +102,7 @@ function buildImplementerPrompt(ctx: PromptContext): string {
   return render(
     "You are acting as the Factory's IMPLEMENTATION ENGINEER for one work item.",
     ctx,
-    "Implement only the instructions below. Add or update tests with any code change. Run the project's own checks before finishing.",
+    "Implement only the instructions below. Verify your change with the project's own executable checks, and follow the behavior-based verification policy above for deciding whether a test needs to be added or updated.",
   );
 }
 

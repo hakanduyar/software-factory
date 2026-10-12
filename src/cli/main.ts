@@ -30,8 +30,12 @@ Usage:
   sf loop status <loop-id>   Show loop phase/iteration/budget (no secrets/transcripts)
   sf loop resume <loop-id>   Resume a loop after a crash/restart
   sf loop cancel <loop-id>   Durably cancel an active loop
+  sf project create <key> --name <name>
+                      Create a Project and print its id as JSON
   sf plan start <project-id> --intent <path> [--config <path>]
                       Plan a natural-language goal into a reviewable, durable plan (TASK-005)
+  sf plan request <project-id> --intent <path> [--config <path>]
+                      Persist a model-free DRAFT request without invoking the planner
   sf plan status <plan-id>   Show plan phase/revision/progress (read-only, no secrets)
   sf plan answer <plan-id> --answers <path>
                       Answer the plan's blocking clarification questions
@@ -52,6 +56,13 @@ Usage:
                                        sf plan resume in a child process. Off by
                                        default: launching spends.
   sf supervise status     Show supervisor state, spending policy and open escalations
+  sf supervisor run [--roadmap-plans <path>] [--plans-db <path>] [--drive-plans]
+                      Run the durable supervisor continuously. Uses the same plan
+                      bindings and explicit launch authority as supervise tick.
+  sf supervisor status    Read durable state (no model, no writes)
+  sf supervisor notifications
+                      Read pending worker-run notifications and run status (no model, no writes)
+  sf supervisor review    Ask for an independent review of a frozen candidate
   sf supervise resources  Show per-resource availability, retry times and backoff
   sf supervise roadmap    Show the durable roadmap queue and what it is waiting on
   sf github publish --roadmap-key <KEY> --head <SHA> --base <SHA>
@@ -63,6 +74,13 @@ Usage:
   sf github readiness ... [--reviewed]
                       Report whether that candidate is bound to remote state and
                       CI evidence well enough to integrate. Integrates nothing.
+  sf run status <run-id> --db <existing-path> --json
+                      Print one persisted Run as JSON (read-only, existing database only)
+  sf run list --work-item <id> --db <existing-path> --json
+                      Print a work item's persisted Runs as a JSON array (read-only, existing database only)
+  sf serve runs --db <existing-path> --port <0..65535> [--shutdown-on-stdin-eof]
+                      Serve persisted Runs over local HTTP (existing database only)
+  sf inbox telegram import ...   Import a Telegram export into the inbox
   sf help             Show this message
 `;
 
@@ -316,9 +334,31 @@ async function main(argv: readonly string[]): Promise<number> {
       console.error(`Usage: sf loop <start|status|resume|cancel>`);
       return 1;
     }
+    case "project": {
+      const sub = argv[1];
+      if (sub !== "create") {
+        console.error("Usage: sf project create <key> --name <name>");
+        return 1;
+      }
+      const key = argv[2];
+      if (key === undefined || key.startsWith("--")) {
+        console.error("Usage: sf project create <key> --name <name>");
+        return 1;
+      }
+      const nameFlagIndex = argv.indexOf("--name");
+      const name = nameFlagIndex === -1 ? undefined : argv[nameFlagIndex + 1];
+      if (name === undefined) {
+        console.error("Usage: sf project create <key> --name <name>");
+        return 1;
+      }
+      const { runProjectCreate } = await import("./project.js");
+      const log = (line: string): void => console.log(line);
+      await runProjectCreate(key, name, { log });
+      return 0;
+    }
     case "plan": {
       const sub = argv[1];
-      const { runPlanStart, runPlanStatus, runPlanAnswer, runPlanApprove, runPlanReject, runPlanResume, runPlanCancel } =
+      const { runPlanStart, runPlanRequest, runPlanStatus, runPlanAnswer, runPlanApprove, runPlanReject, runPlanResume, runPlanCancel } =
         await import("./plan.js");
       const log = (line: string): void => console.log(line);
       const flag = (name: string): string | undefined => {
@@ -326,14 +366,17 @@ async function main(argv: readonly string[]): Promise<number> {
         return index === -1 ? undefined : argv[index + 1];
       };
 
-      if (sub === "start") {
+      if (sub === "start" || sub === "request") {
         const projectId = argv[2];
         const intentPath = flag("--intent");
         if (projectId === undefined || intentPath === undefined) {
-          console.error("Usage: sf plan start <project-id> --intent <path> [--config <path>]");
+          console.error(`Usage: sf plan ${sub} <project-id> --intent <path> [--config <path>]`);
           return 1;
         }
-        const view = await runPlanStart(projectId, intentPath, flag("--config"), { log });
+        const view =
+          sub === "start"
+            ? await runPlanStart(projectId, intentPath, flag("--config"), { log })
+            : await runPlanRequest(projectId, intentPath, flag("--config"), { log });
         return view.phase === "BLOCKED" || view.phase === "RECOVERY_REQUIRED" ? 1 : 0;
       }
       if (sub === "answer") {
@@ -372,7 +415,7 @@ async function main(argv: readonly string[]): Promise<number> {
                   : await runPlanCancel(planId, { log });
         return view.phase === "BLOCKED" || view.phase === "RECOVERY_REQUIRED" ? 1 : 0;
       }
-      console.error(`Usage: sf plan <start|status|answer|approve|reject|resume|cancel>`);
+      console.error(`Usage: sf plan <start|request|status|answer|approve|reject|resume|cancel>`);
       return 1;
     }
     case "supervise": {
@@ -434,13 +477,110 @@ async function main(argv: readonly string[]): Promise<number> {
       console.error(`Usage: sf supervise <tick|status|resources|roadmap|block>`);
       return 1;
     }
+    case "supervisor": {
+      /**
+       * THE LONG-RUNNING FACTORY (TASK-019), kept apart from `sf supervise`.
+       *
+       * `supervise` is a set of one-shot commands a person runs. `supervisor`
+       * is the service that runs whether or not a person is there, which is the
+       * whole difference this task exists to make — and the separation keeps an
+       * operator from starting a daemon when they meant to look at a state.
+       */
+      const sub = argv[1];
+      const { runSupervisorService, runSupervisorStatus, runSupervisorWorkerRunNotifications, requestReview } =
+        await import("./supervisor.js");
+      const log = (line: string): void => console.log(line);
+
+      if (sub === "run") {
+        const parsed = parseSuperviseTickArgs(argv.slice(2));
+        if (!parsed.ok) {
+          console.error(parsed.error);
+          console.error(
+            "Usage: sf supervisor run [--roadmap-plans <path>] [--plans-db <path>] [--drive-plans]",
+          );
+          return 1;
+        }
+        const outcome = await runSupervisorService({ log, ...parsed.value });
+        log(JSON.stringify(outcome));
+        return outcome.kind === "STOPPED" ? 0 : 1;
+      }
+      if (sub === "status") {
+        const view = await runSupervisorStatus({ log });
+        if (view === undefined) {
+          log("no supervisor state exists yet");
+          return 1;
+        }
+        log(JSON.stringify(view, null, 2));
+        return 0;
+      }
+      if (sub === "notifications") {
+        // READ-ONLY VISIBILITY (DEFECT-DURABLE-WORKER-RUN-ENVELOPE AC-9): durable
+        // reads only, no reconciliation, no provider call, no state mutation.
+        const view = await runSupervisorWorkerRunNotifications({ log });
+        if (view === undefined) {
+          log("no supervisor state exists yet");
+          return 1;
+        }
+        log(JSON.stringify(view, null, 2));
+        return 0;
+      }
+      if (sub === "review") {
+        const flags = new Map<string, string>();
+        for (let index = 2; index < argv.length; index += 2) {
+          const name = argv[index];
+          const value = argv[index + 1];
+          if (name === undefined || value === undefined || !name.startsWith("--")) {
+            console.error(
+              "Usage: sf supervisor review --key <ROADMAP_KEY> --commit <SHA> --tree <SHA> --fingerprint <HEX>",
+            );
+            return 1;
+          }
+          flags.set(name.slice(2), value);
+        }
+        const key = flags.get("key");
+        const commit = flags.get("commit");
+        const tree = flags.get("tree");
+        const fingerprint = flags.get("fingerprint");
+        if (key === undefined || commit === undefined || tree === undefined || fingerprint === undefined) {
+          console.error(
+            "Usage: sf supervisor review --key <ROADMAP_KEY> --commit <SHA> --tree <SHA> --fingerprint <HEX>",
+          );
+          return 1;
+        }
+        const request = await requestReview({
+          roadmapKey: key,
+          commit,
+          tree,
+          fingerprint,
+          ...(flags.has("provider") ? { provider: flags.get("provider")! } : {}),
+          ...(flags.has("model") ? { model: flags.get("model")! } : {}),
+          ...(flags.has("effort") ? { effort: flags.get("effort")! } : {}),
+          log,
+        });
+        log(JSON.stringify(request, null, 2));
+        return 0;
+      }
+      console.error(`Usage: sf supervisor <run|status|notifications|review>`);
+      return 1;
+    }
     case "github": {
       const sub = argv[1];
-      const { parseGithubPublishArgs, runGithubPublish, runGithubReadiness } = await import("./github.js");
+      const { parseGithubIssueArgs, parseGithubPublishArgs, runGithubIssue, runGithubPublish, runGithubReadiness } =
+        await import("./github.js");
       const log = (line: string): void => console.log(line);
       const usage =
         "Usage: sf github <publish|readiness> --roadmap-key <KEY> --head <SHA> --base <SHA> " +
         "--head-ref <BRANCH> --base-ref <BRANCH> --repo <owner/name> [--reviewed]";
+
+      if (sub === "issue") {
+        const parsedIssue = parseGithubIssueArgs(argv.slice(2));
+        if (!parsedIssue.ok) {
+          console.error(parsedIssue.error);
+          console.error("Usage: sf github issue --repo <owner/name> --number <N>");
+          return 1;
+        }
+        return await runGithubIssue(parsedIssue.value, { log });
+      }
 
       if (sub === "publish" || sub === "readiness") {
         /**
@@ -467,6 +607,40 @@ async function main(argv: readonly string[]): Promise<number> {
       }
       console.error(usage);
       return 1;
+    }
+    case "run": {
+      if (argv[1] === "list") {
+        const { runRunList } = await import("./runList.js");
+        return await runRunList(argv.slice(2));
+      }
+      if (argv[1] !== "status") {
+        console.error("Usage: sf run status <run-id> --db <existing-path> --json");
+        console.error("       sf run list --work-item <id> --db <existing-path> --json");
+        return 2;
+      }
+      const { runRunStatus } = await import("./runStatus.js");
+      return await runRunStatus(argv.slice(2));
+    }
+    case "serve": {
+      if (argv[1] !== "runs") {
+        console.error("Usage: sf serve runs --db <existing-path> --port <0..65535> [--shutdown-on-stdin-eof]");
+        return 2;
+      }
+      const { runServeRuns } = await import("./serveRuns.js");
+      return await runServeRuns(argv.slice(2));
+    }
+    case "inbox": {
+      if (argv[1] !== "telegram" || argv[2] !== "import") {
+        console.error("Telegram import failed.");
+        return 1;
+      }
+      try {
+        const { handleTelegramImport } = await import("./telegramImport.js");
+        return await handleTelegramImport(argv.slice(3));
+      } catch {
+        console.error("Telegram import failed.");
+        return 1;
+      }
     }
     case "help":
     case "--help":

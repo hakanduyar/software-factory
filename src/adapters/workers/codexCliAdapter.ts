@@ -26,6 +26,7 @@
 import { FACTORY_ROLES, type FactoryRole } from "../../domain/role.js";
 import type { ProcessResult, ProcessRunner } from "../../ports/processRunner.js";
 import type { Worker } from "../../ports/worker.js";
+import type { DirectHostAdmissionSurface } from "../../supervision/directWorkerAdmission.js";
 import type { BuildInvocationArgs, CliInvocationPlan, CliReportedResult } from "./cliWorker.js";
 import { createCliWorker } from "./cliWorker.js";
 import { DEFAULT_WORKER_ENVIRONMENT_POLICY, type EnvironmentPolicy } from "./environmentPolicy.js";
@@ -43,6 +44,12 @@ export interface CodexCliWorkerOptions {
   readonly processRunner: ProcessRunner;
   readonly environmentPolicy?: EnvironmentPolicy;
   readonly roles?: readonly FactoryRole[];
+  /** See CliWorkerAdapterConfig.maxEvidenceChars in cliWorker.ts. */
+  readonly maxEvidenceChars?: number;
+  /** See CliWorkerAdapterConfig.directAdmissionChannel in cliWorker.ts. Omitted when absent; missing default fails closed there. */
+  readonly directAdmissionChannel?: DirectHostAdmissionSurface;
+  /** See CliWorkerAdapterConfig.maxTotalOutputBytes in cliWorker.ts. Omitted preserves unbounded-aggregate behavior. */
+  readonly maxTotalOutputBytes?: number;
 }
 
 export function sandboxForRole(role: FactoryRole): "read-only" | "workspace-write" {
@@ -77,8 +84,15 @@ export function resolveCodexEffort(effort: string | undefined): { argv: readonly
   };
 }
 
-export function extractCodexFinalMessage(stdout: string): string | undefined {
+interface CodexJsonlScan {
+  readonly finalMessage?: string;
+  /** See CliReportedResult.streamCorrupted in cliWorker.ts. */
+  readonly corrupted: boolean;
+}
+
+function scanCodexJsonl(stdout: string): CodexJsonlScan {
   let last: string | undefined;
+  let corrupted = false;
   for (const line of stdout.split("\n")) {
     const trimmed = line.trim();
     if (trimmed.length === 0) continue;
@@ -86,7 +100,12 @@ export function extractCodexFinalMessage(stdout: string): string | undefined {
     try {
       event = JSON.parse(trimmed);
     } catch {
-      continue; // Malformed/truncated JSONL line — ignore, this channel is informational only.
+      // A malformed line breaks Codex's own one-JSON-object-per-line
+      // contract. `finalMessage` extraction is informational only — the
+      // planner (TASK-005) is the consumer that must fail closed on this,
+      // because a later authoritative message could be hidden behind it.
+      corrupted = true;
+      continue;
     }
     if (
       typeof event === "object" &&
@@ -100,7 +119,11 @@ export function extractCodexFinalMessage(stdout: string): string | undefined {
       }
     }
   }
-  return last;
+  return { ...(last === undefined ? {} : { finalMessage: last }), corrupted };
+}
+
+export function extractCodexFinalMessage(stdout: string): string | undefined {
+  return scanCodexJsonl(stdout).finalMessage;
 }
 
 /** Pure argv-building: no I/O, directly unit-testable without spawning anything. */
@@ -124,8 +147,11 @@ export function buildCodexInvocation(args: BuildInvocationArgs): CliInvocationPl
 
 /** Pure output parsing: no I/O, directly unit-testable with a fabricated ProcessResult. */
 export function interpretCodexOutput(processResult: ProcessResult): CliReportedResult {
-  const finalMessage = extractCodexFinalMessage(processResult.stdout);
-  return finalMessage === undefined ? {} : { finalMessage };
+  const scan = scanCodexJsonl(processResult.stdout);
+  return {
+    ...(scan.finalMessage === undefined ? {} : { finalMessage: scan.finalMessage }),
+    ...(scan.corrupted ? { streamCorrupted: true } : {}),
+  };
 }
 
 export function createCodexCliWorker(options: CodexCliWorkerOptions): Worker {
@@ -141,6 +167,9 @@ export function createCodexCliWorker(options: CodexCliWorkerOptions): Worker {
     workspace: options.workspace,
     processRunner: options.processRunner,
     environmentPolicy: options.environmentPolicy ?? DEFAULT_WORKER_ENVIRONMENT_POLICY,
+    ...(options.maxEvidenceChars === undefined ? {} : { maxEvidenceChars: options.maxEvidenceChars }),
+    ...(options.directAdmissionChannel === undefined ? {} : { directAdmissionChannel: options.directAdmissionChannel }),
+    ...(options.maxTotalOutputBytes === undefined ? {} : { maxTotalOutputBytes: options.maxTotalOutputBytes }),
     buildInvocation: buildCodexInvocation,
     interpretOutput: interpretCodexOutput,
   });

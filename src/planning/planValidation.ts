@@ -15,8 +15,9 @@
  * execution sequence can never disagree.
  */
 
+import { parseWorkerTicket } from "../supervision/workerContract.js";
 import type { ParsedPlannerProposal } from "./plannerOutputContract.js";
-import type { PlannedWorkItem } from "./planTypes.js";
+import { candidateTicketFromTemplate, findUnknownTicketTemplateFields, type PlannedWorkItem, type WorkItemTicketTemplate } from "./planTypes.js";
 
 export type PlanValidation =
   | { readonly ok: true; readonly order: readonly string[] }
@@ -127,4 +128,159 @@ export function validateProposal(proposal: ParsedPlannerProposal): PlanValidatio
   }
 
   return topologicalOrder(proposal.items);
+}
+
+// =====================================================================
+// Per-work-item ticket templates (NC-RUNTIME-01 / NC-10 / NC-11)
+// =====================================================================
+
+/**
+ * The three answers a plan can give to "may this item be dispatched?".
+ *
+ * The split is the fail-closed part. `INVALID` means the templates the plan
+ * DOES carry are structurally wrong — malformed against the frozen contract,
+ * duplicated, orphaned or contradicting the revision's criteria — and nothing
+ * may run. `NON_EXECUTABLE` means authority was never recorded for some item
+ * (a legacy plan, or an incomplete one): the plan stays readable and the
+ * remedy is a replan, never a synthesized ticket. Only `EXECUTABLE` yields
+ * templates, and only for items that actually have one.
+ */
+export type PlanTicketExecutability =
+  | { readonly status: "EXECUTABLE"; readonly templatesByKey: ReadonlyMap<string, WorkItemTicketTemplate> }
+  | { readonly status: "NON_EXECUTABLE"; readonly reason: string; readonly replanAction: string }
+  | { readonly status: "INVALID"; readonly reason: string };
+
+const REPLAN_ACTION =
+  "replan this request so the approved execution configuration captures a structured ticket template " +
+  "for every work item; ownership and budgets must be stated explicitly, never inferred from plan prose";
+
+/**
+ * Structural validation of ONE template, independent of any revision.
+ *
+ * Conformance is decided by the accepted `parseWorkerTicket` rather than
+ * restated here: that parser already refuses unsupported wire versions,
+ * placeholder objectives, empty ownership, overlapping owned/forbidden scope,
+ * non-positive or non-finite budgets and unknown result fields, and a second
+ * copy of those rules would be a second place for them to rot.
+ *
+ * One thing the accepted parser does NOT do: refuse an unrecognized nested
+ * key (e.g. `scope.grantAll`). It builds each nested object by naming only
+ * its known fields, so an unknown one is silently absent from the value it
+ * returns rather than being a reason to fail. That is fine as a NARROWING
+ * step, but it must never be the ONLY check — a template smuggling an
+ * unrecognized grant must be refused outright, not quietly stripped of it.
+ * So unknown nested keys are checked here FIRST, and on success the value
+ * returned is the accepted parser's own narrowed output (never the caller's
+ * original, unvalidated object), so nothing unvalidated can reach EXECUTABLE
+ * or the approval digest.
+ */
+export function validateTicketTemplate(
+  template: WorkItemTicketTemplate,
+): { readonly ok: true; readonly value: WorkItemTicketTemplate } | { readonly ok: false; readonly reason: string } {
+  if (typeof template.planItemKey !== "string" || template.planItemKey.trim().length === 0) {
+    return { ok: false, reason: "ticket template does not name a plan-local work item key" };
+  }
+  const unexpected = findUnknownTicketTemplateFields(template as unknown as Record<string, unknown>);
+  if (unexpected !== undefined) {
+    return {
+      ok: false,
+      reason: `ticket template for "${template.planItemKey}" carries unrecognized field(s): ${unexpected}`,
+    };
+  }
+  // The plan-local key stands in for the dispatch-time ticket id, which no
+  // template is allowed to carry.
+  const parsed = parseWorkerTicket(candidateTicketFromTemplate(template, template.planItemKey));
+  if (!parsed.ok) {
+    return {
+      ok: false,
+      reason: `ticket template for "${template.planItemKey}" does not satisfy the frozen WorkerTicket contract: ${parsed.errors.join("; ")}`,
+    };
+  }
+  const ticket = parsed.value;
+  return {
+    ok: true,
+    value: {
+      planItemKey: template.planItemKey,
+      schemaVersion: ticket.schemaVersion,
+      objective: ticket.objective,
+      acceptanceCriteria: ticket.acceptanceCriteria,
+      scope: ticket.scope,
+      model: ticket.model,
+      budgets: ticket.budgets,
+      policy: ticket.policy,
+      resultSchema: ticket.resultSchema,
+    },
+  };
+}
+
+function criterionTexts(values: readonly string[]): string[] {
+  return values.map((value) => value.trim()).sort();
+}
+
+/**
+ * Decides executability of `items` against the templates a plan captured.
+ *
+ * `templates === undefined` is the legacy shape: it is NOT an error, it is an
+ * absence of authority.
+ */
+export function planTicketExecutability(
+  items: readonly PlannedWorkItem[],
+  templates: readonly WorkItemTicketTemplate[] | undefined,
+): PlanTicketExecutability {
+  if (templates === undefined) {
+    return {
+      status: "NON_EXECUTABLE",
+      reason: "this plan records no per-work-item ticket templates (legacy plan)",
+      replanAction: REPLAN_ACTION,
+    };
+  }
+
+  const itemsByKey = new Map(items.map((item) => [item.key, item]));
+  const byKey = new Map<string, WorkItemTicketTemplate>();
+
+  for (const template of templates) {
+    const shape = validateTicketTemplate(template);
+    if (!shape.ok) {
+      return { status: "INVALID", reason: shape.reason };
+    }
+    // EXECUTABLE must expose only the explicitly validated canonical template
+    // — the accepted parser's own narrowed output — never the caller's
+    // original, unvalidated object.
+    const canonical = shape.value;
+    if (byKey.has(canonical.planItemKey)) {
+      return { status: "INVALID", reason: `plan item "${canonical.planItemKey}" has more than one ticket template` };
+    }
+    byKey.set(canonical.planItemKey, canonical);
+
+    const item = itemsByKey.get(canonical.planItemKey);
+    if (item === undefined) {
+      return {
+        status: "INVALID",
+        reason: `ticket template names plan item "${canonical.planItemKey}", which is not part of this revision`,
+      };
+    }
+    // MISMATCH: the criteria a worker is held to must be exactly the criteria
+    // the human approved for that item — no extras the plan never stated, and
+    // none quietly dropped. Each template criterion additionally carries its
+    // own version (NC-11), so "the criteria changed" is always visible.
+    const declared = criterionTexts(item.acceptanceCriteria.map((criterion) => criterion.text));
+    const bound = criterionTexts(canonical.acceptanceCriteria.map((criterion) => criterion.description));
+    if (declared.length !== bound.length || declared.some((text, index) => text !== bound[index])) {
+      return {
+        status: "INVALID",
+        reason: `ticket template for "${canonical.planItemKey}" binds criteria [${bound.join(" | ")}], which do not match the approved acceptance criteria [${declared.join(" | ")}]`,
+      };
+    }
+  }
+
+  const uncovered = items.map((item) => item.key).filter((key) => !byKey.has(key)).sort();
+  if (uncovered.length > 0) {
+    return {
+      status: "NON_EXECUTABLE",
+      reason: `no ticket template is recorded for plan item(s): ${uncovered.join(", ")}`,
+      replanAction: REPLAN_ACTION,
+    };
+  }
+
+  return { status: "EXECUTABLE", templatesByKey: byKey };
 }

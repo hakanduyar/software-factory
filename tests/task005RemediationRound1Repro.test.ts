@@ -45,6 +45,7 @@ import {
 import { renderPlannerResponse } from "../src/planning/scriptedPlannerWorkers.js";
 import type { ProcessResult, ProcessRunner } from "../src/ports/processRunner.js";
 import { cleanupTempDbs, tempDbPath } from "./support/factoryFixtures.js";
+import { createSyntheticPlannerAdmissionSource } from "./support/plannerAdmissionFixtures.js";
 import {
   PLAN_HUMAN,
   TEST_PLANNER_CONFIG,
@@ -1074,11 +1075,13 @@ function fakeProcessResult(overrides: Partial<ProcessResult> = {}): ProcessResul
 /** The REAL chain: createCliPlannerWorker -> createLoopWorker -> createCliWorker -> ProcessRunner. */
 function productionPlanner(result: ProcessResult): PlannerWorker {
   const runner: ProcessRunner = { run: async () => result };
+  const { source } = createSyntheticPlannerAdmissionSource({ model: "fake-model-never-invoked" });
   return createCliPlannerWorker({
     tool: "claude-code",
     model: "fake-model-never-invoked",
     workspace: PLANNER_WORKSPACE,
     processRunner: runner,
+    admissionSource: source,
   });
 }
 

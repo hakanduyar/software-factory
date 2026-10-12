@@ -13,7 +13,7 @@ import { agent, human, system } from "../../src/domain/actor.js";
 import { createSequentialIdGenerator } from "../../src/domain/ids.js";
 import type { PlanRepository } from "../../src/planning/planRepository.js";
 import { createPlanBindingResolver, PlanningService } from "../../src/planning/planningService.js";
-import type { PlanExecutionConfig, PlannerConfig, Plan } from "../../src/planning/planTypes.js";
+import type { PlanExecutionConfig, PlannerConfig, Plan, WorkItemTicketTemplate } from "../../src/planning/planTypes.js";
 import type { PlannerWorker } from "../../src/planning/plannerWorker.js";
 import {
   createScriptedDispatcher,
@@ -38,13 +38,96 @@ export const PLAN_FIXTURE_START = "2026-01-01T00:00:00.000Z";
 
 export const TEST_PLANNER_CONFIG: PlannerConfig = { tool: "scripted", model: "test-planner" };
 
-export function testExecutionConfig(workspaceRoot = "/tmp/sf-plan-test"): PlanExecutionConfig {
+/**
+ * A structurally valid WorkerTicket template bound to one plan-local item and
+ * its exact acceptance-criterion text (NC-RUNTIME-01 / NC-10 / NC-11).
+ * `planTicketExecutability` refuses a template whose criteria do not match the
+ * approved revision's own, so the caller must pass the EXACT planner-output
+ * criterion text.
+ */
+export function validTicketTemplate(planItemKey: string, criterionText: string): WorkItemTicketTemplate {
+  return {
+    planItemKey,
+    schemaVersion: "1.0.0",
+    objective: "Implement the roadmap item to a reviewable, verifiable state.",
+    acceptanceCriteria: [{ id: "AC-1", version: "1.0.0", description: criterionText }],
+    scope: {
+      owned: ["src/example.ts"],
+      forbidden: [],
+      read: [],
+      dependencies: [],
+      validation: ["npm test"],
+    },
+    model: {
+      eligibleModels: ["claude-code/opus"],
+      reasoningEffort: "medium",
+      rationale: "Needs multi-file reasoning across the module.",
+    },
+    budgets: {
+      contextTokens: 100000,
+      outputTokens: 4000,
+      elapsedSeconds: 1800,
+      maxAttempts: 2,
+    },
+    policy: {
+      checkpoint: "after each verification pass",
+      stopConditions: ["acceptance criteria met"],
+      escalation: "escalate to a human on repeated failure",
+    },
+    resultSchema: {
+      requiredFields: ["status", "summary"],
+      maxResultBytes: 2048,
+    },
+  };
+}
+
+/** The default acceptance criterion text `renderPlannerResponse` fills in when a test does not override one. */
+export function defaultPlannerCriterionText(title: string): string {
+  return `${title} behaves as specified`;
+}
+
+/** Matches `simplePlanResponse()`'s single item (key "WI-A", title "Do the thing"). */
+export const WI_A_TICKET_TEMPLATES: readonly WorkItemTicketTemplate[] = [
+  validTicketTemplate("WI-A", defaultPlannerCriterionText("Do the thing")),
+];
+
+/** Matches the common "WI-A: First / WI-B: Second, dependsOn WI-A" two-item fixture used across these tests. */
+export const A_THEN_B_TICKET_TEMPLATES: readonly WorkItemTicketTemplate[] = [
+  validTicketTemplate("WI-A", defaultPlannerCriterionText("First")),
+  validTicketTemplate("WI-B", defaultPlannerCriterionText("Second")),
+];
+
+/** Matches the "WI-A: Schema / WI-B: API, dependsOn WI-A" fixture used in planDependencies.test.ts. */
+export const SCHEMA_THEN_API_TICKET_TEMPLATES: readonly WorkItemTicketTemplate[] = [
+  validTicketTemplate("WI-A", defaultPlannerCriterionText("Schema")),
+  validTicketTemplate("WI-B", defaultPlannerCriterionText("API")),
+];
+
+/** Matches the diamond fixture (WI-A: Base, WI-B: Left, WI-C: Right, WI-D: Join). */
+export const DIAMOND_TICKET_TEMPLATES: readonly WorkItemTicketTemplate[] = [
+  validTicketTemplate("WI-A", defaultPlannerCriterionText("Base")),
+  validTicketTemplate("WI-B", defaultPlannerCriterionText("Left")),
+  validTicketTemplate("WI-C", defaultPlannerCriterionText("Right")),
+  validTicketTemplate("WI-D", defaultPlannerCriterionText("Join")),
+];
+
+/** Matches the two-item fixture with explicit acceptance criteria text ("A works" / "B works"). */
+export const TWO_ITEMS_TICKET_TEMPLATES: readonly WorkItemTicketTemplate[] = [
+  validTicketTemplate("WI-A", "A works"),
+  validTicketTemplate("WI-B", "B works"),
+];
+
+export function testExecutionConfig(
+  workspaceRoot = "/tmp/sf-plan-test",
+  ticketTemplates: readonly WorkItemTicketTemplate[] = WI_A_TICKET_TEMPLATES,
+): PlanExecutionConfig {
   return {
     implementer: { tool: "scripted", model: "test-implementer" },
     reviewer: { tool: "scripted", model: "test-reviewer" },
     verificationCommands: [{ id: "check", executable: "node", argv: ["-e", "process.exit(0)"] }],
     workspaceRoot,
     loopBudget: { maxIterations: 2 },
+    ticketTemplates,
   };
 }
 

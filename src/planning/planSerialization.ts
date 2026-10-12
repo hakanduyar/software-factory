@@ -35,7 +35,9 @@
 import { ACTOR_KINDS, type Actor } from "../domain/actor.js";
 import { PersistenceCorruptionError } from "../domain/errors.js";
 import { PRIORITIES, WORK_ITEM_TYPES } from "../domain/workItem.js";
+import { parseWorkerTicket } from "../supervision/workerContract.js";
 import { approvalDigestOfPlan, digestOfRevision } from "./planDigest.js";
+import { validateVerificationExecutionPolicy } from "./planTypes.js";
 import {
   ACTIVE_PLAN_PHASES,
   PLAN_EVENT_KINDS,
@@ -45,6 +47,7 @@ import {
   PLANNER_ACTION_STATES,
   canonicalCorrelationTag,
   canonicalPlannerActionTag,
+  findUnknownTicketTemplateFields,
   isTerminalPlanPhase,
   type PlannerAction,
   type PlannerActionState,
@@ -62,6 +65,7 @@ import {
   type PlannerConfig,
   type PlanPhase,
   type PlanRevision,
+  type WorkItemTicketTemplate,
 } from "./planTypes.js";
 
 function corrupt(context: string, message: string): never {
@@ -201,6 +205,48 @@ function parsePlannerConfig(value: unknown, context: string): PlannerConfig {
   };
 }
 
+/**
+ * Strict decode of one persisted ticket template (NC-RUNTIME-01).
+ *
+ * Conformance is decided by the accepted `parseWorkerTicket`, and the NARROWED
+ * value it returns is what gets stored — so a persisted template can never be
+ * weaker than a live one, and the rules for "what authority may look like"
+ * exist in exactly one file. A template row that does not conform is
+ * corruption: it fails closed here rather than becoming a broad-ownership,
+ * unbounded-budget ticket later.
+ *
+ * `ticketId` is not a template field, so the plan-local key stands in for it
+ * during validation; an unexpected field — at the top level OR inside
+ * `scope`/`model`/`budgets`/`policy`/`resultSchema`/`acceptanceCriteria`
+ * entries, including a smuggled `ticketId` or e.g. `scope.grantAll` — is
+ * rejected outright rather than being silently narrowed away by the accepted
+ * parser's own field-by-field construction.
+ */
+function parseTicketTemplate(value: unknown, context: string): WorkItemTicketTemplate {
+  const row = asObject(value, context);
+  const unexpected = findUnknownTicketTemplateFields(row);
+  if (unexpected !== undefined) {
+    corrupt(context, `unexpected ticket template field(s): ${unexpected}`);
+  }
+  const planItemKey = str(row, "planItemKey", context);
+  const parsed = parseWorkerTicket({ ...row, planItemKey: undefined, ticketId: planItemKey });
+  if (!parsed.ok) {
+    corrupt(context, `ticket template for "${planItemKey}" violates the frozen WorkerTicket contract: ${parsed.errors.join("; ")}`);
+  }
+  const ticket = parsed.value;
+  return {
+    planItemKey,
+    schemaVersion: ticket.schemaVersion,
+    objective: ticket.objective,
+    acceptanceCriteria: ticket.acceptanceCriteria,
+    scope: ticket.scope,
+    model: ticket.model,
+    budgets: ticket.budgets,
+    policy: ticket.policy,
+    resultSchema: ticket.resultSchema,
+  };
+}
+
 function parseExecutionConfig(value: unknown, context: string): PlanExecutionConfig {
   const row = asObject(value, context);
   const commands = asArray(row.verificationCommands, `${context}.verificationCommands`).map((entry, index) => {
@@ -218,6 +264,24 @@ function parseExecutionConfig(value: unknown, context: string): PlanExecutionCon
   });
   if (commands.length === 0) {
     corrupt(context, "verificationCommands must declare at least one deterministic command");
+  }
+
+  // Absent means "legacy plan, no recorded item authority": still readable,
+  // but `planTicketExecutability` will refuse to dispatch it. Present means
+  // every entry must conform and name a distinct plan item.
+  let ticketTemplates: readonly WorkItemTicketTemplate[] | undefined;
+  if (row.ticketTemplates !== undefined) {
+    const templates = asArray(row.ticketTemplates, `${context}.ticketTemplates`).map((entry, index) =>
+      parseTicketTemplate(entry, `${context}.ticketTemplates[${index}]`),
+    );
+    const seenKeys = new Set<string>();
+    for (const template of templates) {
+      if (seenKeys.has(template.planItemKey)) {
+        corrupt(`${context}.ticketTemplates`, `plan item "${template.planItemKey}" has more than one ticket template`);
+      }
+      seenKeys.add(template.planItemKey);
+    }
+    ticketTemplates = templates;
   }
 
   let loopBudget: PlanExecutionConfig["loopBudget"];
@@ -238,12 +302,24 @@ function parseExecutionConfig(value: unknown, context: string): PlanExecutionCon
     };
   }
 
+  let verificationExecutionPolicy: PlanExecutionConfig["verificationExecutionPolicy"];
+  if ("verificationExecutionPolicy" in row) {
+    const shape = validateVerificationExecutionPolicy(row.verificationExecutionPolicy);
+    if (!shape.ok) {
+      corrupt(`${context}.verificationExecutionPolicy`, shape.reason);
+    } else {
+      verificationExecutionPolicy = shape.value;
+    }
+  }
+
   return {
     implementer: parsePlannerConfig(row.implementer, `${context}.implementer`),
     reviewer: parsePlannerConfig(row.reviewer, `${context}.reviewer`),
     verificationCommands: commands,
+    ...(ticketTemplates === undefined ? {} : { ticketTemplates }),
     workspaceRoot: str(row, "workspaceRoot", context),
     ...(loopBudget === undefined ? {} : { loopBudget }),
+    ...(verificationExecutionPolicy === undefined ? {} : { verificationExecutionPolicy }),
   };
 }
 
@@ -755,6 +831,26 @@ export function parsePlan(json: string, columns: PlanRowColumns): Plan {
     startedAt: timestamp(row, "startedAt", context),
     lastTransitionAt: timestamp(row, "lastTransitionAt", context),
   };
+
+  // ORPHANED TICKET TEMPLATES (NC-RUNTIME-01). A template names the plan-local
+  // item whose authority it carries, so one naming an item that does not exist
+  // in the revision that would actually be executed — the latest, since
+  // revisions are append-only and no revision follows an approval — could only
+  // come from corruption or from an edit that dropped the item. Held to the
+  // same standard as materialized mappings. A plan with no revision yet
+  // (DRAFT/PLANNING) has nothing to orphan against, so nothing is checked.
+  const latestRevision = plan.revisions.at(-1);
+  if (latestRevision !== undefined && plan.execution.ticketTemplates !== undefined) {
+    const itemKeys = new Set(latestRevision.items.map((item) => item.key));
+    for (const template of plan.execution.ticketTemplates) {
+      if (!itemKeys.has(template.planItemKey)) {
+        corrupt(
+          context,
+          `ticket template names plan item "${template.planItemKey}", which is not part of revision ${latestRevision.revision}`,
+        );
+      }
+    }
+  }
 
   // CHECK 3 (completed). The approved digest is recomputed here — where the
   // whole plan value finally exists — because remediation round 1 proved a

@@ -90,15 +90,33 @@ function killGroup(pid: number, signal: NodeJS.Signals): void {
   }
 }
 
+function isInvalidPositiveSafeInteger(value: number): boolean {
+  return !Number.isFinite(value) || !Number.isSafeInteger(value) || value <= 0;
+}
+
 export function createNodeProcessRunner(options: NodeProcessRunnerOptions = {}): ProcessRunner {
   const killGraceMs = options.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
 
   return {
     run(request: ProcessRequest): Promise<ProcessResult> {
+      if (
+        request.maxTotalOutputBytes !== undefined &&
+        isInvalidPositiveSafeInteger(request.maxTotalOutputBytes)
+      ) {
+        return Promise.reject(
+          new Error("maxTotalOutputBytes must be a positive safe integer when supplied"),
+        );
+      }
+
       const startedAt: Timestamp = Date.now();
       const maxOutputBytes = request.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
       const stdout = new BoundedCollector(maxOutputBytes);
       const stderr = new BoundedCollector(maxOutputBytes);
+      const maxTotalOutputBytes = request.maxTotalOutputBytes;
+      let totalRawBytes = 0;
+      let outputLimitExceeded = false;
+      let stdoutAggregateTruncated = false;
+      let stderrAggregateTruncated = false;
 
       return new Promise<ProcessResult>((resolvePromise) => {
         let settled = false;
@@ -139,12 +157,13 @@ export function createNodeProcessRunner(options: NodeProcessRunnerOptions = {}):
             signal: partial.signal,
             stdout: stdout.text(),
             stderr: stderr.text(),
-            stdoutTruncated: stdout.wasTruncated(),
-            stderrTruncated: stderr.wasTruncated(),
+            stdoutTruncated: stdout.wasTruncated() || stdoutAggregateTruncated,
+            stderrTruncated: stderr.wasTruncated() || stderrAggregateTruncated,
             startedAt,
             finishedAt,
             durationMs: finishedAt - startedAt,
             ...(partial.spawnError === undefined ? {} : { spawnError: partial.spawnError }),
+            ...(outputLimitExceeded ? { outputLimitExceeded: true } : {}),
           });
         }
 
@@ -171,8 +190,33 @@ export function createNodeProcessRunner(options: NodeProcessRunnerOptions = {}):
           }
         }
 
-        child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
-        child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+        function output(collector: BoundedCollector, chunk: Buffer, markTruncated: () => void): void {
+          try { request.onOutput?.(chunk.length); } catch { /* observational hook */ }
+          if (maxTotalOutputBytes !== undefined) {
+            const remainingAggregate = maxTotalOutputBytes - totalRawBytes;
+            totalRawBytes += chunk.length;
+            if (remainingAggregate <= 0) {
+              markTruncated();
+              if (!terminating && requestedReason === undefined) {
+                outputLimitExceeded = true;
+                requestTermination("CANCELLED");
+              }
+              return;
+            }
+            if (chunk.length > remainingAggregate) {
+              collector.push(chunk.subarray(0, remainingAggregate));
+              markTruncated();
+              if (!terminating && requestedReason === undefined) {
+                outputLimitExceeded = true;
+                requestTermination("CANCELLED");
+              }
+              return;
+            }
+          }
+          collector.push(chunk);
+        }
+        child.stdout.on("data", (chunk: Buffer) => output(stdout, chunk, () => { stdoutAggregateTruncated = true; }));
+        child.stderr.on("data", (chunk: Buffer) => output(stderr, chunk, () => { stderrAggregateTruncated = true; }));
         // Never let a stream error (e.g. EPIPE after the child exits) crash the process.
         child.stdout.on("error", () => {});
         child.stderr.on("error", () => {});
@@ -184,6 +228,14 @@ export function createNodeProcessRunner(options: NodeProcessRunnerOptions = {}):
             child.stdin.end(request.input);
           } catch {
             // A child that closes stdin immediately is a hostile-but-legal case, not a crash.
+          }
+          if (child.pid !== undefined) {
+            try {
+              request.onSpawn?.({ pid: child.pid });
+            } catch {
+              // A caller's callback throwing must never break this runner or
+              // its child, exactly like a stream error must not (see above).
+            }
           }
           if (terminating) {
             sendTermSignal();

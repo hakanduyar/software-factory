@@ -220,6 +220,64 @@ export function classifyResourceOutcome(input: ClassificationInput): Classificat
 }
 
 // =====================================================================
+// A provider that reported its OWN failure (SF-R3)
+// =====================================================================
+
+/**
+ * The one measured provider-failure text in this checkout.
+ *
+ * MEASURED on 2026-09-24 against claude-code 2.1.238 on this machine: a real
+ * zero-token invocation returned `is_error: true` with exactly this `result`
+ * string, `subtype: "success"`, `terminal_reason: "api_error"` and
+ * `duration_api_ms: 0`. The redacted response is kept as a permanent fixture at
+ * `tests/fixtures/claude-code-auth-expired-result.json`; account, session and
+ * uuid fields were removed before it entered the repository (C6).
+ *
+ * Note what this does NOT say. The zero-token auth probe (`claude auth status`)
+ * can report `loggedIn: true` while an actual invocation fails this way —
+ * that combination is what was observed — so the two facts are kept apart: the
+ * probe reports what the credential store contains, this reports what the
+ * provider did when asked to work. The invocation is the stronger evidence about
+ * whether work can happen, and `AUTH_REQUIRED` is human-only, so it is never
+ * cleared by a timer.
+ */
+const CLAUDE_OAUTH_EXPIRED =
+  /failed to authenticate:\s*oauth session expired and could not be refreshed/i;
+
+/**
+ * Classifies a failure the PROVIDER ITSELF structurally reported.
+ *
+ * Deliberately separate from `classifyResourceOutcome`'s signature table: this
+ * input is not scraped prose, it is the `result` field of a structured object
+ * whose `is_error` flag said the invocation failed. The evidence rule is the
+ * same as everywhere else in this file — only a MEASURED signature classifies,
+ * and everything else is `UNKNOWN_FAILURE`, which still earns bounded durable
+ * backoff.
+ *
+ * THERE IS NO QUOTA SIGNATURE HERE, and that is a statement about evidence
+ * rather than about effort: no real exhausted-plan response has been captured in
+ * this checkout, and observing one costs real quota. A provider refusal for
+ * quota reasons therefore classifies as `UNKNOWN_FAILURE` today — the immediate
+ * retry loop is closed either way, and a later measured sample sharpens the
+ * state to `USAGE_LIMIT_REACHED` without changing anything else.
+ */
+export function classifyProviderReportedError(provider: string, message: string): Classification {
+  if (provider === "claude-code" && CLAUDE_OAUTH_EXPIRED.test(message)) {
+    return {
+      state: "AUTH_REQUIRED",
+      reason: `claude-code reported is_error with the measured OAuth-expired failure: ${boundedDiagnostic(message)}`,
+      signatureId: "claude-code-oauth-expired",
+    };
+  }
+  return {
+    state: "UNKNOWN_FAILURE",
+    reason:
+      `${provider} reported is_error with no measured failure signature ` +
+      `(a quota subtype is UNVERIFIED here): ${boundedDiagnostic(message)}`,
+  };
+}
+
+// =====================================================================
 // Zero-token probe interpretation
 // =====================================================================
 

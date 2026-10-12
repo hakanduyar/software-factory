@@ -25,6 +25,14 @@ import { resolveWorkspace } from "../src/adapters/workers/workspace.js";
 import { cleanupTempDbs, newSqliteFactory, seedWorkItem, tempDbPath, toImplementing } from "./support/factoryFixtures.js";
 import { fakeCliPath } from "./support/fakeCli.js";
 import { cleanupTempWorkspaces, createTempWorkspace } from "./support/tempWorkspace.js";
+import {
+  buildRuntime,
+  buildRuntimeWithStore,
+  makeRetainedAuthority,
+  TICKET,
+  TICKET_REFERENCE,
+  PRESTART_TICKET_REFERENCE,
+} from "./support/directRuntimeFixture.js";
 
 after(() => {
   cleanupTempDbs();
@@ -41,22 +49,47 @@ describe("worker output redaction: Run.summary must never carry unredacted worke
     const item = await seedWorkItem(built.factory);
     await toImplementing(built.factory, item.id);
 
+    const retained = makeRetainedAuthority();
+    const runtime = buildRuntimeWithStore(retained.authority, built.store);
+
+    const criteria = await built.store.criteria.listByWorkItem(item.id);
+
     const workspace = resolveWorkspace(createTempWorkspace());
+    assert.ok(runtime.channel !== undefined, "trusted direct-admission channel must be present on the real Factory");
+    const eligibleModel = TICKET.model.eligibleModels[0];
+    assert.ok(eligibleModel !== undefined, "TICKET.model.eligibleModels must contain at least one model");
     const worker = createCodexCliWorker({
       executable: fakeCliPath("fake-codex.mjs"),
-      model: "m",
+      model: eligibleModel,
       workspace,
       processRunner: runner,
       environmentPolicy: { allowedVars: ["PATH"], extraVars: { FAKE_CODEX_MESSAGE: SYNTHETIC_SECRET } },
+      directAdmissionChannel: runtime.channel,
     });
-    built.factory.registerWorker(worker, ["IMPLEMENTER"]);
+    const workerPrincipal = runtime.factory.registerWorker(worker, ["IMPLEMENTER"]);
+    assert.ok(workerPrincipal.requiresDirectAdmission, "a real Codex worker must require direct admission");
 
-    const { run: outcomeRun, evidence: outcomeEvidence } = await built.factory.runWorker({
+    runtime.registerApprovedPrestart({
+      reference: PRESTART_TICKET_REFERENCE,
+      item: { id: item.id, specRevision: item.specRevision },
+      principal: workerPrincipal,
+      role: "IMPLEMENTER",
+      criteria,
+      dependencyWorkItemIds: item.dependencies,
+    });
+
+    const { run: outcomeRun, evidence: outcomeEvidence } = await runtime.factory.runWorker({
       workItemId: item.id,
       role: "IMPLEMENTER",
       worker,
       instructions: "implement the thing",
+      directTicketReference: TICKET_REFERENCE,
+      expectedModel: TICKET.model,
+      expectedScope: TICKET.scope,
+      expectedBudgets: TICKET.budgets,
     });
+
+    assert.equal(retained.calls.atomicConsumeLaunch, 1, "admission must have actually reached the real child via one real consume");
 
     // Before persistence round-trip: the returned WorkerOutcome-derived Run/Evidence.
     assert.doesNotMatch(outcomeRun.summary ?? "", /sk-ant-test-/, "Run.summary must not carry the raw synthetic secret");
@@ -96,26 +129,50 @@ describe("worker output redaction: Run.summary must never carry unredacted worke
   });
 
   it("does not mangle ordinary, non-secret worker output in Run.summary", async () => {
-    const { factory } = (await import("./support/factoryFixtures.js")).newFactory();
-    const item = await seedWorkItem(factory);
-    await toImplementing(factory, item.id);
+    const retained = makeRetainedAuthority();
+    const runtime = buildRuntime(retained.authority);
+
+    const item = await seedWorkItem(runtime.factory);
+    await toImplementing(runtime.factory, item.id);
+
+    const criteria = await runtime.store.criteria.listByWorkItem(item.id);
 
     const workspace = resolveWorkspace(createTempWorkspace());
+    assert.ok(runtime.factory.sharedDirectAdmissionChannel !== undefined, "trusted direct-admission channel must be present on the real Factory");
+    const eligibleModel = TICKET.model.eligibleModels[0];
+    assert.ok(eligibleModel !== undefined, "TICKET.model.eligibleModels must contain at least one model");
     const worker = createCodexCliWorker({
       executable: fakeCliPath("fake-codex.mjs"),
-      model: "m",
+      model: eligibleModel,
       workspace,
       processRunner: runner,
       environmentPolicy: { allowedVars: ["PATH"], extraVars: { FAKE_CODEX_MESSAGE: "All 12 tests passed, no issues found." } },
+      directAdmissionChannel: runtime.factory.sharedDirectAdmissionChannel,
     });
-    factory.registerWorker(worker, ["IMPLEMENTER"]);
+    const workerPrincipal = runtime.factory.registerWorker(worker, ["IMPLEMENTER"]);
+    assert.ok(workerPrincipal.requiresDirectAdmission, "a real Codex worker must require direct admission");
 
-    const { run } = await factory.runWorker({
+    runtime.registerApprovedPrestart({
+      reference: PRESTART_TICKET_REFERENCE,
+      item: { id: item.id, specRevision: item.specRevision },
+      principal: workerPrincipal,
+      role: "IMPLEMENTER",
+      criteria,
+      dependencyWorkItemIds: item.dependencies,
+    });
+
+    const { run } = await runtime.factory.runWorker({
       workItemId: item.id,
       role: "IMPLEMENTER",
       worker,
       instructions: "implement the thing",
+      directTicketReference: TICKET_REFERENCE,
+      expectedModel: TICKET.model,
+      expectedScope: TICKET.scope,
+      expectedBudgets: TICKET.budgets,
     });
+
+    assert.equal(retained.calls.atomicConsumeLaunch, 1, "admission must have actually reached the real child via one real consume");
 
     assert.match(run.summary ?? "", /All 12 tests passed, no issues found\./);
     assert.doesNotMatch(run.summary ?? "", /\[REDACTED\]/);

@@ -51,6 +51,49 @@ export const T_CATUP = "dist/tests/catalogUpgrade.test.js";
 export const T_CATPERS = "dist/tests/catalogUpgradePersistence.test.js";
 export const T_ROADMAP = "dist/tests/roadmapStructuralIntegrity.test.js";
 
+// ---- TASK-018 Part B: durable orchestration ------------------------------
+/**
+ * WHY THESE MUTATIONS SAY `Number.isNaN(0)` RATHER THAN `false`.
+ *
+ * `&& false` is the obvious way to switch a guard off, and it does not work
+ * here. TypeScript folds the condition, marks the branch unreachable, and stops
+ * applying control-flow narrowing inside it — so a `held` that the enclosing
+ * `if (held !== undefined)` had narrowed goes back to `ActivityLease |
+ * undefined`, the file stops compiling, and preflight refuses the mutation as
+ * UNMEASURED. Five mutations failed exactly that way, twice.
+ *
+ * `Number.isNaN(0)` is `false` at runtime and opaque to the checker, so the
+ * branch stays reachable, narrowing survives, and what changes is only the
+ * behaviour — which is the whole point of a mutation. `!Number.isNaN(0)` is the
+ * same trick for a condition that must become always-true.
+ */
+export const ACTIVITY = "src/supervision/activity.ts";
+export const PROCLIVE = "src/adapters/supervision/procLiveness.ts";
+
+export const T_ACT = "dist/tests/activity.test.js";
+export const T_PROCLIVE = "dist/tests/procLiveness.test.js";
+export const T_ACTREC = "dist/tests/activityRecovery.test.js";
+
+/**
+ * TASK-018 round 7: consuming a verdict is the part that was missing, and the
+ * part whose absence cost twenty-two hours.
+ */
+export const ACCEPT = "src/supervision/acceptance.ts";
+export const FILEVERDICT = "src/adapters/supervision/fileVerdictSource.ts";
+
+export const T_AV = "dist/tests/acceptanceVerdict.test.js";
+
+/**
+ * DEFECT-DURABLE-WORKER-RUN-ENVELOPE.
+ */
+export const WORKER_RUN_ENVELOPE = "src/supervision/workerRunEnvelope.ts";
+export const WORKER_RUN_ARTIFACT = "src/adapters/supervision/workerRunArtifact.ts";
+
+export const T_WORKER_RUN_ENVELOPE = "dist/tests/workerRunEnvelope.test.js";
+export const T_WORKER_RUN_ARTIFACT = "dist/tests/workerRunArtifact.test.js";
+export const T_WORKER_RUN_RECOVERY = "dist/tests/supervisorWorkerRunRecovery.test.js";
+export const T_VC = "dist/tests/verdictConsumption.test.js";
+
 export const MUTATIONS = [
   // ---- AC-1: only runners this repository knows to be unmetered -------------
   {
@@ -1012,6 +1055,525 @@ export const MUTATIONS = [
     expect: "is IDEMPOTENT",
   },
 
+  // =========================================================================
+  // TASK-018 PART B — durable orchestration
+  //
+  // The property under measurement here is unusual in the other direction from
+  // Part A: these guards exist to stop the Factory believing that work is
+  // happening when nothing is running, and to stop a second owner starting
+  // beside a first. Each mutation asks whether a dead process can be mistaken
+  // for a live one, or the reverse.
+  // =========================================================================
+
+  // ---- AC-12: holding a lease requires being alive ------------------------
+  {
+    id: "a dead lease holder keeps the activity",
+    edits: [[ACTIVITY,
+      '      if (liveness === "ALIVE") {',
+      '      if (liveness === "ALIVE" || liveness === "GONE") {']],
+    tests: [T_ACTREC],
+    expect: "ALLOWS a real process to take over once the holder is dead",
+  },
+  {
+    id: "an unknown lease holder is treated as gone, so a second owner starts",
+    edits: [[ACTIVITY,
+      '      if (liveness === "UNKNOWN") {',
+      '      if (liveness === "UNKNOWN" && Number.isNaN(0)) {']],
+    tests: [T_ACT],
+    expect: "REFUSES when liveness cannot be established",
+  },
+  {
+    id: "a reused pid is reported as the original holder",
+    edits: [[PROCLIVE,
+      "      if (started !== lease.processStartedAt) {",
+      "      if (started !== lease.processStartedAt && Number.isNaN(0)) {"]],
+    tests: [T_PROCLIVE],
+    expect: "reports GONE when the pid is REUSED by an unrelated process",
+  },
+  {
+    id: "a lease from another machine is judged anyway",
+    edits: [[PROCLIVE,
+      "      if (lease.machine !== machine) {",
+      "      if (lease.machine !== machine && Number.isNaN(0)) {"]],
+    tests: [T_PROCLIVE],
+    expect: "reports UNKNOWN for a lease from another machine",
+  },
+  {
+    id: "an unreadable /proc entry is read as death",
+    edits: [[PROCLIVE,
+      '        return (error as NodeJS.ErrnoException)?.code === "ENOENT" ? "GONE" : "UNKNOWN";',
+      '        return "GONE";']],
+    tests: [T_PROCLIVE],
+    // Aimed at the READ failure, not the parse failure. The parse case reaches
+    // the parser and never enters this catch, which is why this mutation
+    // survived its first run.
+    expect: "reports UNKNOWN when the entry cannot be READ",
+  },
+  {
+    id: "the stat parser splits on the FIRST parenthesis",
+    edits: [[PROCLIVE,
+      '  const close = raw.lastIndexOf(")");\n  if (close === -1) return undefined;\n  const fields = raw.slice(close + 1).trim().split(/\\s+/);',
+      '  const close = raw.indexOf(")");\n  if (close === -1) return undefined;\n  const fields = raw.slice(close + 1).trim().split(/\\s+/);']],
+    tests: [T_PROCLIVE],
+    expect: "reads it when the executable name contains spaces and parentheses",
+  },
+
+  /**
+   * ROUND-2 REVIEW. Neither of these two guards had a mutation aimed at it,
+   * which the reviewer noted as a coverage gap in an otherwise valid matrix.
+   * Both are the guards that round found missing, so both are measured now.
+   */
+  {
+    id: "production runs work when it cannot establish its own identity",
+    edits: [[SUP_SVC,
+      "    if (recordsActivities && lease === undefined) {",
+      "    if (recordsActivities && lease === undefined && Number.isNaN(0)) {"]],
+    tests: [T_ACTREC],
+    expect: "REFUSES to run when it cannot establish its own process identity",
+  },
+  /**
+   * ROUND-3 REVIEW. Neither of these guards existed to be mutated before, and
+   * the reviewer's sharper point was about coverage: the passing "live
+   * activity" fixture held no `activeClaim`, so nothing could have caught the
+   * two records of one fact disagreeing.
+   */
+  /**
+   * ROUND-4 REVIEW. Both guards are new, and the second one is the interesting
+   * case: losing the record of a SUCCESS is worse than losing the race, so the
+   * mutation makes the retry give up on the first conflict.
+   */
+  /**
+   * ROUND-5 REVIEW. Both guards are new: `AMBIGUOUS` must stop the tick rather
+   * than annotate it, and a write must prove it comes from the current holder.
+   */
+  /**
+   * ROUND-6 REVIEW. Three guards the previous matrix could not measure, and the
+   * first is the one that mattered most: a heartbeat that refreshed its
+   * timestamp without the COUNT moving defeated stall detection entirely.
+   */
+  {
+    id: "an unchanged progress count still refreshes the stall clock",
+    edits: [[ACTIVITY,
+      "  if (previous !== undefined && previous.progress === heartbeat.progress) {",
+      "  if (previous !== undefined && previous.progress === heartbeat.progress && previous.at === heartbeat.at) {"]],
+    tests: [T_ACT],
+    expect: "does NOT refresh the stall clock when the count has not moved",
+  },
+  {
+    id: "a no-probe refusal records the wrong classification",
+    edits: [[SUP_SVC,
+      '          const recorded = recordReconciliation(classified, entry.id, {\n            verdict: "AMBIGUOUS",',
+      '          const recorded = recordReconciliation(classified, entry.id, {\n            verdict: "LIVE",']],
+    tests: [T_ACTREC],
+    expect: "REFUSES to run anything while an activity is unfinished and liveness is uncheckable",
+  },
+  {
+    id: "work is launched even though its start could not be recorded",
+    edits: [[SUP_SVC,
+      "      if (!launched.recorded) {",
+      "      if (!launched.recorded && Number.isNaN(0)) {"]],
+    tests: [T_ACTREC],
+    expect: "REFUSES to launch when the start of the work cannot be recorded",
+  },
+  {
+    id: "an ambiguous activity is annotated instead of refusing the tick",
+    edits: [[SUP_SVC,
+      "    if (ambiguous.length > 0) {",
+      "    if (ambiguous.length > 0 && Number.isNaN(0)) {"]],
+    tests: [T_ACTREC],
+    expect: "REFUSES to schedule while any activity's owner cannot be established",
+  },
+  {
+    id: "a write from a process that no longer holds the activity is accepted",
+    edits: [[ACTIVITY,
+      "  if (!sameHolder(activity.lease, holder)) {",
+      "  if (!sameHolder(activity.lease, holder) && Number.isNaN(0)) {"]],
+    tests: [T_ACT],
+    expect: "REFUSES a completion from a process that no longer holds the activity",
+  },
+  {
+    id: "holders are told apart by pid alone",
+    edits: [[ACTIVITY,
+      "  return (\n    a.pid === b.pid &&\n    a.processStartedAt === b.processStartedAt &&\n    a.machine === b.machine &&\n    a.boot === b.boot\n  );",
+      "  return a.pid === b.pid;"]],
+    tests: [T_ACT],
+    expect: "tells holders apart by START TIME, MACHINE and BOOT, not by pid alone",
+  },
+  /**
+   * Aimed at the EXHAUSTION test, not the successful-retry one. The first
+   * spelling named the round-5 test, which always succeeds on the retry and so
+   * never reaches this branch — the mutation SURVIVED, and then reported WRONG
+   * TEST once the right fixture existed. The harness found both, in order.
+   */
+  {
+    id: "an unrecorded completion is settled as though it had been recorded",
+    edits: [[SUP_SVC,
+      "      if (!written.recorded) {\n        /**\n         * THE OUTCOME IS NOT SETTLED IF IT COULD NOT BE RECORDED (round-5",
+      "      if (!written.recorded && Number.isNaN(0)) {\n        /**\n         * THE OUTCOME IS NOT SETTLED IF IT COULD NOT BE RECORDED (round-5"]],
+    tests: [T_ACTREC],
+    expect: "REFUSES to settle an outcome whose completion could never be written",
+  },
+  {
+    id: "a half-configured installation runs unobserved",
+    edits: [[SUP_SVC,
+      "    if (intendsActivities && !recordsActivities) {",
+      "    if (intendsActivities && !recordsActivities && Number.isNaN(0)) {"]],
+    tests: [T_ACTREC],
+    expect: "REFUSES to run when configured by halves",
+  },
+  {
+    id: "a completion lost to a rival's write is not retried",
+    // The LOOP BOUND is mutated, not the reload. Adding `|| true` to the
+    // undefined check stops TypeScript narrowing `fresh` afterwards and the
+    // file ceases to compile — the same folding trap as before. One attempt
+    // means a conflict is never retried, which is the defect exactly.
+    edits: [[SUP_SVC,
+      "    for (let attempt = 0; attempt < 5; attempt += 1) {\n      const next = mutate(current.activities ?? []);",
+      "    for (let attempt = 0; attempt < 1; attempt += 1) {\n      const next = mutate(current.activities ?? []);"]],
+    tests: [T_ACTREC],
+    expect: "the supervisor records a completion even when a rival advances the state mid-run",
+  },
+  {
+    id: "a live claim holder is still declared lost",
+    edits: [[SUP_SVC,
+      "        ? { lease: owner.lease, liveness: probe.check(owner.lease) }",
+      '        ? { lease: owner.lease, liveness: Number.isNaN(0) ? probe.check(owner.lease) : "GONE" }']],
+    tests: [T_ACTREC],
+    expect: "STANDS DOWN and names the holder when the claim's owner is still running",
+  },
+  {
+    id: "a supervisor that cannot check liveness schedules work anyway",
+    edits: [[SUP_SVC,
+      "      if (unfinished.length === 0) {\n        return { state };\n      }",
+      "      if (unfinished.length >= 0) {\n        return { state };\n      }"]],
+    tests: [T_ACTREC],
+    expect: "REFUSES to run anything while an activity is unfinished and liveness is uncheckable",
+  },
+  {
+    id: "an empty boot identity is accepted when building a lease",
+    edits: [[PROCLIVE,
+      "  if (boot === undefined || boot.length === 0) {",
+      "  if (boot === undefined) {"]],
+    tests: [T_PROCLIVE],
+    expect: "refuses to BUILD a lease when the boot is empty",
+  },
+  {
+    id: "a lease from a previous boot is accepted as the current holder",
+    edits: [[PROCLIVE,
+      "      if (lease.boot !== boot) {",
+      "      if (lease.boot !== boot && Number.isNaN(0)) {"]],
+    tests: [T_PROCLIVE],
+    expect: "reports GONE for a lease written before a REBOOT",
+  },
+  /**
+   * The refusal becomes a lease with an EMPTY boot rather than being deleted.
+   * Deleting it leaves `boot` possibly-undefined where the returned lease needs
+   * a string, so the file stops compiling and preflight refuses the mutation as
+   * UNMEASURED — the guard is load-bearing for the types as well as the
+   * behaviour. Returning a lease nothing can ever check is the defect stated
+   * exactly.
+   */
+  {
+    id: "a lease is built without a boot identity, so it can never be checked",
+    edits: [[PROCLIVE,
+      "    return undefined;\n  }\n  return {\n    pid: process.pid,",
+      '    return { pid: process.pid, processStartedAt: started, machine: options.machine ?? machineIdentity(), boot: "", claimedAt };\n  }\n  return {\n    pid: process.pid,']],
+    tests: [T_PROCLIVE],
+    expect: "refuses to BUILD a lease when the boot cannot be established",
+  },
+
+  // ---- AC-14: a stall is a measurement, not an opinion ---------------------
+  {
+    id: "liveness stops deciding before recency, so a dead owner looks stalled",
+    edits: [[ACTIVITY,
+      '  if (liveness === "GONE") {',
+      '  if (liveness === "GONE" && Number.isNaN(0)) {']],
+    tests: [T_ACT],
+    expect: "CRASHED when the owner is gone, however recent its last progress",
+  },
+  {
+    id: "a live owner that never reported anything is called LIVE forever",
+    edits: [[ACTIVITY,
+      "    if (waited > input.stallAfterMs) {",
+      "    if (waited > input.stallAfterMs && Number.isNaN(0)) {"]],
+    tests: [T_ACT],
+    expect: "NEVER_STARTED when a live owner has held it without reporting anything",
+  },
+  {
+    id: "the stall threshold is ignored, so nothing is ever stalled",
+    edits: [[ACTIVITY,
+      "  if (since > input.stallAfterMs) {",
+      "  if (since > input.stallAfterMs && Number.isNaN(0)) {"]],
+    tests: [T_ACT],
+    expect: "STALLED only when the owner is ALIVE and progress has stopped",
+  },
+
+  // ---- AC-17: idempotence, and disagreement refusing -----------------------
+  /**
+   * The CONDITION is widened rather than the refusal deleted. Deleting the
+   * `return` left `what` and `id` unused and the file stopped compiling, so
+   * preflight refused it as UNMEASURED. Treating every repeat as identical
+   * turns a disagreeing second completion into a silent no-op, which is the
+   * defect: two owners disagree and nobody hears about it.
+   */
+  {
+    id: "a second, DISAGREEING completion is silently treated as the same one",
+    edits: [[ACTIVITY,
+      "  if (canonical(current) === canonical(incoming)) {",
+      "  if (canonical(current) !== canonical(incoming) || !Number.isNaN(0)) {"]],
+    tests: [T_ACT],
+    expect: "REFUSES a second completion that DISAGREES",
+  },
+  {
+    id: "progress is allowed to go backwards",
+    edits: [[ACTIVITY,
+      "  if (previous !== undefined && heartbeat.progress < previous.progress) {",
+      "  if (previous !== undefined && heartbeat.progress < previous.progress && Number.isNaN(0)) {"]],
+    tests: [T_ACT],
+    expect: "REFUSES progress that goes backwards",
+  },
+
+  // ---- AC-15/AC-19: a result that exists is discoverable -------------------
+  {
+    id: "an unobserved completion is not reported as outstanding",
+    edits: [[ACTIVITY,
+      "  return activities.filter((entry) => isTerminal(entry.state) && entry.observedAt === undefined);",
+      "  return activities.filter((entry) => isTerminal(entry.state) && entry.observedAt !== undefined);"]],
+    tests: [T_ACT],
+    expect: "lists a completion nothing has acted on",
+  },
+
+  // ---- AC-16: a re-claim must not resurrect a dead owner's authority -------
+  {
+    id: "a re-claim carries the dead owner's completion forward",
+    edits: [[ACTIVITY,
+      "  return previous.heartbeat === undefined ? {} : { heartbeat: previous.heartbeat };",
+      "  return previous.heartbeat === undefined ? { ...previous } : { ...previous, heartbeat: previous.heartbeat };"]],
+    tests: [T_ACT],
+    expect: "carries progress across a re-claim, but never a completion or an observation",
+  },
+
+  // ---- AC-20: recovery restores knowledge, never authority -----------------
+  /**
+   * The CONSTANT is mutated rather than its use. Writing `"DONE" as const` at
+   * the call site left `RECOVERY_TO_STATUS` imported and unused, so the file
+   * stopped compiling and preflight refused it. Changing what the constant MEANS
+   * is also the more honest statement of the defect: recovery advancing an item
+   * instead of returning it to the queue.
+   */
+  {
+    id: "recovery marks a crashed item DONE instead of re-queueing it",
+    edits: [[ACTIVITY,
+      'export const RECOVERY_TO_STATUS = "PENDING" as const;',
+      'export const RECOVERY_TO_STATUS = "DONE" as const;']],
+    tests: [T_ACTREC],
+    expect: "never advances an item: a crashed ACTIVE item goes back to PENDING and no further",
+  },
+  {
+    id: "recovery re-queues an item whatever state somebody else put it in",
+    edits: [[ACTIVITY,
+      "    if (item.status !== RECOVERY_FROM_STATUS) continue;",
+      "    if (item.status === RECOVERY_FROM_STATUS && Number.isNaN(0)) continue;"]],
+    tests: [T_ACTREC],
+    expect: "REFUSES to re-queue an item at WAITING_FOR_HUMAN_REQUIRED",
+  },
+
+  // ---- round 7, HIGH 1: a live owner is not displaced ----------------------
+  {
+    id: "a live owner's claim is cleared anyway",
+    edits: [[SUP_SVC,
+      '    if (holding?.liveness === "ALIVE") {',
+      '    if (holding?.liveness === "ALIVE" && Number.isNaN(0)) {']],
+    tests: [T_ACTREC],
+    expect: "REFUSES to clear a CLAIMED claim while its owner is still running",
+  },
+  {
+    id: "the launch patch uses the claim it read at the top of the tick",
+    edits: [[SUP_SVC,
+      '          return { ok: true, patch: { activeClaim: { ...durable, state: "RUNNING" } } };',
+      '          return { ok: true, patch: { activeClaim: { ...claim, state: "RUNNING" } } };']],
+    tests: [T_ACTREC],
+    expect: "carries the rival's field through the launch write, not the copy it read first",
+  },
+  {
+    id: "a displaced supervisor launches anyway",
+    edits: [[SUP_SVC,
+      "          if (durable.actionId !== claim.actionId) {",
+      "          if (durable.actionId !== claim.actionId && Number.isNaN(0)) {"]],
+    tests: [T_ACTREC],
+    expect: "REFUSES to launch on a claim that is no longer ours, and leaves the rival's claim alone",
+  },
+
+  // ---- round 7, HIGH 2: which failures are stale reads ---------------------
+  {
+    id: "a rival's provenance append is not treated as a stale read",
+    edits: [[SUP_SVC,
+      "  return error instanceof ConcurrencyError || error instanceof ProvenanceRegressionError;",
+      "  return error instanceof ConcurrencyError || (error instanceof ProvenanceRegressionError && Number.isNaN(0));"]],
+    tests: [T_ACTREC],
+    expect: "re-reads and re-applies when a rival APPENDED PROVENANCE rather than merely winning the CAS",
+  },
+  {
+    id: "a lost compare-and-set is not treated as a stale read",
+    edits: [[SUP_SVC,
+      "  return error instanceof ConcurrencyError || error instanceof ProvenanceRegressionError;",
+      "  return (error instanceof ConcurrencyError && Number.isNaN(0)) || error instanceof ProvenanceRegressionError;"]],
+    tests: [T_ACTREC],
+    expect: "records the classification even when another supervisor writes first",
+  },
+  {
+    id: "a refusal about this write is retried into",
+    edits: [[SUP_SVC,
+      "        if (fresh.version === current.version) {",
+      "        if (fresh.version === current.version && Number.isNaN(0)) {"]],
+    tests: [T_ACTREC],
+    expect: "REFUSES rather than retrying when nothing actually raced the write",
+  },
+  {
+    id: "the repository stops distinguishing a short chain from a rewritten one",
+    edits: [[SUP_REPO,
+      "    throw new ProvenanceRegressionError(",
+      "    void ProvenanceRegressionError;\n    throw new SchemaIntegrityError("]],
+    tests: [T_ACTREC],
+    expect: "re-reads and re-applies when a rival APPENDED PROVENANCE rather than merely winning the CAS",
+  },
+
+  // ---- round 7, HIGH 3: the classification is durable or it is named -------
+  {
+    id: "a classification that could not be written is reported as if it had been",
+    edits: [[SUP_SVC,
+      "      if (!written.recorded) {\n        return {\n          state: written.state,\n          refusal: boundedDiagnostic(",
+      "      if (!written.recorded && Number.isNaN(0)) {\n        return {\n          state: written.state,\n          refusal: boundedDiagnostic("]],
+    tests: [T_ACTREC],
+    expect: "SAYS SO when the classification cannot be made durable at all",
+  },
+
+  // ---- round 7 gap: a verdict that exists is consumed ----------------------
+  {
+    id: "a review with nowhere to read its verdict is passed over",
+    edits: [[SUP_SVC,
+      "      return { state: noted.state, refusal: unreachable };",
+      "      void unreachable;\n      return { state: noted.state };"]],
+    tests: [T_VC],
+    expect: "H. a supervisor that has no way to read verdicts REFUSES rather than passing over one",
+  },
+  {
+    id: "a verdict for a different candidate is applied anyway",
+    edits: [[SUP_SVC,
+      "      if (mismatch !== undefined) {",
+      "      if (mismatch !== undefined && Number.isNaN(0)) {"]],
+    tests: [T_VC],
+    expect: "F. a verdict for a different candidate is REFUSED, not applied",
+  },
+  {
+    id: "a reviewer that is still working is declared to have produced nothing",
+    edits: [[SUP_SVC,
+      '          probe !== undefined && activity.lease !== undefined && probe.check(activity.lease) === "GONE";',
+      '          probe !== undefined && activity.lease !== undefined && probe.check(activity.lease) !== "GONE";']],
+    tests: [T_VC],
+    expect: "C2. ...and a reviewer still running is left alone, not declared failed",
+  },
+  {
+    id: "the review's claim outlives the review",
+    edits: [[SUP_SVC,
+      "    return canonicalActivityId(claim.roadmapKey, claim.kind, claim.attempt) === activity.id",
+      "    return canonicalActivityId(claim.roadmapKey, claim.kind, claim.attempt) !== activity.id"]],
+    tests: [T_VC],
+    expect: "A. consumes CHANGES_REQUIRED on a cold tick, with no notification at all",
+  },
+  {
+    id: "a settled review is read again on every tick",
+    edits: [[ACTIVITY,
+      "  return activities.filter((activity) => activity.review !== undefined && !isTerminal(activity.state));",
+      "  return activities.filter((activity) => activity.review !== undefined);"]],
+    tests: [T_VC],
+    expect: "G. re-reconciling an already-consumed verdict changes nothing",
+  },
+  {
+    id: "two verdict tags are treated as agreement",
+    edits: [[ACCEPT,
+      "  return second === null ? first : undefined;",
+      "  return second === null || !Number.isNaN(0) ? first : undefined;"]],
+    tests: [T_AV],
+    expect: "REFUSES a second VERDICT line even when both say the same thing",
+  },
+  {
+    id: "an accepted verdict stops caring about HIGH findings",
+    edits: [[ACCEPT,
+      "    outcome.high === 0 &&",
+      "    (outcome.high === 0 || !Number.isNaN(0)) &&"]],
+    tests: [T_AV],
+    expect: "refuses a PASS with any CRITICAL, any HIGH, or safe-to-commit NO",
+  },
+  {
+    id: "an accepted verdict stops caring about safe-to-commit",
+    edits: [[ACCEPT,
+      "    outcome.safeToCommit\n  );",
+      "    (outcome.safeToCommit || !Number.isNaN(0))\n  );"]],
+    tests: [T_AV],
+    expect: "refuses a PASS with any CRITICAL, any HIGH, or safe-to-commit NO",
+  },
+  {
+    id: "a relative verdict path is resolved instead of refused",
+    edits: [[FILEVERDICT,
+      "      if (!isAbsolute(path)) {",
+      "      if (!isAbsolute(path) && Number.isNaN(0)) {"]],
+    tests: [T_AV],
+    expect: "REFUSES a relative source path rather than resolving it",
+  },
+
+  // ---- round 8: the other half of every guard round 7 half-fixed ----------
+  {
+    id: "a contended write is never retried",
+    edits: [[SUP_SVC,
+      "    for (let attempt = 0; attempt < 5; attempt += 1) {",
+      "    for (let attempt = 0; attempt < 1; attempt += 1) {"]],
+    tests: [T_ACTREC],
+    expect: "records a PROBE-BACKED ambiguity even when another supervisor writes first",
+  },
+  {
+    id: "a review the Factory stopped over is left unclassified",
+    edits: [[SUP_SVC,
+      "          for (const entry of current.filter((candidate) => candidate.review !== undefined && !isTerminal(candidate.state))) {",
+      "          for (const entry of current.filter((candidate) => candidate.review !== undefined && isTerminal(candidate.state))) {"]],
+    tests: [T_VC],
+    expect: "H. a supervisor that has no way to read verdicts REFUSES rather than passing over one",
+  },
+  {
+    id: "the clock that read a verdict becomes part of the verdict",
+    edits: [[ACTIVITY,
+      "    if (existing.outcome !== input.completion.outcome || existing.detail !== input.completion.detail) {",
+      "    if (existing.outcome !== input.completion.outcome || existing.detail !== input.completion.detail || existing.at !== input.completion.at) {"]],
+    tests: [T_VC],
+    expect: "E3. a retry that meets its own verdict already settled by another clock does not refuse",
+  },
+
+  // ---- round 9: one tick draws one conclusion ------------------------------
+  {
+    id: "the same lease is asked about twice in one tick",
+    edits: [[SUP_SVC,
+      "      const already = seen.get(key);\n      if (already !== undefined) {",
+      "      const already = seen.get(key);\n      if (already !== undefined && Number.isNaN(0)) {"]],
+    tests: [T_ACTREC],
+    expect: "asks about a lease exactly ONCE, so two readers of one tick cannot disagree",
+  },
+  {
+    id: "an ambiguity recorded by the write itself is not looked at",
+    edits: [[SUP_SVC,
+      "    if (unresolved.length > 0) {",
+      "    if (unresolved.length > 0 && Number.isNaN(0)) {"]],
+    tests: [T_ACTREC],
+    expect: "REFUSES when the write it just made recorded an ambiguity",
+  },
+  {
+    id: "a verdict another supervisor already consumed is released again",
+    edits: [[SUP_SVC,
+      "  return activity !== undefined && isTerminal(activity.state) && activity.observedAt !== undefined;",
+      "  return activity !== undefined && isTerminal(activity.state) && activity.observedAt !== undefined && Number.isNaN(0);"]],
+    tests: [T_VC],
+    expect: "E4. does not re-release an item a previous consumer already released and started",
+  },
+
   // ---- AC-9: the dependency is real ---------------------------------------
   {
     id: "the router stops depending on durable orchestration",
@@ -1020,5 +1582,97 @@ export const MUTATIONS = [
       'dependsOn: ["EXECUTOR_WIRING"]']],
     tests: [T_CATPERS],
     expect: "is NOT eligible while durable orchestration is not DONE",
+  },
+
+  // =========================================================================
+  // DEFECT-DURABLE-WORKER-RUN-ENVELOPE
+  // =========================================================================
+
+  // ---- AC-1: CAS-before-spawn ----------------------------------------------
+  {
+    id: "WORKER_RUN_ORDERING: parent PREPARED returns without its durable CAS",
+    edits: [["src/adapters/supervision/workerRunLifecycle.ts",
+      "          await deps.repository.compareAndSave(\n            { ...state, workerRuns: verdict.runs, version: state.version + 1 },\n            state.version,\n          );\n          return verdict.run;",
+      "          return verdict.run;"]],
+    tests: ["dist/tests/supervisorWorkerRunRealKill.test.js"],
+    expect: "failed PREPARED CAS produces zero wrapper and provider launches",
+  },
+
+  {
+    id: "WORKER_RUN_GATE: MAX_TURNS is no longer a scheduler refusal",
+    edits: [[SUP_SVC,
+      '["PREPARED", "RUNNING", "AMBIGUOUS", "LOST", "STALLED", "AWAITING_CONTROLLER"].includes(run.state)',
+      '["PREPARED", "RUNNING", "AMBIGUOUS", "LOST", "STALLED"].includes(run.state)']],
+    tests: ["dist/tests/supervisorWorkerRunRealKill.test.js"],
+    expect: "exit-zero structured MAX_TURNS gates next provider",
+  },
+
+  {
+    id: "WORKER_RUN_DUPLICATE: canonical action can be prepared twice",
+    edits: [[WORKER_RUN_ENVELOPE,
+      "  if (existing !== undefined) {",
+      "  if (existing !== undefined && Number.isNaN(0)) {"]],
+    tests: [T_WORKER_RUN_ENVELOPE],
+    expect: "refuses to prepare a second launch",
+  },
+
+  // ---- AC-2/AC-3: the child's own ACK, and a different identity is AMBIGUOUS
+  {
+    id: "WORKER_RUN_ENVELOPE: a different process is silently accepted as the same holder",
+    edits: [[WORKER_RUN_ENVELOPE,
+      "    if (sameHolder(run.wrapperLease, input.lease)) {",
+      "    if (sameHolder(run.wrapperLease, input.lease) || !Number.isNaN(0)) {"]],
+    tests: [T_WORKER_RUN_ENVELOPE],
+    expect: "refuses a different PID for an already-running envelope",
+  },
+
+  // ---- gate: a finished run can still be adopted as running -----------------
+  {
+    id: "WORKER_RUN_ENVELOPE: a finished worker run can still be adopted as RUNNING",
+    edits: [[WORKER_RUN_ENVELOPE,
+      '  if (run.state !== "PREPARED") {',
+      '  if (run.state !== "PREPARED" && Number.isNaN(0)) {']],
+    tests: [T_WORKER_RUN_ENVELOPE],
+    expect: "refuses to adopt a run that already finished",
+  },
+
+  // ---- AC-6: verified MAX_TURNS never auto-continues -------------------------
+  {
+    id: "WORKER_RUN_ENVELOPE: AWAITING_CONTROLLER stops being a terminal state",
+    edits: [[WORKER_RUN_ENVELOPE,
+      '  "AMBIGUOUS",\n  "AWAITING_CONTROLLER",\n];',
+      '  "AMBIGUOUS",\n];']],
+    tests: [T_WORKER_RUN_ENVELOPE],
+    expect: "AWAITING_CONTROLLER never auto-continues",
+  },
+
+  // ---- AC-8: at most one pending notification per (run, kind) ---------------
+  {
+    id: "WORKER_RUN_ENVELOPE: the same notification is enqueued more than once",
+    edits: [[WORKER_RUN_ENVELOPE,
+      "  if (outbox.some((entry) => entry.key === notification.key)) {",
+      "  if (outbox.some((entry) => entry.key === notification.key) && Number.isNaN(0)) {"]],
+    tests: [T_WORKER_RUN_ENVELOPE],
+    expect: "adds it exactly once",
+  },
+
+  // ---- AC-5: a torn artifact write is accepted as data -----------------------
+  {
+    id: "WORKER_RUN_ARTIFACT: a torn write is accepted instead of refused",
+    edits: [[WORKER_RUN_ARTIFACT,
+      "  if (recomputed !== hashRaw) {",
+      "  if (recomputed !== hashRaw && Number.isNaN(0)) {"]],
+    tests: [T_WORKER_RUN_ARTIFACT],
+    expect: "REFUSES a torn write",
+  },
+
+  // ---- AC-7: artifact-first ordering during reconciliation -------------------
+  {
+    id: "WORKER_RUN_ENVELOPE: reconciliation stops reading the artifact before consulting liveness",
+    edits: [[SUP_SVC,
+      "    if (this.deps.workerRunArtifactDir === undefined) {\n      return state;\n    }",
+      "    if (this.deps.workerRunArtifactDir === undefined || !Number.isNaN(0)) {\n      return state;\n    }"]],
+    tests: [T_WORKER_RUN_RECOVERY],
+    expect: "reads a valid completion artifact FIRST",
   },
 ];

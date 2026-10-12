@@ -70,6 +70,27 @@ export interface GitRepositoryReader {
   usesLfs(headSha: string): Promise<boolean | undefined>;
 }
 
+/**
+ * Bounded, typed, UNTRUSTED source read from a GitHub Issue. It carries no
+ * approval, no READY state and no authority: it is input to planning only.
+ */
+export interface ReadOnlyIssueSource {
+  readonly kind: "github-issue";
+  readonly trust: "untrusted";
+  readonly access: "read-only";
+  readonly repository: string;
+  readonly number: number;
+  readonly url: string;
+  readonly state: "open" | "closed";
+  readonly title: string;
+  readonly body: string | null;
+}
+
+/** Separate from GitHubClient on purpose: it can only read one Issue. */
+export interface ReadOnlyIssueClient {
+  issue(number: number): Promise<ReadOnlyIssueSource>;
+}
+
 export interface GitHubClient {
   /** Repository identity plus the facts the liability report is derived from. */
   repository(): Promise<RemoteRepository>;

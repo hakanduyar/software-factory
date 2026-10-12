@@ -25,7 +25,7 @@ import { describe, it } from "node:test";
 import { createPlanBackedExecutor, type PlanAdvancer } from "../src/supervision/planBackedExecutor.js";
 import type { AiRunConfigRecord } from "../src/supervision/modelEnforcement.js";
 import type { AuthorizedResource, WorkOutcome } from "../src/supervision/supervisorPorts.js";
-import type { Plan } from "../src/planning/planTypes.js";
+import type { Plan, WorkItemTicketTemplate } from "../src/planning/planTypes.js";
 import type { RoadmapItem } from "../src/supervision/supervisorTypes.js";
 import type { Timestamp } from "../src/domain/time.js";
 
@@ -60,18 +60,73 @@ const SINGLETON_CONFIG: AiRunConfigRecord = {
   note: "scripted for tests",
 };
 
+/**
+ * e954: the one plan item every fixture here carries, and the text its
+ * matching ticket template must bind EXACTLY — `planTicketExecutability`
+ * refuses a template whose criteria do not match the approved revision's own.
+ */
+const WI_A_ITEM = {
+  key: "WI-A",
+  title: "Do the thing",
+  type: "FEATURE",
+  priority: "P2",
+  spec: "Implement the thing.",
+  acceptanceCriteria: [{ text: "It works", verificationHint: "npm test" }],
+  dependsOn: [],
+};
+
+/** A structurally valid WorkerTicket template, conforming to the frozen contract. */
+function validTicketTemplate(planItemKey: string, criterionText: string): WorkItemTicketTemplate {
+  return {
+    planItemKey,
+    schemaVersion: "1.0.0",
+    objective: "Implement the roadmap item to a reviewable, verifiable state.",
+    acceptanceCriteria: [{ id: "AC-1", version: "1.0.0", description: criterionText }],
+    scope: {
+      owned: ["src/example.ts"],
+      forbidden: [],
+      read: [],
+      dependencies: [],
+      validation: ["npm test"],
+    },
+    model: {
+      eligibleModels: ["claude-code/opus"],
+      reasoningEffort: "medium",
+      rationale: "Needs multi-file reasoning across the module.",
+    },
+    budgets: {
+      contextTokens: 100000,
+      outputTokens: 4000,
+      elapsedSeconds: 1800,
+      maxAttempts: 2,
+    },
+    policy: {
+      checkpoint: "after each verification pass",
+      stopConditions: ["acceptance criteria met"],
+      escalation: "escalate to a human on repeated failure",
+    },
+    resultSchema: {
+      requiredFields: ["status", "summary"],
+      maxResultBytes: 2048,
+    },
+  };
+}
+
 function planRunning(worker: { tool: string; model: string; effort?: string }): Plan {
   return {
     id: "plan-1",
     phase: "APPROVED",
     declaredConstraints: [`roadmap-key: ${ITEM.key}`],
     approvedDigest: "plan-approval-digest-1",
+    approvedRevision: 1,
+    revisions: [{ revision: 1, items: [WI_A_ITEM] }],
     planner: worker,
     execution: {
       implementer: worker,
       reviewer: worker,
       verificationCommands: [],
       workspaceRoot: "/tmp/ws",
+      ticketTemplates: [validTicketTemplate(WI_A_ITEM.key, "It works")],
     },
   } as unknown as Plan;
 }

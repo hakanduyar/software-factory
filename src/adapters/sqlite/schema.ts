@@ -452,3 +452,20 @@ export function ensureSchema(db: DatabaseSync): void {
       throw new SchemaIntegrityError(classification.reason);
   }
 }
+
+/**
+ * The read-only counterpart to `ensureSchema`: never writes anything (no
+ * `PRAGMA`, no DDL, no `schema_meta` insert), and accepts exactly one
+ * classification — `CURRENT_FACTORY`. Every other outcome (missing/empty
+ * database, unsupported version, corrupt/incomplete Factory shape, or an
+ * unrelated non-empty database) is refused with the same bounded, generic
+ * error: a read-only caller gets no classification detail to distinguish
+ * these cases by (that distinction belongs to whatever composes this into an
+ * HTTP/CLI error later, not to this function).
+ */
+export function assertReadonlyFactorySchema(db: DatabaseSync): void {
+  const classification = classifyDatabase(db);
+  if (classification.kind !== "CURRENT_FACTORY") {
+    throw new SchemaIntegrityError("database is not a readable current-version Factory database");
+  }
+}

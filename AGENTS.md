@@ -74,3 +74,11 @@ in a prompt because both implementers and reviewers must follow them.
 - Report commands run and their outcomes.
 - Report remaining risks or TODOs.
 - Leave unrelated files untouched.
+
+## Permanent test selection for this active checkout
+
+For new and resumed planning, implementation and review, read [the central test-selection policy](C:/Users/hakan/.codex/worktrees/e954/software-factory/docs/tasks/NO-CODE-CHIEF.md#test-selection-before-dispatch). This local absolute reference identifies the governing policy in the current host workspace; if the checkout moves or the reference is unavailable, recover the policy through the controller before selecting checks rather than silently dropping it.
+
+- Record acceptance criterion/system invariant -> observable failure -> smallest sufficient test group, required commands and justified fingerprint-bound evidence reuse in the ticket. Reuse existing adequate tests; add tests only for distinct missing behavior protection.
+- Reviewers justify additional tests by missing criterion, demonstrated failure or security-invariant protection. Avoid implementation-mirroring mocks, incidental call-order assertions, count/coverage quotas and repeated unchanged full suites; retain meaningful authority-boundary, concurrency and failure-integrity checks.
+- Preserve every stronger execution-discipline rule above, frozen criterion, required check and independent exact-fingerprint review. Do not delete tests to obtain green results. This instruction does not implement an automated test selector or change runtime authority.

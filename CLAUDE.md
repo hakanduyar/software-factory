@@ -28,3 +28,7 @@ You are primarily the implementation engineer.
   repository and to completing its approved roadmap; it does not generalise, and
   it does not alter runtime TrustedHuman semantics.
 - When finished, provide a concise implementation report suitable for an independent reviewer.
+
+## Test selection on new and resumed tasks
+
+Follow `AGENTS.md`'s permanent test-selection section and its central-policy reference. Maintaining tests with a code change includes reusing existing adequate behavior protection with recorded reasoning; it does not require duplicate tests. Choose the smallest sufficient behavior checks while retaining every required validation and independent review gate, including the stronger constraints above.

@@ -34,7 +34,12 @@ import {
   type RemotePullRequest,
   type RemoteRepository,
 } from "../../github/candidateBinding.js";
-import type { GitHubClient, GitRepositoryReader } from "../../github/githubPorts.js";
+import type {
+  GitHubClient,
+  GitRepositoryReader,
+  ReadOnlyIssueClient,
+  ReadOnlyIssueSource,
+} from "../../github/githubPorts.js";
 import { isRemoteWriteAuthorized } from "../../supervision/financialSafety.js";
 import type { RepositoryOwnerType, RepositoryVisibility } from "../../supervision/financialSafety.js";
 import type { ProcessRunner } from "../../ports/processRunner.js";
@@ -144,6 +149,108 @@ async function run(
  * hand the binding checks "no pull request" when the truth is "we could not
  * tell", and those two must not be the same answer.
  */
+export const ISSUE_TITLE_MAX_BYTES = 1024;
+export const ISSUE_BODY_MAX_BYTES = 65536;
+
+/** `owner/name` with GitHub's character sets; never a path-like or dotted-only name. */
+export function isGithubRepositorySlug(value: string): boolean {
+  const parts = value.split("/");
+  if (parts.length !== 2) {
+    return false;
+  }
+  const owner = parts[0] ?? "";
+  const name = parts[1] ?? "";
+  return /^[A-Za-z0-9][A-Za-z0-9-]{0,38}$/.test(owner) && /^[A-Za-z0-9_.-]{1,100}$/.test(name) && !/^[.]+$/.test(name);
+}
+
+function normalizeIssueSource(
+  raw: Record<string, unknown>,
+  repository: string,
+  number: number,
+): ReadOnlyIssueSource {
+  if ("pull_request" in raw) {
+    throw new Error("issue response is a pull request, expected an issue");
+  }
+  if (raw["number"] !== number) {
+    throw new Error("issue response number does not match the requested number");
+  }
+  const url = `https://github.com/${repository}/issues/${String(number)}`;
+  const reported = raw["html_url"];
+  if (typeof reported !== "string" || reported.toLowerCase() !== url.toLowerCase()) {
+    throw new Error("issue response url does not match the requested issue");
+  }
+  const state = raw["state"];
+  if (state !== "open" && state !== "closed") {
+    throw new Error("issue response state is not open or closed");
+  }
+  const title = raw["title"];
+  if (typeof title !== "string") {
+    throw new Error("issue response title is not a string");
+  }
+  const body = raw["body"];
+  if (body !== null && typeof body !== "string") {
+    throw new Error("issue response body is neither a string nor null");
+  }
+  if (Buffer.byteLength(title, "utf8") > ISSUE_TITLE_MAX_BYTES) {
+    throw new Error(`issue title exceeds ${String(ISSUE_TITLE_MAX_BYTES)} UTF-8 bytes`);
+  }
+  if (body !== null && Buffer.byteLength(body, "utf8") > ISSUE_BODY_MAX_BYTES) {
+    throw new Error(`issue body exceeds ${String(ISSUE_BODY_MAX_BYTES)} UTF-8 bytes`);
+  }
+  if (redactSecrets(title) !== title || (body !== null && redactSecrets(body) !== body)) {
+    throw new Error("issue content appears to contain a secret and was refused");
+  }
+  return {
+    kind: "github-issue",
+    trust: "untrusted",
+    access: "read-only",
+    repository,
+    number,
+    url,
+    state,
+    title,
+    body,
+  };
+}
+
+/**
+ * Read-only Issue intake: one `gh api --method GET` call, nothing else. It
+ * never writes, never selects a provider and never grants approval.
+ */
+export function createGhReadOnlyIssueClient(deps: GhCliDeps): ReadOnlyIssueClient {
+  if (!isGithubRepositorySlug(deps.repository)) {
+    throw new Error("repository must be owner/name");
+  }
+  const repository = deps.repository;
+  return {
+    async issue(number: number): Promise<ReadOnlyIssueSource> {
+      if (!Number.isSafeInteger(number) || number <= 0) {
+        throw new Error("issue number must be a positive safe integer");
+      }
+      const executable = resolveExecutable("gh", deps.ghPath);
+      const argv = ["api", "--method", "GET", `repos/${repository}/issues/${String(number)}`];
+      const result = await deps.processRunner.run({
+        executable,
+        argv,
+        cwd: deps.cwd,
+        env: buildWorkerEnvironment(GITHUB_CLI_ENVIRONMENT_POLICY, deps.env ?? process.env),
+        timeoutMs: deps.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+        maxOutputBytes: MAX_OUTPUT_BYTES,
+      });
+      if (result.terminationReason !== "EXITED" || result.exitCode !== 0) {
+        const detail = diagnostic(result.stderr.length > 0 ? result.stderr : result.stdout);
+        throw new Error(
+          `gh api failed (${result.terminationReason}, exit ${String(result.exitCode)}): ${detail}`,
+        );
+      }
+      if (result.stdoutTruncated) {
+        throw new Error("gh api issue output was truncated");
+      }
+      return normalizeIssueSource(parseObject(result.stdout, "gh api issue"), repository, number);
+    },
+  };
+}
+
 function parseObject(raw: string, what: string): Record<string, unknown> {
   let parsed: unknown;
   try {

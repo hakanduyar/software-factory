@@ -138,6 +138,36 @@ describe("codexCliAdapter: output parsing (informational only)", () => {
     assert.equal(extractCodexFinalMessage("not json\n{broken"), undefined);
     assert.equal(interpretCodexOutput(fakeProcessResult({ stdout: "garbage" })).finalMessage, undefined);
   });
+
+  it("flags streamCorrupted when a valid final agent_message is followed by a malformed JSONL tail", () => {
+    // The exact production shape: a clean, valid final message, then a
+    // truncated/malformed trailing line ('\n{') that JSON.parse rejects.
+    // extractCodexFinalMessage still returns the valid message (informational,
+    // unchanged) but interpretCodexOutput must also report streamCorrupted so
+    // a consumer that cannot trust an earlier message over a hidden later one
+    // (see cliPlannerWorker.ts) can fail closed.
+    const stdout =
+      [
+        JSON.stringify({ type: "thread.started" }),
+        JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "final answer" } }),
+      ].join("\n") + "\n{";
+
+    assert.equal(extractCodexFinalMessage(stdout), "final answer");
+    const reported = interpretCodexOutput(fakeProcessResult({ stdout }));
+    assert.equal(reported.finalMessage, "final answer");
+    assert.equal(reported.streamCorrupted, true);
+  });
+
+  it("does not flag streamCorrupted for a clean, fully well-formed JSONL stream", () => {
+    const stdout = [
+      JSON.stringify({ type: "thread.started" }),
+      JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "final answer" } }),
+      JSON.stringify({ type: "turn.completed" }),
+    ].join("\n");
+    const reported = interpretCodexOutput(fakeProcessResult({ stdout }));
+    assert.equal(reported.finalMessage, "final answer");
+    assert.equal(reported.streamCorrupted, undefined);
+  });
 });
 
 describe("codexCliAdapter: end-to-end execute() against the fake CLI", () => {

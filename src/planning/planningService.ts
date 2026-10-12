@@ -26,7 +26,7 @@ import { planSubject } from "../domain/approval.js";
 import type { Actor } from "../domain/actor.js";
 import { ConcurrencyError, HumanIdentityError, NotFoundError, ValidationError } from "../domain/errors.js";
 import type { TrustedHumanToken } from "../domain/humanIdentity.js";
-import type { IdGenerator, ProjectId, WorkItemId } from "../domain/ids.js";
+import type { ApprovalId, IdGenerator, ProjectId, WorkItemId } from "../domain/ids.js";
 import type { WorkItem } from "../domain/workItem.js";
 import type { FactoryService } from "../app/factoryService.js";
 import type { Clock } from "../ports/clock.js";
@@ -55,7 +55,9 @@ import {
   canonicalRequestKey,
   expectedMaterializedItemShape,
   isTerminalPlanPhase,
+  validateVerificationExecutionPolicy,
   type ClarificationAnswer,
+  type MaterializedItem,
   type Plan,
   type PlanBudget,
   type PlanEventKind,
@@ -65,7 +67,7 @@ import {
   type PlanPhase,
   type PlanRevision,
 } from "./planTypes.js";
-import { topologicalOrder, validateProposal } from "./planValidation.js";
+import { planTicketExecutability, topologicalOrder, validateProposal } from "./planValidation.js";
 
 export interface PlanningServiceDeps {
   readonly factory: FactoryService;
@@ -94,11 +96,46 @@ export interface StartPlanInput {
   readonly planner: PlannerConfig;
   readonly execution: PlanExecutionConfig;
   readonly budget?: Partial<PlanBudget>;
+  /**
+   * PHASE7-112. When true, persists (or adopts) the plan WITHOUT driving it:
+   * no planner call, no attempt/run counter change, no work item, no
+   * dispatch. Defaults to false, which preserves every existing `start()`
+   * caller's behavior exactly.
+   */
+  readonly requestOnly?: boolean;
 }
 
 export interface SubmittedAnswer {
   readonly questionId: string;
   readonly answer: string;
+}
+
+/**
+ * PHASE7-97. The minimal, immutable, point-in-time set of approved execution
+ * facts a later supplier may bind actual registry/action facts against — and
+ * nothing more.
+ *
+ * Deliberately NOT a launch authority, a capability, a reservation or proof of
+ * ongoing/cross-store atomicity: it is a deep-copied, frozen read of what THIS
+ * call to `verifyApprovalAuthority` found true a moment ago. No raw request,
+ * answer, prompt or transcript is carried — only the plan/project identity,
+ * the version and phase this was read at, the cancellation fact, the recorded
+ * human approval's id/revision/digest, the approved revision's own items, the
+ * execution configuration (including ticket templates) and the existing
+ * materialization mappings.
+ */
+export interface ApprovedExecutionSnapshot {
+  readonly planId: string;
+  readonly projectId: ProjectId;
+  readonly version: number;
+  readonly phase: PlanPhase;
+  readonly cancelRequested: boolean;
+  readonly approvalId: ApprovalId;
+  readonly approvedRevision: number;
+  readonly approvedDigest: string;
+  readonly items: readonly PlannedWorkItem[];
+  readonly execution: PlanExecutionConfig;
+  readonly materialized: readonly MaterializedItem[];
 }
 
 type StepResult =
@@ -314,6 +351,12 @@ export class PlanningService {
     if (input.execution.verificationCommands.length === 0) {
       throw new ValidationError("plan execution config must declare at least one deterministic verification command");
     }
+    if ("verificationExecutionPolicy" in input.execution) {
+      const shape = validateVerificationExecutionPolicy(input.execution.verificationExecutionPolicy);
+      if (!shape.ok) {
+        throw new ValidationError(`plan execution config verificationExecutionPolicy ${shape.reason}`);
+      }
+    }
     // Fail fast on a project that does not exist, BEFORE a plan row is created
     // and before a planner attempt is charged — a typo'd project id must not
     // cost a real model invocation. `getProject` throws NotFoundError; an
@@ -329,6 +372,10 @@ export class PlanningService {
     const requestKey = canonicalRequestKey(input.projectId, input.intent, sha256Hex);
     const existing = await this.plans.findActiveByRequestKey(requestKey);
     if (existing !== undefined) {
+      if (input.requestOnly === true) {
+        this.log(`[plan ${existing.id}] request-only: returning existing active plan without driving`);
+        return existing;
+      }
       this.log(`[plan ${existing.id}] adopting existing active plan for this request`);
       return this.drive(existing.id);
     }
@@ -362,7 +409,156 @@ export class PlanningService {
 
     await this.plans.create(plan);
     this.log(`[plan ${plan.id}] started for project ${input.projectId} by ${input.actor.displayName}`);
+    if (input.requestOnly === true) {
+      this.log(`[plan ${plan.id}] request-only: persisted without driving`);
+      return plan;
+    }
     return this.drive(plan.id);
+  }
+
+  /**
+   * PHASE8-147. Request-only persist-or-adopt of a plan keyed by an inbound
+   * (botId, updateId) link, through the repository's atomic linked operation.
+   * Never drives: no planner call, no work item, no dispatch, no approval.
+   *
+   * The input and link are deep-copied into frozen plain data, and the
+   * repository method is bound, BEFORE the first await, so a caller mutating
+   * its objects (or swapping the method) while `getProject` is pending cannot
+   * change what is digested or persisted. The request digest is derived here
+   * from the complete captured request; a caller can never supply one.
+   */
+  async requestLinked(
+    input: Omit<StartPlanInput, "requestOnly">,
+    link: { readonly botId: number; readonly updateId: number; readonly chatId: number; readonly senderId: number },
+  ): Promise<Plan> {
+    if (typeof input === "object" && input !== null && Object.prototype.hasOwnProperty.call(input, "requestOnly")) {
+      throw new ValidationError("a linked plan request must not supply requestOnly");
+    }
+    const createOrAdopt = this.plans.createOrAdoptLinkedRequest;
+    if (typeof createOrAdopt !== "function") {
+      throw new ValidationError("the plan repository does not support linked requests");
+    }
+    const atomicCreateOrAdopt = createOrAdopt.bind(this.plans);
+    const captured = capturePlainData(input, "input") as Omit<StartPlanInput, "requestOnly">;
+    const capturedLink = capturePlainData(link, "link") as Record<string, unknown>;
+
+    const linkKeys = Object.keys(capturedLink).sort().join(",");
+    if (linkKeys !== "botId,chatId,senderId,updateId") {
+      throw new ValidationError("a linked plan request link must have exactly botId, updateId, chatId and senderId");
+    }
+    const { botId, updateId, chatId, senderId } = capturedLink as {
+      botId: unknown;
+      updateId: unknown;
+      chatId: unknown;
+      senderId: unknown;
+    };
+    if (typeof botId !== "number" || !Number.isSafeInteger(botId) || botId <= 0) {
+      throw new ValidationError("link botId must be a positive safe integer");
+    }
+    if (typeof updateId !== "number" || !Number.isSafeInteger(updateId) || updateId < 0) {
+      throw new ValidationError("link updateId must be a non-negative safe integer");
+    }
+    if (typeof chatId !== "number" || !Number.isSafeInteger(chatId)) {
+      throw new ValidationError("link chatId must be a safe integer");
+    }
+    if (typeof senderId !== "number" || !Number.isSafeInteger(senderId)) {
+      throw new ValidationError("link senderId must be a safe integer");
+    }
+
+    const actor = captured.actor as unknown;
+    if (
+      !isCapturedRecord(actor) ||
+      typeof actor.id !== "string" ||
+      typeof actor.kind !== "string" ||
+      typeof actor.displayName !== "string"
+    ) {
+      throw new ValidationError("a linked plan request needs a well-formed actor");
+    }
+    if (typeof captured.projectId !== "string") {
+      throw new ValidationError("a linked plan request needs a project id");
+    }
+    if (typeof captured.intent !== "string" || captured.intent.trim().length === 0) {
+      throw new ValidationError("a plan needs a non-empty intent");
+    }
+    if (captured.constraints !== undefined) {
+      if (!Array.isArray(captured.constraints) || captured.constraints.some((entry) => typeof entry !== "string")) {
+        throw new ValidationError("plan constraints must be an array of strings");
+      }
+    }
+    if (!isCapturedRecord(captured.planner)) {
+      throw new ValidationError("a linked plan request needs a planner config");
+    }
+    const execution = captured.execution as unknown;
+    if (!isCapturedRecord(execution) || !Array.isArray(execution.verificationCommands)) {
+      throw new ValidationError("a linked plan request needs an execution config with verificationCommands");
+    }
+    if (execution.verificationCommands.length === 0) {
+      throw new ValidationError("plan execution config must declare at least one deterministic verification command");
+    }
+    if ("verificationExecutionPolicy" in execution) {
+      const shape = validateVerificationExecutionPolicy(execution.verificationExecutionPolicy);
+      if (!shape.ok) {
+        throw new ValidationError(`plan execution config verificationExecutionPolicy ${shape.reason}`);
+      }
+    }
+    if (captured.budget !== undefined && !isCapturedRecord(captured.budget)) {
+      throw new ValidationError("plan budget must be an object");
+    }
+
+    // Same fail-fast project check as ordinary `start`, before any write.
+    await this.factory.getProject(captured.projectId);
+
+    const budget: PlanBudget = { ...DEFAULT_PLAN_BUDGET, ...(captured.budget ?? {}) };
+    if (budget.maxPlannerAttempts < 1 || budget.maxTotalPlannerRuns < 1) {
+      throw new ValidationError("plan budget must allow at least one planner attempt and one planner run");
+    }
+
+    const constraints: readonly string[] = captured.constraints ?? [];
+    const requestKey = canonicalRequestKey(captured.projectId, captured.intent, sha256Hex);
+    const requestDigest = sha256Hex(
+      canonicalJson({
+        version: "LinkedPlanRequest/v1",
+        actor: captured.actor,
+        intent: captured.intent,
+        constraints,
+        planner: captured.planner,
+        execution: captured.execution,
+        budget,
+        projectId: captured.projectId,
+        link: { botId, updateId, chatId, senderId },
+      }),
+    );
+
+    const now = this.clock.now();
+    const plan: Plan = {
+      id: this.ids.next("plan"),
+      projectId: captured.projectId,
+      requestKey,
+      version: 1,
+      phase: "DRAFT",
+      intent: captured.intent,
+      declaredConstraints: constraints,
+      budget,
+      planner: captured.planner,
+      execution: captured.execution,
+      revisions: [],
+      openQuestions: [],
+      answers: [],
+      attemptsForCurrentRevision: 0,
+      clarificationCycles: 0,
+      totalPlannerRuns: 0,
+      materialized: [],
+      dispatches: [],
+      cancelRequested: false,
+      events: [{ seq: 1, kind: "REQUEST_CREATED", detail: bound(`request ${requestKey} created`), at: now }],
+      startedBy: captured.actor,
+      startedAt: now,
+      lastTransitionAt: now,
+    };
+
+    const persisted = await atomicCreateOrAdopt(plan, { botId, updateId, requestDigest });
+    this.log(`[plan ${persisted.id}] linked request-only: persisted or adopted without driving`);
+    return persisted;
   }
 
   /**
@@ -398,6 +594,64 @@ export class PlanningService {
    */
   async status(planId: string): Promise<Plan> {
     return this.projectFailClosed(await this.requirePlan(planId));
+  }
+
+  /**
+   * PHASE7-97. Read-only, verified approved-execution query.
+   *
+   * `status()` alone is insufficient here: its fail-closed projection only
+   * re-derives approval authority for phases that ASSERT one
+   * (`PHASES_ASSERTING_APPROVAL`), so a `BLOCKED` or other non-asserting plan
+   * can pass `status()` without any approval having ever been proven. This
+   * query calls the unchanged `verifyApprovalAuthority` on every call,
+   * regardless of persisted phase, so a caller of this one path can never be
+   * shown approved-execution facts for a plan whose approval does not
+   * currently, actually verify — a stale, superseded, digest-drifted,
+   * non-human-decided or currently-rejected record all refuse here exactly as
+   * they refuse in the write paths.
+   *
+   * Performs no mutation of any kind: it reads the plan from this service's
+   * own repository, verifies, and returns. It does not resume, drive,
+   * materialize or dispatch anything, and it writes nothing. The returned
+   * value is deep-copied and frozen, so a caller mutating what it got back
+   * cannot alter this service's stored state — proven by
+   * `PHASE7-97: verified approved execution query`'s mutation-isolation case.
+   *
+   * This is a SNAPSHOT, not a grant: it carries no launch handle, no
+   * authority, no capability, no reservation, and it is not proof of ongoing
+   * or cross-store atomicity. A later supplier must still bind live
+   * registry/action facts and real capacity/quota before anything may launch.
+   */
+  async verifiedApprovedExecutionSnapshot(planId: string): Promise<ApprovedExecutionSnapshot> {
+    const plan = await this.requirePlan(planId);
+    const authority = await this.verifyApprovalAuthority(plan);
+    if (!authority.ok) {
+      throw new ValidationError(`plan ${planId} has no currently verified approval: ${authority.reason}`);
+    }
+    // `verifyApprovalAuthority` having returned `ok` guarantees these three are
+    // defined and that `plan.revisions` contains the approved revision.
+    const approvalId = plan.approvalId as ApprovalId;
+    const approvedRevision = plan.approvedRevision as number;
+    const approvedDigest = plan.approvedDigest as string;
+    const revision = plan.revisions.find((entry) => entry.revision === approvedRevision);
+    if (revision === undefined) {
+      throw new ValidationError(`plan ${planId} has no currently verified approval: approved revision is missing`);
+    }
+
+    const snapshot: ApprovedExecutionSnapshot = {
+      planId: plan.id,
+      projectId: plan.projectId,
+      version: plan.version,
+      phase: plan.phase,
+      cancelRequested: plan.cancelRequested,
+      approvalId,
+      approvedRevision,
+      approvedDigest,
+      items: revision.items,
+      execution: plan.execution,
+      materialized: plan.materialized,
+    };
+    return deepFreezeClone(snapshot);
   }
 
   /**
@@ -1812,6 +2066,39 @@ export class PlanningService {
       );
     }
 
+    /**
+     * FAIL-CLOSED TICKET EXECUTABILITY (NC-RUNTIME-01).
+     *
+     * Checked against THIS read of `atClaim` — the same read the digest above
+     * was just verified on — never against the `revision`/`plan` the caller
+     * passed in, which may already be stale. A legacy plan that recorded no
+     * structured `ticketTemplates` grants no authority to dispatch anything,
+     * whatever its prose spec says; neither does a template set that is
+     * malformed, orphaned, duplicated or bound to acceptance criteria that do
+     * not match the approved revision's own. Only `EXECUTABLE`, naming the
+     * exact plan item about to be claimed, may reach the CAS below.
+     */
+    const atClaimRevision = atClaim.revisions.find((entry) => entry.revision === atClaim.approvedRevision);
+    if (atClaimRevision === undefined) {
+      throw new ValidationError(
+        `plan ${plan.id} has no approved revision to dispatch "${planItemKey}" against`,
+      );
+    }
+    const executability = planTicketExecutability(atClaimRevision.items, atClaim.execution.ticketTemplates);
+    if (executability.status === "NON_EXECUTABLE") {
+      throw new ValidationError(
+        `plan ${plan.id} cannot dispatch "${planItemKey}": ${executability.reason}. ${executability.replanAction}`,
+      );
+    }
+    if (executability.status === "INVALID") {
+      throw new ValidationError(`plan ${plan.id} cannot dispatch "${planItemKey}": ${executability.reason}`);
+    }
+    if (!executability.templatesByKey.has(planItemKey)) {
+      throw new ValidationError(
+        `plan ${plan.id} cannot dispatch "${planItemKey}": no ticket template is bound to this plan item`,
+      );
+    }
+
     // CLAIM before the side effect: a cancellation that committed first wins
     // this CAS, and the loop is never started. The CAS is against the version
     // the digest above was read from, which is what makes the pair atomic.
@@ -1981,6 +2268,31 @@ export class PlanningService {
   }
 }
 
+/**
+ * Deep-copies, then deep-freezes, an arbitrary JSON-shaped value — PHASE7-97's
+ * isolation guarantee. A plain `structuredClone` would copy but not freeze; a
+ * shallow `Object.freeze` would freeze but leave nested arrays/objects (e.g.
+ * `items`, `materialized`) mutable in place. Every reachable object and array
+ * is frozen here, so neither the top-level snapshot nor anything nested in it
+ * can be mutated by a caller, and no such mutation can reach this service's
+ * own repository state because nothing returned shares identity with it.
+ */
+function deepFreezeClone<T>(value: T): T {
+  const cloned = structuredClone(value);
+  deepFreeze(cloned);
+  return cloned;
+}
+
+function deepFreeze(value: unknown): void {
+  if (value === null || typeof value !== "object" || Object.isFrozen(value)) {
+    return;
+  }
+  Object.freeze(value);
+  for (const entry of Object.values(value)) {
+    deepFreeze(entry);
+  }
+}
+
 function stripPlannerAction(plan: Plan): Plan {
   if (plan.plannerAction === undefined) {
     return plan;
@@ -1994,6 +2306,85 @@ function stripPlannerAction(plan: Plan): Plan {
 function bound(detail: string): string {
   const flattened = detail.replace(/\s+/g, " ").trim();
   return flattened.length <= MAX_EVENT_DETAIL_LENGTH ? flattened : `${flattened.slice(0, MAX_EVENT_DETAIL_LENGTH - 1)}…`;
+}
+
+const MAX_CAPTURE_DEPTH = 64;
+
+function isCapturedRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * Deep-copies a caller value into frozen plain data, or refuses it. Accepts
+ * only null, strings, booleans, finite numbers, arrays and plain objects with
+ * own enumerable data properties; refuses undefined, non-finite numbers,
+ * accessors, symbols, class instances, sparse arrays and cycles/over-deep
+ * nesting. Synchronous, so it fixes the value before any await.
+ */
+function capturePlainData(value: unknown, path: string, depth = 0): unknown {
+  if (depth > MAX_CAPTURE_DEPTH) {
+    throw new ValidationError(`${path} is nested too deeply`);
+  }
+  if (value === null || typeof value === "string" || typeof value === "boolean") {
+    return value;
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) {
+      throw new ValidationError(`${path} must be a finite number`);
+    }
+    return value;
+  }
+  if (Array.isArray(value)) {
+    if (Object.getPrototypeOf(value) !== Array.prototype || Object.getOwnPropertyNames(value).length !== value.length + 1) {
+      throw new ValidationError(`${path} must be a plain dense array`);
+    }
+    if (Object.getOwnPropertySymbols(value).length > 0) {
+      throw new ValidationError(`${path} must not have symbol properties`);
+    }
+    const copy: unknown[] = [];
+    for (let index = 0; index < value.length; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, index);
+      if (descriptor === undefined || !("value" in descriptor) || descriptor.enumerable !== true) {
+        throw new ValidationError(`${path}[${index}] must be a plain data element`);
+      }
+      copy.push(capturePlainData(descriptor.value, `${path}[${index}]`, depth + 1));
+    }
+    return Object.freeze(copy);
+  }
+  if (typeof value === "object") {
+    const proto = Object.getPrototypeOf(value);
+    if (proto !== Object.prototype && proto !== null) {
+      throw new ValidationError(`${path} must be a plain object`);
+    }
+    const copy: Record<string, unknown> = {};
+    for (const key of Reflect.ownKeys(value)) {
+      if (typeof key !== "string" || key === "__proto__") {
+        throw new ValidationError(`${path} has an unsupported key`);
+      }
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (descriptor === undefined || !("value" in descriptor) || descriptor.enumerable !== true) {
+        throw new ValidationError(`${path}.${key} must be an enumerable data property`);
+      }
+      copy[key] = capturePlainData(descriptor.value, `${path}.${key}`, depth + 1);
+    }
+    return Object.freeze(copy);
+  }
+  throw new ValidationError(`${path} has an unsupported value type`);
+}
+
+/** Stable canonical JSON over captured plain data: sorted object keys, preserved array order. */
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map((entry) => canonicalJson(entry)).join(",")}]`;
+  }
+  if (value !== null && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
 }
 
 /** The most recent contract/validation rejection, so a retry can correct itself. */

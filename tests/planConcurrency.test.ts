@@ -24,6 +24,7 @@ import { buildPlannerPrompt } from "../src/planning/planPrompts.js";
 import { renderPlannerResponse } from "../src/planning/scriptedPlannerWorkers.js";
 import type { Plan } from "../src/planning/planTypes.js";
 import {
+  A_THEN_B_TICKET_TEMPLATES,
   approvedPlan,
   authorizePlanHuman,
   newPlanning,
@@ -116,7 +117,9 @@ describe("TASK-005 AC-12: duplicate work is prevented structurally", () => {
 
   it("concurrent resumes never duplicate work items or loops", async () => {
     const context = await newPlanning({ plannerOutputs: [A_THEN_B] });
-    const plan = await approvedPlan(context);
+    const plan = await approvedPlan(context, "Build the thing.", {
+      execution: testExecutionConfig(undefined, A_THEN_B_TICKET_TEMPLATES),
+    });
     const itemsBefore = (await context.factory.listWorkItemsByProject(context.projectId)).length;
     const startsBefore = context.dispatcher.startCount();
 
@@ -212,7 +215,9 @@ describe("TASK-005: cancellation is a trusted-human governance action", () => {
 
   it("no new dispatch happens after cancellation, and existing work is left for the human", async () => {
     const context = await newPlanning({ plannerOutputs: [A_THEN_B] });
-    const plan = await approvedPlan(context);
+    const plan = await approvedPlan(context, "Build the thing.", {
+      execution: testExecutionConfig(undefined, A_THEN_B_TICKET_TEMPLATES),
+    });
     assert.equal(plan.dispatches.length, 1, "WI-A dispatched, WI-B waiting");
 
     const cancelled = await context.service.cancel(plan.id, PLAN_HUMAN, authorizePlanHuman(context.factory));
@@ -232,7 +237,9 @@ describe("TASK-005: cancellation is a trusted-human governance action", () => {
 
   it("a durable cancellation request beats an in-flight drive", async () => {
     const context = await newPlanning({ plannerOutputs: [A_THEN_B] });
-    const plan = await approvedPlan(context);
+    const plan = await approvedPlan(context, "Build the thing.", {
+      execution: testExecutionConfig(undefined, A_THEN_B_TICKET_TEMPLATES),
+    });
 
     const current = (await context.plans.findById(plan.id))!;
     await context.plans.compareAndSave({ ...current, cancelRequested: true, version: current.version + 1 }, current.version);
@@ -278,7 +285,9 @@ describe("TASK-005 AC-13: approved execution proceeds with no human prompts", ()
     // The whole approve -> materialize -> ready -> dispatch cycle runs to
     // completion inside one call, with nothing read from stdin and no callback
     // asking a question. If any step needed a human, this would hang or throw.
-    const plan = await approvedPlan(context);
+    const plan = await approvedPlan(context, "Build the thing.", {
+      execution: testExecutionConfig(undefined, A_THEN_B_TICKET_TEMPLATES),
+    });
 
     assert.equal(plan.phase, "EXECUTING");
     assert.equal(plan.materialized.length, 2);

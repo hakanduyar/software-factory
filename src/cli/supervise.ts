@@ -20,6 +20,9 @@ import {
   type SqliteSupervisorRepository,
 } from "../adapters/supervision/sqliteSupervisorRepository.js";
 import { createNodeProcessRunner } from "../adapters/process/nodeProcessRunner.js";
+import { createProcLivenessProbe, leaseForThisProcess } from "../adapters/supervision/procLiveness.js";
+import { createFileVerdictSource } from "../adapters/supervision/fileVerdictSource.js";
+import { createCodexReviewLauncher } from "../adapters/supervision/codexReviewLauncher.js";
 import { createSequentialIdGenerator } from "../domain/ids.js";
 import { DEFAULT_ROUTING_POLICY } from "../supervision/modelRouting.js";
 import { parseFinancialPolicy } from "../supervision/financialSafety.js";
@@ -32,6 +35,7 @@ import {
   createChildPlanAdvancer,
   createChildPlanStateReader,
 } from "../adapters/supervision/childPlanAdvancer.js";
+import { createWorkerRunLifecycle } from "../adapters/supervision/workerRunLifecycle.js";
 import { DEFAULT_PLANS_DB_PATH } from "./plan.js";
 import {
   createPlanBackedExecutor,
@@ -44,7 +48,9 @@ import type { WorkExecutor } from "../supervision/supervisorPorts.js";
 import { ESCALATION_REASONS, type EscalationReason, type SupervisorState } from "../supervision/supervisorTypes.js";
 import { systemClock } from "../ports/clock.js";
 
-const DEFAULT_SUPERVISOR_DB_PATH = ".factory/supervisor.db";
+export const DEFAULT_SUPERVISOR_DB_PATH = ".factory/supervisor.db";
+/** Where bounded, redacted worker-run terminal artifacts are written (DEFECT-DURABLE-WORKER-RUN-ENVELOPE AC-5). */
+export const DEFAULT_WORKER_RUN_ARTIFACT_DIR = ".factory/worker-runs";
 
 export interface SuperviseCliOptions {
   readonly supervisorDbPath?: string;
@@ -79,6 +85,8 @@ export interface SuperviseCliOptions {
   readonly roadmapPlansPath?: string;
   /** Where the plans database lives; defaults as `sf plan` does. */
   readonly plansDbPath?: string;
+  /** Where bounded, redacted worker-run terminal artifacts are written. */
+  readonly workerRunArtifactDir?: string;
 }
 
 /**
@@ -120,6 +128,20 @@ function resolveDbPath(options: SuperviseCliOptions): string {
   return resolve(
     options.supervisorDbPath ?? process.env["FACTORY_SUPERVISOR_DB_PATH"] ?? DEFAULT_SUPERVISOR_DB_PATH,
   );
+}
+
+export function openSupervisorRepository(options: SuperviseCliOptions): SqliteSupervisorRepository {
+  return openRepository(options);
+}
+
+/** Build both supervisor entry points around the same explicitly wired executor. */
+export function buildSupervisorService(
+  repository: SqliteSupervisorRepository,
+  log: (line: string) => void,
+  executor: WorkExecutor,
+  options: SuperviseCliOptions = {},
+): SupervisorService {
+  return buildService(repository, log, executor, options);
 }
 
 function openRepository(options: SuperviseCliOptions): SqliteSupervisorRepository {
@@ -223,7 +245,7 @@ function readRoadmapPlanBindings(path: string): Readonly<Record<string, string>>
   return bindings;
 }
 
-interface SupervisorExecutorWiring {
+export interface SupervisorExecutorWiring {
   readonly executor: WorkExecutor;
   close(): void;
 }
@@ -251,9 +273,10 @@ interface SupervisorExecutorWiring {
  * (TASK-011 AC-1). The supervisor's own process never contains the engineering
  * loop or an AI worker.
  */
-function createSupervisorExecutor(
+export function createSupervisorExecutor(
   options: SuperviseCliOptions,
   log: (line: string) => void,
+  repository?: SqliteSupervisorRepository,
 ): SupervisorExecutorWiring {
   const closers: (() => void)[] = [];
 
@@ -307,12 +330,32 @@ function createSupervisorExecutor(
     });
 
     if (options.drivePlans === true) {
+      /**
+       * THE DURABLE WORKER-RUN ENVELOPE (DEFECT-DURABLE-WORKER-RUN-ENVELOPE).
+       *
+       * Wired only when a repository is available to CAS against — every
+       * production caller passes one; the absence is a deployment that opted
+       * out of durable tracking for this launch entirely, never a silent
+       * partial one (see `ChildPlanAdvancerDeps`'s own doc comment).
+       */
       planning = createChildPlanAdvancer({
         processRunner: createNodeProcessRunner(),
         plans,
         cwd: process.cwd(),
         plansDbPath,
         log,
+        ...(repository === undefined
+          ? {}
+          : {
+              workerRuns: createWorkerRunLifecycle({ repository, clock: systemClock }),
+              supervisorDbPath: resolveDbPath(options),
+              clock: systemClock,
+              artifactDir: resolve(
+                options.workerRunArtifactDir ??
+                  process.env["FACTORY_WORKER_RUN_ARTIFACT_DIR"] ??
+                  DEFAULT_WORKER_RUN_ARTIFACT_DIR,
+              ),
+            }),
       });
     }
   } else if (options.drivePlans === true) {
@@ -347,6 +390,7 @@ function buildService(
   repository: SqliteSupervisorRepository,
   log: (line: string) => void,
   executor: WorkExecutor,
+  options: SuperviseCliOptions = {},
 ): SupervisorService {
   return new SupervisorService({
     repository,
@@ -356,6 +400,55 @@ function buildService(
     ids: createSequentialIdGenerator(),
     routingPolicy: DEFAULT_ROUTING_POLICY,
     resourceCatalog: RESOURCE_CATALOG,
+    /**
+     * THE SAME DIRECTORY `createChildPlanAdvancer` WRITES TO.
+     *
+     * Reconciliation's artifact-first recovery (AC-7) only finds a terminal
+     * artifact if it looks in the same place the launch wrote one — resolved
+     * identically here and in `createSupervisorExecutor` for exactly that
+     * reason.
+     */
+    workerRunArtifactDir: resolve(
+      options.workerRunArtifactDir ?? process.env["FACTORY_WORKER_RUN_ARTIFACT_DIR"] ?? DEFAULT_WORKER_RUN_ARTIFACT_DIR,
+    ),
+    /**
+     * TASK-018 Part B, and the round-1 CRITICAL was that these two lines were
+     * missing.
+     *
+     * Without them the supervisor records no activity, no lease and no
+     * completion, and reconciliation concludes nothing — so every durable
+     * orchestration property held in tests and in nothing that actually runs.
+     * This is the only place production decides that work in flight is
+     * observable, which is why it is wired at the top-level entry point rather
+     * than defaulted somewhere inside the service.
+     */
+    liveness: createProcLivenessProbe(),
+    activityLease: (claimedAt) => leaseForThisProcess(claimedAt),
+    /**
+     * ...and the same reasoning for verdicts. A review recorded in durable
+     * state with no way to read its result back is a review nothing can ever
+     * finish, and round 7 showed what that costs in hours. Wired HERE, beside
+     * the probe, because forgetting one of the three is the misconfiguration
+     * the service now refuses rather than works around.
+     */
+    acceptanceVerdicts: createFileVerdictSource(),
+    reviewLauncher: createCodexReviewLauncher({
+      repository: process.cwd(),
+      packet: (request) => [
+        `Independently review roadmap item ${request.roadmapKey} in this repository.`,
+        `Review run: ${request.reviewId}. Candidate commit: ${request.candidate.commit}.`,
+        `Candidate tree: ${request.candidate.tree}. Working-tree fingerprint: ${request.candidate.fingerprint}.`,
+        "Read AGENTS.md, the Factory Constitution, the accepted ADRs, and the frozen task criteria.",
+        "Inspect the candidate and relevant checks. Do not edit files or invoke paid services.",
+        "Report findings, then end with four whole-line fields in this order:",
+        "VERDICT: followed by exactly one of PASS, PASS_WITH_NON_BLOCKING_NOTES, CHANGES_REQUIRED",
+        "Safe to commit: followed by exactly one of YES, NO",
+        "FACTORY_ACCEPTANCE_COUNTS: CRITICAL=<number> HIGH=<number>",
+        `FACTORY_ACCEPTANCE_CANDIDATE: ${request.candidate.commit} ${request.candidate.tree} ${request.candidate.fingerprint}`,
+        "Do not use a PASS verdict if evidence is missing or the candidate differs.",
+      ].join("\n"),
+      log,
+    }),
     log,
   });
 }
@@ -460,7 +553,7 @@ export async function runSuperviseBlock(options: SuperviseBlockOptions): Promise
   let repository: SqliteSupervisorRepository | undefined;
   try {
     repository = openRepository(options);
-    const service = buildService(repository, log, refuseToExecute);
+    const service = buildService(repository, log, refuseToExecute, options);
     const result = await service.recordBlocker({
       roadmapKey: options.roadmapKey,
       reason: options.reason as EscalationReason,
@@ -495,8 +588,8 @@ export async function runSuperviseTick(options: SuperviseCliOptions = {}): Promi
   let wiring: SupervisorExecutorWiring | undefined;
   try {
     repository = openRepository(options);
-    wiring = createSupervisorExecutor(options, log);
-    const result = await buildService(repository, log, wiring.executor).tick();
+    wiring = createSupervisorExecutor(options, log, repository);
+    const result = await buildService(repository, log, wiring.executor, options).tick();
     describeTick(result, log);
     return result;
   } finally {

@@ -23,7 +23,7 @@ import {
 import { createSqlitePlanRepository } from "../src/adapters/planning/sqlitePlanRepository.js";
 import { computePlanContentDigest } from "../src/planning/planDigest.js";
 import type { AiRunConfigRecord } from "../src/supervision/modelEnforcement.js";
-import type { Plan, PlanPhase, PlannedWorkItem } from "../src/planning/planTypes.js";
+import type { Plan, PlanPhase, PlannedWorkItem, WorkItemTicketTemplate } from "../src/planning/planTypes.js";
 import type { WorkExecutionInput } from "../src/supervision/supervisorPorts.js";
 import type { RoadmapItem } from "../src/supervision/supervisorTypes.js";
 
@@ -74,6 +74,58 @@ const AUTHORIZED: AiRunConfigRecord = {
   note: "scripted for tests",
 };
 
+/**
+ * e954: the one plan item every `planWith` fixture carries, and the text its
+ * matching ticket template must bind EXACTLY — `planTicketExecutability`
+ * refuses a template whose criteria do not match the approved revision's own.
+ */
+const VALID_PLAN_ITEM: PlannedWorkItem = {
+  key: "WI-A",
+  title: "Do the thing",
+  type: "FEATURE",
+  priority: "P2",
+  spec: "Implement the thing.",
+  acceptanceCriteria: [{ text: "It works", verificationHint: "npm test" }],
+  dependsOn: [],
+};
+
+/** A structurally valid WorkerTicket template, conforming to the frozen contract. */
+function validTicketTemplate(planItemKey: string, criterionText: string): WorkItemTicketTemplate {
+  return {
+    planItemKey,
+    schemaVersion: "1.0.0",
+    objective: "Implement the roadmap item to a reviewable, verifiable state.",
+    acceptanceCriteria: [{ id: "AC-1", version: "1.0.0", description: criterionText }],
+    scope: {
+      owned: ["src/example.ts"],
+      forbidden: [],
+      read: [],
+      dependencies: [],
+      validation: ["npm test"],
+    },
+    model: {
+      eligibleModels: ["claude-code/opus"],
+      reasoningEffort: "medium",
+      rationale: "Needs multi-file reasoning across the module.",
+    },
+    budgets: {
+      contextTokens: 100000,
+      outputTokens: 4000,
+      elapsedSeconds: 1800,
+      maxAttempts: 2,
+    },
+    policy: {
+      checkpoint: "after each verification pass",
+      stopConditions: ["acceptance criteria met"],
+      escalation: "escalate to a human on repeated failure",
+    },
+    resultSchema: {
+      requiredFields: ["status", "summary"],
+      maxResultBytes: 2048,
+    },
+  };
+}
+
 function planWith(phase: PlanPhase): Plan {
   return {
     id: "plan-1",
@@ -87,8 +139,71 @@ function planWith(phase: PlanPhase): Plan {
       reviewer: AUTHORIZED_WORKER,
       verificationCommands: [],
       workspaceRoot: "/tmp/ws",
+      // e954: every fixture plan is fully templated by default, so a case
+      // about something else is not silently a case about missing ticket
+      // authority — the same reasoning AUTHORIZED_WORKER already applies.
+      ticketTemplates: [validTicketTemplate(VALID_PLAN_ITEM.key, "It works")],
+    },
+    revisions: [
+      {
+        revision: 1,
+        summary: "Deliver it.",
+        assumptions: [],
+        constraints: [],
+        risks: [],
+        items: [VALID_PLAN_ITEM],
+        contentDigest: "fixture-digest",
+        plannerRunRef: "plan-1:r1:planner:a1",
+        generatedAt: 0,
+      },
+    ],
+    approvedRevision: 1,
+  } as unknown as Plan;
+}
+
+/** `planWith`, but with no ticket templates recorded — the legacy shape. */
+function planWithNoTicketTemplates(phase: PlanPhase): Plan {
+  const plan = planWith(phase) as unknown as Record<string, unknown>;
+  const execution = plan.execution as Record<string, unknown>;
+  return { ...plan, execution: { ...execution, ticketTemplates: undefined } } as unknown as Plan;
+}
+
+/** `planWith`, but carrying a duplicate (structurally invalid) template for the same item. */
+function planWithInvalidTicketTemplate(phase: PlanPhase): Plan {
+  const plan = planWith(phase) as unknown as Record<string, unknown>;
+  const execution = plan.execution as Record<string, unknown>;
+  return {
+    ...plan,
+    execution: {
+      ...execution,
+      ticketTemplates: [
+        validTicketTemplate(VALID_PLAN_ITEM.key, "It works"),
+        validTicketTemplate(VALID_PLAN_ITEM.key, "It works"),
+      ],
     },
   } as unknown as Plan;
+}
+
+/** `planWith`, but with no approved revision recorded at all. */
+function planWithoutApprovedRevision(phase: PlanPhase): Plan {
+  const plan = planWith(phase) as unknown as Record<string, unknown>;
+  const { approvedRevision, ...rest } = plan;
+  void approvedRevision;
+  return rest as unknown as Plan;
+}
+
+/**
+ * Returns a DIFFERENT plan on the first call than on every call after, so a
+ * test can script "what the top-of-function read saw" versus "what the fresh
+ * `atLaunch` read sees" — the two reads `execute` performs around a launch.
+ */
+function sequencedLookup(...plans: readonly Plan[]): RoadmapPlanLookup {
+  const queue = [...plans];
+  return {
+    async findPlanForItem() {
+      return queue.length > 1 ? queue.shift() : queue[0];
+    },
+  };
 }
 
 function input(overrides: Partial<WorkExecutionInput> = {}): WorkExecutionInput {
@@ -786,6 +901,10 @@ describe("TASK-014 AC-4: dispatch is idempotent through the REAL planning seam",
         verificationCommands: [{ id: "check", executable: "node", argv: ["-e", "process.exit(0)"] }],
         workspaceRoot: "/tmp/sf-plan-test",
         loopBudget: { maxIterations: 2 },
+        // e954: the default scripted planner output (simplePlanResponse) names
+        // item "WI-A" with the default criterion text below; the template must
+        // bind that text exactly or the plan would never be executable.
+        ticketTemplates: [validTicketTemplate("WI-A", "Do the thing behaves as specified")],
       },
     });
 
@@ -973,5 +1092,104 @@ describe("TASK-014: an unconfigured supervisor is honest rather than stubbed", (
       /not permitted to drive plans/,
     );
     assert.notEqual(outcome.kind, "COMPLETED");
+  });
+});
+
+/**
+ * e954: `planTicketExecutability` is consulted, on the FRESH `atLaunch` read,
+ * before any launch. Authority for what a worker may do comes only from a
+ * structured ticket template bound to the plan's own approved revision —
+ * never from plan prose, and never from the row's unverified phase.
+ */
+describe("e954: ticket authority is required before a plan launches", () => {
+  it("resumes a plan whose approved revision carries a template for every item", async () => {
+    const planning = advancer(planWith("EXECUTING"));
+    const executor = createPlanBackedExecutor({
+      plans: lookup(planWith("APPROVED")),
+      planning,
+      state: authoritySays("APPROVED", "EXECUTING"),
+      clock: CLOCK,
+    });
+
+    const outcome = await executor.execute(input());
+
+    assert.deepEqual(planning.resumed, ["plan-1"], "a fully templated, approved plan was not resumed");
+    assert.equal(outcome.kind, "CHECKPOINT");
+  });
+
+  it("never resumes a plan that records no ticket templates at all (legacy plan)", async () => {
+    const planning = advancer(planWith("EXECUTING"));
+    const executor = createPlanBackedExecutor({
+      plans: lookup(planWithNoTicketTemplates("APPROVED")),
+      planning,
+      state: authoritySays("APPROVED"),
+      clock: CLOCK,
+    });
+
+    const outcome = await executor.execute(input());
+
+    assert.deepEqual(planning.resumed, [], "a plan with no ticket templates was resumed");
+    assert.equal(outcome.kind, "HUMAN_REQUIRED");
+    assert.equal(outcome.kind === "HUMAN_REQUIRED" ? outcome.action.kind : "", "RECONCILE_PLAN_TICKETS");
+    assert.match(outcome.kind === "HUMAN_REQUIRED" ? outcome.detail : "", /replan/i);
+  });
+
+  it("never resumes a plan whose ticket templates are structurally invalid (duplicate)", async () => {
+    const planning = advancer(planWith("EXECUTING"));
+    const executor = createPlanBackedExecutor({
+      plans: lookup(planWithInvalidTicketTemplate("APPROVED")),
+      planning,
+      state: authoritySays("APPROVED"),
+      clock: CLOCK,
+    });
+
+    const outcome = await executor.execute(input());
+
+    assert.deepEqual(planning.resumed, [], "a plan with an invalid ticket template was resumed");
+    assert.equal(outcome.kind, "HUMAN_REQUIRED");
+    assert.equal(outcome.kind === "HUMAN_REQUIRED" ? outcome.action.kind : "", "RECONCILE_PLAN_TICKETS");
+  });
+
+  it("never resumes a plan with no approved revision recorded", async () => {
+    const planning = advancer(planWith("EXECUTING"));
+    const executor = createPlanBackedExecutor({
+      plans: lookup(planWithoutApprovedRevision("APPROVED")),
+      planning,
+      state: authoritySays("APPROVED"),
+      clock: CLOCK,
+    });
+
+    const outcome = await executor.execute(input());
+
+    assert.deepEqual(planning.resumed, [], "a plan with no approved revision was resumed");
+    assert.equal(outcome.kind, "HUMAN_REQUIRED");
+    assert.equal(outcome.kind === "HUMAN_REQUIRED" ? outcome.action.kind : "", "RECONCILE_PLAN_TICKETS");
+  });
+
+  /**
+   * The gate reads `atLaunch`, not the plan `execute` first looked at. A
+   * template present at the top-of-function read but gone by the fresh
+   * re-read immediately before launch must still refuse — exactly the
+   * time-of-check/time-of-use window `checkPlanAuthorization`'s own re-read
+   * already closes for authorization.
+   */
+  it("never resumes when a template present at the first read is gone from the fresh atLaunch read", async () => {
+    const planning = advancer(planWith("EXECUTING"));
+    const executor = createPlanBackedExecutor({
+      plans: sequencedLookup(planWith("APPROVED"), planWithNoTicketTemplates("APPROVED")),
+      planning,
+      state: authoritySays("APPROVED"),
+      clock: CLOCK,
+    });
+
+    const outcome = await executor.execute(input());
+
+    assert.deepEqual(
+      planning.resumed,
+      [],
+      "a template that disappeared between the first read and the fresh atLaunch read was not re-checked",
+    );
+    assert.equal(outcome.kind, "HUMAN_REQUIRED");
+    assert.equal(outcome.kind === "HUMAN_REQUIRED" ? outcome.action.kind : "", "RECONCILE_PLAN_TICKETS");
   });
 });

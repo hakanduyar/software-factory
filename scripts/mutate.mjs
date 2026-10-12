@@ -140,6 +140,22 @@ function runTests(files) {
   return { pass: count("pass"), fail: count("fail"), failed, timedOut, signal: result.signal ?? undefined };
 }
 
+/**
+ * A NOT-GREEN TREE MUST SAY WHICH GUARD IS NOT GREEN.
+ *
+ * `restored: pass=36 fail=1` was the entire report, so the only fact available
+ * afterwards was that something in a 37-test file had failed — indistinguishable
+ * from a flake, a real breakage and a harness bug, and reproducible only by
+ * guessing. The names are already collected by `runTests`; they were simply
+ * never printed. The green lines keep their exact shape, because the chain
+ * matches `^restored: pass=[0-9]* fail=0$` on them.
+ */
+function reportFailures(label, run) {
+  if (run.fail > 0 && run.failed.length > 0) {
+    console.log(`${label} failures: ${JSON.stringify(run.failed)}`);
+  }
+}
+
 const only = process.argv.includes("--only")
   ? process.argv[process.argv.indexOf("--only") + 1]
   : undefined;
@@ -512,6 +528,7 @@ if (!first.ok) {
 const allTests = [...new Set(selected.flatMap((m) => m.tests))];
 const start = runTests(allTests);
 console.log(`baseline: pass=${start.pass} fail=${start.fail}`);
+reportFailures("baseline", start);
 if (start.timedOut) {
   // Distinguished from "not green": a baseline that never finished tells us
   // nothing about the tree, and reporting it as failing tests would be a guess.
@@ -623,6 +640,7 @@ if (!restored.ok) {
 }
 const end = runTests(allTests);
 console.log(`restored: pass=${end.pass} fail=${end.fail}`);
+reportFailures("restored", end);
 if (end.timedOut) {
   console.error("ABORT: the restored tree's test run did not finish, so the tree is not proven green");
   process.exit(2);

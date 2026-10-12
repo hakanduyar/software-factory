@@ -20,8 +20,8 @@ import { describe, it } from "node:test";
 import { planSubject } from "../src/domain/approval.js";
 import { ApprovalIntegrityError, HumanIdentityError, ValidationError } from "../src/domain/errors.js";
 import { approvalDigestOfPlan } from "../src/planning/planDigest.js";
-import type { Plan } from "../src/planning/planTypes.js";
-import { renderPlannerResponse } from "../src/planning/scriptedPlannerWorkers.js";
+import type { MaterializedItem, Plan } from "../src/planning/planTypes.js";
+import { createScriptedPlannerWorker, renderPlannerResponse } from "../src/planning/scriptedPlannerWorkers.js";
 import {
   approvedPlan,
   authorizePlanHuman,
@@ -38,6 +38,8 @@ import {
   simplePlanResponse,
   TEST_PLANNER_CONFIG,
   testExecutionConfig,
+  validTicketTemplate,
+  WI_A_TICKET_TEMPLATES,
   type TestPlanning,
 } from "./support/planFixtures.js";
 
@@ -488,6 +490,344 @@ describe("TASK-005 AC-5: approval binds to plan id, revision and exact content",
 });
 
 // =====================================================================
+// PHASE7-97 — verified approved execution query
+// =====================================================================
+
+describe("PHASE7-97: verified approved execution query", () => {
+  it("returns approved execution facts for a valid baseline approval", async () => {
+    const context = await newPlanning();
+    const plan = await approvedPlan(context);
+    const revision = plan.revisions.at(-1)!;
+
+    const snapshot = await context.service.verifiedApprovedExecutionSnapshot(plan.id);
+
+    assert.equal(snapshot.planId, plan.id);
+    assert.equal(snapshot.projectId, plan.projectId);
+    assert.equal(snapshot.approvalId, plan.approvalId);
+    assert.equal(snapshot.approvedRevision, plan.approvedRevision);
+    assert.equal(snapshot.approvedDigest, plan.approvedDigest);
+    assert.deepEqual(snapshot.items, revision.items);
+    assert.deepEqual(snapshot.execution, plan.execution);
+    assert.deepEqual(snapshot.materialized, plan.materialized);
+    assert.equal(snapshot.cancelRequested, false);
+  });
+
+  it("verifies phase-independently: a valid approval under a non-asserting BLOCKED phase still succeeds", async () => {
+    const context = await newPlanning();
+    const plan = await approvedPlan(context);
+
+    // Force the persisted phase to BLOCKED — a phase `authorityProblem`'s
+    // "read" mode does NOT check for approval assertion — while leaving the
+    // real recorded approval and digest untouched. `status()` would not
+    // re-derive authority here; this query must anyway.
+    const current = (await context.plans.findById(plan.id))!;
+    const blocked: Plan = { ...current, phase: "BLOCKED", version: current.version + 1 };
+    await context.plans.compareAndSave(blocked, current.version);
+
+    const viaStatus = await context.service.status(plan.id);
+    assert.equal(viaStatus.phase, "BLOCKED", "status() does not demote a non-asserting phase");
+
+    const snapshot = await context.service.verifiedApprovedExecutionSnapshot(plan.id);
+    assert.equal(snapshot.approvalId, plan.approvalId);
+    assert.equal(snapshot.approvedRevision, plan.approvedRevision);
+  });
+
+  it("refuses when no plan exists", async () => {
+    const context = await newPlanning();
+    await assert.rejects(context.service.verifiedApprovedExecutionSnapshot("plan-does-not-exist"));
+  });
+
+  it("refuses when no approval is recorded (an unapproved BLOCKED plan)", async () => {
+    const context = await newPlanning({ plannerOutputs: [clarificationResponse()] });
+    const asked = await context.service.start({
+      projectId: context.projectId,
+      actor: PLAN_HUMAN,
+      intent: "Vague",
+      planner: TEST_PLANNER_CONFIG,
+      execution: testExecutionConfig(),
+      budget: { maxPlannerAttempts: 2, maxTotalPlannerRuns: 6, maxClarificationCycles: 1 },
+    });
+    const blocked = await context.service.answer(asked.id, PLAN_HUMAN, authorizePlanHuman(context.factory), [
+      { questionId: "q1", answer: "still ambiguous" },
+    ]);
+    assert.equal(blocked.phase, "BLOCKED");
+    assert.equal(blocked.approvalId, undefined);
+
+    await assert.rejects(
+      context.service.verifiedApprovedExecutionSnapshot(blocked.id),
+      ValidationError,
+    );
+  });
+
+  it("refuses when the approved revision has been superseded", async () => {
+    const context = await newPlanning();
+    const plan = await approvedPlan(context);
+    const approvedRevision = plan.revisions.at(-1)!;
+
+    // First, the genuine current approval queries successfully.
+    const baseline = await context.service.verifiedApprovedExecutionSnapshot(plan.id);
+    assert.equal(baseline.approvalId, plan.approvalId);
+
+    // Now a newer revision is appended underneath the real approval: the
+    // recorded approval id/revision/digest are all genuine, but they no
+    // longer describe the plan's latest revision.
+    const current = (await context.plans.findById(plan.id))!;
+    const superseded: Plan = {
+      ...current,
+      revisions: [...current.revisions, { ...approvedRevision, revision: approvedRevision.revision + 1 }],
+      version: current.version + 1,
+    };
+    await context.plans.compareAndSave(superseded, current.version);
+
+    await assert.rejects(
+      context.service.verifiedApprovedExecutionSnapshot(plan.id),
+      ValidationError,
+    );
+  });
+
+  it("refuses when the live content/execution digest no longer matches the approved digest", async () => {
+    const context = await newPlanning();
+    const plan = await approvedPlan(context);
+
+    // Query successfully first, against the real, untouched approval/digest.
+    const baseline = await context.service.verifiedApprovedExecutionSnapshot(plan.id);
+    assert.equal(baseline.approvedDigest, plan.approvedDigest);
+
+    // The approval and its recorded digest are left genuinely intact; only
+    // the approved execution configuration itself drifts, so the digest the
+    // service recomputes from live state no longer matches what was approved.
+    const current = (await context.plans.findById(plan.id))!;
+    const driftedExecution = { ...current.execution, workspaceRoot: "/tmp/sf-plan-test-drifted" };
+    const drifted: Plan = { ...current, execution: driftedExecution, version: current.version + 1 };
+    await context.plans.compareAndSave(drifted, current.version);
+
+    await assert.rejects(
+      context.service.verifiedApprovedExecutionSnapshot(plan.id),
+      ValidationError,
+    );
+  });
+
+  it("refuses when the recorded decision was not made by a human", async () => {
+    const context = await newPlanning();
+    const plan = await planAtReview(context);
+    const revision = plan.revisions.at(-1)!;
+    const digest = approvalDigestOfPlan(plan, revision);
+
+    // A real, durable approval row — but decided by an AGENT, never reachable
+    // through `approve()`'s trusted-human gate, forged directly into the store
+    // the way AC-8's own tests forge off-revision/off-content approvals.
+    const nonHuman = await context.store.approvals.save({
+      id: "apr-non-human",
+      gate: "PLAN_APPROVAL",
+      subject: planSubject(plan.id),
+      decision: "APPROVED",
+      decidedBy: PLAN_AGENT,
+      context: { statusWhenDecided: "PLAN_REVIEW", specRevision: revision.revision, planContentDigest: digest },
+      decidedAt: 1,
+    });
+    const forged: Plan = {
+      ...plan,
+      phase: "APPROVED",
+      approvalId: nonHuman.id,
+      approvedRevision: revision.revision,
+      approvedDigest: digest,
+      version: plan.version + 1,
+    };
+    await context.plans.compareAndSave(forged, plan.version);
+
+    await assert.rejects(
+      context.service.verifiedApprovedExecutionSnapshot(plan.id),
+      ValidationError,
+    );
+  });
+
+  it("refuses when the plan's latest decision is a current rejection", async () => {
+    const context = await newPlanning();
+    const plan = await approvedPlan(context);
+
+    // The genuine, current HUMAN approval queries successfully first.
+    const baseline = await context.service.verifiedApprovedExecutionSnapshot(plan.id);
+    assert.equal(baseline.approvalId, plan.approvalId);
+
+    // Put the plan row back at PLAN_REVIEW so the real `reject()` path can
+    // record a genuine, later HUMAN rejection of the same subject — the
+    // approval identity/revision/digest this plan already earned are kept
+    // verbatim, never fabricated.
+    const approved = (await context.plans.findById(plan.id))!;
+    const backToReview: Plan = { ...approved, phase: "PLAN_REVIEW", version: approved.version + 1 };
+    await context.plans.compareAndSave(backToReview, approved.version);
+
+    const rejected = await context.service.reject(plan.id, PLAN_HUMAN, authorizePlanHuman(context.factory), "revoked after approval");
+    assert.equal(rejected.phase, "REJECTED");
+
+    // Restore the plan's genuine approval fields onto the now-REJECTED row,
+    // so the ONLY thing distinguishing this plan from `baseline` is that the
+    // gate's current decision for this subject is now a rejection.
+    const current = (await context.plans.findById(plan.id))!;
+    const approvedApprovalId = plan.approvalId;
+    const approvedRevision = plan.approvedRevision;
+    const approvedDigest = plan.approvedDigest;
+    assert.ok(approvedApprovalId);
+    assert.ok(approvedRevision);
+    assert.ok(approvedDigest);
+    const relabelled: Plan = {
+      ...current,
+      approvalId: approvedApprovalId,
+      approvedRevision: approvedRevision,
+      approvedDigest: approvedDigest,
+      version: current.version + 1,
+    };
+    await context.plans.compareAndSave(relabelled, current.version);
+
+    await assert.rejects(
+      context.service.verifiedApprovedExecutionSnapshot(plan.id),
+      ValidationError,
+    );
+  });
+
+  it("mutating the returned snapshot cannot alter stored plan/item/run/approval facts", async () => {
+    const context = await newPlanning();
+    const plan = await approvedPlan(context);
+    const mapping = plan.materialized[0]!;
+
+    const beforePlan = await context.plans.findById(plan.id);
+    const beforeItem = await context.factory.getWorkItem(mapping.workItemId);
+    const beforeGate = await context.factory.gateStatus("PLAN_APPROVAL", planSubject(plan.id));
+    const beforeRuns = await context.factory.listRuns(mapping.workItemId);
+    const beforeApprovals = await context.factory.listApprovals(planSubject(plan.id));
+
+    const snapshot = await context.service.verifiedApprovedExecutionSnapshot(plan.id);
+
+    assert.throws(() => {
+      (snapshot as { approvedDigest: string }).approvedDigest = "mutated";
+    });
+    assert.throws(() => {
+      (snapshot.materialized as unknown as MaterializedItem[]).push({
+        planItemKey: "WI-X",
+        workItemId: mapping.workItemId,
+        correlationTag: "forged",
+        materializedAt: 0,
+        readied: true,
+      });
+    });
+    assert.throws(() => {
+      (snapshot.items as unknown as { key: string }[])[0]!.key = "mutated";
+    });
+
+    const afterPlan = await context.plans.findById(plan.id);
+    const afterItem = await context.factory.getWorkItem(mapping.workItemId);
+    const afterGate = await context.factory.gateStatus("PLAN_APPROVAL", planSubject(plan.id));
+    const afterRuns = await context.factory.listRuns(mapping.workItemId);
+    const afterApprovals = await context.factory.listApprovals(planSubject(plan.id));
+
+    assert.deepEqual(afterPlan, beforePlan, "no plan row changed");
+    assert.deepEqual(afterItem, beforeItem, "no work item changed");
+    assert.deepEqual(afterGate, beforeGate, "no approval/gate state changed");
+    assert.deepEqual(afterRuns, beforeRuns, "no run facts changed");
+    assert.deepEqual(afterApprovals, beforeApprovals, "no approval facts changed");
+    assert.equal(context.dispatcher.startCount(), 1, "the query dispatched nothing new");
+  });
+
+  it("never accepts a caller-supplied approved boolean or an unverified APPROVED row alone", async () => {
+    const context = await newPlanning();
+    const plan = await planAtReview(context);
+    const revision = plan.revisions.at(-1)!;
+
+    // A plan phase-stamped APPROVED, with a syntactically plausible approval
+    // id/revision/digest, but with NO corresponding row in the approvals store
+    // at all — exactly the "trust the row/status alone" shape this query must
+    // not accept.
+    const forged: Plan = {
+      ...plan,
+      phase: "APPROVED",
+      approvalId: "apr-never-recorded",
+      approvedRevision: revision.revision,
+      approvedDigest: approvalDigestOfPlan(plan, revision),
+      version: plan.version + 1,
+    };
+    await context.plans.compareAndSave(forged, plan.version);
+
+    await assert.rejects(
+      context.service.verifiedApprovedExecutionSnapshot(plan.id),
+      ValidationError,
+    );
+  });
+});
+
+// =====================================================================
+// NC-RUNTIME-01 — fail-closed ticket executability at dispatch
+// =====================================================================
+
+describe("NC-RUNTIME-01: dispatch requires a recorded, matching ticket template", () => {
+  it("dispatches normally when a valid ticket template covers the approved item", async () => {
+    const context = await newPlanning();
+    const plan = await approvedPlan(context, "Build the thing.", {
+      execution: testExecutionConfig(undefined, WI_A_TICKET_TEMPLATES),
+    });
+
+    assert.equal(plan.phase, "EXECUTING");
+    assert.equal(plan.dispatches.length, 1);
+    assert.equal(context.dispatcher.startCount(), 1);
+  });
+
+  it("refuses to dispatch a legacy plan that recorded no ticket templates at all", async () => {
+    const context = await newPlanning();
+    const { ticketTemplates: _dropped, ...legacyExecution } = testExecutionConfig();
+    void _dropped;
+    const atReview = await planAtReview(context, "Build the thing.", {
+      execution: legacyExecution,
+    });
+
+    await assert.rejects(
+      context.service.approve(atReview.id, PLAN_HUMAN, authorizePlanHuman(context.factory)),
+      /no per-work-item ticket templates/,
+    );
+
+    const stored = await context.plans.findById(atReview.id);
+    assert.equal(stored?.dispatchClaim, undefined, "no dispatch claim may persist for a non-executable plan");
+    assert.equal(stored?.dispatches.length, 0, "no claim was recorded for a legacy plan with no ticket templates");
+    assert.equal(context.dispatcher.startCount(), 0, "no worker was started for a legacy plan with no ticket templates");
+  });
+
+  it("refuses to dispatch when the recorded ticket template's criteria do not match the approved item", async () => {
+    const context = await newPlanning();
+    const mismatched = [validTicketTemplate("WI-A", "this does not match the planner's own criterion text")];
+    const atReview = await planAtReview(context, "Build the thing.", {
+      execution: testExecutionConfig(undefined, mismatched),
+    });
+
+    await assert.rejects(
+      context.service.approve(atReview.id, PLAN_HUMAN, authorizePlanHuman(context.factory)),
+      /do not match the approved acceptance criteria/,
+    );
+
+    const stored = await context.plans.findById(atReview.id);
+    assert.equal(stored?.dispatchClaim, undefined, "no dispatch claim may persist for a non-executable plan");
+    assert.equal(stored?.dispatches.length, 0, "no claim was recorded for a template that fails validation");
+    assert.equal(context.dispatcher.startCount(), 0, "no worker was started for a template that fails validation");
+  });
+
+  it("a NON_EXECUTABLE plan never claims a dispatch, no matter how many times it is resumed", async () => {
+    const context = await newPlanning();
+    const { ticketTemplates: _dropped, ...legacyExecution } = testExecutionConfig();
+    void _dropped;
+    const atReview = await planAtReview(context, "Build the thing.", {
+      execution: legacyExecution,
+    });
+    await context.service.approve(atReview.id, PLAN_HUMAN, authorizePlanHuman(context.factory)).catch(() => undefined);
+    const before = context.dispatcher.startCount();
+
+    await context.service.resume(atReview.id).catch(() => undefined);
+    await context.service.resume(atReview.id).catch(() => undefined);
+
+    assert.equal(context.dispatcher.startCount(), before, "a repeated resume must not start a worker either");
+    const stored = await context.plans.findById(atReview.id);
+    assert.equal(stored?.dispatchClaim, undefined, "no dispatch claim may persist for a non-executable plan");
+    assert.equal(stored?.dispatches.length, 0);
+  });
+});
+
+// =====================================================================
 // AC-8 — derived per-work-item approval integrity
 // =====================================================================
 
@@ -683,3 +1023,193 @@ function dependentTwoItemResponse(): string {
     ],
   });
 }
+
+// =====================================================================
+// PHASE7-101: approved deterministic verification policy
+// =====================================================================
+
+describe("PHASE7-101: approved deterministic verification policy", () => {
+  /**
+   * Budgets describing the real process capacity a deterministic verification
+   * command is allowed to consume: wall-clock seconds, captured output bytes
+   * and attempts. These are deliberately independent of any planner
+   * token/`maxResultBytes` figure — a verification run's capacity is a property
+   * of the process that executes it, not of the model that proposed the plan.
+   */
+  const VALID_POLICY = {
+    budgets: { elapsedSeconds: 900, outputBytes: 65536, maxAttempts: 3 },
+    executionPolicy: {
+      rationale: "Deterministic verification runs bounded: 15 minutes, 64 KiB captured output, 3 attempts.",
+    },
+  } as const;
+
+  function executionWithPolicy(policy: unknown) {
+    // `policy` is deliberately `unknown` so a malformed PRESENT candidate can be
+    // handed to the real public `start` boundary without weakening the
+    // production `PlanExecutionConfig` type to accommodate the test.
+    return { ...testExecutionConfig(), verificationExecutionPolicy: policy } as unknown as ReturnType<
+      typeof testExecutionConfig
+    >;
+  }
+
+  it("carries an approved policy through a genuine HUMAN approval into the verified snapshot, deeply frozen", async () => {
+    const context = await newPlanning();
+    const plan = await approvedPlan(context, "Build the thing.", {
+      execution: executionWithPolicy(VALID_POLICY),
+    });
+
+    assert.equal(plan.phase, "EXECUTING");
+    assert.ok(plan.approvalId, "the plan carries a real approval recorded through the trusted-human gate");
+
+    const snapshot = await context.service.verifiedApprovedExecutionSnapshot(plan.id);
+    const policy = snapshot.execution.verificationExecutionPolicy;
+    assert.ok(policy, "the verified snapshot retains the approved policy");
+
+    assert.equal(policy.budgets.elapsedSeconds, 900);
+    assert.equal(policy.budgets.outputBytes, 65536);
+    assert.equal(policy.budgets.maxAttempts, 3);
+    assert.equal(policy.executionPolicy.rationale, VALID_POLICY.executionPolicy.rationale);
+
+    // A snapshot is a cloned, deeply frozen projection — not a handle onto the
+    // stored policy, and not a grant to run anything under these budgets.
+    assert.ok(Object.isFrozen(policy));
+    assert.ok(Object.isFrozen(policy.budgets));
+    assert.ok(Object.isFrozen(policy.executionPolicy));
+    assert.throws(() => {
+      (policy.budgets as { outputBytes: number }).outputBytes = 1;
+    });
+    assert.throws(() => {
+      (policy.executionPolicy as { rationale: string }).rationale = "mutated";
+    });
+
+    const stored = (await context.plans.findById(plan.id))!;
+    assert.equal(stored.execution.verificationExecutionPolicy?.budgets.outputBytes, 65536, "the stored policy is untouched");
+  });
+
+  it("refuses the verified query once the approved policy drifts under the untouched approval", async () => {
+    const context = await newPlanning();
+    const plan = await approvedPlan(context, "Build the thing.", {
+      execution: executionWithPolicy(VALID_POLICY),
+    });
+
+    // The genuine, current HUMAN approval queries successfully first.
+    const baseline = await context.service.verifiedApprovedExecutionSnapshot(plan.id);
+    assert.equal(baseline.approvalId, plan.approvalId);
+    assert.equal(baseline.execution.verificationExecutionPolicy?.budgets.outputBytes, 65536);
+
+    // ONLY the approved policy's own budget drifts. The recorded approval id,
+    // approved revision and approved digest are kept verbatim, so the single
+    // thing distinguishing this row from `baseline` is that the live execution
+    // policy is no longer the one the human approved.
+    const current = (await context.plans.findById(plan.id))!;
+    const approvedPolicy = current.execution.verificationExecutionPolicy!;
+    const drifted: Plan = {
+      ...current,
+      execution: {
+        ...current.execution,
+        verificationExecutionPolicy: {
+          ...approvedPolicy,
+          budgets: { ...approvedPolicy.budgets, outputBytes: 131072 },
+        },
+      },
+      version: current.version + 1,
+    };
+    await context.plans.compareAndSave(drifted, current.version);
+
+    const after = (await context.plans.findById(plan.id))!;
+    assert.equal(after.approvalId, plan.approvalId, "the original HUMAN approval is untouched");
+    assert.equal(after.approvedDigest, plan.approvedDigest, "the originally approved digest is untouched");
+
+    await assert.rejects(
+      context.service.verifiedApprovedExecutionSnapshot(plan.id),
+      ValidationError,
+    );
+  });
+
+  it("refuses a malformed PRESENT policy before any plan row exists and before the planner is invoked", async () => {
+    // One deliberately invalid PRESENT candidate per distinct malformed-shape
+    // class the strict validator separates: absent-looking presence, a wrong
+    // scalar type, a non-integer/non-positive budget, filler rationale, and an
+    // unknown field at each level. The exhaustive per-value matrix already
+    // lives in the digest and serialization suites; this table proves only
+    // that the LIVE `start` boundary refuses each class before side effects.
+    const malformed: readonly { readonly label: string; readonly policy: unknown }[] = [
+      // Explicit `undefined` key presence still satisfies `"key" in object`, so
+      // it is malformed-PRESENT, not absence. Constructed as an `unknown`
+      // boundary value rather than by loosening the production type.
+      { label: "explicit undefined", policy: undefined },
+      { label: "explicit null", policy: null },
+      { label: "non-object policy", policy: "bounded" },
+      { label: "missing budgets object", policy: { executionPolicy: VALID_POLICY.executionPolicy } },
+      {
+        label: "non-numeric elapsedSeconds",
+        policy: { budgets: { ...VALID_POLICY.budgets, elapsedSeconds: "900" }, executionPolicy: VALID_POLICY.executionPolicy },
+      },
+      {
+        label: "non-positive elapsedSeconds",
+        policy: { budgets: { ...VALID_POLICY.budgets, elapsedSeconds: 0 }, executionPolicy: VALID_POLICY.executionPolicy },
+      },
+      {
+        label: "non-integer outputBytes",
+        policy: { budgets: { ...VALID_POLICY.budgets, outputBytes: 65536.5 }, executionPolicy: VALID_POLICY.executionPolicy },
+      },
+      {
+        label: "non-integer maxAttempts",
+        policy: { budgets: { ...VALID_POLICY.budgets, maxAttempts: 2.5 }, executionPolicy: VALID_POLICY.executionPolicy },
+      },
+      {
+        label: "filler rationale",
+        policy: { budgets: VALID_POLICY.budgets, executionPolicy: { rationale: "short" } },
+      },
+      {
+        label: "unknown top-level field",
+        policy: { ...VALID_POLICY, providerOverride: "anything" },
+      },
+      {
+        label: "unknown budgets field",
+        policy: { budgets: { ...VALID_POLICY.budgets, tokens: 10 }, executionPolicy: VALID_POLICY.executionPolicy },
+      },
+      {
+        label: "unknown nested executionPolicy field",
+        policy: {
+          budgets: VALID_POLICY.budgets,
+          executionPolicy: { rationale: VALID_POLICY.executionPolicy.rationale, tokenPolicy: "mixed" },
+        },
+      },
+    ];
+
+    for (const { label, policy } of malformed) {
+      // A planner that counts its own invocations: if validation were reached
+      // too late, this would record a charged attempt. Its scripted output
+      // stays a valid plan response, so the count — not a broken planner — is
+      // what fails the test.
+      let plannerCalls = 0;
+      const scripted = createScriptedPlannerWorker({ outputs: [simplePlanResponse()] });
+      const context = await newPlanning({
+        planner: {
+          id: "counting-planner",
+          async plan(request) {
+            plannerCalls += 1;
+            return scripted.plan(request);
+          },
+        },
+      });
+
+      await assert.rejects(
+        context.service.start({
+          projectId: context.projectId,
+          actor: PLAN_HUMAN,
+          intent: `Build the thing with a ${label} policy.`,
+          planner: TEST_PLANNER_CONFIG,
+          execution: executionWithPolicy(policy),
+        }),
+        ValidationError,
+        `${label} must be refused as malformed-present`,
+      );
+
+      assert.equal((await context.plans.listByProject(context.projectId)).length, 0, `${label}: no plan row was created`);
+      assert.equal(plannerCalls, 0, `${label}: no planner attempt was charged`);
+      assert.equal(context.dispatcher.startCount(), 0, `${label}: nothing was dispatched`);
+    }
+  });
+});

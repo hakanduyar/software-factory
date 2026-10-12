@@ -67,6 +67,30 @@ import {
 import type { FactoryRepositories, FactoryStore } from "../ports/repositories.js";
 import type { Worker, WorkerOutcome } from "../ports/worker.js";
 import type { WorkerRegistry } from "../ports/workerRegistry.js";
+import {
+  DirectAdmissionRefusedError,
+  type DirectHostAdmissionHandle,
+  // PHASE7-102: the Factory is a deterministic-capable holder, so it names the
+  // EXPLICIT execution-union channel/request seams rather than the AI aliases.
+  type DirectHostExecutionAdmissionSurface,
+  type DirectHostExecutionLaunchRequest,
+  type TrustedTicketReference,
+  type DirectLaunchModelExpectation,
+  type DirectLaunchScopeExpectation,
+  type DirectLaunchBudgetExpectation,
+  type DirectLaunchCommandExpectation,
+  type DirectLaunchDeterministicBudgetExpectation,
+  type DirectLaunchExecutionPolicyExpectation,
+} from "../supervision/directWorkerAdmission.js";
+import { DETERMINISTIC_EXECUTION_KIND } from "../supervision/workerContract.js";
+import {
+  resolveApprovedPrestart,
+  PrestartAdmissionRefusedError,
+  type ApprovedExecutionPrestartPort,
+  type PrestartTicketReference,
+} from "../supervision/directWorkerPrestartAdmission.js";
+import type { DirectLaunchBinding } from "../ports/worker.js";
+import type { WorkerPrincipal } from "../domain/workerPrincipal.js";
 import { evaluateGate, requireGate, type GateBinding, type GateStatus } from "../workflow/gateGuard.js";
 import {
   resolveCurrentImplementation,
@@ -89,6 +113,37 @@ export interface FactoryServiceDeps {
    * absent, recording a PLAN approval is refused rather than recorded unbound.
    */
   readonly planBindingResolver?: PlanBindingResolver;
+  /**
+   * D1-85: the ONE trusted host constructor-only hook that builds this
+   * Factory's shared DirectHostAdmissionSurface. Called exactly once, here in
+   * the constructor, with the Factory-bound `readCurrentDirectLaunchRequest`
+   * callback — the SAME callback `createDirectHostAdmissionChannel` invokes
+   * on every later readiness/consume call, so drift after issuance is always
+   * read fresh from live repository state, never an issuance-time snapshot.
+   * The hook's returned surface is captured as the one channel this Factory
+   * and its CLI adapters must share (via `sharedDirectAdmissionChannel`); it
+   * is never reconstructed and never substituted by a per-run channel or a
+   * caller-supplied WorkerRequest callback. Absent by default (no default
+   * authority): a principal flagged `requiresDirectAdmission` with no hook
+   * configured fails closed rather than falling back to any caller-supplied
+   * ticket or structural revalidate callback.
+   */
+  readonly createDirectAdmissionChannel?: (
+    readCurrentRequest: (
+      binding: DirectLaunchBinding,
+      issuedRequest: DirectHostExecutionLaunchRequest,
+    ) => Promise<DirectHostExecutionLaunchRequest>,
+  ) => DirectHostExecutionAdmissionSurface;
+  /**
+   * D1-93: the ONE trusted, constructor-injected prestart authority. Every
+   * nonmock principal's run requires it; only the accepted A80 trusted-mock
+   * identity (src/adapters/workers/mockWorker.ts) is exempt. Captured
+   * privately — never re-derived, never substituted per-call — and consulted
+   * in PHASE 1, after the fresh operable item/role/target/criteria reads but
+   * BEFORE `runs.create`, so a missing/invalid/stale/mismatched prestart
+   * authority refuses before any RUNNING row is ever durable.
+   */
+  readonly approvedPrestartPort?: ApprovedExecutionPrestartPort;
 }
 
 export interface CreateProjectInput {
@@ -115,6 +170,169 @@ export interface RunWorkerInput {
   readonly instructions: string;
   /** Required for VERIFIER/REVIEWER runs: the implementation run under examination. */
   readonly againstRunId?: RunId;
+  /**
+   * D1-85: required whenever the worker's registry-issued principal is
+   * host-flagged `requiresDirectAdmission`. Only an opaque trusted-host
+   * reference plus the caller's EXPECTED model/scope — both validated
+   * against the host grant and current store, never trusted as authority
+   * themselves (see src/supervision/directWorkerAdmission.ts composition).
+   */
+  readonly directTicketReference?: TrustedTicketReference;
+  readonly expectedModel?: DirectLaunchModelExpectation;
+  readonly expectedScope?: DirectLaunchScopeExpectation;
+  /**
+   * D1-93: required alongside expectedModel/expectedScope whenever the
+   * worker's registry-issued principal is nonmock. Compared against the
+   * trusted prestart authority's OWN retained approved facts; never derived
+   * from the resolved approval itself (see
+   * src/supervision/directWorkerPrestartAdmission.ts).
+   */
+  readonly expectedBudgets?: DirectLaunchBudgetExpectation;
+  /**
+   * PHASE7-102: the execution kind this run's host expectations are
+   * expressed in. Absent means the unchanged "ai" shape, so every existing
+   * AI callsite is unaffected. `"deterministic-execution"` switches the
+   * mandatory expectation set to the deterministic one below; an unknown
+   * value refuses.
+   */
+  readonly expectedExecutionKind?: "ai" | typeof DETERMINISTIC_EXECUTION_KIND;
+  /**
+   * PHASE7-102 deterministic host expectations: required together, and ONLY,
+   * when `expectedExecutionKind === "deterministic-execution"`. These are
+   * the caller's genuine, independently captured host configuration — the
+   * actual ordered commands, the workspace root, the real process limits and
+   * the executionPolicy rationale — compared against the trusted prestart
+   * authority's own HUMAN-approved facts, never derived from them. No
+   * model/token/provider quota participates in this branch, and none may be
+   * synthesized to stand in for a missing deterministic expectation.
+   */
+  readonly expectedCommands?: DirectLaunchCommandExpectation;
+  readonly expectedWorkspace?: string;
+  readonly expectedDeterministicBudgets?: DirectLaunchDeterministicBudgetExpectation;
+  readonly expectedExecutionPolicy?: DirectLaunchExecutionPolicyExpectation;
+  /** @deprecated legacy compile-only compatibility; never read as admission authority. */
+  readonly directTicket?: unknown;
+}
+
+/** D1-85 owned per-run expected context, never caller-visible; compared against current store state on every reader invocation. */
+interface OwnedDirectLaunchContextCommon {
+  readonly runId: RunId;
+  readonly workItemId: WorkItemId;
+  readonly principal: WorkerPrincipal;
+  readonly role: FactoryRole;
+  readonly ticketReference: TrustedTicketReference;
+  readonly againstRunId: RunId | undefined;
+  readonly expectedScope: DirectLaunchScopeExpectation;
+}
+
+/**
+ * PHASE7-102: the owned expectations are discriminated by execution kind.
+ * The AI member is unchanged (and is what an absent kind means); the
+ * deterministic member carries the caller's independently captured ordered
+ * commands/workspace/process limits/rationale and deliberately no model.
+ * Both are Factory-private and re-compared against live store state on every
+ * reader invocation.
+ */
+type OwnedDirectLaunchContext =
+  | (OwnedDirectLaunchContextCommon & {
+      readonly executionKind: "ai";
+      readonly expectedModel: DirectLaunchModelExpectation;
+    })
+  | (OwnedDirectLaunchContextCommon & {
+      readonly executionKind: typeof DETERMINISTIC_EXECUTION_KIND;
+      readonly expectedCommands: DirectLaunchCommandExpectation;
+      readonly expectedWorkspace: string;
+      readonly expectedDeterministicBudgets: DirectLaunchDeterministicBudgetExpectation;
+      readonly expectedExecutionPolicy: DirectLaunchExecutionPolicyExpectation;
+    });
+
+const AI_ONLY_RUN_WORKER_EXPECTATION_FIELDS: readonly string[] = [
+  "expectedModel",
+  "expectedBudgets",
+];
+const DETERMINISTIC_ONLY_RUN_WORKER_EXPECTATION_FIELDS: readonly string[] = [
+  "expectedCommands",
+  "expectedWorkspace",
+  "expectedDeterministicBudgets",
+  "expectedExecutionPolicy",
+];
+
+/**
+ * PHASE7-102: resolves the caller's declared expectation kind, refusing an
+ * unknown value and any MIXED shape that declares one kind while also
+ * carrying the other kind's expectation keys. Presence is KEY presence, so an
+ * explicitly `undefined` opposite-kind expectation is still mixed and is
+ * never normalized away. A MISSING same-kind expectation is never exempted
+ * here — the caller checks its own branch's complete fact set.
+ */
+function requireRunWorkerExecutionKind(
+  input: RunWorkerInput,
+): "ai" | typeof DETERMINISTIC_EXECUTION_KIND {
+  const declared = input.expectedExecutionKind;
+  const bag = input as unknown as Record<string, unknown>;
+  if (declared === DETERMINISTIC_EXECUTION_KIND) {
+    if (AI_ONLY_RUN_WORKER_EXPECTATION_FIELDS.some((field) => field in bag)) {
+      throw new PrestartAdmissionRefusedError(
+        "deterministic direct run declares expectedExecutionKind \"deterministic-execution\" but also carries AI-only model/token expectations",
+      );
+    }
+    return DETERMINISTIC_EXECUTION_KIND;
+  }
+  if (declared === undefined || declared === "ai") {
+    if (DETERMINISTIC_ONLY_RUN_WORKER_EXPECTATION_FIELDS.some((field) => field in bag)) {
+      throw new PrestartAdmissionRefusedError(
+        "AI direct run carries deterministic-only command/workspace/process expectations; a mixed expectation shape is refused",
+      );
+    }
+    return "ai";
+  }
+  throw new PrestartAdmissionRefusedError(
+    "direct provider-backed run declares an unrecognized expectedExecutionKind",
+  );
+}
+
+/**
+ * PHASE7-102 defect 24EAA3D4/65B88: deep-COPIES and then deep-freezes the
+ * caller's independently supplied deterministic expectation fields plus
+ * expectedScope, so the SAME frozen private values can be reused across the
+ * pre-row snapshot, the owned context, and the current reader without
+ * re-reading caller-mutable `input` across later awaits. The copies are
+ * independent: the caller's own objects are never frozen and never mutated,
+ * and recursion continues through an ALREADY FROZEN source object so a
+ * mutable descendant of a frozen outer object is still copied and frozen.
+ * Deliberately does not touch `worker`, principal, or any function/handle
+ * identity.
+ */
+function deepFreezeDeterministicExpectationBundle<
+  T extends {
+    readonly expectedCommands?: unknown;
+    readonly expectedScope?: unknown;
+    readonly expectedDeterministicBudgets?: unknown;
+    readonly expectedExecutionPolicy?: unknown;
+    readonly expectedWorkspace?: string;
+  },
+>(bundle: T): T {
+  const deepCopyFreeze = (value: unknown): unknown => {
+    if (value === null || typeof value !== "object") {
+      return value;
+    }
+    if (Array.isArray(value)) {
+      return Object.freeze(value.map((entry) => deepCopyFreeze(entry)));
+    }
+    const copy: Record<string, unknown> = {};
+    for (const key of Object.keys(value as Record<string, unknown>)) {
+      copy[key] = deepCopyFreeze((value as Record<string, unknown>)[key]);
+    }
+    return Object.freeze(copy);
+  };
+  return Object.freeze({
+    ...bundle,
+    expectedCommands: deepCopyFreeze(bundle.expectedCommands),
+    expectedScope: deepCopyFreeze(bundle.expectedScope),
+    expectedDeterministicBudgets: deepCopyFreeze(bundle.expectedDeterministicBudgets),
+    expectedExecutionPolicy: deepCopyFreeze(bundle.expectedExecutionPolicy),
+    expectedWorkspace: bundle.expectedWorkspace,
+  }) as T;
 }
 
 export interface VerifyAcceptanceCriteriaInput {
@@ -171,6 +389,11 @@ export class FactoryService {
   private readonly identityGate: HumanIdentityGate;
   private readonly workerRegistry: WorkerRegistry;
   private readonly planBindingResolver: PlanBindingResolver | undefined;
+  private readonly approvedPrestartPort: ApprovedExecutionPrestartPort | undefined;
+  /** PHASE7-102: the captured channel is EXPLICITLY the execution-union surface. */
+  private readonly directAdmissionChannel: DirectHostExecutionAdmissionSurface | undefined;
+  /** D1-85 owned per-run expected context, keyed by runId; deleted at finalization. Never exposed to callers. */
+  private readonly directLaunchContextByRunId = new Map<RunId, OwnedDirectLaunchContext>();
   readonly workflow: WorkflowService;
 
   constructor(deps: FactoryServiceDeps) {
@@ -180,7 +403,30 @@ export class FactoryService {
     this.identityGate = deps.identityGate;
     this.workerRegistry = deps.workerRegistry;
     this.planBindingResolver = deps.planBindingResolver;
+    // D1-93: captured privately, exactly once, from the constructor only —
+    // never re-derived, never substituted by a per-call authority.
+    this.approvedPrestartPort = deps.approvedPrestartPort;
+    // D1-85: the hook is called exactly once, here, with the Factory-bound
+    // reader — never a caller callback — so the channel's own captured
+    // readiness/consume path always re-reads live repository state fresh,
+    // not an issuance-time snapshot. No hook configured => no channel.
+    this.directAdmissionChannel =
+      deps.createDirectAdmissionChannel === undefined
+        ? undefined
+        : deps.createDirectAdmissionChannel((binding, issuedRequest) =>
+            this.readCurrentDirectLaunchRequestFromIssued(binding, issuedRequest),
+          );
     this.workflow = this.workflowFor(deps.store);
+  }
+
+  /**
+   * D1-85 trusted sharing accessor: returns the IDENTICAL surface this
+   * Factory was constructed with, for a trusted host to inject into
+   * createCliWorker configuration. Undefined when no hook was configured;
+   * never constructs a second channel.
+   */
+  get sharedDirectAdmissionChannel(): DirectHostExecutionAdmissionSurface | undefined {
+    return this.directAdmissionChannel;
   }
 
   /** A WorkflowService reading through one specific repository set (live store or a transaction). */
@@ -363,8 +609,17 @@ export class FactoryService {
   }
 
   /** Registers a Worker and returns its immutable, registry-issued principal. */
-  registerWorker(worker: Worker, roles?: readonly FactoryRole[]) {
-    return this.workerRegistry.register(worker, roles === undefined ? {} : { roles });
+  registerWorker(
+    worker: Worker,
+    roles?: readonly FactoryRole[],
+    options?: { readonly requiresDirectAdmission?: boolean },
+  ) {
+    return this.workerRegistry.register(worker, {
+      ...(roles === undefined ? {} : { roles }),
+      ...(options?.requiresDirectAdmission === undefined
+        ? {}
+        : { requiresDirectAdmission: options.requiresDirectAdmission }),
+    });
   }
 
   /**
@@ -730,7 +985,145 @@ export class FactoryService {
    *
    * Note what this never does: change the work item's status.
    */
+  /**
+   * D1-85 trusted current-reader. Rereads live repository state for THIS
+   * runId/workItemId — never a caller callback — reruns the same operability
+   * and target checks runWorker itself enforces, and reconstructs the exact
+   * principal/item/spec/role/criteria/dependencies this run is attached to.
+   * Used both at issuance and (via the channel's own captured callback) at
+   * every later readiness/consume call, so drift after issuance is caught.
+   */
+  private async readCurrentDirectLaunchRequest(
+    context: OwnedDirectLaunchContext,
+  ): Promise<DirectHostExecutionLaunchRequest> {
+    const { runId, workItemId, principal, role, ticketReference, againstRunId } = context;
+    const item = await this.store.workItems.findById(workItemId);
+    if (item === undefined || isTerminal(item.status)) {
+      throw new DirectAdmissionRefusedError(`WorkItem ${workItemId} is missing or terminal at admission check`);
+    }
+    assertRoleStartable(role, item.status);
+    if (!item.runIds.includes(runId)) {
+      throw new DirectAdmissionRefusedError(`Run ${runId} is not attached to WorkItem ${workItemId}.runIds`);
+    }
+    const run = await this.store.runs.findById(runId);
+    if (
+      run === undefined ||
+      run.workItemId !== workItemId ||
+      run.status !== "RUNNING" ||
+      run.role !== role ||
+      run.workerPrincipalId !== principal.principalId ||
+      run.specRevision !== item.specRevision ||
+      run.targetRunId !== againstRunId
+    ) {
+      throw new DirectAdmissionRefusedError(
+        `Run ${runId} is not the live owned RUNNING attempt matching principal/role/spec/target for ${workItemId}`,
+      );
+    }
+    if (againstRunId !== undefined) {
+      const target = await this.store.runs.findById(againstRunId);
+      if (target === undefined || target.workItemId !== workItemId) {
+        throw new DirectAdmissionRefusedError(`Target run ${againstRunId} for WorkItem ${workItemId} no longer exists`);
+      }
+    }
+    for (const dependencyId of item.dependencies) {
+      const dependency = await this.store.workItems.findById(dependencyId);
+      if (dependency === undefined) {
+        throw new DirectAdmissionRefusedError(`Dependency ${dependencyId} for WorkItem ${workItemId} is missing`);
+      }
+      if (dependency.status === "DONE") {
+        continue;
+      }
+      if (dependency.status === "WAITING_FOR_HUMAN") {
+        const authority = await this.resolveWaitingForHumanAuthority(dependency.id);
+        if (authority.ok) {
+          continue;
+        }
+      }
+      throw new DirectAdmissionRefusedError(
+        `Dependency ${dependencyId} for WorkItem ${workItemId} is not currently ready`,
+      );
+    }
+    const criteria = await this.store.criteria.listByWorkItem(workItemId);
+    // PHASE7-102: the live linkage/criteria/dependency facts above are shared;
+    // the kind-specific expectations come from THIS run's owned context, so a
+    // deterministic run returns commands/workspace/process budgets/rationale
+    // and never touches `expectedModel`, while an AI run is byte-for-byte
+    // unchanged.
+    const common = {
+      ticketReference,
+      registryPrincipalId: principal.principalId,
+      workItemId: item.id,
+      specRevision: item.specRevision,
+      runId,
+      role,
+      acceptanceCriteria: criteria,
+      dependencyWorkItemIds: item.dependencies,
+      scope: context.expectedScope,
+    };
+    if (context.executionKind === DETERMINISTIC_EXECUTION_KIND) {
+      return {
+        ...common,
+        executionKind: DETERMINISTIC_EXECUTION_KIND,
+        commands: context.expectedCommands,
+        workspace: context.expectedWorkspace,
+        budgets: context.expectedDeterministicBudgets,
+        executionPolicy: context.expectedExecutionPolicy,
+      };
+    }
+    return {
+      ...common,
+      executionKind: "ai",
+      model: context.expectedModel,
+    };
+  }
+
+  /**
+   * D1-85 bound callback passed once into the constructor hook. Looks up
+   * THIS run's owned expected context (never the issued snapshot) and
+   * re-derives the current request from live store state, refusing if the
+   * owned context is gone (already finalized) or current linkage drifted
+   * from the original attached run/target/principal/role/spec.
+   */
+  private readonly readCurrentDirectLaunchRequestFromIssued = async (
+    _binding: DirectLaunchBinding,
+    issuedRequest: DirectHostExecutionLaunchRequest,
+  ): Promise<DirectHostExecutionLaunchRequest> => {
+    const context = this.directLaunchContextByRunId.get(issuedRequest.runId);
+    if (context === undefined) {
+      throw new DirectAdmissionRefusedError(
+        `no owned direct-launch context for run ${issuedRequest.runId}; it was never issued or was already finalized`,
+      );
+    }
+    return this.readCurrentDirectLaunchRequest(context);
+  };
+
   async runWorker(input: RunWorkerInput): Promise<{ run: Run; evidence: readonly Evidence[] }> {
+    // PHASE7-102 defect 24EAA3D4/65B88: for a DETERMINISTIC call only,
+    // capture the execution kind and take independent deep copies of the
+    // caller's expectation objects BEFORE any async admission work, so
+    // nested caller mutation during later awaits cannot change the admitted
+    // facts. Every later reference (pre-row snapshot, owned context, current
+    // reader) reuses this SAME captured kind and frozen bundle rather than
+    // re-reading caller-mutable `input`. An ordinary AI call is left exactly
+    // as it was: nothing is copied and no caller object is frozen.
+    const capturedExecutionKind =
+      input.expectedExecutionKind === DETERMINISTIC_EXECUTION_KIND
+        ? requireRunWorkerExecutionKind(input)
+        : undefined;
+    const input_ =
+      capturedExecutionKind === DETERMINISTIC_EXECUTION_KIND
+        ? ({
+            ...input,
+            ...deepFreezeDeterministicExpectationBundle({
+              expectedCommands: input.expectedCommands,
+              expectedScope: input.expectedScope,
+              expectedDeterministicBudgets: input.expectedDeterministicBudgets,
+              expectedExecutionPolicy: input.expectedExecutionPolicy,
+              ...(input.expectedWorkspace === undefined ? {} : { expectedWorkspace: input.expectedWorkspace }),
+            }),
+          } as RunWorkerInput)
+        : input;
+    const deterministicExpectations = input_;
     // Trusted identity: whatever the worker says about itself is ignored.
     const principal = this.workerRegistry.principalFor(input.worker);
     if (!principalSupportsRole(principal, input.role)) {
@@ -738,6 +1131,67 @@ export class FactoryService {
     }
     if ((input.role === "VERIFIER" || input.role === "REVIEWER") && input.againstRunId === undefined) {
       throw new ValidationError(`a ${input.role} run must name the implementation run it examines (againstRunId)`);
+    }
+    // D1-85 mandatory same-channel admission gate: host-issued
+    // (registration-time), never self-declared by the Worker object. No
+    // caller full ticket or structural revalidate callback grants authority
+    // here — only the ONE trusted host-constructed channel this Factory was
+    // constructed with. Missing channel or missing trusted reference fails
+    // closed before any RUNNING row is ever durable.
+    if (principal.requiresDirectAdmission) {
+      if (this.directAdmissionChannel === undefined) {
+        throw new DirectAdmissionRefusedError(
+          "direct provider-backed run requires a trusted host-constructed admission channel; none is configured",
+        );
+      }
+      if (input.directTicketReference === undefined) {
+        throw new DirectAdmissionRefusedError(
+          "direct provider-backed run requires a trusted ticketReference; none was supplied",
+        );
+      }
+      // D1-93: mandatory trusted PRE-ROW prestart admission for every
+      // nonmock principal; only the accepted A80 trusted-mock identity is
+      // exempt (that branch never reaches here, since only a mock worker can
+      // have requiresDirectAdmission === false). Never derive the expected
+      // model/scope/budgets from the resolved approval — the caller's
+      // genuine current request is what gets compared against it.
+      if (this.approvedPrestartPort === undefined) {
+        throw new PrestartAdmissionRefusedError(
+          "direct provider-backed run requires a trusted constructor-injected approved-prestart authority; none is configured",
+        );
+      }
+      // PHASE7-102: the expectation set is strictly discriminated by the
+      // caller's declared execution kind BEFORE any RUNNING row exists. An
+      // unknown kind, or a kind declared while the OTHER kind's expectation
+      // keys are also present (key presence, so an explicit `undefined`
+      // still counts as mixed), refuses closed rather than being narrowed
+      // into whichever branch happens to validate.
+      const expectedKind = capturedExecutionKind ?? requireRunWorkerExecutionKind(input);
+      if (deterministicExpectations.expectedScope === undefined) {
+        throw new PrestartAdmissionRefusedError(
+          "direct provider-backed run requires the caller's actual expectedScope; it may not be omitted",
+        );
+      }
+      if (expectedKind === DETERMINISTIC_EXECUTION_KIND) {
+        // No model/token/provider expectation participates here, and none is
+        // synthesized to stand in for a missing deterministic one: the
+        // caller's independently captured commands/workspace/process
+        // budgets/rationale must each be present in full.
+        if (
+          deterministicExpectations.expectedCommands === undefined ||
+          deterministicExpectations.expectedWorkspace === undefined ||
+          deterministicExpectations.expectedDeterministicBudgets === undefined ||
+          deterministicExpectations.expectedExecutionPolicy === undefined
+        ) {
+          throw new PrestartAdmissionRefusedError(
+            "deterministic direct run requires the caller's actual expectedCommands, expectedWorkspace, expectedDeterministicBudgets and expectedExecutionPolicy; none may be omitted",
+          );
+        }
+      } else if (input.expectedModel === undefined || input.expectedBudgets === undefined) {
+        throw new PrestartAdmissionRefusedError(
+          "direct provider-backed run requires the caller's actual expectedModel, expectedScope and expectedBudgets; none may be omitted",
+        );
+      }
     }
 
     const runId = this.ids.next("run");
@@ -755,6 +1209,48 @@ export class FactoryService {
       }
 
       const criteria = await repos.criteria.listByWorkItem(item.id);
+
+      // D1-93: fresh operable item/role/target/criteria reads are above;
+      // this call happens strictly BEFORE runs.create below, so a
+      // missing/invalid/stale/mismatched prestart authority refuses before
+      // any RUNNING row is ever durable. Uses the registry-issued principal
+      // and the requested role/againstRunId — never anything the worker
+      // self-reports.
+      if (principal.requiresDirectAdmission) {
+        // PHASE7-102: the kind was already strictly discriminated above, and
+        // the branch-specific snapshot carries ONLY that kind's expectation
+        // keys, so the prestart authority's own mixed-shape guard sees a
+        // clean shape. Every expectation is the caller's actual current
+        // request; nothing here is derived from the retained approval.
+        const expectedKind = capturedExecutionKind ?? requireRunWorkerExecutionKind(input);
+        const commonSnapshot = {
+          item: { id: item.id, specRevision: item.specRevision, dependencies: item.dependencies },
+          role: input.role,
+          principal,
+          criteria,
+          ...(input.againstRunId !== undefined ? { targetRunId: input.againstRunId } : {}),
+          requestedScope: deterministicExpectations.expectedScope!,
+        };
+        resolveApprovedPrestart(
+          this.approvedPrestartPort!,
+          input.directTicketReference as string as PrestartTicketReference,
+          expectedKind === DETERMINISTIC_EXECUTION_KIND
+            ? {
+                ...commonSnapshot,
+                executionKind: DETERMINISTIC_EXECUTION_KIND,
+                requestedCommands: deterministicExpectations.expectedCommands!,
+                requestedWorkspace: deterministicExpectations.expectedWorkspace!,
+                requestedDeterministicBudgets: deterministicExpectations.expectedDeterministicBudgets!,
+                requestedExecutionPolicy: deterministicExpectations.expectedExecutionPolicy!,
+              }
+            : {
+                ...commonSnapshot,
+                requestedModel: input.expectedModel!,
+                requestedBudgets: input.expectedBudgets!,
+              },
+        );
+      }
+
       const pending: Run = {
         id: runId,
         workItemId: item.id,
@@ -776,10 +1272,69 @@ export class FactoryService {
       return { item, criteria };
     });
 
-    // PHASE 2 — external execution, no transaction held open.
+    // D1-85: after PHASE 1 commits (the attached RUNNING row now exists),
+    // issue the opaque admission handle through the ONE trusted channel.
+    // readCurrentRequest is bound to THIS runId/workItemId and re-reads live
+    // repository state (never a caller callback on WorkerRequest), so the
+    // same reader the channel invokes at readiness/consume time rechecks
+    // principal/item/spec/role/criteria/dependencies/run linkage fresh, not
+    // the issued snapshot. Issuance failure here throws before Worker.execute
+    // is invoked; PHASE 3 still finalizes the already-durable RUNNING row as
+    // FAILED (owned settlement), never silently orphaning it.
+    let directAdmissionHandle: DirectHostAdmissionHandle | undefined;
     let outcome: WorkerOutcome | undefined;
     let thrown: unknown;
     try {
+      if (principal.requiresDirectAdmission) {
+        const channel = this.directAdmissionChannel;
+        const ticketReference = input.directTicketReference;
+        if (channel === undefined || ticketReference === undefined) {
+          throw new DirectAdmissionRefusedError(
+            "direct provider-backed run requires both a trusted admission channel and ticketReference at issuance",
+          );
+        }
+        // PHASE7-102: capture the COMPLETE branch-specific expectation set
+        // this run was admitted with, immutably and Factory-privately. The
+        // deterministic member carries no model/token/provider expectation at
+        // all; neither member is ever derived from the retained approval.
+        const expectedKind = capturedExecutionKind ?? requireRunWorkerExecutionKind(input);
+        const commonContext = {
+          runId,
+          workItemId: input.workItemId,
+          principal,
+          role: input.role,
+          ticketReference,
+          againstRunId: input.againstRunId,
+          expectedScope: deterministicExpectations.expectedScope as DirectLaunchScopeExpectation,
+        };
+        const context: OwnedDirectLaunchContext = Object.freeze(
+          expectedKind === DETERMINISTIC_EXECUTION_KIND
+            ? {
+                ...commonContext,
+                executionKind: DETERMINISTIC_EXECUTION_KIND,
+                expectedCommands: deterministicExpectations.expectedCommands as DirectLaunchCommandExpectation,
+                expectedWorkspace: deterministicExpectations.expectedWorkspace as string,
+                expectedDeterministicBudgets:
+                  deterministicExpectations.expectedDeterministicBudgets as DirectLaunchDeterministicBudgetExpectation,
+                expectedExecutionPolicy:
+                  deterministicExpectations.expectedExecutionPolicy as DirectLaunchExecutionPolicyExpectation,
+              }
+            : {
+                ...commonContext,
+                executionKind: "ai" as const,
+                expectedModel: input.expectedModel as DirectLaunchModelExpectation,
+              },
+        );
+        this.directLaunchContextByRunId.set(runId, context);
+        const request = await this.readCurrentDirectLaunchRequest(context);
+        directAdmissionHandle = await channel.issue(request);
+        const ready = await channel.checkReadiness(directAdmissionHandle).catch(() => false);
+        if (!ready) {
+          throw new DirectAdmissionRefusedError(`admission channel reports run ${runId} is not ready after issuance`);
+        }
+      }
+
+      // PHASE 2 — external execution, no transaction held open.
       outcome = await input.worker.execute({
         runId,
         workItemId: started.item.id,
@@ -787,10 +1342,26 @@ export class FactoryService {
         title: started.item.title,
         instructions: input.instructions,
         acceptanceCriteria: started.criteria,
+        ...(directAdmissionHandle === undefined ? {} : { directAdmissionHandle }),
       });
     } catch (error) {
       thrown = error;
     }
+
+    // Owned cancellation (A84): a denial here never leaves the live handle
+    // reserved past this run's own finalization. Only ever cancels the
+    // handle this exact runWorker call issued; never another authority's.
+    if (directAdmissionHandle !== undefined && thrown !== undefined) {
+      const channel = this.directAdmissionChannel;
+      if (channel !== undefined) {
+        await channel.cancel(directAdmissionHandle).catch(() => undefined);
+      }
+    }
+    // Owned context is scoped to this run's admission lifecycle only; delete
+    // it at finalization regardless of outcome so a later run with a reused
+    // id can never read a stale context, and the channel callback correctly
+    // refuses once this run is no longer live.
+    this.directLaunchContextByRunId.delete(runId);
 
     const failureSummary =
       thrown === undefined

@@ -26,9 +26,23 @@
 
 import { mkdirSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import {
+  SqliteDirectHostAuthority,
+  type BoundExecutionWorkerAction,
+  type SqliteDirectHostAuthorityDeps,
+} from "../adapters/supervision/sqliteDirectHostAuthority.js";
+import {
+  createDirectHostAdmissionChannel,
+  type DirectHostExecutionAuthorityPort,
+  type TrustedTicketReference,
+} from "../supervision/directWorkerAdmission.js";
+import type { ApprovedExecutionPrestartPort } from "../supervision/directWorkerPrestartAdmission.js";
+import type { PrepareDirectLaunch } from "../orchestration/engineeringLoopService.js";
 
 import { createSqliteLoopRepository, type SqliteLoopRepository } from "../adapters/orchestration/sqliteLoopRepository.js";
 import { createCliPlannerWorker } from "../adapters/planning/cliPlannerWorker.js";
+import { withWorkerRunEnvironment } from "../adapters/supervision/workerRunLifecycle.js";
 import { createEngineeringLoopDispatcher } from "../adapters/planning/engineeringLoopDispatcher.js";
 import { createSqlitePlanRepository, type SqlitePlanRepository } from "../adapters/planning/sqlitePlanRepository.js";
 import { createNodeProcessRunner } from "../adapters/process/nodeProcessRunner.js";
@@ -46,6 +60,7 @@ import type { LoopWorkerConfig, VerificationCommandConfig } from "../orchestrati
 import { PlanningService, createPlanBindingResolver, type SubmittedAnswer } from "../planning/planningService.js";
 import {
   toPlanStatusView,
+  validateVerificationExecutionPolicy,
   type PlanBudget,
   type PlanExecutionConfig,
   type PlannerConfig,
@@ -265,6 +280,14 @@ function loadPlanConfig(configPath: string): PlanCliConfig {
   const loopBudget = row.loopBudget === undefined ? undefined : validateLoopBudget(row.loopBudget);
   const budget = row.budget === undefined ? undefined : validatePlanBudget(row.budget);
   const constraints = row.constraints === undefined ? undefined : validateConstraints(row.constraints);
+  let verificationExecutionPolicy: PlanExecutionConfig["verificationExecutionPolicy"];
+  if ("verificationExecutionPolicy" in row) {
+    const shape = validateVerificationExecutionPolicy(row.verificationExecutionPolicy);
+    if (!shape.ok) {
+      throw new Error(`--config "verificationExecutionPolicy" ${shape.reason}`);
+    }
+    verificationExecutionPolicy = shape.value;
+  }
 
   return {
     planner,
@@ -274,6 +297,7 @@ function loadPlanConfig(configPath: string): PlanCliConfig {
       verificationCommands,
       workspaceRoot: row.workspace,
       ...(loopBudget === undefined ? {} : { loopBudget }),
+      ...(verificationExecutionPolicy === undefined ? {} : { verificationExecutionPolicy }),
     },
     ...(budget === undefined ? {} : { budget }),
     ...(constraints === undefined ? {} : { constraints }),
@@ -328,6 +352,188 @@ export interface PlanCliOptions {
   readonly factoryDbPath?: string;
   readonly loopsDbPath?: string;
   readonly plansDbPath?: string;
+  /**
+   * Constructor-only trusted host dependencies for the OFFLINE approved-resume
+   * seam. They never come from plan JSON, loop input, CLI flags or model output.
+   * When any required one is absent, status/read still work and execution is denied.
+   */
+  readonly approvedResumeReservationDbPath?: string;
+  readonly approvedResumeAuthorityNamespace?: string;
+  readonly approvedResumeCapability?: SqliteDirectHostAuthorityDeps["capability"];
+  readonly approvedResumeDeterministicCapability?: SqliteDirectHostAuthorityDeps["deterministicCapability"];
+}
+
+type HostDeps = SqliteDirectHostAuthorityDeps;
+type DirectAdmissionReader = Parameters<typeof createDirectHostAdmissionChannel>[1];
+
+interface ApprovedResumeHost {
+  readonly facade: ApprovedExecutionPrestartPort & DirectHostExecutionAuthorityPort;
+  readonly prepareDirectLaunch: PrepareDirectLaunch;
+}
+
+const ownedHostDatabases = new WeakMap<object, DatabaseSync>();
+
+function closeOwnedHost(owner: object): void {
+  const db = ownedHostDatabases.get(owner);
+  if (db === undefined) {
+    return;
+  }
+  ownedHostDatabases.delete(owner);
+  try {
+    db.close();
+  } catch {
+    // best-effort: the command result must not be masked by a close failure
+  }
+}
+
+function createApprovedResumeFacade(
+  routes: ReadonlyMap<string, SqliteDirectHostAuthority>,
+): ApprovedExecutionPrestartPort & DirectHostExecutionAuthorityPort {
+  const owner = (key: string): SqliteDirectHostAuthority => {
+    const authority = routes.get(key);
+    if (authority === undefined) {
+      throw new Error("approved-resume: unknown direct-host reservation; refusing");
+    }
+    return authority;
+  };
+  return {
+    resolveApprovedPrestart: (reference) => routes.get(reference)?.resolveApprovedPrestart(reference),
+    resolveAndReserve: async (request) => owner(request.ticketReference).resolveAndReserve(request),
+    revalidate: async (grant, request) => owner(grant.binding.reservationId).revalidate(grant, request),
+    checkReadiness: async (binding) => routes.get(binding.reservationId)?.checkReadiness(binding) ?? false,
+    atomicConsumeLaunch: async (binding) => owner(binding.reservationId).atomicConsumeLaunch(binding),
+    cancel: async (binding) => owner(binding.reservationId).cancel(binding),
+    checkConsumedContinuation: async (receipt) =>
+      routes.get(receipt.binding.reservationId)?.checkConsumedContinuation(receipt) ?? false,
+  };
+}
+
+function openApprovedResumeHost(input: {
+  readonly owner: object;
+  readonly options: PlanCliOptions;
+  readonly storedPlanId: string | undefined;
+  readonly execution: PlanExecutionConfig;
+  readonly implementer: LoopWorkerConfig;
+  readonly reviewer: LoopWorkerConfig;
+  readonly deps: Pick<HostDeps, "planning" | "store" | "loops" | "registry" | "clock">;
+}): ApprovedResumeHost | undefined {
+  const { options, storedPlanId, execution, implementer, reviewer, deps } = input;
+  const dbPath = options.approvedResumeReservationDbPath;
+  const authorityId = options.approvedResumeAuthorityNamespace;
+  const capability = options.approvedResumeCapability;
+  if (
+    storedPlanId === undefined ||
+    dbPath === undefined ||
+    dbPath.trim() === "" ||
+    authorityId === undefined ||
+    authorityId.trim() === "" ||
+    capability === undefined
+  ) {
+    return undefined;
+  }
+  // Independent capture of the stored configuration before any await.
+  const workspaceRoot = resolve(execution.workspaceRoot);
+  const commands = execution.verificationCommands.map((c) => ({
+    executable: c.executable,
+    argv: [...c.argv],
+    cwd: c.cwd ?? ".",
+  }));
+  const policy = execution.verificationExecutionPolicy;
+  const verification =
+    policy === undefined
+      ? undefined
+      : { budgets: { ...policy.budgets }, executionPolicy: { ...policy.executionPolicy } };
+
+  const db = new DatabaseSync(dbPath);
+  ownedHostDatabases.set(input.owner, db);
+  const shared: Omit<HostDeps, "boundWorkers"> = {
+    ...deps,
+    db,
+    authorityId,
+    capability,
+    ...(options.approvedResumeDeterministicCapability === undefined
+      ? {}
+      : { deterministicCapability: options.approvedResumeDeterministicCapability }),
+  };
+  const routes = new Map<string, SqliteDirectHostAuthority>();
+  const bound = new WeakMap<object, { readonly authority: SqliteDirectHostAuthority; readonly fingerprint: string }>();
+
+  const prepareDirectLaunch: PrepareDirectLaunch = async (context) => {
+    const { loop, iteration, kind, actionConfig, worker } = context;
+    const snapshot = await deps.planning.verifiedApprovedExecutionSnapshot(storedPlanId);
+    const item = snapshot.materialized.find((m) => m.workItemId === loop.workItemId);
+    const template =
+      item === undefined
+        ? undefined
+        : snapshot.execution.ticketTemplates?.find((t) => t.planItemKey === item.planItemKey);
+    if (template === undefined) {
+      throw new Error("approved-resume: no approved execution template for the loop work item; refusing");
+    }
+
+    const bindAndPrepare = async (action: BoundExecutionWorkerAction): Promise<TrustedTicketReference> => {
+      const fingerprint = JSON.stringify(action, (key, value: unknown) => (key === "worker" ? undefined : value));
+      const prior = bound.get(worker);
+      let authority: SqliteDirectHostAuthority;
+      if (prior === undefined) {
+        authority = new SqliteDirectHostAuthority({ ...shared, boundWorkers: [action] });
+        bound.set(worker, { authority, fingerprint });
+      } else if (prior.fingerprint !== fingerprint) {
+        throw new Error("approved-resume: worker is already bound to a different action; refusing rebinding");
+      } else {
+        authority = prior.authority;
+      }
+      const facts = await authority.prepare({
+        planId: storedPlanId,
+        loopId: loop.id,
+        iteration,
+        slot: kind,
+        worker,
+      });
+      const existing = routes.get(facts.reservationId);
+      if (existing !== undefined && existing !== authority) {
+        throw new Error("approved-resume: reservation already routed to a different supplier; refusing");
+      }
+      routes.set(facts.reservationId, authority);
+      return facts.reservationId as TrustedTicketReference;
+    };
+
+    if (kind === "VERIFY") {
+      if (verification === undefined) {
+        throw new Error("approved-resume: no approved verification execution policy; refusing");
+      }
+      const directTicketReference = await bindAndPrepare({
+        executionKind: "deterministic-execution",
+        worker,
+        slot: "VERIFY",
+        commands,
+        workspaceRoot,
+        budgets: verification.budgets,
+        executionPolicy: verification.executionPolicy,
+      });
+      return {
+        directTicketReference,
+        expectedExecutionKind: "deterministic-execution" as const,
+        expectedScope: template.scope,
+        expectedCommands: commands,
+        expectedWorkspace: workspaceRoot,
+        expectedDeterministicBudgets: verification.budgets,
+        expectedExecutionPolicy: verification.executionPolicy,
+      };
+    }
+    const config = kind === "IMPLEMENT" ? implementer : reviewer;
+    if (actionConfig === undefined || JSON.stringify(actionConfig) !== JSON.stringify(config)) {
+      throw new Error("approved-resume: action config does not match the approved role configuration; refusing");
+    }
+    const directTicketReference = await bindAndPrepare({ worker, slot: kind, config, workspaceRoot });
+    return {
+      directTicketReference,
+      expectedModel: template.model,
+      expectedScope: template.scope,
+      expectedBudgets: template.budgets,
+    };
+  };
+
+  return { facade: createApprovedResumeFacade(routes), prepareDirectLaunch };
 }
 
 interface OpenStores {
@@ -368,6 +574,7 @@ function openLoopRepository(loopsDbPath: string, store: SqliteFactoryStore): Sql
   try {
     return createSqliteLoopRepository(loopsDbPath);
   } catch (error) {
+    closeOwnedHost(store);
     store.close();
     throw error;
   }
@@ -384,6 +591,7 @@ function openStores(
   plans: SqlitePlanRepository,
   planner: PlannerConfig,
   execution: PlanExecutionConfig,
+  storedPlanId?: string,
 ): OpenStores {
   // Resolve every piece of trusted configuration BEFORE any database handle
   // exists, so a bad workspace path or an unknown tool fails loudly at setup
@@ -408,6 +616,7 @@ function openStores(
   try {
     return buildServices();
   } catch (error) {
+    closeOwnedHost(store);
     store.close();
     loops.close();
     throw error;
@@ -418,14 +627,45 @@ function openStores(
   // the factory be constructed before the service exists (no cycle), and it is
   // why a PLAN approval binding can only be derived from durably stored state.
   const planBindingResolver = createPlanBindingResolver(plans);
+  const registry = createLocalWorkerRegistry(systemClock);
+  // PlanningService is constructed last; the supplier only needs it at prepare time.
+  let planningRef: PlanningService | undefined;
+  const planningPort: Pick<PlanningService, "verifiedApprovedExecutionSnapshot"> = {
+    verifiedApprovedExecutionSnapshot: (...args) => {
+      if (planningRef === undefined) {
+        throw new Error("approved-resume: planning service is not assigned yet; refusing");
+      }
+      return planningRef.verifiedApprovedExecutionSnapshot(...args);
+    },
+  };
+  const host = openApprovedResumeHost({
+    owner: store,
+    options,
+    storedPlanId,
+    execution,
+    implementer,
+    reviewer,
+    deps: { planning: planningPort, store, loops, registry, clock: systemClock },
+  });
   const factory = new FactoryService({
     store,
     clock: systemClock,
     ids: createRandomIdGenerator(),
     identityGate: createLocalHumanIdentityGate({ credential: CLI_CREDENTIAL, clock: systemClock }),
-    workerRegistry: createLocalWorkerRegistry(systemClock),
+    workerRegistry: registry,
     planBindingResolver,
+    ...(host === undefined
+      ? {}
+      : {
+          approvedPrestartPort: host.facade,
+          createDirectAdmissionChannel: (reader: DirectAdmissionReader) =>
+            createDirectHostAdmissionChannel(host.facade, reader),
+        }),
   });
+  const sharedDirectAdmissionChannel = factory.sharedDirectAdmissionChannel;
+  if (host !== undefined && sharedDirectAdmissionChannel === undefined) {
+    throw new Error("approved-resume: factory did not create the shared direct admission channel; refusing");
+  }
   const loopService = new EngineeringLoopService({
     factory,
     loops,
@@ -433,6 +673,12 @@ function openStores(
     ids: createRandomIdGenerator(),
     processRunner: createNodeProcessRunner(),
     ...(options.log === undefined ? {} : { log: options.log }),
+    ...(host === undefined || sharedDirectAdmissionChannel === undefined
+      ? {}
+      : {
+          directAdmissionChannel: sharedDirectAdmissionChannel,
+          prepareDirectLaunch: host.prepareDirectLaunch,
+        }),
   });
   const dispatcher = createEngineeringLoopDispatcher({
     service: loopService,
@@ -457,11 +703,20 @@ function openStores(
     plans,
     clock: systemClock,
     ids: createRandomIdGenerator(),
-    planner: plannerWorker,
+    // No genuine pre-planning (PLANNER) direct-host authority exists: refuse before any model process.
+    planner: {
+      ...plannerWorker,
+      plan: async () => {
+        throw new Error(
+          "PLANNER consultation is unsupported: no genuine pre-planning direct-host authority is available; refusing before any model process",
+        );
+      },
+    },
     dispatcher,
     ...(options.log === undefined ? {} : { log: options.log }),
     projectRules: PROJECT_RULES,
   });
+  planningRef = service;
   return { store, loops, plans, factory, service };
   }
 }
@@ -513,7 +768,7 @@ async function openForStoredPlan(planId: string, options: PlanCliOptions): Promi
     if (plan === undefined) {
       throw new NotFoundError("Plan", planId);
     }
-    return openStores(options, plans, plan.planner, plan.execution);
+    return openStores(options, plans, plan.planner, plan.execution, plan.id);
   } catch (error) {
     // Nothing else is open yet on this path, so the plan store is ours to release.
     plans.close();
@@ -550,16 +805,19 @@ function printStatus(view: PlanStatusView, log: (line: string) => void): void {
 // Commands
 // =====================================================================
 
-export async function runPlanStart(
+async function runPlanStartOrRequest(
   projectId: string,
   intentPath: string,
   configPath: string | undefined,
-  options: PlanCliOptions = {},
+  options: PlanCliOptions,
+  requestOnly: boolean,
 ): Promise<PlanStatusView> {
   const log = options.log ?? ((): void => {});
   if (configPath === undefined) {
     throw new Error(
-      "sf plan start requires --config <file>: the workspace and worker configuration a plan will be executed with is captured at start, not guessed later",
+      requestOnly
+        ? "sf plan request requires --config <file>: the workspace and worker configuration a plan will be executed with is captured at request, not guessed later"
+        : "sf plan start requires --config <file>: the workspace and worker configuration a plan will be executed with is captured at start, not guessed later",
     );
   }
   const intent = loadIntent(intentPath);
@@ -578,15 +836,35 @@ export async function runPlanStart(
       execution: config.execution,
       ...(config.constraints === undefined ? {} : { constraints: config.constraints }),
       ...(config.budget === undefined ? {} : { budget: config.budget }),
+      ...(requestOnly ? { requestOnly: true } : {}),
     });
     const view = toPlanStatusView(plan);
     printStatus(view, log);
     return view;
   } finally {
+    closeOwnedHost(store);
     store.close();
     loops.close();
     plans.close();
   }
+}
+
+export async function runPlanStart(
+  projectId: string,
+  intentPath: string,
+  configPath: string | undefined,
+  options: PlanCliOptions = {},
+): Promise<PlanStatusView> {
+  return runPlanStartOrRequest(projectId, intentPath, configPath, options, false);
+}
+
+export async function runPlanRequest(
+  projectId: string,
+  intentPath: string,
+  configPath: string | undefined,
+  options: PlanCliOptions = {},
+): Promise<PlanStatusView> {
+  return runPlanStartOrRequest(projectId, intentPath, configPath, options, true);
 }
 
 export async function runPlanStatus(planId: string, options: PlanCliOptions = {}): Promise<PlanStatusView> {
@@ -601,6 +879,7 @@ export async function runPlanStatus(planId: string, options: PlanCliOptions = {}
     printStatus(view, log);
     return view;
   } finally {
+    closeOwnedHost(store);
     store.close();
     loops.close();
     plans.close();
@@ -624,6 +903,7 @@ export async function runPlanAnswer(planId: string, answersPath: string, options
     printStatus(view, log);
     return view;
   } finally {
+    closeOwnedHost(store);
     store.close();
     loops.close();
     plans.close();
@@ -645,6 +925,7 @@ export async function runPlanApprove(planId: string, options: PlanCliOptions = {
     printStatus(view, log);
     return view;
   } finally {
+    closeOwnedHost(store);
     store.close();
     loops.close();
     plans.close();
@@ -664,6 +945,7 @@ export async function runPlanReject(planId: string, note: string | undefined, op
     printStatus(view, log);
     return view;
   } finally {
+    closeOwnedHost(store);
     store.close();
     loops.close();
     plans.close();
@@ -708,10 +990,11 @@ export async function runPlanResume(
     // The pin travels INTO the service, which re-checks it against every read
     // its drive loop makes. The check above is a fast, clear refusal; this is
     // the one that actually protects the launch (round-2 finding 1).
-    const view = toPlanStatusView(await service.resume(planId, options.expectApprovedDigest));
+    const view = toPlanStatusView(await withWorkerRunEnvironment(() => service.resume(planId, options.expectApprovedDigest)));
     printStatus(view, log);
     return view;
   } finally {
+    closeOwnedHost(store);
     store.close();
     loops.close();
     plans.close();
@@ -733,6 +1016,7 @@ export async function runPlanCancel(planId: string, options: PlanCliOptions = {}
     printStatus(view, log);
     return view;
   } finally {
+    closeOwnedHost(store);
     store.close();
     loops.close();
     plans.close();

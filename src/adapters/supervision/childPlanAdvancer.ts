@@ -75,8 +75,13 @@ import {
 } from "../workers/environmentPolicy.js";
 import { boundedDiagnostic } from "../../supervision/resourceClassifier.js";
 import { PLAN_PHASES, type Plan, type PlanPhase } from "../../planning/planTypes.js";
-import type { PlanAdvancer, PlanStateReader } from "../../supervision/planBackedExecutor.js";
-import type { ProcessRunner } from "../../ports/processRunner.js";
+import type { PlanAdvancer, PlanStateReader, WorkerRunLaunchContext } from "../../supervision/planBackedExecutor.js";
+import type { ProcessRunner, ProcessResult } from "../../ports/processRunner.js";
+import type { Clock } from "../../ports/clock.js";
+import type { WorkerRunLifecycle } from "../../supervision/supervisorPorts.js";
+import { canonicalWorkerRunId } from "../../supervision/workerRunEnvelope.js";
+import { workerRunArtifactPath, writeWorkerRunArtifact } from "./workerRunArtifact.js";
+import { completionFromWorkerRunEvidence } from "./workerRunLifecycle.js";
 
 /**
  * How long a single `sf plan resume` may run before it is terminated.
@@ -93,6 +98,14 @@ const BUDGET_MARGIN_MS = 60_000;
 
 /** Enough of the child's output to diagnose a failure; never treated as data. */
 const MAX_CHILD_OUTPUT_BYTES = 64 * 1024;
+
+/**
+ * How often the wrapper heartbeat ticks while `sf plan resume` is running
+ * (DEFECT-DURABLE-WORKER-RUN-ENVELOPE AC-4). Independent of model output —
+ * this is wall-clock only, driven from THIS process, never from anything the
+ * child prints.
+ */
+export const DEFAULT_WORKER_RUN_HEARTBEAT_INTERVAL_MS = 30_000;
 
 /** The narrow read this adapter needs, so tests need no database. */
 export interface PlanReader {
@@ -117,6 +130,27 @@ export interface ChildPlanAdvancerDeps {
   readonly environmentSource?: NodeJS.ProcessEnv;
   readonly timeoutMs?: number;
   readonly log?: (line: string) => void;
+  /**
+   * The durable worker-run envelope lifecycle (DEFECT-DURABLE-WORKER-RUN-ENVELOPE).
+   *
+   * OPTIONAL, and its absence is not a silent downgrade INSIDE this module —
+   * it is the caller declaring "this launch is not tracked as a worker run".
+   * Every production wiring (`createSupervisorExecutor`) supplies it;
+   * `createChildPlanStateReader` and most of this file's own pre-existing
+   * tests never construct one, because they exercise the argv/env/readback
+   * behaviour this file already had and do not need a second durable store to
+   * do it. When present, `clock` and `artifactDir` are REQUIRED alongside it.
+   */
+  readonly workerRuns?: WorkerRunLifecycle;
+  readonly supervisorDbPath?: string;
+  readonly clock?: Clock;
+  /** Where this launch's bounded, redacted terminal artifact is written. Required together with `workerRuns`. */
+  readonly artifactDir?: string;
+  readonly heartbeatIntervalMs?: number;
+  /** Overridable so a test can point liveness lookups at a fixture `/proc`. */
+  readonly procRoot?: string;
+  readonly machine?: string;
+  readonly boot?: string | undefined;
 }
 
 function defaultCliEntry(): string {
@@ -171,37 +205,113 @@ export function createChildPlanAdvancer(deps: ChildPlanAdvancerDeps): PlanAdvanc
   const nodeExecutable = deps.nodeExecutable ?? process.execPath;
 
   return {
-    async resume(planId: string, expectApprovedDigest?: string): Promise<Plan> {
+    async resume(
+      planId: string,
+      expectApprovedDigest?: string,
+      runContext?: WorkerRunLaunchContext,
+    ): Promise<Plan> {
       const before = await deps.plans.findById(planId);
       const timeoutMs = timeoutFor(before, deps.timeoutMs);
 
-      log(`launching a child process: sf plan resume ${planId} (timeout ${timeoutMs}ms)`);
-      const result = await deps.processRunner.run({
-        executable: nodeExecutable,
-        // No shell, no concatenation, and the plan id is an ARGUMENT rather than
-        // part of a command string — `ProcessRequest` has no `shell` option for
-        // exactly this reason.
-        // The digest travels WITH the request, so the child cannot act on a plan
-        // whose approval changed after the supervisor cleared it (finding 3).
-        argv: [
-          cliEntry,
-          "plan",
-          "resume",
-          planId,
-          ...(expectApprovedDigest === undefined ? [] : ["--expect-approved-digest", expectApprovedDigest]),
-        ],
-        cwd: deps.cwd,
-        env: buildWorkerEnvironment(
-          {
-            allowedVars: DEFAULT_WORKER_ENV_ALLOWLIST,
-            extraVars: factoryPaths(deps.plansDbPath, source),
-          },
-          source,
-        ),
-        timeoutMs,
-        maxOutputBytes: MAX_CHILD_OUTPUT_BYTES,
-      });
+      /**
+       * THE WORKER-RUN ENVELOPE LIFECYCLE (DEFECT-DURABLE-WORKER-RUN-ENVELOPE).
+       *
+       * Wired only when the caller supplied BOTH a full `workerRuns`/`clock`/
+       * `artifactDir` triple (see the doc comment on `ChildPlanAdvancerDeps`)
+       * AND a `runContext` naming this specific launch — most existing callers
+       * of this factory supply neither, and `resume()` behaves exactly as it
+       * did before this defect for them. `runId` is derived, never invented,
+       * from the SAME `actionId` the supervisor already committed a claim
+       * under.
+       */
+      const tracking =
+        deps.workerRuns !== undefined && deps.clock !== undefined && deps.artifactDir !== undefined && runContext !== undefined
+          ? {
+              workerRuns: deps.workerRuns,
+              clock: deps.clock,
+              artifactDir: deps.artifactDir,
+              runContext,
+              runId: canonicalWorkerRunId(runContext.actionId),
+            }
+          : undefined;
 
+      if (tracking !== undefined) {
+        if (deps.supervisorDbPath === undefined) throw new Error("tracked plan resume requires supervisor database binding");
+        /**
+         * AC-1: DURABLE PREPARED, WRITTEN BEFORE ANYTHING IS SPAWNED.
+         *
+         * `prepare` throws on any refusal — a domain refusal or CAS exhaustion
+         * alike — and this call sits BEFORE `deps.processRunner.run(...)`
+         * below, so a throw here means the process below is never reached.
+         * Zero durable write, zero launch.
+         */
+        await tracking.workerRuns.prepare({
+          actionId: tracking.runContext.actionId,
+          roadmapKey: tracking.runContext.roadmapKey,
+          attempt: tracking.runContext.attempt,
+          provider: tracking.runContext.provider,
+          model: tracking.runContext.model,
+          ...(tracking.runContext.effort === undefined ? {} : { effort: tracking.runContext.effort }),
+        });
+        log(`worker run ${tracking.runId}: PREPARED`);
+      }
+
+      log(`launching a child process: sf plan resume ${planId} (timeout ${timeoutMs}ms)`);
+
+      let result: ProcessResult;
+      try {
+        result = await deps.processRunner.run({
+          executable: nodeExecutable,
+          argv: [cliEntry, "plan", "resume", planId,
+            ...(expectApprovedDigest === undefined ? [] : ["--expect-approved-digest", expectApprovedDigest])],
+          cwd: deps.cwd,
+          env: buildWorkerEnvironment({
+            allowedVars: DEFAULT_WORKER_ENV_ALLOWLIST,
+            extraVars: { ...factoryPaths(deps.plansDbPath, source),
+              ...(tracking === undefined ? {} : { FACTORY_WORKER_RUN_BINDING: JSON.stringify({
+                runId: tracking.runId, actionId: tracking.runContext.actionId,
+                database: deps.supervisorDbPath, artifactDir: tracking.artifactDir,
+              }) }) },
+          }, source),
+          timeoutMs, maxOutputBytes: MAX_CHILD_OUTPUT_BYTES,
+        });
+      } catch {
+        result = { terminationReason: "SPAWN_ERROR", exitCode: null, signal: null,
+          stdout: "", stderr: "plan resume wrapper runner failed", stdoutTruncated: false, stderrTruncated: false,
+          startedAt: tracking?.clock.now() ?? Date.now(), finishedAt: tracking?.clock.now() ?? Date.now(), durationMs: 0 };
+      }
+      if (tracking !== undefined) {
+        const run = await tracking.workerRuns.read(tracking.runId);
+        if (run.state === "AWAITING_CONTROLLER") throw new Error("MAX_TURNS: awaiting controller");
+        if (run.state !== "PREPARED" && run.state !== "RUNNING")
+          throw new Error(`worker action already settled as ${run.state}`);
+        const recovered = completionFromWorkerRunEvidence(run, tracking.artifactDir);
+        if (recovered !== undefined) {
+          await tracking.workerRuns.complete({runId:tracking.runId,input:recovered});
+          if (recovered.state === "AWAITING_CONTROLLER") throw new Error("MAX_TURNS: awaiting controller");
+          if (recovered.state !== "COMPLETED") throw new Error("worker action recovered as failed");
+        } else if (run.invocations?.some(child => child.finishedAt === undefined)) {
+          // Preserve the wrapper diagnostic separately: the provider owns the action's outcome.
+          writeWorkerRunArtifact(workerRunArtifactPath(tracking.artifactDir, tracking.runId) + ".wrapper.json", {
+            runId:tracking.runId,actionId:tracking.runContext.actionId,
+            exitCode:result.exitCode,signal:result.signal,terminationReason:result.terminationReason,
+            detail:"wrapper exited with an unsettled provider; controller reconciliation required",at:result.finishedAt,
+          });
+          throw new Error("provider invocation remains unsettled; refusing wrapper completion");
+        } else {
+        const cleanExit = result.terminationReason === "EXITED" && result.exitCode === 0;
+        const detail = boundedDiagnostic(`sf plan resume ${planId}: ${result.terminationReason}, exit ${result.exitCode}`);
+        const artifact = writeWorkerRunArtifact(workerRunArtifactPath(tracking.artifactDir, tracking.runId), {
+          runId: tracking.runId, actionId: tracking.runContext.actionId,
+          exitCode: result.exitCode, signal: result.signal, terminationReason: result.terminationReason,
+          detail, at: result.finishedAt,
+        });
+        await tracking.workerRuns.complete({ runId: tracking.runId, input: {
+          state: cleanExit ? "COMPLETED" : "FAILED", exitCode: result.exitCode, signal: result.signal,
+          artifact, detail, at: result.finishedAt,
+        } });
+        }
+      }
       if (result.terminationReason !== "EXITED" || result.exitCode !== 0) {
         /**
          * The child's output is UNTRUSTED and only ever a diagnostic: bounded,

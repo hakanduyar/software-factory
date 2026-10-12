@@ -58,4 +58,14 @@ describe("buildWorkerPrompt", () => {
     const prompt = buildWorkerPrompt("VERIFIER", context({ acceptanceCriteria: [] }));
     assert.match(prompt, /No acceptance criteria were supplied/);
   });
+
+  for (const role of ["PLANNER", "IMPLEMENTER", "VERIFIER", "REVIEWER"] as const) {
+    it(`includes behavior-based verification policy and preserves required checks for ${role}`, () => {
+      const prompt = buildWorkerPrompt(role, context());
+      assert.match(prompt, /Behavior-based verification policy/);
+      assert.match(prompt, /smallest sufficient group of checks/);
+      assert.match(prompt, /Never delete or weaken a required final\/security\/approval gate/);
+      assert.doesNotMatch(prompt, /Add or update tests with any code change\./);
+    });
+  }
 });

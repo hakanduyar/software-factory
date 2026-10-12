@@ -48,7 +48,9 @@ import { checkPlanAuthorization, declaredPlanResources } from "./planAuthorizati
 import { checkPlanBinding } from "./planBinding.js";
 import type { Clock } from "../ports/clock.js";
 import type { Plan, PlanPhase } from "../planning/planTypes.js";
+import { planTicketExecutability } from "../planning/planValidation.js";
 import type {
+  NoLaunchEvidence,
   RequiredResource,
   WorkExecutionInput,
   WorkExecutor,
@@ -76,6 +78,40 @@ export interface RoadmapPlanLookup {
  * answer on a human's behalf — the same reason `LoopDispatcher` is four methods
  * instead of the whole loop service.
  */
+/**
+ * Everything a durable worker-run envelope needs to be opened for this launch
+ * (DEFECT-DURABLE-WORKER-RUN-ENVELOPE), carried ALONGSIDE the existing
+ * `resume(planId, expectApprovedDigest?)` call as a third, OPTIONAL argument
+ * rather than folded into a replacement request type.
+ *
+ * DELIBERATELY ADDITIVE. `PlanAdvancer` is implemented by real `PlanningService`
+ * instances and by more than a dozen scripted fakes across this repository's
+ * test suite, every one of them written against a TWO-argument
+ * `resume(planId, expectApprovedDigest?)`. Widening the signature to a single
+ * request object would be a breaking change to every one of them for a
+ * capability only `createChildPlanAdvancer` needs — exactly the kind of
+ * broadening this defect's own scope note asks to stop and report rather than
+ * do. A third OPTIONAL parameter is structurally backward compatible: every
+ * existing implementation (fewer parameters than the interface declares)
+ * still satisfies it unchanged, and only `createChildPlanAdvancer` reads it.
+ *
+ * `actionId`/`roadmapKey`/`attempt` are the SAME canonical coordinates the
+ * supervisor already committed a claim under — this executor never invents a
+ * second identity for the same launch. `provider`/`model`/`effort` are what
+ * this action was CONFIGURED to run, taken from `input.config` when the
+ * supervisor's model-enforcement layer produced one, so the envelope records
+ * a fact this layer already has rather than asking the plan what it thinks it
+ * is running.
+ */
+export interface WorkerRunLaunchContext {
+  readonly actionId: string;
+  readonly roadmapKey: string;
+  readonly attempt: number;
+  readonly provider: string;
+  readonly model: string;
+  readonly effort?: string;
+}
+
 export interface PlanAdvancer {
   /**
    * `expectApprovedDigest` closes the last of the time-of-check window
@@ -89,8 +125,11 @@ export interface PlanAdvancer {
    * So the check travels WITH the request. The digest is the one a human
    * approval is bound to, and the child refuses to act on a plan whose approval
    * digest is no longer the one the supervisor authorised.
+   *
+   * `runContext`: see `WorkerRunLaunchContext` above. Absent for any caller
+   * that does not need a durable worker-run envelope for this launch.
    */
-  resume(planId: string, expectApprovedDigest?: string): Promise<Plan>;
+  resume(planId: string, expectApprovedDigest?: string, runContext?: WorkerRunLaunchContext): Promise<Plan>;
 }
 
 /**
@@ -174,7 +213,48 @@ const TERMINAL_UNSUCCESSFUL: readonly PlanPhase[] = [
 /** Phases in which the plan carries a human approval and may be driven. */
 const DRIVABLE: readonly PlanPhase[] = ["APPROVED", "MATERIALIZING", "EXECUTING"];
 
-function authorPlan(item: RoadmapItem, detail: string): WorkOutcome {
+/**
+ * Recovers the attempt number a canonical action id was minted with
+ * (`canonicalActionId` in supervisorTypes.ts: `${roadmapKey}:${kind}:a${attempt}`).
+ *
+ * DERIVED where possible, never invented: `WorkExecutionInput` carries no
+ * separate attempt field, and the number is already encoded — by the ONE
+ * place action ids are ever minted in production — in the id this executor
+ * already has. `1` is the fallback for an action id that does not carry the
+ * suffix, which is informational-only (this feeds the worker-run envelope's
+ * audit `attempt` field, never any authorization or lifecycle decision) —
+ * never a throw, because a launch this gate already authorised must not be
+ * blocked by a display field it cannot fully recover.
+ */
+function attemptFromActionId(actionId: string): number {
+  const match = /:a(\d+)$/.exec(actionId);
+  return match === null ? 1 : Number(match[1]);
+}
+
+/** What this launch was CONFIGURED to run, for the worker-run envelope (DEFECT-DURABLE-WORKER-RUN-ENVELOPE). */
+function runResourceOf(input: WorkExecutionInput): { readonly provider: string; readonly model: string; readonly effort?: string } {
+  if (input.config !== undefined) {
+    return {
+      provider: input.config.effectiveProvider,
+      model: input.config.effectiveModel,
+      ...(input.config.effectiveEffort === undefined ? {} : { effort: input.config.effectiveEffort }),
+    };
+  }
+  const fallback = input.authorizedResources?.[0];
+  if (fallback !== undefined) {
+    return {
+      provider: fallback.provider,
+      model: fallback.model,
+      ...(fallback.effort === undefined ? {} : { effort: fallback.effort }),
+    };
+  }
+  // Unreachable in production (a plan-driven launch always carries a
+  // configuration or an authorized resource), kept honest rather than thrown:
+  // the envelope still needs SOME provider/model to record.
+  return { provider: "unknown", model: "unknown" };
+}
+
+function authorPlan(item: RoadmapItem, detail: string): Extract<WorkOutcome, { kind: "HUMAN_REQUIRED" }> {
   return {
     kind: "HUMAN_REQUIRED",
     action: {
@@ -299,9 +379,116 @@ async function verifiedPhaseOf(plan: Plan, deps: PlanBackedExecutorDeps): Promis
   return verified;
 }
 
+/**
+ * DEFECT-NO-LAUNCH-LINEAGE, round 4, and DEFECT-NO-LAUNCH-LINEAGE-C4/C5,
+ * round 5.
+ *
+ * Round 3 closed import-order races by making the mint/registry
+ * module-private, but `createPlanBackedExecutor` itself is public and takes
+ * caller-controlled `deps`. Round 4 bound evidence to the exact executor
+ * OBJECT that minted it, which closed the nested-helper attack — an arbitrary
+ * `WorkExecutor.execute` building its OWN helper through this same factory
+ * and forwarding the helper's genuine evidence, which stayed bound to the
+ * helper, never to the outer, untrusted object.
+ *
+ * Round 5 (C5) closed what object identity alone cannot: the factory returns
+ * a MUTABLE object, so a caller holding the exact executor `SupervisorService`
+ * will dispatch to can do `const genuine = executor.execute.bind(executor)`,
+ * REPLACE `executor.execute` in place with a wrapper that does uncertain work
+ * and then calls `genuine`, and forward the trusted call's `noLaunchEvidence`
+ * field into a NEW, self-authored `WorkOutcome`. Binding evidence to the exact
+ * `WorkOutcome` object minted alongside it (below) closes REPACKAGING: a
+ * wrapper that builds a new envelope around the forwarded evidence produces an
+ * object this module never minted, so the reference check fails.
+ *
+ * Round 5 left one gap independent review measured (C6): a wrapper that does
+ * `return genuine(input)` UNMODIFIED still passed, on the reasoning that the
+ * settled outcome then genuinely IS this module's own result. That reasoning
+ * is not enough — `uncertainCalls` in the wrapper itself proves the EXECUTION
+ * SupervisorService actually invoked was the wrapper, doing uncertain work,
+ * not the trusted boundary; that the wrapper happened to forward the genuine
+ * object unmodified is a property of this one wrapper's code, not something
+ * settlement can know about the next one. So round 6 does not try to
+ * distinguish "forwarded unmodified" from "repackaged" after the fact. It
+ * removes the seam that both need: `executor.execute` is made a
+ * runtime-immutable OWN PROPERTY (`writable: false, configurable: false`)
+ * before the factory returns. `const genuine = executor.execute.bind(executor)`
+ * still works — reading the property is unaffected — but
+ * `executor.execute = wrapper` now THROWS (this module runs under ESM, which
+ * is always strict) before any wrapper body ever runs. There is no longer a
+ * later point at which uncertain work can have already happened and only THEN
+ * decide whether to forward genuine evidence: the assignment that would
+ * install such a wrapper never completes, so `uncertainCalls` cannot become
+ * nonzero through this seam at all. `declareResources` is deliberately left
+ * mutable/replaceable: it carries no evidence and authorises nothing by
+ * itself, so locking it would narrow nothing this defect needs and would only
+ * make instrumentation strictly harder.
+ */
+const mintedNoLaunchEvidence = new WeakMap<
+  NoLaunchEvidence,
+  { readonly executor: WorkExecutor; readonly outcome: WorkOutcome }
+>();
+
+function mintNoLaunchOutcome(
+  item: RoadmapItem,
+  actionId: string,
+  detail: string,
+  reason: string,
+  mintedBy: WorkExecutor,
+): WorkOutcome {
+  const evidence: NoLaunchEvidence = Object.freeze({ actionId, reason });
+  const outcome: WorkOutcome = Object.freeze({
+    ...authorPlan(item, detail),
+    noLaunchEvidence: evidence,
+  });
+  mintedNoLaunchEvidence.set(evidence, { executor: mintedBy, outcome });
+  return outcome;
+}
+
+/**
+ * Fail-closed: an outcome that is not `HUMAN_REQUIRED`, carries no evidence,
+ * carries unfrozen or never-minted evidence, was minted against a DIFFERENT
+ * executor instance, is bound to a different action, or — round 5 — is not
+ * itself (by reference) the exact object this module minted, all return
+ * `false`. `false` means settlement treats the outcome as it would any
+ * ordinary `HUMAN_REQUIRED` — real lineage recorded, nothing suppressed.
+ *
+ * `outcome` must be the exact `WorkOutcome` `SupervisorService` is actually
+ * settling and `executor` the exact `WorkExecutor` it actually dispatched to
+ * for this action — never reconstructed, rewrapped, or looked up by action id
+ * — or the checks this closes are not being checked at all.
+ *
+ * Round 6 (C6) does not add a check here: it closes the gap one layer
+ * earlier, by making `executor.execute` itself impossible to replace in place
+ * (see the comment above `createPlanBackedExecutor`'s return). This function's
+ * contract is unchanged.
+ */
+export function verifyNoLaunchEvidence(
+  outcome: WorkOutcome | undefined,
+  actionId: string,
+  executor: WorkExecutor,
+): boolean {
+  if (outcome === undefined || outcome.kind !== "HUMAN_REQUIRED") {
+    return false;
+  }
+  const evidence = outcome.noLaunchEvidence;
+  if (evidence === undefined || !Object.isFrozen(evidence)) {
+    return false;
+  }
+  const entry = mintedNoLaunchEvidence.get(evidence);
+  return (
+    entry !== undefined &&
+    entry.executor === executor &&
+    entry.outcome === outcome &&
+    evidence.actionId === actionId
+  );
+}
+
 export function createPlanBackedExecutor(deps: PlanBackedExecutorDeps): WorkExecutor {
   const log = deps.log ?? ((): void => {});
-  return {
+  // Named so `execute` can mint evidence bound to THIS exact object (round 4)
+  // rather than to any executor that merely happens to construct one like it.
+  const executor: WorkExecutor = {
     /**
      * WHAT THIS WORK WILL LAUNCH (TASK-015 AC-2).
      *
@@ -360,9 +547,22 @@ export function createPlanBackedExecutor(deps: PlanBackedExecutorDeps): WorkExec
       try {
         const found = await deps.plans.findPlanForItem(input.item);
         if (found === undefined) {
-          return authorPlan(
+          /**
+           * THE ONE PLACE THIS EXECUTOR CAN PROVE NO WORKER LAUNCHED
+           * (DEFECT-NO-LAUNCH-LINEAGE).
+           *
+           * Nothing above this line touched `deps.planning`, so no AI resource
+           * was routed, dispatched, or ran. `mintNoLaunchEvidence` is private to
+           * this module and this is its only call site, so settlement can trust
+           * the result without trusting this function's honesty in general —
+           * see the comment above `verifyNoLaunchEvidence`.
+           */
+          return mintNoLaunchOutcome(
             input.item,
+            input.actionId,
             "no plan exists for this roadmap item; creating and approving one is a human decision",
+            "no plan exists for this roadmap item; no worker was launched",
+            executor,
           );
         }
 
@@ -467,6 +667,54 @@ export function createPlanBackedExecutor(deps: PlanBackedExecutorDeps): WorkExec
           return humanRequired(input.item, "RECONCILE_PLAN_AUTHORIZATION", authorization.reason);
         }
 
+        /**
+         * TICKET AUTHORITY, CHECKED ON THE SAME FRESH READ (e954).
+         *
+         * `checkPlanAuthorization` just confirmed WHO may run this plan; this
+         * confirms WHAT a worker would be authorised to do once launched. The
+         * only source of that authority is a structured ticket template bound
+         * to the plan's OWN approved revision (NC-RUNTIME-01) — never plan
+         * prose, never the untrusted row phase. A legacy plan with no
+         * templates, an incomplete, malformed, duplicated, orphaned or
+         * criteria-mismatched template, or a plan with no approved revision at
+         * all, is never launched; each returns a bounded HUMAN_REQUIRED naming
+         * a replan or reconciliation rather than inventing the missing
+         * authority.
+         *
+         * Read from `atLaunch`, the SAME re-read `checkPlanAuthorization` above
+         * just used, so a template that changed or disappeared between the
+         * top-of-function read and this one is caught here rather than
+         * grandfathered in on stale state.
+         */
+        if (atLaunch.approvedRevision === undefined) {
+          return humanRequired(
+            input.item,
+            "RECONCILE_PLAN_TICKETS",
+            `plan ${atLaunch.id} carries no approved revision, so no ticket templates can be bound to one; replan and have a human approve the revision carrying them`,
+          );
+        }
+        const approvedRevisionRecord = atLaunch.revisions.find(
+          (revision) => revision.revision === atLaunch.approvedRevision,
+        );
+        if (approvedRevisionRecord === undefined) {
+          return humanRequired(
+            input.item,
+            "RECONCILE_PLAN_TICKETS",
+            `plan ${atLaunch.id} approved revision ${atLaunch.approvedRevision} is not among its recorded revisions; reconcile the plan before it can be driven`,
+          );
+        }
+        const executability = planTicketExecutability(
+          approvedRevisionRecord.items,
+          atLaunch.execution.ticketTemplates,
+        );
+        if (executability.status !== "EXECUTABLE") {
+          const detail =
+            executability.status === "NON_EXECUTABLE"
+              ? `plan ${atLaunch.id} is not executable: ${executability.reason}; ${executability.replanAction}`
+              : `plan ${atLaunch.id} carries invalid ticket templates: ${executability.reason}; reconcile the plan's execution configuration before it can be driven`;
+          return humanRequired(input.item, "RECONCILE_PLAN_TICKETS", detail);
+        }
+
         // Approved AND authorised: hand it to planning, which owns every
         // transition from here. In the shipped wiring `resume` runs the plan in
         // a SEPARATE OS PROCESS (`createChildPlanAdvancer`); this file holds the
@@ -478,7 +726,15 @@ export function createPlanBackedExecutor(deps: PlanBackedExecutorDeps): WorkExec
          * approval digest is not a bypass: such a plan cannot be APPROVED, so it
          * never reaches this line.
          */
-        const advanced = await deps.planning.resume(plan.id, atLaunch.approvedDigest);
+        const runResource = runResourceOf(input);
+        const advanced = await deps.planning.resume(plan.id, atLaunch.approvedDigest, {
+          actionId: input.actionId,
+          roadmapKey: input.item.key,
+          attempt: attemptFromActionId(input.actionId),
+          provider: runResource.provider,
+          model: runResource.model,
+          ...(runResource.effort === undefined ? {} : { effort: runResource.effort }),
+        });
         /**
          * VERIFIED ON THE WAY OUT TOO, so the invariant is uniform.
          *
@@ -511,4 +767,26 @@ export function createPlanBackedExecutor(deps: PlanBackedExecutorDeps): WorkExec
       }
     },
   };
+  /**
+   * THE C6 CORRECTION: `execute` is made a runtime-immutable own property
+   * before this factory ever hands `executor` to a caller.
+   *
+   * `Object.freeze(executor)` would also do this, but it would additionally
+   * lock `declareResources`, which carries no evidence and is not the seam
+   * round 5/6 are about; narrowing exactly to `execute` keeps the boundary as
+   * small as the defect it closes. `writable: false` makes
+   * `executor.execute = anything` a no-op in sloppy-mode code and a thrown
+   * `TypeError` under strict mode (which is what this module, its tests, and
+   * every ESM caller run under) — either way, the assignment never takes
+   * effect, so no wrapper body can ever run in its place. Reading the
+   * property — `executor.execute`, `executor.execute.bind(executor)` — is
+   * completely unaffected; only replacing it is.
+   */
+  Object.defineProperty(executor, "execute", {
+    value: executor.execute,
+    writable: false,
+    configurable: false,
+    enumerable: true,
+  });
+  return executor;
 }

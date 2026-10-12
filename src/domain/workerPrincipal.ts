@@ -27,6 +27,16 @@ export interface WorkerPrincipal {
   /** Roles captured at registration; later mutation of the worker is ignored. */
   readonly roles: readonly FactoryRole[];
   readonly registeredAt: Timestamp;
+  /**
+   * Host-issued (registration-time caller), never self-declared by the
+   * Worker object (never read from `worker.capabilities.deterministic`).
+   * When true, this principal is exempt from the direct provider-admission
+   * ticket gate (src/supervision/directWorkerAdmission.ts) because the
+   * registering caller is itself the trust boundary vouching for a
+   * deterministic/mock worker. Defaults to false (gate required) for any
+   * principal registered without an explicit, host-authoritative flag.
+   */
+  readonly requiresDirectAdmission: boolean;
 }
 
 export function principalSupportsRole(principal: WorkerPrincipal, role: FactoryRole): boolean {

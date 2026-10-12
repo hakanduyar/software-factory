@@ -183,6 +183,66 @@ describe("ProcessRunner: bounded output capture", () => {
   });
 });
 
+describe("ProcessRunner: aggregate output ceiling", () => {
+  it("refuses an invalid maxTotalOutputBytes before spawning the child", async () => {
+    const invalidValues = [0, -5, 1.5, NaN, Infinity, -Infinity, Number.MAX_SAFE_INTEGER + 1];
+    for (const invalid of invalidValues) {
+      const onSpawnCalls: number[] = [];
+      await assert.rejects(
+        fastRunner.run(
+          baseRequest({
+            ...fakeCliInvocation("echo-args.mjs"),
+            maxTotalOutputBytes: invalid,
+            onSpawn: (info) => onSpawnCalls.push(info.pid),
+          }),
+        ),
+      );
+      assert.equal(onSpawnCalls.length, 0, `onSpawn must never fire for a refused resource bound (${invalid})`);
+    }
+  });
+
+  it("terminates and reports outputLimitExceeded when combined raw stdout+stderr exceeds the ceiling, and never captures more than the ceiling", async () => {
+    const result = await fastRunner.run(
+      baseRequest({
+        ...fakeCliInvocation("large-output.mjs", [String(50_000), String(50_000)]),
+        timeoutMs: 10000,
+        maxTotalOutputBytes: 60_000,
+      }),
+    );
+    assert.equal(result.terminationReason, "CANCELLED");
+    assert.equal(result.outputLimitExceeded, true);
+    assert.ok(
+      result.stdout.length + result.stderr.length <= 60_000,
+      "combined captured output must never exceed the configured aggregate ceiling",
+    );
+  });
+
+  it("does not terminate when combined raw output is exactly at the ceiling", async () => {
+    const result = await fastRunner.run(
+      baseRequest({
+        ...fakeCliInvocation("large-output.mjs", [String(30_000), String(20_000)]),
+        timeoutMs: 10000,
+        maxTotalOutputBytes: 50_000,
+      }),
+    );
+    assert.equal(result.terminationReason, "EXITED");
+    assert.equal(result.outputLimitExceeded, undefined);
+    assert.equal(result.stdout.length, 30_000);
+    assert.equal(result.stderr.length, 20_000);
+  });
+
+  it("omitting the ceiling preserves existing unbounded-aggregate behavior", async () => {
+    const result = await fastRunner.run(
+      baseRequest({
+        ...fakeCliInvocation("large-output.mjs", [String(100_000), String(100_000)]),
+        timeoutMs: 10000,
+      }),
+    );
+    assert.equal(result.terminationReason, "EXITED");
+    assert.equal(result.outputLimitExceeded, undefined);
+  });
+});
+
 describe("ProcessRunner: hostile stdin", () => {
   it("does not crash or hang when the child exits without reading stdin", async () => {
     const largeInput = "x".repeat(5 * 1024 * 1024);
@@ -203,5 +263,57 @@ describe("ProcessRunner: exactly-once settlement", () => {
       baseRequest({ ...fakeCliInvocation("slow-exit.mjs", ["10000", "0"]), timeoutMs: 20 }),
     );
     assert.equal(result.terminationReason, "TIMEOUT");
+  });
+});
+
+/**
+ * DEFECT-DURABLE-WORKER-RUN-ENVELOPE AC-2: `onSpawn`.
+ *
+ * The one new capability this port gained for this defect: a synchronous
+ * callback firing with the real OS pid the moment the child is confirmed to
+ * exist — the ACK a durable "RUNNING" record may be built from, as opposed to
+ * launcher intent alone.
+ */
+describe("ProcessRunner: onSpawn", () => {
+  it("fires exactly once, with the real pid, before the process settles", async () => {
+    const calls: number[] = [];
+    const result = await fastRunner.run(
+      baseRequest({
+        ...fakeCliInvocation("echo-args.mjs"),
+        onSpawn: (info) => calls.push(info.pid),
+      }),
+    );
+    assert.equal(result.terminationReason, "EXITED");
+    assert.equal(calls.length, 1, "onSpawn must fire exactly once");
+    assert.ok(Number.isInteger(calls[0]) && calls[0]! > 0, "onSpawn must report a real, positive OS pid");
+  });
+
+  it("never fires for a spawn error, and a throwing callback never breaks the runner", async () => {
+    const calls: number[] = [];
+    const result = await fastRunner.run(
+      baseRequest({
+        executable: "/definitely/not/a/real/executable/anywhere",
+        argv: [],
+        onSpawn: (info) => {
+          calls.push(info.pid);
+          throw new Error("a caller's callback misbehaving must never propagate");
+        },
+      }),
+    );
+    assert.equal(result.terminationReason, "SPAWN_ERROR");
+    assert.equal(calls.length, 0, "a process that never spawned must never ACK");
+  });
+
+  it("a throwing onSpawn callback does not prevent the process from completing normally", async () => {
+    const result = await fastRunner.run(
+      baseRequest({
+        ...fakeCliInvocation("echo-args.mjs"),
+        onSpawn: () => {
+          throw new Error("must be swallowed, exactly like a stream error is");
+        },
+      }),
+    );
+    assert.equal(result.terminationReason, "EXITED");
+    assert.equal(result.exitCode, 0);
   });
 });

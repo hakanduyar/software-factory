@@ -55,6 +55,7 @@ import { createLoopWorker, type LoopWorkerFactoryOptions } from "./loopWorkerFac
 import { buildImplementerInstructions, buildReviewerInstructions } from "./loopPrompts.js";
 import { parseReviewVerdict } from "./reviewVerdictParser.js";
 import { assertVerificationCommandsContained, createVerificationWorker } from "./verificationWorker.js";
+import type { DeterministicVerificationPreparation } from "./verificationWorker.js";
 import {
   DEFAULT_LOOP_BUDGET,
   canonicalActionId,
@@ -87,6 +88,14 @@ import type { FactoryService } from "../app/factoryService.js";
 import type { Clock } from "../ports/clock.js";
 import type { ProcessRunner } from "../ports/processRunner.js";
 import type { Worker, WorkerOutcome, WorkerRequest } from "../ports/worker.js";
+import type {
+  DirectHostAdmissionSurface,
+  DirectHostExecutionAdmissionSurface,
+  DirectLaunchBudgetExpectation,
+  DirectLaunchModelExpectation,
+  DirectLaunchScopeExpectation,
+  TrustedTicketReference,
+} from "../supervision/directWorkerAdmission.js";
 
 export interface StartLoopInput {
   readonly workItemId: WorkItemId;
@@ -101,6 +110,101 @@ export interface StartLoopInput {
 }
 
 export type LoopWorkerFactory = (config: LoopWorkerConfig, options: LoopWorkerFactoryOptions) => Worker;
+
+/** Exact, trusted-caller-supplied context for a single guarded, registered launch — never caller-asserted ticket data. */
+export interface DirectLaunchPreparationContext {
+  readonly loop: EngineeringLoop;
+  readonly iteration: number;
+  readonly slot: WorkerSlot;
+  readonly kind: WorkerActionKind;
+  readonly claim: WorkerActionClaim;
+  readonly actionConfig?: LoopWorkerConfig;
+  readonly workspace: Workspace;
+  readonly worker: Worker;
+  readonly targetRunId?: RunId;
+}
+
+/** Trusted, opaque reference plus independently captured expectations — never raw authority. */
+export interface DirectLaunchPreparationResult {
+  readonly directTicketReference: TrustedTicketReference;
+  readonly expectedModel: DirectLaunchModelExpectation;
+  readonly expectedScope: DirectLaunchScopeExpectation;
+  readonly expectedBudgets: DirectLaunchBudgetExpectation;
+}
+
+/**
+ * Constructor-owned async preparation hook (D1-85/D1-93 transport only, not a
+ * new authority). Invoked for the EXACT guarded, registered Worker, after
+ * `launchClaimedWorker` creates and registers it, BEFORE `factory.runWorker`.
+ * Bound only from the constructor — never from `StartLoopInput` or model
+ * output. An unsupported/unknown VERIFY mapping (or any other refusal) must
+ * reject this promise; the loop's existing error handling turns that into an
+ * honest FAILED record, never a blind relaunch.
+ */
+export type PrepareDirectLaunch = (
+  context: DirectLaunchPreparationContext,
+) => Promise<DirectLaunchExecutionPreparationResult>;
+
+/** Deterministic (VERIFY) preparation: the verifier bundle plus the trusted ticket reference. No handle. */
+export interface DeterministicDirectLaunchPreparationResult extends DeterministicVerificationPreparation {
+  readonly directTicketReference: TrustedTicketReference;
+}
+
+/** AI preparation (unchanged) or deterministic-execution preparation. */
+export type DirectLaunchExecutionPreparationResult =
+  | DirectLaunchPreparationResult
+  | DeterministicDirectLaunchPreparationResult;
+
+const AI_PREPARATION_KEYS: ReadonlySet<string> = new Set([
+  "directTicketReference",
+  "expectedModel",
+  "expectedScope",
+  "expectedBudgets",
+]);
+
+const DETERMINISTIC_PREPARATION_KEYS: ReadonlySet<string> = new Set([
+  "directTicketReference",
+  "expectedExecutionKind",
+  "expectedScope",
+  "expectedCommands",
+  "expectedWorkspace",
+  "expectedDeterministicBudgets",
+  "expectedExecutionPolicy",
+]);
+
+function deepFreezeAll<T>(value: T): T {
+  if (typeof value === "object" && value !== null && !Object.isFrozen(value)) {
+    for (const key of Reflect.ownKeys(value)) {
+      deepFreezeAll((value as Record<PropertyKey, unknown>)[key]);
+    }
+    Object.freeze(value);
+  }
+  return value;
+}
+
+function requireAiPreparation(result: DirectLaunchExecutionPreparationResult): DirectLaunchPreparationResult {
+  if ("expectedExecutionKind" in result || Object.keys(result).some((key) => !AI_PREPARATION_KEYS.has(key))) {
+    throw new Error("direct launch preparation refused: mixed or unknown preparation kind for an AI slot");
+  }
+  return result;
+}
+
+/** Copies (never aliases) the deterministic expectations and freezes the copy once; the reference stays opaque. */
+function splitDeterministicPreparation(result: DirectLaunchExecutionPreparationResult): {
+  readonly reference: TrustedTicketReference;
+  readonly bundle: DeterministicVerificationPreparation;
+} {
+  if (
+    !("expectedExecutionKind" in result) ||
+    result.expectedExecutionKind !== "deterministic-execution" ||
+    Object.keys(result).some((key) => !DETERMINISTIC_PREPARATION_KEYS.has(key))
+  ) {
+    throw new Error("direct launch preparation refused: VERIFY requires a deterministic-execution preparation");
+  }
+  const { directTicketReference, ...expectations } = result;
+  const bundle: DeterministicVerificationPreparation = deepFreezeAll(structuredClone(expectations));
+  return { reference: directTicketReference, bundle };
+}
 
 export interface EngineeringLoopServiceDeps {
   readonly factory: FactoryService;
@@ -120,6 +224,21 @@ export interface EngineeringLoopServiceDeps {
    */
   readonly createImplementerWorker?: LoopWorkerFactory;
   readonly createReviewerWorker?: LoopWorkerFactory;
+  /**
+   * D1-85 same-channel transport: the configured surface, if provided, must
+   * be the EXACT object `FactoryService.sharedDirectAdmissionChannel`
+   * returns for `factory` — never a structurally similar re-implementation.
+   * Verified once in the constructor; mismatch refuses to construct rather
+   * than silently using either side.
+   */
+  readonly directAdmissionChannel?: DirectHostAdmissionSurface;
+  /**
+   * D1-85/D1-93 constructor-owned preparation contract: required alongside
+   * `directAdmissionChannel` to launch any action whose Worker needs direct
+   * admission. Absence fails closed (no fallback to an inert legacy ticket
+   * or mock privilege) — never bound from `StartLoopInput` or model output.
+   */
+  readonly prepareDirectLaunch?: PrepareDirectLaunch;
 }
 
 /** The evidence channel that carried a structured, contract-satisfying tool answer (see cliWorker.ts). */
@@ -198,6 +317,8 @@ export class EngineeringLoopService {
   private readonly orchestratorActor: Actor;
   private readonly createImplementerWorker: LoopWorkerFactory;
   private readonly createReviewerWorker: LoopWorkerFactory;
+  private readonly directAdmissionChannel: DirectHostExecutionAdmissionSurface | undefined;
+  private readonly prepareDirectLaunch: PrepareDirectLaunch | undefined;
 
   constructor(deps: EngineeringLoopServiceDeps) {
     this.factory = deps.factory;
@@ -209,6 +330,18 @@ export class EngineeringLoopService {
     this.orchestratorActor = agent("agent:engineering-loop", "Engineering Loop Orchestrator");
     this.createImplementerWorker = deps.createImplementerWorker ?? createLoopWorker;
     this.createReviewerWorker = deps.createReviewerWorker ?? createLoopWorker;
+
+    // D1-85: the configured channel, if any, must be the EXACT object this
+    // Factory already shares — never a structurally similar stand-in. A
+    // mismatch refuses construction outright rather than silently preferring
+    // either side.
+    if (deps.directAdmissionChannel !== undefined && deps.directAdmissionChannel !== this.factory.sharedDirectAdmissionChannel) {
+      throw new ValidationError(
+        "engineering loop service directAdmissionChannel must be the exact object returned by factory.sharedDirectAdmissionChannel",
+      );
+    }
+    this.directAdmissionChannel = this.factory.sharedDirectAdmissionChannel;
+    this.prepareDirectLaunch = deps.prepareDirectLaunch;
   }
 
   // =====================================================================
@@ -387,11 +520,13 @@ export class EngineeringLoopService {
           workspace,
           processRunner: this.processRunner,
           roles: ["IMPLEMENTER"],
+          ...(this.directAdmissionChannel === undefined ? {} : { directAdmissionChannel: this.directAdmissionChannel }),
         }),
         reviewerWorker: this.createReviewerWorker(loop.reviewer, {
           workspace,
           processRunner: this.processRunner,
           roles: ["REVIEWER"],
+          ...(this.directAdmissionChannel === undefined ? {} : { directAdmissionChannel: this.directAdmissionChannel }),
         }),
         ownerToken,
       };
@@ -821,11 +956,27 @@ export class EngineeringLoopService {
     const { loop: claimedLoop, claim } = claimed;
 
     const collected: VerificationCommandResult[] = [];
+    let verificationPreparation: DeterministicVerificationPreparation | undefined;
+    let verificationConfigured = false;
+    const configureVerification = (prepared: DeterministicVerificationPreparation): void => {
+      if (verificationConfigured) {
+        throw new Error("verification preparation refused: already configured");
+      }
+      verificationConfigured = true;
+      verificationPreparation = prepared;
+    };
+    const readPreparedExecution = (): DeterministicVerificationPreparation | undefined => {
+      const prepared = verificationPreparation;
+      verificationPreparation = undefined;
+      return prepared;
+    };
     const verificationWorker = createVerificationWorker({
       commands: claimedLoop.verificationCommands,
       workspace: ctx.workspace,
       processRunner: this.processRunner,
       ...(claimedLoop.budget.verificationTimeoutMs === undefined ? {} : { defaultTimeoutMs: claimedLoop.budget.verificationTimeoutMs }),
+      ...(this.directAdmissionChannel === undefined ? {} : { directAdmissionChannel: this.directAdmissionChannel }),
+      readPreparedExecution,
       onCommandResult: (result) => collected.push(result),
     });
     const iterationNumber = claimedLoop.iterations.at(-1)!.iteration;
@@ -837,6 +988,7 @@ export class EngineeringLoopService {
       instructions: "Run the configured deterministic verification commands and record their results.",
       againstRunId: claimedLoop.iterations.at(-1)!.implementerRunId!,
       commandResults: collected,
+      configureVerification,
     });
     return { kind: "advanced", loop: updated };
   }
@@ -1069,19 +1221,70 @@ export class EngineeringLoopService {
       readonly instructions: string;
       readonly againstRunId?: RunId;
       readonly commandResults?: VerificationCommandResult[];
+      readonly configureVerification?: (prepared: DeterministicVerificationPreparation) => void;
     },
   ): Promise<EngineeringLoop> {
     const guarded = this.guardedWorker(input.worker, loop.id, iterationNumber, slot, claim);
     this.factory.registerWorker(guarded);
 
+    const actionConfig = slot === "implement" ? loop.implementer : slot === "review" ? loop.reviewer : undefined;
+
     let run: Run;
     try {
+      let directLaunch: DirectLaunchPreparationResult | undefined;
+      let deterministicLaunch: DeterministicVerificationPreparation | undefined;
+      let deterministicReference: TrustedTicketReference | undefined;
+      if (this.prepareDirectLaunch !== undefined) {
+        const context: DirectLaunchPreparationContext = {
+          loop,
+          iteration: iterationNumber,
+          slot,
+          kind: SLOT_KIND[slot],
+          claim,
+          worker: guarded,
+          workspace: resolveWorkspace(loop.workspaceRoot),
+          ...(actionConfig === undefined ? {} : { actionConfig }),
+          ...(input.againstRunId === undefined ? {} : { targetRunId: input.againstRunId }),
+        };
+        const prepared = await this.prepareDirectLaunch(context);
+        if (slot === "verify") {
+          if (input.configureVerification === undefined) {
+            throw new Error("direct launch preparation refused: VERIFY has no verification configuration callback");
+          }
+          const split = splitDeterministicPreparation(prepared);
+          deterministicLaunch = split.bundle;
+          deterministicReference = split.reference;
+          input.configureVerification(deterministicLaunch);
+        } else {
+          directLaunch = requireAiPreparation(prepared);
+        }
+      }
+
       const result = await this.factory.runWorker({
         workItemId: loop.workItemId,
         role: SLOT_ROLE[slot],
         worker: guarded,
         instructions: input.instructions,
         ...(input.againstRunId === undefined ? {} : { againstRunId: input.againstRunId }),
+        ...(directLaunch === undefined
+          ? {}
+          : {
+              directTicketReference: directLaunch.directTicketReference,
+              expectedModel: directLaunch.expectedModel,
+              expectedScope: directLaunch.expectedScope,
+              expectedBudgets: directLaunch.expectedBudgets,
+            }),
+        ...(deterministicLaunch === undefined || deterministicReference === undefined
+          ? {}
+          : {
+              directTicketReference: deterministicReference,
+              expectedExecutionKind: deterministicLaunch.expectedExecutionKind,
+              expectedScope: deterministicLaunch.expectedScope,
+              expectedCommands: deterministicLaunch.expectedCommands,
+              expectedWorkspace: deterministicLaunch.expectedWorkspace,
+              expectedDeterministicBudgets: deterministicLaunch.expectedDeterministicBudgets,
+              expectedExecutionPolicy: deterministicLaunch.expectedExecutionPolicy,
+            }),
       });
       run = result.run;
     } catch (error) {

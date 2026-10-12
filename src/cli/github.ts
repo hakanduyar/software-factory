@@ -12,7 +12,13 @@
  * consumes it.
  */
 
-import { createGhCliClient, createGitRepositoryReader } from "../adapters/github/ghCliClient.js";
+import {
+  createGhCliClient,
+  createGhReadOnlyIssueClient,
+  createGitRepositoryReader,
+  isGithubRepositorySlug,
+} from "../adapters/github/ghCliClient.js";
+import { redactSecrets as redactIssueSecrets } from "../adapters/workers/environmentPolicy.js";
 import type { ProcessRunner } from "../ports/processRunner.js";
 import { createNodeProcessRunner } from "../adapters/process/nodeProcessRunner.js";
 import { publishCandidate, type PublishOutcome } from "../github/publishCandidate.js";
@@ -167,6 +173,85 @@ function candidateFrom(args: GithubPublishArgs): ReviewedCandidate {
 }
 
 /** Everything printed goes through the same bounding/redacting chokepoint. */
+export interface GithubIssueArgs {
+  readonly repo: string;
+  readonly number: number;
+}
+
+export type GithubIssueArgsResult =
+  | { readonly ok: true; readonly value: GithubIssueArgs }
+  | { readonly ok: false; readonly error: string };
+
+export interface GithubIssueCliOptions extends GithubCliOptions {
+  /** Injectable so a test can observe refusals without touching stderr. */
+  readonly logError?: (line: string) => void;
+}
+
+/** Strict: exactly `--repo owner/name` and `--number N`, each once, nothing else. */
+export function parseGithubIssueArgs(args: readonly string[]): GithubIssueArgsResult {
+  let repo: string | undefined;
+  let number: string | undefined;
+  for (let i = 0; i < args.length; i += 2) {
+    const flag = args[i];
+    const value = args[i + 1];
+    if (flag !== "--repo" && flag !== "--number") {
+      return { ok: false, error: "unknown or stray argument" };
+    }
+    if (value === undefined) {
+      return { ok: false, error: `${flag} requires a value` };
+    }
+    if (flag === "--repo") {
+      if (repo !== undefined) {
+        return { ok: false, error: "--repo given more than once" };
+      }
+      repo = value;
+    } else {
+      if (number !== undefined) {
+        return { ok: false, error: "--number given more than once" };
+      }
+      number = value;
+    }
+  }
+  if (repo === undefined || number === undefined) {
+    return { ok: false, error: "both --repo and --number are required" };
+  }
+  if (!isGithubRepositorySlug(repo)) {
+    return { ok: false, error: "--repo must be owner/name" };
+  }
+  if (!/^[1-9][0-9]*$/.test(number) || !Number.isSafeInteger(Number(number))) {
+    return { ok: false, error: "--number must be a positive safe integer" };
+  }
+  return { ok: true, value: { repo, number: Number(number) } };
+}
+
+/**
+ * Read-only Issue intake. Prints exactly one JSON source line on success
+ * (exit 0); any refusal prints a bounded, redacted diagnostic (exit 1).
+ * It never writes to GitHub and never produces READY or an approval.
+ */
+export async function runGithubIssue(
+  args: GithubIssueArgs,
+  options: GithubIssueCliOptions = {},
+): Promise<number> {
+  const log = options.log ?? ((line: string): void => console.log(line));
+  const logError = options.logError ?? ((line: string): void => console.error(line));
+  let line: string;
+  try {
+    const client = createGhReadOnlyIssueClient({
+      processRunner: options.processRunner ?? createNodeProcessRunner(),
+      cwd: options.cwd ?? process.cwd(),
+      repository: args.repo,
+      ...(options.ghPath !== undefined ? { ghPath: options.ghPath } : {}),
+    });
+    line = JSON.stringify(await client.issue(args.number));
+  } catch (error) {
+    logError(redactIssueSecrets(boundedDiagnostic(error instanceof Error ? error.message : String(error))));
+    return 1;
+  }
+  log(line);
+  return 0;
+}
+
 function safe(value: string): string {
   return boundedDiagnostic(value);
 }

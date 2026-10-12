@@ -43,7 +43,7 @@ import {
 } from "../orchestration/scriptedLoopWorkers.js";
 import type { LoopDispatcher } from "../planning/loopDispatcher.js";
 import { createPlanBindingResolver, PlanningService } from "../planning/planningService.js";
-import type { PlanExecutionConfig, PlannerConfig, PlanStatusView } from "../planning/planTypes.js";
+import type { PlanExecutionConfig, PlannerConfig, PlanStatusView, WorkItemTicketTemplate } from "../planning/planTypes.js";
 import { toPlanStatusView } from "../planning/planTypes.js";
 import { createScriptedDispatcher, createScriptedPlannerWorker, renderPlannerResponse } from "../planning/scriptedPlannerWorkers.js";
 import { createFixedClock } from "../ports/clock.js";
@@ -84,7 +84,51 @@ function makeScratchWorkspace(scratchDirs: string[]): string {
   return dir;
 }
 
-function executionConfig(workspaceRoot: string): PlanExecutionConfig {
+/** Explicit authority for canned demo scenarios, never inferred from planner output. */
+function demoTicketTemplate(
+  planItemKey: string,
+  objective: string,
+  criterionText: string,
+  owned: readonly string[],
+  dependencies: readonly string[] = [],
+): WorkItemTicketTemplate {
+  return {
+    planItemKey,
+    schemaVersion: "1.0.0",
+    objective,
+    acceptanceCriteria: [{ id: "AC-1", version: "1.0.0", description: criterionText }],
+    scope: { owned, forbidden: [".git", "credentials"], read: dependencies, dependencies, validation: ['node -e "process.exit(0)"'] },
+    model: {
+      eligibleModels: ["scripted/demo-implementer"],
+      reasoningEffort: "low",
+      rationale: "The offline demo uses a bounded scripted implementer in an isolated scratch workspace.",
+    },
+    budgets: { contextTokens: 4000, outputTokens: 2000, elapsedSeconds: 120, maxAttempts: 2 },
+    policy: {
+      checkpoint: "after deterministic verification and independent review",
+      stopConditions: ["accepted scenario criteria met", "iteration or elapsed budget exhausted"],
+      escalation: "stop the demo and report a failed Factory gate to the operator",
+    },
+    resultSchema: { requiredFields: ["status", "summary"], maxResultBytes: 2048 },
+  };
+}
+
+const SCENARIO_1_TICKETS: readonly WorkItemTicketTemplate[] = [
+  demoTicketTemplate("WI-A", "Expose GET /health returning service status.", "Add /health endpoint behaves as specified", ["src/health.ts"]),
+];
+const SCENARIO_2_TICKETS: readonly WorkItemTicketTemplate[] = [
+  demoTicketTemplate("WI-A", "Archive records older than 90 days without deleting them.", "Archive expired records behaves as specified", ["src/archive.ts"]),
+];
+const SCENARIO_3_TICKETS: readonly WorkItemTicketTemplate[] = [
+  demoTicketTemplate("WI-A", "Create the records table.", "Add the schema behaves as specified", ["src/recordsSchema.ts"]),
+  demoTicketTemplate("WI-B", "Expose the records API after the schema is ready.", "Add the API behaves as specified", ["src/recordsApi.ts"], ["src/recordsSchema.ts"]),
+];
+const SCENARIO_5_TICKETS: readonly WorkItemTicketTemplate[] = [
+  demoTicketTemplate("WI-A", "Do the first independent demo item.", "First item behaves as specified", ["src/first.ts"]),
+  demoTicketTemplate("WI-B", "Do the second independent demo item.", "Second item behaves as specified", ["src/second.ts"]),
+];
+
+function executionConfig(workspaceRoot: string, ticketTemplates?: readonly WorkItemTicketTemplate[]): PlanExecutionConfig {
   return {
     implementer: { tool: "scripted", model: "demo-implementer" },
     reviewer: { tool: "scripted", model: "demo-reviewer" },
@@ -95,6 +139,7 @@ function executionConfig(workspaceRoot: string): PlanExecutionConfig {
     })),
     workspaceRoot,
     loopBudget: { maxIterations: 2 },
+    ...(ticketTemplates === undefined ? {} : { ticketTemplates }),
   };
 }
 
@@ -262,7 +307,7 @@ export async function runPlanDemo(options: PlanDemoOptions = {}): Promise<PlanDe
       actor: OPERATOR,
       intent: "Add a health endpoint so we can monitor the service.",
       planner: DEMO_PLANNER,
-      execution: executionConfig(s1Workspace),
+      execution: executionConfig(s1Workspace, SCENARIO_1_TICKETS),
     });
     emit(`plan is ${plan1.phase} with ${plan1.revisions.at(-1)?.items.length ?? 0} proposed item(s); nothing has been built yet`);
 
@@ -310,7 +355,7 @@ export async function runPlanDemo(options: PlanDemoOptions = {}): Promise<PlanDe
       actor: OPERATOR,
       intent: "Clean up old records.",
       planner: DEMO_PLANNER,
-      execution: executionConfig(s2Workspace),
+      execution: executionConfig(s2Workspace, SCENARIO_2_TICKETS),
     });
     emit(`plan is ${plan2.phase}: ${plan2.openQuestions.map((question) => question.question).join(" | ")}`);
 
@@ -356,7 +401,7 @@ export async function runPlanDemo(options: PlanDemoOptions = {}): Promise<PlanDe
       actor: OPERATOR,
       intent: "Add a records API backed by a new table.",
       planner: DEMO_PLANNER,
-      execution: executionConfig(makeScratchWorkspace(scratchDirs)),
+      execution: executionConfig(makeScratchWorkspace(scratchDirs), SCENARIO_3_TICKETS),
     });
     plan3 = await s3Service.approve(plan3.id, OPERATOR, s3.factory.authorizeHuman(OPERATOR, DEMO_CREDENTIAL));
     emit(`after approval: ${plan3.dispatches.length} of ${plan3.materialized.length} item(s) dispatched — B is waiting on A`);
@@ -442,7 +487,7 @@ export async function runPlanDemo(options: PlanDemoOptions = {}): Promise<PlanDe
       actor: OPERATOR,
       intent: "Do two independent things.",
       planner: DEMO_PLANNER,
-      execution: executionConfig(makeScratchWorkspace(scratchDirs)),
+      execution: executionConfig(makeScratchWorkspace(scratchDirs), SCENARIO_5_TICKETS),
     });
     try {
       await crashedService.approve(plan5Draft.id, OPERATOR, crashingFactory.authorizeHuman(OPERATOR, DEMO_CREDENTIAL));

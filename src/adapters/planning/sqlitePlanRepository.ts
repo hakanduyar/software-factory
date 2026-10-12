@@ -39,9 +39,10 @@
  *   create a work item, derive an approval, or dispatch an external worker.
  */
 
+import { statSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 
-import { ConcurrencyError, SchemaIntegrityError, SchemaVersionError } from "../../domain/errors.js";
+import { ConcurrencyError, PersistenceCorruptionError, SchemaIntegrityError, SchemaVersionError } from "../../domain/errors.js";
 import { deepFreeze } from "../../domain/freeze.js";
 import type { ProjectId } from "../../domain/ids.js";
 import { encodePlan, parsePlan } from "../../planning/planSerialization.js";
@@ -49,6 +50,124 @@ import type { PlanRepository } from "../../planning/planRepository.js";
 import { ACTIVE_PLAN_PHASES, type Plan, type PlanPhase } from "../../planning/planTypes.js";
 
 const PLAN_SCHEMA_VERSION = 1;
+
+// Canonical future-producer DDL for the plan request link table. The literal
+// spelling is frozen: validatePlanLinkSchema compares sqlite_master.sql to it
+// after only whitespace normalization (GLOB literals are case-sensitive).
+const PLAN_LINK_SCHEMA_DDL =
+  "CREATE TABLE plan_request_links (" +
+  "bot_id INTEGER NOT NULL CHECK(bot_id BETWEEN 1 AND 9007199254740991), " +
+  "update_id INTEGER NOT NULL CHECK(update_id BETWEEN 0 AND 9007199254740991), " +
+  "request_digest TEXT NOT NULL CHECK(length(request_digest)=64 AND request_digest NOT GLOB '*[^0-9a-f]*'), " +
+  "plan_id TEXT NOT NULL CHECK(length(plan_id)>0), " +
+  "PRIMARY KEY(bot_id,update_id)) STRICT;";
+
+function normalizePlanLinkSql(sql: string): string {
+  let text = sql.trim();
+  if (text.endsWith(";")) {
+    text = text.slice(0, -1);
+  }
+  return text.replace(/\s+/g, " ").trim();
+}
+
+function validatePlanLinkSchema(db: DatabaseSync): void {
+  const name = "plan_request_links";
+  const fail = (detail: string): never => {
+    throw new SchemaIntegrityError(`plans database: ${name} ${detail}`);
+  };
+
+  const objects = db.prepare("SELECT type, name, tbl_name, sql FROM sqlite_master").all() as {
+    type: string;
+    name: string;
+    tbl_name: string;
+    sql: string | null;
+  }[];
+  const tables = objects.filter((row) => row.name === name);
+  if (tables.length !== 1 || tables[0]!.type !== "table") {
+    fail("must exist as exactly one table object");
+  }
+  const actualSql = tables[0]!.sql;
+  if (actualSql === null || normalizePlanLinkSql(actualSql) !== normalizePlanLinkSql(PLAN_LINK_SCHEMA_DDL)) {
+    fail("definition does not match the canonical DDL");
+  }
+  for (const row of objects) {
+    if (row.name === name) {
+      continue;
+    }
+    const isPkIndex = row.type === "index" && row.tbl_name === name && row.name === `sqlite_autoindex_${name}_1`;
+    const linked = row.tbl_name === name || row.name.includes(name) || (row.sql ?? "").includes(name);
+    if (linked && !isPkIndex) {
+      fail(`has unexpected linked ${row.type} "${row.name}"`);
+    }
+  }
+
+  const listed = (db.prepare(`PRAGMA table_list("${name}")`).all() as {
+    schema: string;
+    name: string;
+    type: string;
+    ncol: number;
+    wr: number;
+    strict: number;
+  }[]).filter((row) => row.name === name);
+  const entry = listed[0];
+  if (listed.length !== 1 || entry!.schema !== "main" || entry!.type !== "table" || Number(entry!.strict) !== 1) {
+    fail("must be a STRICT table in schema main");
+  }
+
+  const columns = db.prepare(`PRAGMA table_info("${name}")`).all() as {
+    cid: number;
+    name: string;
+    type: string;
+    notnull: number;
+    dflt_value: unknown;
+    pk: number;
+  }[];
+  const expectedColumns = [
+    ["bot_id", "INTEGER", 1],
+    ["update_id", "INTEGER", 2],
+    ["request_digest", "TEXT", 0],
+    ["plan_id", "TEXT", 0],
+  ] as const;
+  if (columns.length !== expectedColumns.length) {
+    fail(`has ${columns.length} columns, expected ${expectedColumns.length}`);
+  }
+  expectedColumns.forEach(([colName, colType, colPk], i) => {
+    const actual = columns[i]!;
+    if (
+      Number(actual.cid) !== i ||
+      actual.name !== colName ||
+      actual.type !== colType ||
+      Number(actual.notnull) !== 1 ||
+      actual.dflt_value !== null ||
+      Number(actual.pk) !== colPk
+    ) {
+      fail(`column ${i} does not match the canonical definition of "${colName}"`);
+    }
+  });
+
+  const indexes = db.prepare(`PRAGMA index_list("${name}")`).all() as {
+    name: string;
+    unique: number;
+    origin: string;
+    partial: number;
+  }[];
+  const pk = indexes[0];
+  if (indexes.length !== 1 || pk!.origin !== "pk" || Number(pk!.unique) !== 1 || Number(pk!.partial) !== 0) {
+    fail("must have exactly one unique non-partial primary-key index");
+  }
+  const keyColumns = (db.prepare(`PRAGMA index_info("${pk!.name}")`).all() as { seqno: number; name: string | null }[]).sort(
+    (a, b) => a.seqno - b.seqno,
+  );
+  if (
+    keyColumns.length !== 2 ||
+    Number(keyColumns[0]!.seqno) !== 0 ||
+    keyColumns[0]!.name !== "bot_id" ||
+    Number(keyColumns[1]!.seqno) !== 1 ||
+    keyColumns[1]!.name !== "update_id"
+  ) {
+    fail("primary key must be exactly (bot_id, update_id)");
+  }
+}
 
 const ACTIVE_PHASES_SQL = ACTIVE_PLAN_PHASES.map((phase) => `'${phase}'`).join(", ");
 
@@ -276,17 +395,70 @@ function validateTable(db: DatabaseSync, table: ExpectedTable): void {
   }
 }
 
-function ensurePlanSchema(db: DatabaseSync): void {
-  const userObjects = listUserSchemaObjects(db);
+/**
+ * Read-only validation of every existing plan_request_links row: actual typed
+ * values (no coercion), then the linked Plan must exist and decode through the
+ * same parsePlan relationship the repository uses on read. Call only after the
+ * base schema and the link table schema have been validated.
+ */
+function validatePlanLinkRows(db: DatabaseSync): void {
+  const fail = (detail: string): never => {
+    throw new SchemaIntegrityError(`plans database: plan_request_links ${detail}`);
+  };
 
-  if (userObjects.length === 0) {
-    db.exec("PRAGMA journal_mode = WAL");
-    db.exec("PRAGMA foreign_keys = OFF");
-    db.exec(PLAN_SCHEMA_DDL);
-    db.prepare("INSERT INTO schema_meta (key, value) VALUES ('plan_schema_version', ?)").run(String(PLAN_SCHEMA_VERSION));
-    return;
+  const links = db.prepare("SELECT bot_id,update_id,request_digest,plan_id FROM plan_request_links").all() as Record<string, unknown>[];
+  const findPlan = db.prepare("SELECT id,project_id,request_key,phase,version,data FROM plans WHERE id=?");
+  for (const link of links) {
+    const botId = link.bot_id;
+    const updateId = link.update_id;
+    const digest = link.request_digest;
+    const planId = link.plan_id;
+    if (typeof botId !== "number" || !Number.isSafeInteger(botId) || botId <= 0) {
+      fail("row has an invalid bot_id");
+    }
+    if (typeof updateId !== "number" || !Number.isSafeInteger(updateId) || updateId < 0) {
+      fail("row has an invalid update_id");
+    }
+    if (typeof digest !== "string" || digest.length !== 64 || !/^[0-9a-f]{64}$/.test(digest)) {
+      fail("row has an invalid request_digest");
+    }
+    if (typeof planId !== "string" || planId.length === 0) {
+      fail("row has an invalid plan_id");
+    }
+
+    const row = findPlan.get(planId as string) as Record<string, unknown> | undefined;
+    if (row === undefined) {
+      fail("row references a Plan that does not exist");
+    }
+    const plan = row as Record<string, unknown>;
+    if (
+      typeof plan.id !== "string" ||
+      typeof plan.project_id !== "string" ||
+      typeof plan.request_key !== "string" ||
+      typeof plan.phase !== "string" ||
+      typeof plan.version !== "number" ||
+      typeof plan.data !== "string"
+    ) {
+      fail("row references a Plan row with invalid column types");
+    }
+    const planRow = plan as unknown as PlanRow;
+    // Throws if the stored Plan serialization/hash/identity is not valid.
+    parsePlan(planRow.data, {
+      id: planRow.id,
+      projectId: planRow.project_id,
+      requestKey: planRow.request_key,
+      phase: planRow.phase,
+      version: planRow.version,
+    });
   }
+}
 
+/**
+ * Read-only validation of a NON-EMPTY existing plans database. Returns the
+ * recognized schema version (1, or 2 once explicitly upgraded). Never writes
+ * and never initializes anything, so it is safe to run before maintenance.
+ */
+function inspectExistingPlanDatabase(db: DatabaseSync): 1 | 2 {
   if (!tableExists(db, "schema_meta")) {
     throw new SchemaIntegrityError(
       "plans database is non-empty but has no schema_meta version marker; refusing to treat it as either fresh or valid",
@@ -302,19 +474,151 @@ function ensurePlanSchema(db: DatabaseSync): void {
   if (!Number.isFinite(stored) || !Number.isInteger(stored)) {
     throw new SchemaIntegrityError(`plans database schema_meta.plan_schema_version value "${rows[0]!.value}" is not a valid integer`);
   }
-  if (stored !== PLAN_SCHEMA_VERSION) {
+  if (stored !== 1 && stored !== 2) {
     throw new SchemaVersionError(
-      `plans database plan_schema_version is ${stored}, this build expects ${PLAN_SCHEMA_VERSION}. Open with a matching build, or a fresh database file.`,
+      `plans database plan_schema_version is ${stored}, this build expects 1 or 2. Open with a matching build, or a fresh database file.`,
     );
   }
 
-  // Version marker matches — now validate the actual structure it claims.
+  // Version marker recognized — now validate the actual structure it claims.
   for (const table of EXPECTED_TABLES) {
     validateTable(db, table);
   }
 
+  if (stored === 1) {
+    const linked = (
+      db.prepare("SELECT name, tbl_name, sql FROM sqlite_master").all() as { name: string; tbl_name: string; sql: string | null }[]
+    ).some(
+      (row) =>
+        row.name === "plan_request_links" ||
+        row.tbl_name === "plan_request_links" ||
+        row.name.includes("plan_request_links") ||
+        (row.sql ?? "").includes("plan_request_links"),
+    );
+    if (linked) {
+      throw new SchemaIntegrityError("plans database: version 1 must not contain plan_request_links objects");
+    }
+    return 1;
+  }
+  validatePlanLinkSchema(db);
+  validatePlanLinkRows(db);
+  return 2;
+}
+
+/**
+ * Public read-only guard: succeeds only for an existing, validated plans
+ * database that has been explicitly upgraded to schema v2. Never writes or
+ * initializes anything.
+ */
+export function assertReadonlyPlanSchemaV2(db: DatabaseSync): void {
+  if (inspectExistingPlanDatabase(db) !== 2) {
+    throw new SchemaVersionError(
+      "plans database is not schema v2; read-only inspection requires an explicitly upgraded v2 database",
+    );
+  }
+}
+
+function ensurePlanSchema(db: DatabaseSync): void {
+  if (listUserSchemaObjects(db).length === 0) {
+    db.exec("PRAGMA journal_mode = WAL");
+    db.exec("PRAGMA foreign_keys = OFF");
+    db.exec(PLAN_SCHEMA_DDL);
+    db.prepare("INSERT INTO schema_meta (key, value) VALUES ('plan_schema_version', ?)").run(String(PLAN_SCHEMA_VERSION));
+    return;
+  }
+  inspectExistingPlanDatabase(db);
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = OFF");
+}
+
+/**
+ * Explicit maintenance-only v1 -> v2 upgrade of an EXISTING plans database.
+ * Never creates, initializes or repairs: a missing/non-file/empty/foreign/
+ * corrupt/newer input throws. A valid v2 is verified read-only and left
+ * untouched. The ordinary constructor never calls this.
+ */
+export function upgradePlanSchemaV1ToV2(existingPath: string): void {
+  let stat: ReturnType<typeof statSync> | undefined;
+  try {
+    stat = statSync(existingPath);
+  } catch {
+    stat = undefined;
+  }
+  if (stat === undefined || !stat.isFile() || stat.size === 0) {
+    throw new SchemaIntegrityError("plans database upgrade requires an existing non-empty database file");
+  }
+
+  const readOnly = new DatabaseSync(existingPath, { readOnly: true });
+  let recognized: 1 | 2 | undefined;
+  let inspectFailure: unknown;
+  let inspectFailed = false;
+  try {
+    recognized = inspectExistingPlanDatabase(readOnly);
+  } catch (error) {
+    inspectFailed = true;
+    inspectFailure = error;
+  }
+  try {
+    readOnly.close();
+  } catch (closeError) {
+    if (!inspectFailed) {
+      inspectFailed = true;
+      inspectFailure = closeError;
+    }
+  }
+  if (inspectFailed) {
+    throw inspectFailure;
+  }
+  if (recognized === 2) {
+    return;
+  }
+
+  const db = new DatabaseSync(existingPath);
+  let failure: unknown;
+  let failed = false;
+  let begun = false;
+  try {
+    // Recheck recognition on the writable handle before any mutation.
+    if (inspectExistingPlanDatabase(db) !== 1) {
+      throw new SchemaIntegrityError("plans database changed during upgrade; expected version 1");
+    }
+    db.exec("BEGIN IMMEDIATE");
+    begun = true;
+    if (inspectExistingPlanDatabase(db) !== 1) {
+      throw new SchemaIntegrityError("plans database changed during upgrade; expected version 1");
+    }
+    db.exec(PLAN_LINK_SCHEMA_DDL);
+    const result = db.prepare("UPDATE schema_meta SET value = ? WHERE key = 'plan_schema_version'").run("2");
+    if (Number(result.changes) !== 1) {
+      throw new SchemaIntegrityError("plans database upgrade did not update exactly one plan_schema_version row");
+    }
+    if (inspectExistingPlanDatabase(db) !== 2) {
+      throw new SchemaIntegrityError("plans database upgrade did not produce a valid version 2 schema");
+    }
+    db.exec("COMMIT");
+    begun = false;
+  } catch (error) {
+    failed = true;
+    failure = error;
+    if (begun) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {
+        // Preserve the original upgrade error even if rollback fails.
+      }
+    }
+  }
+  try {
+    db.close();
+  } catch (closeError) {
+    if (!failed) {
+      failed = true;
+      failure = closeError;
+    }
+  }
+  if (failed) {
+    throw failure;
+  }
 }
 
 function isUniqueConstraintError(error: unknown): boolean {
@@ -356,7 +660,16 @@ interface PlanRow {
 
 export function createSqlitePlanRepository(path: string): SqlitePlanRepository {
   const db = new DatabaseSync(path);
-  ensurePlanSchema(db);
+  try {
+    ensurePlanSchema(db);
+  } catch (error) {
+    try {
+      db.close();
+    } catch {
+      // Preserve the original schema error even if close fails.
+    }
+    throw error;
+  }
 
   const insert = db.prepare("INSERT INTO plans (id, project_id, request_key, phase, version, data) VALUES (?, ?, ?, ?, ?, ?)");
   const cas = db.prepare(
@@ -435,6 +748,119 @@ export function createSqlitePlanRepository(path: string): SqlitePlanRepository {
     async listByProject(projectId: ProjectId): Promise<readonly Plan[]> {
       const rows = listStmt.all(projectId) as unknown as PlanRow[];
       return rows.map((row) => decodeRow(row));
+    },
+    async createOrAdoptLinkedRequest(
+      candidate: Plan,
+      binding: { botId: number; updateId: number; requestDigest: string },
+    ): Promise<Plan> {
+      // Everything up to BEGIN is synchronous: binding and candidate are copied
+      // once, so later caller mutation or aliasing cannot influence the write.
+      const botId = binding.botId;
+      const updateId = binding.updateId;
+      const requestDigest = binding.requestDigest;
+      if (typeof botId !== "number" || !Number.isSafeInteger(botId) || botId < 1) {
+        throw new TypeError("linked request botId must be a safe integer >= 1");
+      }
+      if (typeof updateId !== "number" || !Number.isSafeInteger(updateId) || updateId < 0) {
+        throw new TypeError("linked request updateId must be a safe integer >= 0");
+      }
+      if (typeof requestDigest !== "string" || requestDigest.length !== 64 || !/^[0-9a-f]{64}$/.test(requestDigest)) {
+        throw new TypeError("linked request requestDigest must be 64 lowercase hex characters");
+      }
+
+      const id = candidate.id;
+      const projectId = candidate.projectId;
+      const requestKey = candidate.requestKey;
+      const phase = candidate.phase;
+      const version = candidate.version;
+      if (phase !== "DRAFT" || version !== 1) {
+        throw new TypeError("linked request candidate must be an initial DRAFT Plan at version 1");
+      }
+      const encoded = encodePlan(candidate);
+      const captured = deepFreeze(parsePlan(encoded, { id, projectId, requestKey, phase, version }));
+
+      if (inspectExistingPlanDatabase(db) !== 2) {
+        throw new SchemaVersionError(
+          "linked plan requests require an explicitly upgraded version 2 plans database; version 1 is not upgraded automatically",
+        );
+      }
+
+      const findLink = db.prepare(
+        "SELECT request_digest, plan_id FROM plan_request_links WHERE bot_id = ? AND update_id = ?",
+      );
+      const insertLink = db.prepare(
+        "INSERT INTO plan_request_links (bot_id, update_id, request_digest, plan_id) VALUES (?, ?, ?, ?)",
+      );
+
+      let chosen: Plan;
+      let begun = false;
+      try {
+        db.exec("BEGIN IMMEDIATE");
+        begun = true;
+        if (inspectExistingPlanDatabase(db) !== 2) {
+          throw new SchemaIntegrityError("plans database changed during linked request; expected version 2");
+        }
+
+        const linked = findLink.get(botId, updateId) as { request_digest: string; plan_id: string } | undefined;
+        if (linked !== undefined) {
+          if (linked.request_digest !== requestDigest) {
+            throw new ConcurrencyError(
+              `linked request ${botId}/${updateId} already exists with a different request digest`,
+            );
+          }
+          const targetRow = findStmt.get(linked.plan_id) as PlanRow | undefined;
+          if (targetRow === undefined) {
+            throw new PersistenceCorruptionError(
+              `linked request ${botId}/${updateId} references missing Plan ${linked.plan_id}`,
+            );
+          }
+          chosen = decodeRow(targetRow);
+        } else {
+          const activeRows = findActiveStmt.all(requestKey) as unknown as PlanRow[];
+          const activeRow = activeRows[0];
+          if (activeRow !== undefined) {
+            chosen = decodeRow(activeRow);
+          } else {
+            try {
+              insert.run(
+                captured.id,
+                captured.projectId,
+                captured.requestKey,
+                captured.phase,
+                captured.version,
+                encodePlan(captured),
+              );
+            } catch (error) {
+              if (isUniqueConstraintError(error)) {
+                throw new ConcurrencyError(
+                  findStmt.get(captured.id) !== undefined
+                    ? `Plan ${captured.id} already exists`
+                    : `an active Plan already exists for request ${captured.requestKey}`,
+                );
+              }
+              throw error;
+            }
+            chosen = captured;
+          }
+          insertLink.run(botId, updateId, requestDigest, chosen.id);
+        }
+
+        if (inspectExistingPlanDatabase(db) !== 2) {
+          throw new SchemaIntegrityError("plans database did not remain a valid version 2 schema after linked request");
+        }
+        db.exec("COMMIT");
+        begun = false;
+      } catch (error) {
+        if (begun) {
+          try {
+            db.exec("ROLLBACK");
+          } catch {
+            // Preserve the original error even if rollback fails.
+          }
+        }
+        throw error;
+      }
+      return chosen;
     },
     close(): void {
       db.close();

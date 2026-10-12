@@ -1361,3 +1361,184 @@ budget today; it is written down so that the choice is visible.
 are named for the point they kill at rather than for the property they suggest,
 and the `ROLLBACK` mutation, which fails a named test if the transaction stops
 being one.
+
+## L-23 - What AC-18's four deaths are actually exercised with
+
+**Status:** OPEN, deliberate, and written because AC-18 requires a stand-in to
+be NAMED rather than implied to be the real thing. The round-1 reviewer found
+this entry missing and was right to.
+
+TASK-018 AC-18 asks for fixtures covering four deaths: a reviewer killed
+mid-review, a chain owner killed between its run and the candidate freeze, the
+supervisor restarted with activities in flight, and the WSL instance restarted.
+Here is exactly what each one runs.
+
+### What is real
+
+**The processes and the deaths are real.** Every fixture spawns a real `node`
+process, which claims a real activity through the production repository against
+a real SQLite file, and is ended with `SIGKILL`, which cannot be caught. Nothing
+simulates a crash by calling a function named `simulateCrash`, and no test marks
+an activity CRASHED by writing CRASHED into it.
+
+**The supervisor restart is a real second process.** A child runs the tick; the
+parent, which shares no memory with it, reads the result out of the database.
+
+**The concurrency is real.** Two children are started before either can finish,
+so the ordering is the operating system's, and the loser's refusal must name the
+winner's pid and machine.
+
+### What is a stand-in, and why
+
+**The dying process is a generic child, not Codex and not `scripts/mutate.mjs`.**
+The fixtures named "a reviewer killed mid-review" and "a chain owner killed
+between its run and the freeze" spawn a child that claims an activity of that
+KIND and dies. They do not launch an actual reviewer or an actual mutation run.
+
+That substitution is deliberate and its limit is precise. What the mechanism
+observes is a lease, a pid, a start time and a heartbeat; it cannot and does not
+inspect what the process was doing, so a reviewer and a mutation run are
+indistinguishable to it by construction. What the substitution does NOT cover is
+anything specific to those programs — a reviewer that hangs without dying, a
+mutation run that leaves its own journal behind. Those are covered, where they
+are covered at all, by `.mutation-journal.json` and by the chain's own gates,
+not here.
+
+Launching a real reviewer inside the suite would also spend money on every test
+run, which `AUTONOMOUS_SPEND_LIMIT = 0` forbids.
+
+**The WSL restart is not exercised at all.** There is no fixture for it. A WSL
+restart ends every process on the machine, so every lease's pid is gone and the
+observable state is the same one the CRASHED fixtures produce — but that is an
+argument, not a test, and it is recorded here as an argument. Restarting the
+host from inside its own test suite is not something this suite can do.
+
+**PID reuse is simulated by a mismatched start time, not by kernel reuse.** The
+fixture takes a live pid and records a start time one tick earlier, which is
+byte-for-byte the state the kernel produces when it hands a pid to a new
+process. Waiting for the kernel to actually recycle a pid is not arrangeable in
+a bounded test; the comparison under test is `started !== lease.processStartedAt`
+and that is exactly what the fixture drives.
+
+### What would close it
+
+A soak environment that can restart WSL and run a real reviewer under it. That
+is a different kind of test from anything in this repository today, it cannot be
+deterministic, and it would prove less per run than the fixtures do. It is not
+worth building now; it is written down so the choice is visible rather than
+discovered later as a gap.
+
+**Kept honest by:** the fixture names, which say what they DO — a child process
+that claims and dies — with the death they stand for in the test description
+rather than in the name; and by this entry, which is the only place the
+substitution is stated.
+
+## L-24 - One unattributed intermittent failure in `activityRecovery.test.ts`
+
+During TASK-018 Part B round-6 remediation, a targeted mutation run reported
+`restored: pass=36 fail=1` for `tests/activityRecovery.test.ts` on a tree that
+was byte-for-byte identical to the green baseline recorded minutes earlier in
+the same run. It happened once in seventeen runs of that file and has not
+recurred.
+
+### What is known
+
+The mutation itself was KILLED for the right reason. The restored tree compiled,
+and `all touched files verified byte-for-byte against the run-start baseline`
+passed, so the failure was not residue from the mutation. The baseline run of the
+same file in the same process reported `pass=37 fail=0`.
+
+### What is not known, and why
+
+Which test failed. `scripts/mutate.mjs` collected the failing names in
+`runTests` and printed only the counts, so the one occurrence left nothing to
+attribute it to — a flake, a real race and a harness bug were indistinguishable
+from the output. That gap is closed: the harness now prints
+`baseline failures: [...]` and `restored failures: [...]` with the test names
+whenever a run is not green, so the next occurrence names itself. The green
+lines keep their exact shape, because the chain matches
+`^restored: pass=[0-9]* fail=0$` on them.
+
+Reproduction was attempted and failed: 12 consecutive runs of the file, 4
+further complete mutation runs, and 30 runs under deliberate four-way CPU load.
+
+### Why it is written down instead of explained
+
+The file contains the only tests in the repository that spawn real processes and
+kill them, and two of them race two writers against one SQLite database through
+separate connections. A timing-sensitive failure there is plausible enough that
+an explanation would be a guess, and a guess recorded as a cause is worse than a
+recorded unknown. The suspicion is not evidence and is not being presented as
+any.
+
+The evidence rule is unchanged and was not weakened to accommodate this: a
+mutation run whose restored tree is not green is NOT valid evidence, and the
+chain stops on it. This entry exists because the run that produced the frozen
+candidate WAS green, and a green run does not erase an earlier red one.
+
+**Kept honest by:** `reportFailures` in `scripts/mutate.mjs`, which makes the
+next occurrence self-describing, and by this entry, which is the only record
+that it happened at all.
+
+## L-25 - Verdict consumption is complete; nothing in production LAUNCHES a review yet
+
+The mechanism that turns a reviewer's verdict into durable state
+(`consumeAcceptanceVerdicts`, `Activity.review`, `createFileVerdictSource`) is
+implemented, wired into `supervise.ts` beside the liveness probe, and driven
+end-to-end by `tests/verdictConsumption.test.ts` against a real database. What
+is NOT yet true is that anything in this repository writes an `Activity.review`
+in production, because the supervisor does not launch independent reviews — a
+shell chain outside the repository does, and has since TASK-014.
+
+### Why this is stated rather than quietly satisfied
+
+The twenty-two-hour gap that produced this work happened in THAT chain: it
+launched the reviewer, validated the verdict, logged it and exited. Consuming
+the verdict is now possible and proven, and the launcher that would record the
+binding belongs to the executor work the roadmap already sequences after this
+item. Writing a half-launcher here — enough to make the mechanism look used —
+would put "how a review is started" in two places, which is the shape that
+produced two records of one fact in round 3.
+
+### What is therefore proven, and what is not
+
+PROVEN: a verdict that exists on disk is consumed from durable state by a cold
+supervisor with no notification, exactly once, refused when it names a different
+candidate, never turned into an approval when it is absent or unreadable, and
+idempotent across restarts and competing supervisors.
+
+NOT PROVEN: that the chain which launches today's reviews records a binding the
+supervisor can later find. It does not, yet. Until the supervisor launches its
+own reviews, the round-to-round acceptance loop for THIS task still depends on
+the chain — including its exit after a verdict.
+
+### OWNER DECISION, 2026-09-20: this is now BLOCKING
+
+This entry was written as a passive limitation. It is not one any more.
+
+Three acceptance rounds of TASK-018 itself reproduced the failure it describes:
+round 7's verdict sat twenty-two hours before anything consumed it, round 8's
+about twenty, round 9's about twenty-five. Nothing crashed in any of them. Each
+time, a correct result sat on disk while the Factory had no owner whose job it
+was to notice, because the thing that launches reviews is a shell script whose
+lifetime is a terminal session.
+
+The owner has promoted this from a recorded limitation to a blocking autonomy
+requirement, tracked as **TASK-019 (AUTONOMOUS_SUPERVISOR)** with its own frozen
+acceptance criteria. Until TASK-019 is accepted:
+
+- this limitation stands, unchanged and unclosed;
+- no claim may be made that the Software Factory has an end-to-end autonomous
+  review loop;
+- the shell chain remains a temporary compatibility/bootstrap mechanism and is
+  explicitly NOT the fix.
+
+### What would close it
+
+`docs/tasks/TASK-019-autonomous-supervisor.md`, AC-2 and nothing less: the
+supervisor itself creates and owns the review record — run identity, candidate
+binding, ownership lease, launch state — in the same write that precedes
+launching the reviewer, and runs as a process that outlives every session.
+
+**Kept honest by:** this entry, and by `supervise.ts`, where the verdict source
+is wired and visibly has nothing yet producing bindings for it to read.

@@ -22,6 +22,9 @@
 
 import { createHash } from "node:crypto";
 
+import { ValidationError } from "../domain/errors.js";
+import { validateTicketTemplate } from "./planValidation.js";
+import { validateVerificationExecutionPolicy } from "./planTypes.js";
 import type {
   Plan,
   PlanBudget,
@@ -29,6 +32,7 @@ import type {
   PlannedWorkItem,
   PlannerConfig,
   PlanRevision,
+  WorkItemTicketTemplate,
 } from "./planTypes.js";
 
 /** The authoritative subset of a revision. Anything absent here is provenance, not content. */
@@ -162,15 +166,128 @@ function canonicalLoopBudget(budget: PlanExecutionConfig["loopBudget"]): string 
   ].join(",")}`;
 }
 
+/**
+ * Every authoritative field of one captured ticket template (NC-11).
+ *
+ * The rule is the same blunt one the approval digest already applies: if it
+ * can change what a worker is allowed to touch, which models may run it, how
+ * much it may spend, when it must stop, what it must return, or what "done"
+ * means for it, it is hashed. Field order is fixed in this function rather
+ * than taken from object key order, so the digest is stable across refactors
+ * and across whatever key order a writer or a JSON round-trip produced.
+ *
+ * Nothing here is derived from plan prose, and there is no prose field to
+ * hash: a template is the only place item-level authority exists, so notes,
+ * summaries and specs cannot move this value at all.
+ */
+function canonicalTicketTemplate(template: WorkItemTicketTemplate): string {
+  // Declared order is preserved for the inner lists: treating them as sets
+  // would make a reordering invisible, and a conservative digest costs only a
+  // re-approval while a permissive one costs authority.
+  const criteria = template.acceptanceCriteria.map(
+    (criterion) => `${seg(criterion.id)}${seg(criterion.version)}${seg(criterion.description)}`,
+  );
+  return [
+    `planItemKey:${seg(template.planItemKey)}`,
+    `schemaVersion:${seg(template.schemaVersion)}`,
+    `objective:${seg(template.objective)}`,
+    `criteria:${criteria.length}[${criteria.join("")}]`,
+    `owned:${segList(template.scope.owned)}`,
+    `forbidden:${segList(template.scope.forbidden)}`,
+    `read:${segList(template.scope.read)}`,
+    `dependencies:${segList(template.scope.dependencies)}`,
+    `validation:${segList(template.scope.validation)}`,
+    `eligibleModels:${segList(template.model.eligibleModels)}`,
+    `reasoningEffort:${seg(template.model.reasoningEffort)}`,
+    `modelRationale:${seg(template.model.rationale)}`,
+    `contextTokens:${template.budgets.contextTokens}`,
+    `outputTokens:${template.budgets.outputTokens}`,
+    `elapsedSeconds:${template.budgets.elapsedSeconds}`,
+    `maxAttempts:${template.budgets.maxAttempts}`,
+    `checkpoint:${seg(template.policy.checkpoint)}`,
+    `stopConditions:${segList(template.policy.stopConditions)}`,
+    `escalation:${seg(template.policy.escalation)}`,
+    `requiredFields:${segList(template.resultSchema.requiredFields)}`,
+    `maxResultBytes:${template.resultSchema.maxResultBytes}`,
+  ].join(",");
+}
+
+/**
+ * `~` for the legacy "no templates recorded" shape, so a plan that records
+ * authority for its items can never share a digest with one that records none.
+ * Templates are keyed by plan item, so they are sorted by that key.
+ *
+ * Every template is re-run through `validateTicketTemplate` — the same frozen
+ * check the live (`planTicketExecutability`) and persisted (`parsePlan`) paths
+ * already apply — and only its narrowed, canonical output is hashed. Without
+ * this, a caller handing this function an already-typed `WorkItemTicketTemplate`
+ * that in fact carries an unrecognized nested field (e.g. `scope.grantAll`)
+ * would digest identically to the valid template it was built from, because
+ * `canonicalTicketTemplate` below only ever reads known fields. This is the
+ * approval-digest half of that same fail-closed rule: a malformed or
+ * authority-smuggling template must never reach a digest at all, let alone an
+ * unchanged one.
+ */
+function canonicalTicketTemplates(templates: PlanExecutionConfig["ticketTemplates"]): string {
+  if (templates === undefined) {
+    return "~";
+  }
+  const canonical = templates.map((template) => {
+    const shape = validateTicketTemplate(template);
+    if (!shape.ok) {
+      throw new ValidationError(
+        `cannot compute an approval digest: ${shape.reason}`,
+      );
+    }
+    return shape.value;
+  });
+  const sorted = [...canonical].sort((a, b) => (a.planItemKey < b.planItemKey ? -1 : a.planItemKey > b.planItemKey ? 1 : 0));
+  return `=${sorted.length}[${sorted.map((template) => seg(canonicalTicketTemplate(template))).join("")}]`;
+}
+
+/**
+ * Only ever called for an explicitly present field: an absent field appends no
+ * segment at all, so there is no absent marker here. A present value is
+ * re-validated through the same strict check every other path applies — an
+ * unknown or malformed field must never digest identically to a candidate it
+ * was silently narrowed from, because that would let a genuine policy mutation
+ * keep satisfying an approval computed before the mutation.
+ */
+function canonicalVerificationExecutionPolicy(policy: NonNullable<PlanExecutionConfig["verificationExecutionPolicy"]>): string {
+  const shape = validateVerificationExecutionPolicy(policy);
+  if (!shape.ok) {
+    throw new ValidationError(`cannot compute an approval digest: verificationExecutionPolicy ${shape.reason}`);
+  }
+  const { budgets, executionPolicy } = shape.value;
+  return `=${[
+    `elapsedSeconds:${budgets.elapsedSeconds}`,
+    `outputBytes:${budgets.outputBytes}`,
+    `maxAttempts:${budgets.maxAttempts}`,
+    `rationale:${seg(executionPolicy.rationale)}`,
+  ].join(",")}`;
+}
+
 function canonicalExecution(execution: PlanExecutionConfig): string {
   const commands = execution.verificationCommands.map(canonicalVerificationCommand);
-  return [
+  const segments = [
     `implementer:${canonicalWorkerConfig(execution.implementer)}`,
     `reviewer:${canonicalWorkerConfig(execution.reviewer)}`,
     `commands:${commands.length}[${commands.map(seg).join("")}]`,
+    `ticketTemplates:${canonicalTicketTemplates(execution.ticketTemplates)}`,
     `workspaceRoot:${seg(execution.workspaceRoot)}`,
     `loopBudget:${canonicalLoopBudget(execution.loopBudget)}`,
-  ].join("|");
+  ];
+  // An absent field appends nothing — not a marker, not a separator — so every
+  // plan approved before this field existed keeps its exact prior digest bytes.
+  // Presence is key presence, so an explicit `undefined` or `null` still flows
+  // into the strict validator and is rejected rather than silently dropped.
+  if ("verificationExecutionPolicy" in execution) {
+    const policy = execution.verificationExecutionPolicy as NonNullable<
+      PlanExecutionConfig["verificationExecutionPolicy"]
+    >;
+    segments.push(`verificationExecutionPolicy:${canonicalVerificationExecutionPolicy(policy)}`);
+  }
+  return segments.join("|");
 }
 
 function canonicalBudget(budget: PlanBudget): string {

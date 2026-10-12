@@ -28,18 +28,24 @@ export interface MockWorkerOptions {
   readonly throws?: unknown;
 }
 
+const trustedMockWorkers = new WeakSet<object>();
+
+export function isTrustedMockWorker(value: unknown): boolean {
+  return typeof value === "object" && value !== null && trustedMockWorkers.has(value);
+}
+
 export function createMockWorker(options: MockWorkerOptions = {}): Worker {
   const id = options.id ?? "mock-worker";
   const outcomeStatus = options.outcomeStatus ?? "SUCCEEDED";
   const claimsAcceptanceMet = options.claimsAcceptanceMet ?? outcomeStatus === "SUCCEEDED";
   const omitted = new Set(options.omitEvidenceForCriteria ?? []);
 
-  return {
+  const worker: Worker = {
     id,
-    capabilities: {
-      roles: options.roles ?? FACTORY_ROLES,
+    capabilities: Object.freeze({
+      roles: Object.freeze([...(options.roles ?? FACTORY_ROLES)]),
       deterministic: true,
-    },
+    }),
     async execute(request: WorkerRequest): Promise<WorkerOutcome> {
       if (options.throws !== undefined) {
         throw options.throws;
@@ -72,4 +78,8 @@ export function createMockWorker(options: MockWorkerOptions = {}): Worker {
       };
     },
   };
+
+  Object.freeze(worker);
+  trustedMockWorkers.add(worker);
+  return worker;
 }

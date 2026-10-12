@@ -19,6 +19,49 @@
  *   - ambiguity fails closed rather than being retried.
  */
 
+import type { LaunchAcknowledgement } from "./acceptance.js";
+import {
+  applyWorkerRunReconciliation,
+  classifyWorkerRun,
+  completeWorkerRun,
+  enqueueWorkerRunNotification,
+  isTerminalWorkerRunState,
+  workerRunNotificationKey,
+  type WorkerRunCompletionInput,
+  type WorkerRunEnvelope,
+  type WorkerRunNotification,
+  type WorkerRunNotificationKind,
+} from "./workerRunEnvelope.js";
+import { completionFromWorkerRunEvidence } from "../adapters/supervision/workerRunLifecycle.js";
+import type { ReviewLauncher, ReviewLaunchRequest } from "./supervisorPorts.js";
+import {
+  bindingMismatch,
+  completionDetail,
+  isAccepted,
+  NO_VERDICT_OUTCOME,
+  type AcceptanceVerdictSource,
+  type ReviewBinding,
+} from "./acceptance.js";
+import {
+  adoptLaunchedReview,
+  canonicalActivityId,
+  claimActivity,
+  classifyActivity,
+  completeActivity,
+  crashedItemsToRequeue,
+  isTerminal,
+  recordReconciliation,
+  RECOVERY_TO_STATUS,
+  reportProgress,
+  reviewsAwaitingVerdict,
+  settleReview,
+  unobservedCompletions,
+  type Activity,
+  type ActivityLease,
+  type Liveness,
+  type LivenessProbe,
+  type TransitionVerdict,
+} from "./activity.js";
 import {
   CATALOG_UPGRADE_STEPS,
   planCatalogUpgrade,
@@ -26,8 +69,10 @@ import {
   type CatalogUpgradeStep,
 } from "./catalogUpgrade.js";
 import { reconcileRoadmapWithCatalog, unprovenCompletion } from "./roadmapCatalog.js";
+import { verifyNoLaunchEvidence } from "./planBackedExecutor.js";
 import {
   ConcurrencyError,
+  ProvenanceRegressionError,
   PersistenceCorruptionError,
   SchemaIntegrityError,
   ValidationError,
@@ -61,7 +106,12 @@ import {
   verifyAgainstAnchor,
   type ProvenanceEntry,
 } from "./provenanceChain.js";
-import { boundedDiagnostic, classifyResourceOutcome, type Classification } from "./resourceClassifier.js";
+import {
+  boundedDiagnostic,
+  classifyProviderReportedError,
+  classifyResourceOutcome,
+  type Classification,
+} from "./resourceClassifier.js";
 import {
   isRetryDue,
   isUsable,
@@ -86,6 +136,7 @@ import {
   DEFAULT_ROADMAP,
   type EscalationReason,
   type HumanEscalation,
+  type ReviewRequest,
   type RoadmapItem,
   type SessionCheckpoint,
   type SupervisorActionClaim,
@@ -134,8 +185,169 @@ export interface SupervisorServiceDeps {
    * ships, and to NONE when a catalog is injected — see `catalogUpgradeSteps`.
    */
   readonly catalogUpgradeSteps?: readonly CatalogUpgradeStep[];
+  /**
+   * How this installation finds out whether a lease holder is still running
+   * (TASK-018 AC-12). Injected for the same reason the probe and clock are: a
+   * test states the fact, and the production adapter reads `/proc`.
+   *
+   * ABSENT means liveness cannot be established, and reconciliation then
+   * concludes nothing — an unknown refuses.
+   */
+  readonly liveness?: LivenessProbe;
+  /** The interval AC-14 measures a stall against. Defaults to forty minutes. */
+  readonly stallAfterMs?: number;
+  /**
+   * How this installation builds a lease for ITSELF (TASK-018 AC-12).
+   *
+   * Injected rather than imported so the supervisor keeps no dependency on
+   * `/proc`, and so a test can hand it a lease whose liveness it controls. The
+   * production adapter is `leaseForThisProcess`, which reads the same file the
+   * probe compares against — a lease built any other way would fail its own
+   * check and the holder would look dead to itself.
+   */
+  readonly activityLease?: (claimedAt: Timestamp) => ActivityLease | undefined;
+  /**
+   * Where a launched review's verdict can be read back from (TASK-018 round-7
+   * gap).
+   *
+   * ABSENT means this installation launches no reviews. An activity that
+   * records one anyway is then unconsumable, and the consumer says so rather
+   * than passing over it in silence.
+   */
+  readonly acceptanceVerdicts?: AcceptanceVerdictSource;
+  /**
+   * How this installation STARTS an independent review (TASK-019 AC-2).
+   *
+   * Absent means this supervisor does not launch reviews, and a durable request
+   * for one is then unservable — which the consumer refuses rather than
+   * ignores, the same rule the probe and the lease follow. The shell chain that
+   * used to do this is not a fallback: a request nobody can service must be
+   * visible, not quietly deferred to something outside the repository.
+   */
+  readonly reviewLauncher?: ReviewLauncher;
+  /**
+   * Where a launched worker run's bounded, redacted terminal artifact lives
+   * (DEFECT-DURABLE-WORKER-RUN-ENVELOPE AC-7).
+   *
+   * ABSENT means this installation cannot read one back during reconciliation
+   * — reconciliation then falls back to liveness alone, exactly as it did
+   * before this defect. Present in every production wiring, because the
+   * artifact is what lets a restarted supervisor recover a RUNNING launch's
+   * real outcome (an owner that finished and left a result behind) instead of
+   * reconciling it away as LOST purely because nothing durable recorded the
+   * completion before the process that would have wrote it died.
+   */
+  readonly workerRunArtifactDir?: string;
   readonly log?: (line: string) => void;
   readonly ownerId?: string;
+}
+
+/**
+ * What a write may carry ALONGSIDE an activity transition — or why it may not.
+ *
+ * See `commitActivityChange`. The refusal case exists because "the state I was
+ * going to patch is no longer the state I read" must be an answer rather than
+ * an overwrite.
+ */
+export type AlongsideVerdict =
+  | { readonly ok: true; readonly patch: Partial<SupervisorState> }
+  | { readonly ok: false; readonly problem: string };
+
+/**
+ * Whether a failed write is worth re-reading and recomputing.
+ *
+ * `ConcurrencyError` is the CAS losing, which IS a stale read.
+ * `ProvenanceRegressionError` is raised BEFORE the CAS, when the provenance
+ * being written is shorter than the stored chain — which is what a rival's
+ * append makes an in-hand snapshot look like. It is only a REASON TO LOOK: the
+ * caller must still prove the durable state moved before treating it as a race,
+ * because a deliberate truncation raises exactly the same error.
+ *
+ * Deliberately narrow. Every other `SchemaIntegrityError` — a rewritten entry,
+ * a broken chain, a malformed table — is a refusal about the write itself, and
+ * retrying one of those is how a corruption guard turns into five attempts at
+ * corrupting.
+ */
+/**
+ * Whether somebody has ALREADY consumed this review.
+ *
+ * ROUND-9 REVIEW, HIGH 3. `settleReview` made a second settlement a correct
+ * no-op, and the patch travelling beside it was applied anyway — so two
+ * supervisors consuming one CHANGES_REQUIRED each released the item and each
+ * launched remediation. Idempotence has to cover the WHOLE transition, not the
+ * half of it that happens to live in the activity list.
+ *
+ * Observed-and-terminal is the mark, because the observation is written by
+ * whoever applied the verdict, in the same write as the roadmap move it
+ * accompanies. If it is there, the move has already happened.
+ */
+function alreadySettled(state: SupervisorState, activityId: string): boolean {
+  const activity = (state.activities ?? []).find((entry) => entry.id === activityId);
+  return activity !== undefined && isTerminal(activity.state) && activity.observedAt !== undefined;
+}
+
+/**
+ * One answer per lease, for the life of one tick.
+ *
+ * Wrapping rather than caching inside the probe, because the probe is a PORT: a
+ * `/proc` read that answers differently a second later is not wrong, it is
+ * honest. What must not differ is two answers used inside ONE decision.
+ */
+function memoisedLiveness(probe: LivenessProbe): LivenessProbe {
+  const seen = new Map<string, Liveness>();
+  return {
+    check(lease) {
+      const key = JSON.stringify([lease.pid, lease.processStartedAt, lease.machine, lease.boot]);
+      const already = seen.get(key);
+      if (already !== undefined) {
+        return already;
+      }
+      const answer = probe.check(lease);
+      seen.set(key, answer);
+      return answer;
+    },
+  };
+}
+
+/**
+ * Where a review reports, derived rather than chosen.
+ *
+ * Derived from the run id, so two reviews cannot collide on one path and a
+ * previous round's file cannot be mistaken for this round's answer — the
+ * wrong-candidate refusal exists for the case where it happens anyway, and this
+ * is the cheaper half of that guard.
+ */
+function reviewSourcePath(request: ReviewRequest, activityId: string): string {
+  return `${reviewDirectory(request)}/${safeName(activityId)}-verdict.txt`;
+}
+
+function reviewAckPath(request: ReviewRequest, activityId: string): string {
+  return `${reviewDirectory(request)}/${safeName(activityId)}-ack.json`;
+}
+
+function reviewDirectory(request: ReviewRequest): string {
+  return `${REVIEW_ROOT}/${safeName(request.roadmapKey)}`;
+}
+
+/** Absolute, because a relative path means different files to different processes. */
+const REVIEW_ROOT = process.env["SF_REVIEW_DIR"] ?? `${process.env["HOME"] ?? "/tmp"}/.software-factory/reviews`;
+
+function safeName(value: string): string {
+  return value.replace(/[^A-Za-z0-9_.-]+/g, "_");
+}
+
+function leaseFromAcknowledgement(ack: LaunchAcknowledgement): ActivityLease {
+  return {
+    pid: ack.pid,
+    processStartedAt: ack.processStartedAt,
+    machine: ack.machine,
+    boot: ack.boot,
+    claimedAt: ack.at,
+  };
+}
+
+function isStaleSnapshot(error: unknown): boolean {
+  return error instanceof ConcurrencyError || error instanceof ProvenanceRegressionError;
 }
 
 export type TickResult =
@@ -263,11 +475,32 @@ export class SupervisorService {
    * `REFUSAL` has no field a basis could ride in, no matter what legitimate
    * housekeeping was committed before the refusal fired.
    */
+  /** Set for the duration of one tick; see `tick`. */
+  private tickProbe: LivenessProbe | undefined;
+
   async tick(): Promise<TickResult> {
     let outcome: TickOutcome;
+    /**
+     * ONE TICK, ONE ANSWER ABOUT ONE LEASE (round-9 review, HIGH 1).
+     *
+     * The first version of this fix memoised inside `reconcileActivities`, and
+     * a test that simply COUNTED the calls showed the probe still being asked
+     * twice: `reconcileClaim` and the claim path ask as well, and they are the
+     * readers whose disagreement decides whether a live owner keeps its claim.
+     * Scoped to one function, the fix would have closed the case the reviewer
+     * reproduced and left the neighbouring ones open — which is the exact
+     * pattern the last three rounds have been about.
+     *
+     * The memo lasts for the tick and is dropped with it, because a `/proc`
+     * read that answers differently a minute later is not wrong; two answers
+     * used inside ONE decision are.
+     */
+    this.tickProbe = this.deps.liveness === undefined ? undefined : memoisedLiveness(this.deps.liveness);
     try {
       outcome = await this.runTick();
+      this.tickProbe = undefined;
     } catch (error) {
+      this.tickProbe = undefined;
       /**
        * A CORRUPT RECORD IS AN ANSWER, NOT AN EXCEPTION (round-8 HIGH).
        *
@@ -433,7 +666,94 @@ export class SupervisorService {
     if (catalogued.result !== undefined) {
       return { kind: "REFUSAL", result: catalogued.result };
     }
-    const defined = catalogued.state;
+    /**
+     * 0c. RESULTS THAT ALREADY EXIST, before anything concludes anyone died
+     * (TASK-018, round-7 gap).
+     *
+     * Ordering is the whole point. A reviewer writes its verdict and exits
+     * immediately, so by the time any supervisor looks, its owner is legitimately
+     * gone — and reconciliation, asked first, would classify that activity
+     * CRASHED and requeue the item as work that never produced anything. The
+     * result exists; being asked in the wrong order is what loses it.
+     *
+     * So the artefact is read before the process is judged. This is the same
+     * lesson AC-19 states about completions, applied to the one kind of work
+     * whose author is guaranteed to be dead when its output is found.
+     */
+    /**
+     * 0b-bis. REVIEWS THIS FACTORY OWNS (TASK-019).
+     *
+     * Before verdicts are consumed and before anything is concluded about who
+     * is alive: a requested review is started if it has not been, and a started
+     * one is adopted once its worker has proved it exists. Both are pure state
+     * transitions over durable rows, and both are safe to repeat — which is
+     * what lets a supervisor die anywhere in here and a fresh one carry on.
+     */
+    const reviewed = await this.reconcileReviews(catalogued.state);
+    if (reviewed.refusal !== undefined) {
+      return {
+        kind: "REFUSAL",
+        result: {
+          kind: "WAITING_FOR_HUMAN",
+          roadmapKey: reviewed.refusal.roadmapKey,
+          reason: "HUMAN_DECISION_REQUIRED",
+          humanActionRequired: reviewed.refusal.problem,
+        },
+      };
+    }
+
+    if (reviewed.blocked !== undefined) {
+      return { kind: "CONCLUSION", result: reviewed.blocked, wakeBasis: reviewed.state };
+    }
+
+    const consumed = await this.consumeAcceptanceVerdicts(reviewed.state);
+    if (consumed.refusal !== undefined) {
+      return {
+        kind: "REFUSAL",
+        result: {
+          kind: "WAITING_FOR_HUMAN",
+          roadmapKey: consumed.refusal.roadmapKey,
+          reason: "HUMAN_DECISION_REQUIRED",
+          humanActionRequired: consumed.refusal.problem,
+        },
+      };
+    }
+
+    /**
+     * 0d. WORK IN FLIGHT, before anything decides what to do next (TASK-018).
+     *
+     * After the definition is trusted and before eligibility is computed: an
+     * item whose owner crashed goes back to the queue here, so the selection
+     * below sees the roadmap as it actually is rather than as a dead process
+     * left it.
+     */
+    // Worker evidence is inspected before activity/claim recovery can requeue the action.
+    const workerRunsReconciled = await this.reconcileWorkerRuns(consumed.state);
+    if (workerRunsReconciled.refusal !== undefined) {
+      return { kind: "REFUSAL", result: { kind: "WAITING_FOR_HUMAN",
+        roadmapKey: workerRunsReconciled.state.roadmap[0]?.key ?? "unknown",
+        reason: "HUMAN_DECISION_REQUIRED", humanActionRequired: workerRunsReconciled.refusal } };
+    }
+    const inFlight = await this.reconcileActivities(workerRunsReconciled.state);
+    if (inFlight.refusal !== undefined) {
+      return {
+        kind: "REFUSAL",
+        result: {
+          kind: "WAITING_FOR_HUMAN",
+          roadmapKey: inFlight.state.roadmap[0]?.key ?? "unknown",
+          reason: "HUMAN_DECISION_REQUIRED",
+          humanActionRequired: inFlight.refusal,
+        },
+      };
+    }
+    /**
+     * 0e. WORKER RUNS RECONCILE THE SAME WAY (DEFECT-DURABLE-WORKER-RUN-ENVELOPE
+     * AC-7, AC-8), immediately after activities and for the identical reason:
+     * a launched Claude/Codex process is work in flight too, and an item whose
+     * launch nobody can currently vouch for must not be treated as free to
+     * launch again. Never increases a launch count — see `reconcileWorkerRuns`.
+     */
+    const defined = inFlight.state;
 
     /**
      * 1a. RESOURCES RECONCILE BEFORE ANY PATH THAT CAN PUBLISH A WAKE
@@ -564,7 +884,69 @@ export class SupervisorService {
     const { activeClaim: _dropped, ...withoutClaim } = state;
     void _dropped;
 
+    /**
+     * A CLAIM IS NOT PROOF THAT ITS OWNER IS GONE — IN EITHER STATE
+     * (round-3 review HIGH 1, widened by round-7 review HIGH 1).
+     *
+     * This function was written when the supervisor was effectively
+     * single-process: a claim still outstanding at the start of a tick could
+     * only mean the process that made it had died, so every one was treated as
+     * abandoned. Part B made that assumption false.
+     *
+     * Round 3 fixed it for RUNNING and left CLAIMED exactly as it was, because
+     * a CLAIMED claim "proves the external launch never happened" and a retry
+     * is therefore safe. That reasoning is about the ACTION; it says nothing
+     * about the PROCESS. Between taking a claim and recording the launch there
+     * is a live owner holding a live lease, and this cleared the claim out from
+     * under it — after which a second supervisor launched a second attempt at
+     * the same work. The reviewer drove exactly that against a real database.
+     *
+     * The activity knows, in both states. It carries a lease whose liveness is
+     * checkable, so that is consulted BEFORE anything is concluded, and a live
+     * holder means this supervisor stands down: the claim is THEIRS and is left
+     * exactly where it is, and the refusal names who has it (AC-13).
+     */
+    const probe = this.livenessProbe();
+    const owner = (state.activities ?? []).find(
+      (entry) => entry.id === canonicalActivityId(claim.roadmapKey, claim.kind, claim.attempt),
+    );
+    const holding =
+      probe !== undefined && owner !== undefined && !isTerminal(owner.state) && owner.lease !== undefined
+        ? { lease: owner.lease, liveness: probe.check(owner.lease) }
+        : undefined;
+
+    if (holding?.liveness === "ALIVE") {
+      const held =
+        `action ${claim.actionId} is held by pid ${holding.lease.pid} on ` +
+        `${JSON.stringify(holding.lease.machine)}, which is still running; this supervisor is standing down`;
+      this.log(`[supervisor] ${held}`);
+      return {
+        // The claim is NOT dropped: it belongs to the process that is still
+        // working, and removing it would let a third supervisor start beside
+        // them both.
+        state,
+        result: {
+          kind: "WAITING_FOR_RESOURCE",
+          roadmapKey: claim.roadmapKey,
+          reason: boundedDiagnostic(held),
+        },
+      };
+    }
+
     if (claim.state === "CLAIMED") {
+      /**
+       * AN UNKNOWABLE OWNER NEVER ARRIVES HERE, AND THAT IS WHY THERE IS NO
+       * BRANCH FOR ONE (round-8 mutation run).
+       *
+       * A branch was written for it, refusing to clear a claim whose holder
+       * could not be resolved. The mutation that disabled it SURVIVED: no test
+       * could tell the difference, because `reconcileActivities` runs earlier in
+       * the same tick and refuses outright for every activity whose liveness is
+       * AMBIGUOUS. An unknowable owner stops the tick before the claim is ever
+       * looked at; and with no probe at all, `holding` is `undefined` and the
+       * branch could not fire either way. It was deleted rather than left as
+       * code that reads like a guard and can never be one.
+       */
       /**
        * Proves the external launch never happened: a bounded retry is safe.
        *
@@ -862,6 +1244,14 @@ export class SupervisorService {
         record.key === chosen ? this.applyClassification(record, confirmation, now) : record,
       ),
     });
+    if (confirmation.state === "AUTH_REQUIRED") {
+      const action = `Authenticate ${chosen} before launching ${item.key}; credentials require a human.`;
+      const escalated = await this.escalate(next, item.key, "HUMAN_CREDENTIAL_REQUIRED", action, `${chosen}: ${confirmation.reason}`);
+      return { ok: false, state: escalated, result: {
+        kind: "WAITING_FOR_HUMAN", roadmapKey: item.key,
+        reason: "HUMAN_CREDENTIAL_REQUIRED", humanActionRequired: action,
+      } };
+    }
     if (confirmation.state !== "AVAILABLE") {
       // It was usable when the schedule was computed and is not usable now.
       // That is ordinary, and it is a wait rather than a failure.
@@ -1577,17 +1967,236 @@ export class SupervisorService {
       attempt,
       claimedAt: this.deps.clock.now(),
     };
-    const claimed = await this.commit(state, {
-      ...state,
-      activeClaim: claim,
-      roadmap: setAttempts(setStatus(state.roadmap, item.key, "ACTIVE"), item.key, attempt),
-    });
+    /**
+     * THE DURABLE ACTIVITY, ALONGSIDE THE CLAIM (TASK-018 Part B, round-1
+     * CRITICAL).
+     *
+     * The first version of Part B built `claimActivity`, `reportProgress` and
+     * `completeActivity` and then called none of them from here, so a real
+     * review or verification process could still die with no lease, no
+     * heartbeat, no completion and nothing for reconciliation to find. The
+     * mechanism existed and the Factory did not use it, which is worth less
+     * than not having built it — it reads as covered.
+     *
+     * WHY BOTH RECORDS. `activeClaim` answers "what did this supervisor launch
+     * and must it be reconciled", and it is singular by design. The activity
+     * answers "is a process still working on this, and what did it end up
+     * doing", survives the supervisor itself, and is one of several. Neither
+     * replaces the other, and `activeClaim` is untouched.
+     */
+    const activityId = canonicalActivityId(item.key, action.kind, attempt);
+    const probe = this.livenessProbe();
+    const leaseSource = this.deps.activityLease;
+    const lease = leaseSource?.(this.deps.clock.now());
 
-    // Second durable write: from here the launch may have happened.
-    const running = await this.commit(claimed, {
-      ...claimed,
-      activeClaim: { ...claim, state: "RUNNING" },
-    });
+    /**
+     * A CONFIGURED INSTALLATION THAT CANNOT IDENTIFY ITSELF MUST NOT RUN
+     * (round-2 review, CRITICAL).
+     *
+     * The first version guarded every activity write with
+     * `lease !== undefined && probe !== undefined`, which reads as caution and
+     * is the exact opposite. When `leaseForThisProcess` could not read
+     * `/proc/<pid>/stat` it returned undefined, and the supervisor then ran the
+     * work, completed it, and marked the item DONE with no activity, no lease
+     * and nothing for reconciliation to find. Unknown liveness RAN THE WORK.
+     * That is fail-open in a codebase whose whole discipline is the reverse.
+     *
+     * The distinction that matters is between an installation that does not
+     * record activities at all — no probe and no lease source, which is how the
+     * demo and most fixtures are built — and one that is configured to and
+     * cannot. The first is a choice; the second is an unknown, and every
+     * unknown here refuses.
+     */
+    /**
+     * HALF-CONFIGURED IS ALSO AN UNKNOWN (round-4 review, HIGH 1).
+     *
+     * The first fix asked for BOTH dependencies and treated anything else as
+     * "this installation does not record activities" — so supplying a real
+     * liveness probe and no lease source ran the work, returned ADVANCED, and
+     * marked the item DONE with zero activities. Fail-open again, one step
+     * further out: I closed "configured and cannot" and left "configured by
+     * halves" wide open.
+     *
+     * EITHER dependency present means somebody INTENDED this installation to
+     * record activities. Neither is a choice; one is a misconfiguration, and a
+     * misconfiguration is not a licence to run unobserved.
+     */
+    const intendsActivities = probe !== undefined || leaseSource !== undefined;
+    const recordsActivities = probe !== undefined && leaseSource !== undefined;
+    if (intendsActivities && !recordsActivities) {
+      const missing = probe === undefined ? "a liveness probe" : "a lease source";
+      const problem =
+        `this supervisor is configured to record activities but has no ${missing}, so work on ${item.key} could ` +
+        "not be reconciled by anything; refusing to run it";
+      this.log(`[supervisor] ${problem}`);
+      return {
+        kind: "CONCLUSION",
+        result: {
+          kind: "WAITING_FOR_HUMAN",
+          roadmapKey: item.key,
+          reason: "HUMAN_DECISION_REQUIRED",
+          humanActionRequired: boundedDiagnostic(problem),
+        },
+        wakeBasis: state,
+      };
+    }
+    if (recordsActivities && lease === undefined) {
+      const problem =
+        `this supervisor cannot establish its own process identity, so it cannot take a lease on ${item.key}; ` +
+        "refusing to run work that nothing could later reconcile";
+      this.log(`[supervisor] ${problem}`);
+      return {
+        kind: "CONCLUSION",
+        result: {
+          kind: "WAITING_FOR_HUMAN",
+          roadmapKey: item.key,
+          reason: "HUMAN_DECISION_REQUIRED",
+          humanActionRequired: boundedDiagnostic(problem),
+        },
+        wakeBasis: state,
+      };
+    }
+
+    let activities = state.activities ?? [];
+
+    if (lease !== undefined && probe !== undefined) {
+      const claimedActivity = claimActivity(
+        activities,
+        { id: activityId, kind: action.kind, roadmapKey: item.key, lease, now: this.deps.clock.now() },
+        probe,
+      );
+      if (!claimedActivity.ok) {
+        /**
+         * Something else owns this, or ownership cannot be established. Either
+         * way this supervisor must not start a second one beside it — that is
+         * the duplicate-owner state AC-13 exists to make impossible, and the
+         * refusal names who holds it.
+         */
+        this.log(`[supervisor] not starting ${item.key}: ${claimedActivity.problem}`);
+        return {
+          kind: "CONCLUSION",
+          result: {
+            kind: "WAITING_FOR_RESOURCE",
+            roadmapKey: item.key,
+            reason: boundedDiagnostic(claimedActivity.problem),
+          },
+          wakeBasis: state,
+        };
+      }
+      activities = claimedActivity.activities;
+    }
+
+    /**
+     * A LOST RACE MUST STILL NAME THE WINNER (round-1 HIGH 5).
+     *
+     * Two supervisors evaluating the claim against the same snapshot both see a
+     * free activity; one commits and the other's CAS fails. The loser used to
+     * surface that as a bare `ConcurrencyError` — technically accurate, and it
+     * tells an operator nothing about who is running the work, which is what
+     * AC-13 requires the refusal to say.
+     *
+     * So a conflict is not the answer: it is the signal to look again. The
+     * state is re-read and the claim re-evaluated against what actually
+     * happened, and the winner's lease then produces the ordinary
+     * "held by pid N on M, which is still running" refusal. Bounded, because a
+     * loop that retries forever is a hang with good intentions.
+     */
+    let claimed: SupervisorState;
+    try {
+      claimed = await this.commit(state, {
+        ...state,
+        activeClaim: claim,
+        activities,
+        roadmap: setAttempts(setStatus(state.roadmap, item.key, "ACTIVE"), item.key, attempt),
+      });
+    } catch (error) {
+      if (!(error instanceof ConcurrencyError) || lease === undefined || probe === undefined) {
+        throw error;
+      }
+      const fresh = await this.deps.repository.load();
+      const recheck =
+        fresh === undefined
+          ? undefined
+          : claimActivity(
+              fresh.activities ?? [],
+              { id: activityId, kind: action.kind, roadmapKey: item.key, lease, now: this.deps.clock.now() },
+              probe,
+            );
+      const problem =
+        recheck !== undefined && !recheck.ok
+          ? recheck.problem
+          : `another supervisor changed ${item.key} while this one was claiming it`;
+      this.log(`[supervisor] lost the race for ${item.key}: ${problem}`);
+      return {
+        kind: "CONCLUSION",
+        result: { kind: "WAITING_FOR_RESOURCE", roadmapKey: item.key, reason: boundedDiagnostic(problem) },
+        wakeBasis: state,
+      };
+    }
+
+    // Second durable write: from here the launch may have happened, and the
+    // activity says so too — a heartbeat before the launch is what separates
+    // "claimed and never started" from "started and stopped reporting".
+    /**
+     * THE LAUNCH WRITE IS RETRIED TOO (round-6 review, HIGH 3).
+     *
+     * This used a raw commit, so another supervisor writing between the claim
+     * and the heartbeat made `tick()` THROW — leaving the activity CLAIMED, the
+     * claim CLAIMED and the item ACTIVE, with nothing having run and no
+     * decision recorded. The retry existed and was wired only to the
+     * completion; contention does not respect which write we happened to
+     * harden first.
+     *
+     * The heartbeat and the claim's CLAIMED -> RUNNING transition travel
+     * together: one without the other is a state that means nothing.
+     */
+    let running = claimed;
+    if (lease === undefined || probe === undefined) {
+      running = await this.commit(claimed, { ...claimed, activeClaim: { ...claim, state: "RUNNING" } });
+    } else {
+      const launched = await this.commitActivityChange(
+        claimed,
+        `record the launch of ${activityId}`,
+        (activities) => reportProgress(activities, activityId, { at: this.deps.clock.now(), progress: 1 }, lease),
+        (fresh) => {
+          /**
+           * The claim that is DURABLE right now, not the one read at the top of
+           * the tick. If it is not ours any more, this supervisor has already
+           * been displaced and must not launch — writing the old claim back
+           * would displace whoever took it, which is the duplicate-owner state
+           * this whole mechanism refuses.
+           */
+          const durable = fresh.activeClaim;
+          if (durable === undefined) {
+            return { ok: false, problem: `the claim on ${item.key} is no longer in durable state` };
+          }
+          if (durable.actionId !== claim.actionId) {
+            return {
+              ok: false,
+              problem: `durable state now holds claim ${durable.actionId}, not ${claim.actionId}`,
+            };
+          }
+          return { ok: true, patch: { activeClaim: { ...durable, state: "RUNNING" } } };
+        },
+      );
+      if (!launched.recorded) {
+        const problem =
+          `${item.key} could not record that its work had started (${launched.problem ?? "unknown reason"}); ` +
+          "refusing to launch work whose start nothing would know about";
+        this.log(`[supervisor] ${problem}`);
+        return {
+          kind: "CONCLUSION",
+          result: {
+            kind: "WAITING_FOR_HUMAN",
+            roadmapKey: item.key,
+            reason: "HUMAN_DECISION_REQUIRED",
+            humanActionRequired: boundedDiagnostic(problem),
+          },
+          wakeBasis: launched.state,
+        };
+      }
+      running = launched.state;
+    }
 
     /**
      * Resuming a checkpoint (F5-RESUME-1).
@@ -1687,8 +2296,60 @@ export class SupervisorService {
       };
     }
 
+    /**
+     * THE COMPLETION EVENT (AC-15), written before anything else settles.
+     *
+     * This is the record that makes "the result has existed for hours and
+     * nobody noticed" impossible: it is durable, it names the outcome, and
+     * `unobservedCompletions` reads it out of the database without anything
+     * having to be told. A FAILED outcome is recorded just as a passing one is,
+     * because a failure nobody noticed is the same problem.
+     */
+    const completion = {
+      outcome: outcome.kind,
+      detail: boundedDiagnostic(`${item.key} ${action.kind} attempt ${attempt}`),
+      at: this.deps.clock.now(),
+    };
+    let finished = running;
+    if (lease !== undefined && probe !== undefined) {
+      const written = await this.commitActivityChange(
+        running,
+        `record the completion of ${activityId}`,
+        (activities) =>
+          completeActivity(activities, activityId, {
+            state: outcome.kind === "COMPLETED" ? "COMPLETED" : "FAILED",
+            completion,
+            holder: lease,
+          }),
+      );
+      if (!written.recorded) {
+        /**
+         * THE OUTCOME IS NOT SETTLED IF IT COULD NOT BE RECORDED (round-5
+         * review, HIGH 2). Settling here would drive the item to DONE with an
+         * activity still RUNNING and no completion — a completion nothing
+         * durable accounts for. A human is told instead, and the outcome is
+         * reported rather than applied.
+         */
+        const problem =
+          `${item.key} ${action.kind} finished as ${outcome.kind}, and its completion could not be recorded ` +
+          `(${written.problem ?? "unknown reason"}); the outcome is NOT being applied`;
+        this.log(`[supervisor] ${problem}`);
+        return {
+          kind: "CONCLUSION",
+          result: {
+            kind: "WAITING_FOR_HUMAN",
+            roadmapKey: item.key,
+            reason: "HUMAN_DECISION_REQUIRED",
+            humanActionRequired: boundedDiagnostic(problem),
+          },
+          wakeBasis: written.state,
+        };
+      }
+      finished = written.state;
+    }
+
     return this.settle(
-      running,
+      finished,
       // R7-SEC-1: the snapshot this function captured, never whatever the
       // executor may have left behind in the object it was handed.
       settleItem,
@@ -1900,8 +2561,39 @@ export class SupervisorService {
      * resource remains correct when it did not, which is every action that
      * declares nothing.
      */
-    const implementerResourceKey =
-      authorized.find((entry) => entry.role === "implementer") === undefined
+    /**
+     * A PROVEN NO-LAUNCH ATTEMPT NAMES NO IMPLEMENTER (DEFECT-NO-LAUNCH-LINEAGE).
+     *
+     * A resource can be routed, probed and financially gated for an action
+     * whose executor then discovers — before dispatching anything — that
+     * there is nothing to launch (`planBackedExecutor`'s no-plan return). The
+     * routed resource did not implement this attempt, so it must not become
+     * this attempt's `IMPLEMENTED_BY` record or `lastRunConfig`.
+     *
+     * `verifyNoLaunchEvidence` is the only thing this trusts: it accepts
+     * nothing that was not minted, bound to this exact `actionId`, to
+     * `this.deps.executor` itself, AND to this exact `outcome` object, by
+     * the boundary that actually observed the non-launch. The executor
+     * identity check (round 4) is why an arbitrary executor cannot build its
+     * own `createPlanBackedExecutor` helper, call it with the same input,
+     * and forward the helper's genuine evidence as proof about ITS OWN
+     * execution: the evidence stays bound to the helper object, never to
+     * `this.deps.executor`. The outcome identity check (round 5 / C5) is why
+     * that same executor object cannot be handed authority by REPLACING its
+     * `execute` method in place: `this.deps.executor` is passed to `execute`
+     * whole, and `verifyNoLaunchEvidence` requires the exact `WorkOutcome`
+     * object this module minted — a wrapper that repackages the trusted
+     * call's evidence into a new, self-authored outcome produces an object
+     * this module never minted, so the check fails regardless of the
+     * executor and actionId matching. Any other outcome — including every
+     * `HUMAN_REQUIRED` a real worker reports — takes the unchanged path
+     * below and records lineage as it always has.
+     */
+    const noLaunchProven = verifyNoLaunchEvidence(outcome, actionId, this.deps.executor);
+
+    const implementerResourceKey = noLaunchProven
+      ? undefined
+      : authorized.find((entry) => entry.role === "implementer") === undefined
         ? usedResourceKey
         : resourceKey(
             authorized.find((entry) => entry.role === "implementer")!.provider,
@@ -1924,43 +2616,62 @@ export class SupervisorService {
             .map((entry) => `${entry.role}=${entry.provider}/${entry.model}${entry.effort === undefined ? "" : `:${entry.effort}`}`)
             .join(", ")}`;
 
-    const lineageProvenance = appendImplementerProvenance(
-      state.provenance,
-      item.key,
-      implementerResourceKey,
-      now,
-      `${LINEAGE_DETAIL[outcome.kind]}${authorizedDetail}`,
-    );
-    const withLineage: SupervisorState = {
-      ...withoutClaim,
-      /**
-       * TWO DIFFERENT QUESTIONS, TWO DIFFERENT RECORDS (round-4 finding 3).
-       *
-       * `reconciled` answers "is what the worker REPORTED consistent with what
-       * it was allowed to run?" — so it must be compared against whichever
-       * authorised member the report names, or an honest reviewer reporting
-       * itself is refused.
-       *
-       * `lastRunConfig` answers "what IMPLEMENTED this item?" — and
-       * `excludedReviewerResources` reads it alongside the implementer history
-       * to keep an implementer from reviewing its own work. Round 3 let the
-       * reconciliation basis flow into this record, so a run whose REVIEWER
-       * reported itself persisted the reviewer as what ran, the two records
-       * disagreed, and every dependent review was blocked again.
-       *
-       * They are now written from their own answers: the implementer record when
-       * a declaration named one, and the reconciled record otherwise.
-       */
-      roadmap: setRunConfig(
-        setImplementer(state.roadmap, item.key, implementerResourceKey),
-        item.key,
-        implementerMember === undefined ? reconciled : implementerBasis,
-      ),
-      provenance: lineageProvenance,
-      // An anchor is written with EVERY chain, so that its absence is a
-      // detectable deletion rather than a permitted state (round-9 CRITICAL).
-      provenanceAnchor: anchorFor(lineageProvenance),
-    };
+    const lineageProvenance = noLaunchProven
+      ? state.provenance
+      : appendImplementerProvenance(
+          state.provenance,
+          item.key,
+          implementerResourceKey,
+          now,
+          `${LINEAGE_DETAIL[outcome.kind]}${authorizedDetail}`,
+        );
+    /**
+     * NO NEW ATTRIBUTION, AND THE ATTEMPT SAYS SO (DEFECT-NO-LAUNCH-LINEAGE).
+     *
+     * `countUnlaunchedAttempt` is the same mechanism `reconcileClaim` uses for
+     * a claim proven never to have reached a worker: `attempts -
+     * unlaunchedAttempts` is what `unprovenCompletion` trusts as "attempts
+     * that reached a worker" on every later tick, so recording it here keeps
+     * that invariant true instead of leaving this attempt looking launched.
+     * Existing lineage — `implementedByResourceKey(s)`, `lastRunConfig`,
+     * provenance, the anchor — is carried over BYTE FOR BYTE from `state`; a
+     * proven non-launch must never clear a real prior attempt's record.
+     */
+    const withLineage: SupervisorState = noLaunchProven
+      ? {
+          ...withoutClaim,
+          roadmap: countUnlaunchedAttempt(withoutClaim.roadmap, item.key),
+        }
+      : {
+          ...withoutClaim,
+          /**
+           * TWO DIFFERENT QUESTIONS, TWO DIFFERENT RECORDS (round-4 finding 3).
+           *
+           * `reconciled` answers "is what the worker REPORTED consistent with what
+           * it was allowed to run?" — so it must be compared against whichever
+           * authorised member the report names, or an honest reviewer reporting
+           * itself is refused.
+           *
+           * `lastRunConfig` answers "what IMPLEMENTED this item?" — and
+           * `excludedReviewerResources` reads it alongside the implementer history
+           * to keep an implementer from reviewing its own work. Round 3 let the
+           * reconciliation basis flow into this record, so a run whose REVIEWER
+           * reported itself persisted the reviewer as what ran, the two records
+           * disagreed, and every dependent review was blocked again.
+           *
+           * They are now written from their own answers: the implementer record when
+           * a declaration named one, and the reconciled record otherwise.
+           */
+          roadmap: setRunConfig(
+            setImplementer(state.roadmap, item.key, implementerResourceKey),
+            item.key,
+            implementerMember === undefined ? reconciled : implementerBasis,
+          ),
+          provenance: lineageProvenance,
+          // An anchor is written with EVERY chain, so that its absence is a
+          // detectable deletion rather than a permitted state (round-9 CRITICAL).
+          provenanceAnchor: anchorFor(lineageProvenance),
+        };
 
     if (reconciled?.verification === "MISMATCH") {
       const escalated = await this.escalate(
@@ -2776,6 +3487,1564 @@ export class SupervisorService {
    * `state.roadmap` instead would be reading exactly the row this exists to
    * distrust, so the reconciled state REPLACES it rather than sitting beside it.
    */
+  /**
+   * How long without progress before a LIVE owner is called STALLED (AC-14).
+   *
+   * Forty minutes, which is the threshold the TASK-017 watchdog used and the one
+   * an operator here already reasons in. A stall is a MEASUREMENT against a
+   * stated interval; without the interval, "stalled" is an opinion.
+   */
+  private stallAfterMs(): number {
+    return this.deps.stallAfterMs ?? 40 * 60 * 1000;
+  }
+
+  /**
+   * Looks at work IN FLIGHT and writes down what it finds (AC-16, AC-19, AC-20).
+   *
+   * RECORDS, and acts only in the one narrow way `crashedItemsToRequeue`
+   * permits. A conclusion about a dead process is knowledge; freeing its lease,
+   * finishing its activity or advancing its item would be decisions, and each of
+   * those has a gate elsewhere.
+   *
+   * It never returns a refusal that stops the tick. A crashed activity is not a
+   * reason to stop the Factory — it is the reason the Factory can carry on,
+   * which is what separates this from the structural refusals above.
+   */
+  /**
+   * Applies a change to the activity list and PERSISTS it, re-reading and
+   * re-applying when another supervisor moved the state first.
+   *
+   * ROUND-4 REVIEW, HIGH 2. A rival supervisor that correctly stood down still
+   * advanced the state with its own reconciliation write, and the owner's
+   * completion then failed its CAS with `ConcurrencyError` — so a piece of work
+   * that had actually FINISHED left no completion at all, and the activity sat
+   * RUNNING for reconciliation to later call crashed. Losing the record of a
+   * success is worse than losing the race.
+   *
+   * A conflict here is not an error, it is a stale read: the transition is
+   * recomputed against what the state now says and written again. `mutate`
+   * must therefore be a pure function of the CURRENT activities, and every
+   * transition in `activity.ts` is exactly that, which is why they take and
+   * return a list rather than editing one.
+   *
+   * Bounded, and it returns the unchanged state rather than throwing when it
+   * runs out of attempts: the caller is on its way to `settle`, and failing to
+   * record a completion must not also lose the outcome it was recording.
+   */
+  private async commitActivityChange(
+    state: SupervisorState,
+    what: string,
+    mutate: (activities: readonly Activity[]) => TransitionVerdict,
+    /**
+     * Anything else that must move in the SAME write.
+     *
+     * The launch heartbeat travels with the claim's CLAIMED -> RUNNING
+     * transition, and splitting them would create a state where one landed and
+     * the other did not — the half-applied shape this task exists to refuse.
+     *
+     * IT IS A FUNCTION OF THE FRESH STATE, AND IT MAY REFUSE (round-7 review,
+     * HIGH 1). It was a function of the fresh state in signature only: the
+     * launch site closed over the claim it had read at the top of the tick and
+     * returned it verbatim, so a retry — or a no-op transition, which skips the
+     * transition entirely and applies the patch alone — wrote that stale claim
+     * over whatever the durable state now held. The reviewer used it to replace
+     * a rival's live claim with a dead one by reporting unchanged progress.
+     *
+     * Deriving from `state` is not enough on its own, because "what I expected
+     * is no longer there" has to be an ANSWER rather than a silent overwrite.
+     */
+    alongside?: (state: SupervisorState) => AlongsideVerdict,
+  ): Promise<{ readonly state: SupervisorState; readonly recorded: boolean; readonly problem?: string }> {
+    let current = state;
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const next = mutate(current.activities ?? []);
+      if (!next.ok) {
+        this.log(`[supervisor] could not ${what}: ${next.problem}`);
+        return { state: current, recorded: false, problem: next.problem };
+      }
+      const extra = alongside?.(current);
+      if (extra !== undefined && !extra.ok) {
+        this.log(`[supervisor] could not ${what}: ${extra.problem}`);
+        return { state: current, recorded: false, problem: extra.problem };
+      }
+      const patch = extra?.patch ?? {};
+      if (!next.changed && Object.keys(patch).length === 0) {
+        return { state: current, recorded: true };
+      }
+      try {
+        return {
+          state: await this.commit(current, {
+            ...current,
+            ...patch,
+            ...(next.changed ? { activities: next.activities } : {}),
+          }),
+          recorded: true,
+        };
+      } catch (error) {
+        if (!isStaleSnapshot(error)) {
+          throw error;
+        }
+        const fresh = await this.deps.repository.load();
+        if (fresh === undefined) {
+          this.log(`[supervisor] could not ${what}: durable state disappeared`);
+          return { state: current, recorded: false, problem: `durable state disappeared while trying to ${what}` };
+        }
+        /**
+         * THE VERSION HAVING MOVED IS THE PROOF (round-7 review, HIGH 2).
+         *
+         * `ConcurrencyError` carries that proof in itself. The provenance
+         * refusal does not: "the history I am writing is shorter than the
+         * stored one" is what a rival's append looks like from here AND what a
+         * deliberate truncation looks like, and they are indistinguishable from
+         * the error alone. So the error only makes this WORTH re-reading, and
+         * the re-read decides: a durable state that has not moved means nothing
+         * raced us and the refusal was about our own write, which must not be
+         * retried into.
+         */
+        if (fresh.version === current.version) {
+          const problem =
+            `refused to ${what}: ${error instanceof Error ? error.message : String(error)} — and durable state ` +
+            `has not moved since it was read (version ${current.version}), so nothing raced this write`;
+          this.log(`[supervisor] ${problem}`);
+          return { state: current, recorded: false, problem };
+        }
+        this.log(`[supervisor] re-reading to ${what}: another supervisor advanced the state`);
+        current = fresh;
+      }
+    }
+    /**
+     * EXHAUSTION IS REPORTED, NOT SWALLOWED (round-5 review, HIGH 2).
+     *
+     * The first version returned the unchanged state and the caller went on to
+     * settle the outcome, so a run that had SUCCEEDED marked its item DONE
+     * while the activity stayed RUNNING with no completion — a `DONE` nothing
+     * durable accounts for, which is the forged-completion shape TASK-012
+     * refuses on the roadmap arriving by yet another door.
+     */
+    const problem = `gave up trying to ${what} after repeated conflicts`;
+    this.log(`[supervisor] ${problem}`);
+    return { state: current, recorded: false, problem };
+  }
+
+  /**
+   * Turns verdicts that already exist into durable state, exactly once.
+   *
+   * THE FAILURE THIS CLOSES, stated plainly because it is this task's own:
+   * round 7's reviewer produced a valid CHANGES_REQUIRED verdict, the chain
+   * validated it, logged it and exited — and the verdict sat on disk for
+   * twenty-two hours until a person sent a message. Nothing had crashed. There
+   * was simply nothing whose job it was to notice.
+   *
+   * Every rule below exists so that noticing cannot be lost:
+   *
+   *   - it runs inside the ordinary tick, so a COLD START consumes a verdict
+   *     that landed while nothing was running (no notification is required, and
+   *     losing one costs nothing);
+   *   - it reads the binding from DURABLE state, so the process that launched
+   *     the review need not exist any more;
+   *   - it refuses a verdict that names a different candidate, because a
+   *     verdict is only about the tree it judged;
+   *   - it settles through the same compare-and-set retry as every other
+   *     transition, so two supervisors converge on ONE consumption;
+   *   - and it never turns absence, silence or an unreadable file into
+   *     approval.
+   */
+  /**
+   * Starts the reviews this Factory has been asked for, and adopts the ones
+   * that have proved they are running (TASK-019 AC-2, AC-4, AC-5).
+   *
+   * THE HANDSHAKE, and why it is two writes rather than one:
+   *
+   *   1. the review record is committed FIRST, carrying its own identity, the
+   *      candidate it is bound to, who is being asked and where the answer will
+   *      appear. Only then is anything spawned. A supervisor that dies here
+   *      leaves a CLAIMED review with no acknowledgement, which the next one
+   *      reads as "the launch may not have happened" and resolves deliberately.
+   *   2. the transition to RUNNING happens only when the WORKER says so, naming
+   *      the run id that was committed before it existed. "The spawn call
+   *      returned" is not evidence and is never recorded as running.
+   *
+   * Repeating either step is harmless: the record is derived from the request,
+   * not generated, and adoption of an already-adopted worker is a no-op.
+   */
+  private async reconcileReviews(
+    state: SupervisorState,
+  ): Promise<{
+    readonly state: SupervisorState;
+    readonly refusal?: { readonly roadmapKey: string; readonly problem: string };
+    readonly blocked?: TickResult;
+  }> {
+    const requests = state.reviewRequests ?? [];
+    if (requests.length === 0) {
+      return { state };
+    }
+
+    const launcher = this.deps.reviewLauncher;
+    if (launcher === undefined) {
+      const problem =
+        `${requests.length} review${requests.length === 1 ? " has" : "s have"} been requested and this supervisor ` +
+        "has no way to launch one; refusing to decide anything while work waits on a review nothing can start";
+      this.log(`[supervisor] ${problem}`);
+      return { state, refusal: { roadmapKey: requests[0]!.roadmapKey, problem: boundedDiagnostic(problem) } };
+    }
+
+    let current = state;
+    for (const request of requests) {
+      const activityId = canonicalActivityId(request.roadmapKey, "REVIEW", request.attempt);
+      const existing = (current.activities ?? []).find((entry) => entry.id === activityId);
+
+      if (existing !== undefined && isTerminal(existing.state)) {
+        // Settled: the verdict consumer owns what happens next.
+        continue;
+      }
+
+      const plan: ReviewLaunchRequest = {
+        reviewId: activityId,
+        roadmapKey: request.roadmapKey,
+        activityId,
+        provider: request.provider,
+        model: request.model,
+        effort: request.effort,
+        candidate: request.candidate,
+        source: reviewSourcePath(request, activityId),
+        ack: reviewAckPath(request, activityId),
+      };
+
+      /**
+       * THE ACKNOWLEDGEMENT IS READ FIRST, ALWAYS — but only for a review that
+       * has a RECORD.
+       *
+       * A worker that has proved it exists outranks every conclusion that could
+       * be drawn about whether it was launched, including this supervisor's own
+       * memory of having launched it, which after a restart it does not have.
+       * What it cannot outrank is the absence of a record: an acknowledgement
+       * sitting beside a review nobody ever started belongs to something else —
+       * a previous attempt, a leftover file — and adopting it would mean
+       * "running" for a process this Factory never launched.
+       */
+      const ack = existing === undefined ? undefined : launcher.acknowledgement(plan);
+
+      if (ack === undefined && existing?.state === "CLAIMED") {
+        const holder = existing.lease === undefined
+          ? "UNKNOWN"
+          : this.livenessProbe()?.check(existing.lease) ?? "UNKNOWN";
+        if (holder !== "ALIVE") {
+          // Parent death is not proof that its detached child never spawned.
+          // A late ACK is still adopted on the next tick; until then a second
+          // launch would risk duplicate inference. Record the uncertainty.
+          const problem = `review ${plan.reviewId} has no worker acknowledgement and its launching owner is ${holder}; ` +
+            "a detached worker may still exist, so automatic relaunch is refused";
+          const noted = await this.commitActivityChange(current, `record uncertain launch ${plan.reviewId}`, (activities) =>
+            recordReconciliation(activities, activityId, {
+              verdict: "AMBIGUOUS", at: this.deps.clock.now(), detail: boundedDiagnostic(problem),
+            }),
+          );
+          return {
+            state: noted.state,
+            refusal: {
+              roadmapKey: request.roadmapKey,
+              problem: boundedDiagnostic(noted.recorded ? problem : `${problem}; could not persist refusal: ${noted.problem ?? "unknown"}`),
+            },
+          };
+        }
+      }
+
+      if (ack === undefined && existing === undefined) {
+        const cleared = await this.authorizeReviewLaunch(current, request);
+        current = cleared.state;
+        if (!cleared.ok) {
+          return { state: current, blocked: cleared.result };
+        }
+        if (existing === undefined) {
+          const recorded = await this.recordReviewLaunch(current, request, plan);
+          if (recorded.refusal !== undefined) {
+            return recorded;
+          }
+          current = recorded.state;
+        }
+
+        /**
+         * SPAWN AFTER THE RECORD IS DURABLE, never before. If this process dies
+         * between the two, the record exists and says "claimed, not
+         * acknowledged" — which is recoverable. The other order leaves a
+         * reviewer running that nothing knows about, which is not.
+         */
+        const started = await launcher.launch(plan);
+        if (!started.ok) {
+          const problem =
+            `review ${plan.reviewId} could not be started (${started.problem})` +
+            (started.exhausted === true ? "; the provider is out of capacity" : "");
+          this.log(`[supervisor] ${problem}`);
+          /**
+           * A failed START is not a failed REVIEW. The record stays CLAIMED with
+           * no acknowledgement, and a later tick tries again once the launching
+           * process is demonstrably gone — which is the same path a supervisor
+           * that died mid-spawn takes, so there is one recovery path rather
+           * than two.
+           */
+          continue;
+        }
+        this.log(`[supervisor] launched review ${plan.reviewId} (${request.model} at ${request.effort})`);
+        continue;
+      }
+
+      if (ack === undefined) {
+        continue;
+      }
+      const adopted = await this.commitActivityChange(current, `adopt review ${plan.reviewId}`, (activities) =>
+        adoptLaunchedReview(activities, activityId, {
+          runId: ack.runId,
+          lease: leaseFromAcknowledgement(ack),
+          at: this.deps.clock.now(),
+        }),
+      );
+      if (!adopted.recorded) {
+        const problem = `review ${plan.reviewId} proved it started and that could not be recorded (${adopted.problem ?? "unknown reason"})`;
+        this.log(`[supervisor] ${problem}`);
+        return { state: adopted.state, refusal: { roadmapKey: request.roadmapKey, problem: boundedDiagnostic(problem) } };
+      }
+      current = adopted.state;
+    }
+
+    return { state: current };
+  }
+
+  /** Clear an independent review through the existing live resource and financial gates. */
+  private async authorizeReviewLaunch(
+    state: SupervisorState,
+    request: ReviewRequest,
+  ): Promise<
+    | { readonly ok: true; readonly state: SupervisorState }
+    | { readonly ok: false; readonly state: SupervisorState; readonly result: TickResult }
+  > {
+    const item = state.roadmap.find((entry) => entry.key === request.roadmapKey);
+    const refusal = async (basis: SupervisorState, reason: string) => {
+      const escalated = await this.escalate(
+        basis, request.roadmapKey, "RECOVERY_REQUIRED",
+        `Correct review request for ${request.roadmapKey}: ${reason}`, reason,
+      );
+      return { ok: false as const, state: escalated, result: { kind: "RECOVERY_REQUIRED" as const, reason } };
+    };
+    if (item === undefined) return refusal(state, `review ${request.roadmapKey} has no roadmap item`);
+    if (item.status === "WAITING_FOR_HUMAN_REQUIRED" || item.status === "BLOCKED") {
+      const action = item.humanActionRequired ?? `Resolve the existing ${item.status} restriction on ${item.key} before reviewing it.`;
+      return { ok: false, state, result: {
+        kind: "WAITING_FOR_HUMAN", roadmapKey: item.key,
+        reason: "HUMAN_DECISION_REQUIRED", humanActionRequired: action,
+      } };
+    }
+    if (request.provider.includes(":") || request.model.includes(":")) {
+      return refusal(state, "review resource identity contains a forbidden colon");
+    }
+    const key = resourceKey(request.provider, request.model);
+
+    const configured = this.deps.resourceCatalog.some(
+      (entry) => entry.provider === request.provider && entry.model === request.model,
+    );
+    const policy = this.deps.routingPolicy;
+    const qualified = policy.eligibleByWorkClass.INDEPENDENT_REVIEW.some(
+      (option) => option.provider === request.provider && option.model === request.model &&
+        option.effort === request.effort && option.qualityTier >= policy.minimumQualityTier.INDEPENDENT_REVIEW,
+    );
+    if (!configured || !qualified) {
+      return refusal(state, `review resource ${key}:${request.effort} is not configured and qualified for independent review`);
+    }
+    const config = planAiRunConfig({
+      provider: request.provider as keyof typeof SUPPORTED_MODELS,
+      model: request.model, effort: request.effort, role: "REVIEWER",
+    });
+    if (!config.ok) return refusal(state, `review resource ${key}:${request.effort} cannot be launched: ${config.reason}`);
+
+    const lineage = this.excludedReviewerResources(state, item);
+    if (lineage.ambiguous.length > 0 || lineage.excluded.includes(key)) {
+      return refusal(state, `reviewer independence cannot be established for ${key}: ambiguous ${lineage.ambiguous.join(", ") || "none"}, excluded ${lineage.excluded.join(", ") || "none"}`);
+    }
+
+    // Review reconciliation runs before normal resource reconciliation.
+    let current = await this.reconcileResourcesWithCatalog(state);
+    const record = current.resources.find((entry) => entry.key === key);
+    if (record === undefined) return refusal(current, `review resource ${key} has no durable resource record`);
+    if (record.state === "AUTH_REQUIRED") {
+      const action = `Authenticate ${key} before launching review ${request.roadmapKey}; credentials require a human.`;
+      const escalated = await this.escalate(current, item.key, "HUMAN_CREDENTIAL_REQUIRED", action, record.diagnostic ?? action);
+      return { ok: false, state: escalated, result: { kind: "WAITING_FOR_HUMAN", roadmapKey: item.key, reason: "HUMAN_CREDENTIAL_REQUIRED", humanActionRequired: action } };
+    }
+    if (!isUsable(record) && !isRetryDue(record, this.deps.clock.now())) {
+      const reason = `review resource ${key} is ${record.state}; next local probe is ${record.retryAt ?? "not scheduled"}`;
+      current = await this.commit(current, { ...current, roadmap: setStatus(current.roadmap, item.key, "WAITING_FOR_RESOURCE", reason) });
+      return { ok: false, state: current, result: { kind: "WAITING_FOR_RESOURCE", roadmapKey: item.key, reason, ...(record.retryAt === undefined ? {} : { nextWakeAt: record.retryAt }) } };
+    }
+
+    const observed = await this.probeAndObserve(current, item, request.provider, request.model);
+    current = observed.state;
+    if (!observed.ok) return { ok: false, state: current, result: observed.result };
+    const gated = await this.gateAiResource(
+      current, item, request.provider, request.model, observed.observation,
+      parseFinancialPolicy(current.financialPolicy), true,
+    );
+    if (!gated.ok) return { ok: false, state: gated.state, result: gated.result };
+    return { ok: true, state: current };
+  }
+
+  /**
+   * Writes the review record, and nothing else, in one compare-and-set.
+   *
+   * The activity is CLAIMED under the SUPERVISOR's lease, because at this
+   * moment the supervisor is the only thing that exists: the reviewer has not
+   * been spawned. Adoption replaces that lease with the worker's, which is what
+   * makes "is it still running" a question about the reviewer afterwards.
+   */
+  private async recordReviewLaunch(
+    state: SupervisorState,
+    request: ReviewRequest,
+    plan: ReviewLaunchRequest,
+  ): Promise<{
+    readonly state: SupervisorState;
+    readonly refusal?: { readonly roadmapKey: string; readonly problem: string };
+  }> {
+    const now = this.deps.clock.now();
+    const lease = this.deps.activityLease?.(now);
+    const probe = this.livenessProbe();
+    if (lease === undefined || probe === undefined) {
+      const problem =
+        `review ${plan.reviewId} cannot be recorded: this supervisor cannot ${lease === undefined ? "establish its own identity" : "check liveness"}, ` +
+        "so nothing could later reconcile the reviewer it started";
+      this.log(`[supervisor] ${problem}`);
+      return { state, refusal: { roadmapKey: request.roadmapKey, problem: boundedDiagnostic(problem) } };
+    }
+
+    const written = await this.commitActivityChange(state, `record review ${plan.reviewId}`, (activities) => {
+      const claimed = claimActivity(
+        activities,
+        { id: plan.activityId, kind: "REVIEW", roadmapKey: request.roadmapKey, lease, now },
+        probe,
+      );
+      if (!claimed.ok) {
+        return claimed;
+      }
+      return {
+        ok: true,
+        changed: true,
+        activities: claimed.activities.map((entry) =>
+          entry.id === plan.activityId
+            ? {
+                ...entry,
+                review: {
+                  reviewId: plan.reviewId,
+                  source: plan.source,
+                  candidate: plan.candidate,
+                  provider: plan.provider,
+                  model: plan.model,
+                  effort: plan.effort,
+                  attempt: request.attempt,
+                  ack: plan.ack,
+                },
+              }
+            : entry,
+        ),
+      };
+    });
+
+    if (!written.recorded) {
+      const problem = `review ${plan.reviewId} could not be recorded (${written.problem ?? "unknown reason"}); nothing was started`;
+      this.log(`[supervisor] ${problem}`);
+      return { state: written.state, refusal: { roadmapKey: request.roadmapKey, problem: boundedDiagnostic(problem) } };
+    }
+    return { state: written.state };
+  }
+
+  private async consumeAcceptanceVerdicts(
+    state: SupervisorState,
+  ): Promise<{
+    readonly state: SupervisorState;
+    readonly refusal?: { readonly roadmapKey: string; readonly problem: string };
+  }> {
+    const awaiting = reviewsAwaitingVerdict(state.activities ?? []);
+    if (awaiting.length === 0) {
+      return { state };
+    }
+
+    const source = this.deps.acceptanceVerdicts;
+    if (source === undefined) {
+      /**
+       * A RECORDED REVIEW WITH NOWHERE TO READ IT IS A MISCONFIGURATION.
+       *
+       * Passing over it would leave the review in flight forever while the
+       * Factory cheerfully did other work — the half-configured fail-open that
+       * round 4 already found once, in the lease and probe.
+       */
+      const problem =
+        `${awaiting.length} review${awaiting.length === 1 ? " is" : "s are"} recorded as in flight, and this ` +
+        "supervisor has no way to read a verdict back; refusing to decide anything while a review's result is " +
+        "unreachable";
+      this.log(`[supervisor] ${problem}`);
+      /**
+       * AND IT IS CLASSIFIED, NOT ONLY REFUSED (round-8 review, HIGH 2).
+       *
+       * This refusal returns BEFORE reconciliation, so returning here left the
+       * reviews with no `reconciliation` at all — AC-16 asks that every
+       * non-terminal activity carry a durable conclusion, and "the tick stopped
+       * for execution reasons" does not exempt the activities it stopped over.
+       * It is the round-6 lesson again, arriving through the door round 7 built.
+       */
+      const noted = await this.commitActivityChange(
+        state,
+        "record that a review's verdict is unreachable",
+        (current) => {
+          let classified = current;
+          let changed = false;
+          for (const entry of current.filter((candidate) => candidate.review !== undefined && !isTerminal(candidate.state))) {
+            const recorded = recordReconciliation(classified, entry.id, {
+              verdict: "AMBIGUOUS",
+              at: this.deps.clock.now(),
+              detail: boundedDiagnostic(
+                `review ${JSON.stringify(entry.id)} is ${entry.state} and this supervisor has no way to read a ` +
+                  "verdict back, so whether it has finished cannot be established",
+              ),
+            });
+            if (!recorded.ok) return recorded;
+            classified = recorded.activities;
+            changed = changed || recorded.changed;
+          }
+          return { ok: true, activities: classified, changed };
+        },
+      );
+      const unreachable = {
+        roadmapKey: awaiting[0]!.roadmapKey,
+        problem: boundedDiagnostic(
+          noted.recorded
+            ? problem
+            : `${problem}. Worse: that could not be recorded durably either (${noted.problem ?? "unknown reason"})`,
+        ),
+      };
+      return { state: noted.state, refusal: unreachable };
+    }
+
+    let current = state;
+    for (const activity of awaiting) {
+      const review = activity.review;
+      if (review === undefined) continue;
+      const reading = source.read(review);
+
+      /**
+       * A VERDICT OUTLIVES ITS AUTHOR; SILENCE DOES NOT.
+       *
+       * A verdict is applied whatever the reviewer is doing now — it wrote its
+       * conclusion, and that conclusion does not expire. Anything SHORT of a
+       * verdict is only conclusive once the reviewer is proven gone: a file
+       * being written this instant parses as no verdict at all, and calling
+       * that a failed review would abandon a review still in progress.
+       */
+      if (reading.kind !== "VERDICT") {
+        /**
+         * A PROCESS THAT FINISHED BADLY IS A FACT ABOUT THE RESOURCE (SF-R3).
+         *
+         * Checked HERE: after a valid verdict has been looked for — a verdict
+         * outranks everything, including evidence that its author then crashed —
+         * and before the generic dead-worker path below, which correctly knows
+         * nothing about WHY a reviewer produced nothing and therefore treats
+         * every silence as "run another review".
+         *
+         * That was the immediate-retry loop: a CLI that launched, hit a provider
+         * refusal and exited became `NO_VERDICT`, the item became claimable
+         * again, the resource stayed `AVAILABLE`, and the next attempt spent
+         * another call straight away. The reviewer's own completion evidence is
+         * what distinguishes that from a reviewer still working.
+         */
+        const failed = await this.settleFailedReviewFromCompletion(current, activity, review);
+        if (failed !== undefined) {
+          if (failed.refusal !== undefined) {
+            return failed;
+          }
+          current = failed.state;
+          continue;
+        }
+
+        const probe = this.livenessProbe();
+        const gone =
+          probe !== undefined && activity.lease !== undefined && probe.check(activity.lease) === "GONE";
+        if (!gone) continue;
+
+        const why =
+          reading.kind === "ABSENT"
+            ? "it exited without writing one"
+            : `what it wrote is not a verdict (${reading.reason})`;
+        const settled = await this.commitActivityChange(
+          current,
+          `record that review ${review.reviewId} produced no verdict`,
+          (activities) =>
+            settleReview(activities, activity.id, {
+              state: "FAILED",
+              at: this.deps.clock.now(),
+              completion: {
+                outcome: NO_VERDICT_OUTCOME,
+                detail: boundedDiagnostic(`review ${review.reviewId} of ${review.candidate.commit}: ${why}`),
+                at: this.deps.clock.now(),
+              },
+            }),
+          (fresh) => this.releaseReviewed(fresh, activity, "ELIGIBLE", `review produced no verdict: ${why}`),
+        );
+        if (!settled.recorded) {
+          const problem =
+            `review ${review.reviewId} produced no verdict and that could not be recorded ` +
+            `(${settled.problem ?? "unknown reason"})`;
+          this.log(`[supervisor] ${problem}`);
+          return { state: settled.state, refusal: { roadmapKey: activity.roadmapKey, problem: boundedDiagnostic(problem) } };
+        }
+        /**
+         * NEVER A PASS. A review that produced nothing is a review that must be
+         * run again; the item returns to the queue and the next round schedules
+         * one. This is the single asymmetry worth hard-coding.
+         */
+        this.log(`[supervisor] review ${review.reviewId} produced no verdict; ${activity.roadmapKey} is claimable again`);
+        current = settled.state;
+        continue;
+      }
+
+      const mismatch = bindingMismatch(review.candidate, reading.outcome.candidate);
+      if (mismatch !== undefined) {
+        /**
+         * THE WRONG CANDIDATE'S VERDICT IS NOT A WEAKER VERDICT, IT IS NONE.
+         *
+         * A previous round's file left on disk, a reviewer pointed at the wrong
+         * tree, a candidate amended after launch: all produce a perfectly
+         * well-formed verdict about something else. Applying it would be the
+         * purest form of the thing C4 exists to prevent — an approval nobody
+         * gave for the code that would actually be integrated.
+         */
+        const problem = `refusing the verdict for review ${review.reviewId}: ${mismatch}`;
+        this.log(`[supervisor] ${problem}`);
+        /**
+         * AND THE REFUSAL IS RECORDED, not merely returned — the round-6 lesson,
+         * applied to the door it arrives at here.
+         *
+         * This refusal stops the tick, and it will stop every tick until someone
+         * looks. A fresh process reading the activity back must find the reason
+         * on it; otherwise the Factory is halted by a fact that exists only in
+         * one process's return value and one log line.
+         */
+        const noted = await this.commitActivityChange(
+          current,
+          `record why the verdict for ${review.reviewId} was refused`,
+          (activities) =>
+            recordReconciliation(activities, activity.id, {
+              verdict: "AMBIGUOUS",
+              at: this.deps.clock.now(),
+              detail: boundedDiagnostic(problem),
+            }),
+        );
+        return {
+          state: noted.state,
+          refusal: {
+            roadmapKey: activity.roadmapKey,
+            problem: boundedDiagnostic(
+              noted.recorded
+                ? problem
+                : `${problem}. The refusal could not be recorded durably either (${noted.problem ?? "unknown reason"})`,
+            ),
+          },
+        };
+      }
+
+      const accepted = isAccepted(reading.outcome);
+      const at = this.deps.clock.now();
+      const settled = await this.commitActivityChange(
+        current,
+        `consume the verdict of review ${review.reviewId}`,
+        (activities) =>
+          settleReview(activities, activity.id, {
+            state: "COMPLETED",
+            at,
+            completion: {
+              outcome: reading.outcome.verdict,
+              detail: boundedDiagnostic(completionDetail(reading.outcome)),
+              at,
+            },
+          }),
+        (fresh) =>
+          accepted
+            ? this.acceptedReviewed(fresh, activity, reading.outcome.candidate.commit)
+            : this.releaseReviewed(
+                fresh,
+                activity,
+                "ELIGIBLE",
+                `independent review returned ${completionDetail(reading.outcome)}`,
+              ),
+      );
+      if (!settled.recorded) {
+        const problem =
+          `the verdict of review ${review.reviewId} could not be recorded (${settled.problem ?? "unknown reason"}); ` +
+          "it is NOT being applied";
+        this.log(`[supervisor] ${problem}`);
+        return { state: settled.state, refusal: { roadmapKey: activity.roadmapKey, problem: boundedDiagnostic(problem) } };
+      }
+      this.log(
+        `[supervisor] consumed ${reading.outcome.verdict} for ${activity.roadmapKey} (review ${review.reviewId}); ` +
+          `${accepted ? "the candidate is at the integration gate" : "remediation is claimable"}`,
+      );
+      current = settled.state;
+    }
+
+    return { state: current };
+  }
+
+  /**
+   * Settles a review whose CLI demonstrably FINISHED BADLY, exactly once
+   * (SF-R3; TASK-019 AC-14, AC-15, AC-16, AC-18).
+   *
+   * Returns `undefined` only for the cases this must not decide — no completion
+   * published, or a clean exit — so the caller's existing paths handle those
+   * unchanged. In particular:
+   *
+   *   - a MISSING completion means the reviewer may still be working, and only
+   *     the dead-worker path may conclude otherwise;
+   *   - an UNUSABLE completion (torn, or naming another run) is not success and
+   *     not permission to launch anything; it is reported, recorded durably as
+   *     `AMBIGUOUS` (below), and refused — it does NOT return `undefined`, so
+   *     the generic dead-worker path can never read it as silence;
+   *   - exit 0 with no valid verdict stays AC-14's `NO_VERDICT`. It cannot pass,
+   *     and it is not evidence that the RESOURCE failed.
+   *
+   * What it does decide is narrow: the review is terminal, the named resource
+   * takes the existing classification and backoff ladder, and the item parks in
+   * a durable wait — `WAITING_FOR_RESOURCE`, or `WAITING_FOR_HUMAN_REQUIRED`
+   * when the provider said its credentials are the problem. It never writes
+   * `ELIGIBLE`, because "claimable again" is what let the next tick spend
+   * another call inside the backoff window.
+   */
+  private async settleFailedReviewFromCompletion(
+    state: SupervisorState,
+    activity: Activity,
+    review: ReviewBinding,
+  ): Promise<
+    | {
+        readonly state: SupervisorState;
+        readonly refusal?: { readonly roadmapKey: string; readonly problem: string };
+      }
+    | undefined
+  > {
+    const launcher = this.deps.reviewLauncher;
+    if (launcher === undefined) {
+      return undefined;
+    }
+    const observed = launcher.completion({ reviewId: review.reviewId, source: review.source });
+    if (observed.kind === "NONE") {
+      return undefined;
+    }
+    if (observed.kind === "UNUSABLE") {
+      /**
+       * TORN OR FOREIGN EVIDENCE IS NOT SILENCE (SF-R3 correction round 1).
+       *
+       * Returning `undefined` here used to fall through to the generic
+       * dead-worker path below, and that path's only question is "is the owner
+       * GONE" — which a torn or foreign completion answers exactly as
+       * affirmatively as a reviewer that simply never wrote anything. That let a
+       * KNOWN-bad record settle `NO_VERDICT` and re-arm the item `ELIGIBLE`,
+       * spending a fresh launch on evidence that was never trustworthy enough to
+       * settle anything. The fix reuses the same durable-ambiguity transition
+       * the candidate-mismatch case above already uses: recorded, and the tick
+       * refuses rather than guessing.
+       */
+      const problem =
+        `review ${review.reviewId} has completion evidence that cannot be used (${observed.reason}); refusing to ` +
+        "treat this as a finished worker or relaunch until that is resolved";
+      this.log(`[supervisor] ${problem}`);
+      const noted = await this.commitActivityChange(
+        state,
+        `record that review ${review.reviewId}'s completion evidence is unusable`,
+        (activities) =>
+          recordReconciliation(activities, activity.id, {
+            verdict: "AMBIGUOUS",
+            at: this.deps.clock.now(),
+            detail: boundedDiagnostic(problem),
+          }),
+      );
+      return {
+        state: noted.state,
+        refusal: {
+          roadmapKey: activity.roadmapKey,
+          problem: boundedDiagnostic(
+            noted.recorded
+              ? problem
+              : `${problem}. That could not be recorded durably either (${noted.problem ?? "unknown reason"})`,
+          ),
+        },
+      };
+    }
+    const evidence = observed.evidence;
+    if (evidence.exitCode === 0 && evidence.providerError === undefined) {
+      return undefined;
+    }
+
+    let key: string;
+    try {
+      key = resourceKey(review.provider, review.model);
+    } catch (error) {
+      const problem =
+        `review ${review.reviewId} finished badly and names an unusable resource identity ` +
+        `(${error instanceof Error ? error.message : String(error)})`;
+      this.log(`[supervisor] ${problem}`);
+      return { state, refusal: { roadmapKey: activity.roadmapKey, problem: boundedDiagnostic(problem) } };
+    }
+
+    /**
+     * THE PROVIDER'S OWN STRUCTURED ERROR OUTRANKS THE EXIT CODE, because it is
+     * the more specific fact: the measured claude-code auth failure reports
+     * `is_error: true` with the reason in `result`, and the same shape could
+     * accompany any exit status. Process facts are still the fallback, through
+     * the same `classifyResourceOutcome` every other failure goes through.
+     */
+    const classification =
+      evidence.providerError === undefined
+        ? classifyResourceOutcome({
+            process: {
+              terminationReason: "EXITED",
+              exitCode: evidence.exitCode,
+              stdout: evidence.failure,
+              stderr: "",
+            },
+          })
+        : classifyProviderReportedError(review.provider, evidence.providerError);
+
+    /**
+     * The row must EXIST before a backoff can be recorded on it. Reconciling
+     * with the catalog first is idempotent and is what the launch path already
+     * does; without it, a cold supervisor whose database predates this resource
+     * would park the item and quietly record no wait at all.
+     */
+    let current = await this.reconcileResourcesWithCatalog(state);
+    const now = this.deps.clock.now();
+    /**
+     * DERIVED ONLY FROM THE EVIDENCE, never from the clock: `settleReview`
+     * compares an existing completion field by field, so a replay must produce a
+     * byte-identical detail or it refuses as a disagreement (AC-16).
+     */
+    const detail = boundedDiagnostic(
+      `review ${review.reviewId} of ${review.candidate.commit}: the reviewer exited ${evidence.exitCode} ` +
+        `without a verdict; ${classification.state}: ${classification.reason}`,
+    );
+    const settled = await this.commitActivityChange(
+      current,
+      `settle review ${review.reviewId} from the completion its reviewer published`,
+      (activities) =>
+        settleReview(activities, activity.id, {
+          state: "FAILED",
+          at: now,
+          completion: { outcome: NO_VERDICT_OUTCOME, detail, at: now },
+        }),
+      (fresh) => this.parkReviewedForResource(fresh, activity, review, key, classification, now),
+    );
+    if (!settled.recorded) {
+      const problem =
+        `review ${review.reviewId} finished badly and that could not be recorded ` +
+        `(${settled.problem ?? "unknown reason"})`;
+      this.log(`[supervisor] ${problem}`);
+      return { state: settled.state, refusal: { roadmapKey: activity.roadmapKey, problem: boundedDiagnostic(problem) } };
+    }
+    this.log(
+      `[supervisor] review ${review.reviewId} exited ${evidence.exitCode} without a verdict; ` +
+        `${key} is ${classification.state} and ${activity.roadmapKey} is waiting`,
+    );
+    return { state: settled.state };
+  }
+
+  /**
+   * The resource and roadmap halves of a failed review, in the SAME write as the
+   * settlement.
+   *
+   * Split across two writes there would be a state where the review is terminal
+   * and nothing is waiting — the half-applied shape this service refuses
+   * everywhere else — and a tick that died in the gap would leave the item
+   * claimable with the resource already spent.
+   */
+  private parkReviewedForResource(
+    fresh: SupervisorState,
+    activity: Activity,
+    review: ReviewBinding,
+    key: string,
+    classification: Classification,
+    now: Timestamp,
+  ): AlongsideVerdict {
+    // Replayed settlement: already terminal AND already observed. Write nothing,
+    // so a second pass cannot advance the ladder or re-park the item (AC-16).
+    if (alreadySettled(fresh, activity.id)) {
+      return { ok: true, patch: {} };
+    }
+    const resources = fresh.resources.map((record) =>
+      record.key === key ? this.applyClassification(record, classification, now) : record,
+    );
+    const reason = `${key}: ${classification.reason}`;
+
+    if (classification.state === "AUTH_REQUIRED") {
+      /**
+       * CREDENTIALS ARE A PERSON'S JOB, NOT A TIMER'S (AC-15).
+       *
+       * `applyClassification` schedules no retry for `AUTH_REQUIRED`, and the
+       * item waits on a human rather than on a resource — the distinction the
+       * measured failure makes necessary: the zero-token probe can report a
+       * logged-in session while the invocation reports an expired one, and a
+       * backoff would poll forever against something no delay can fix.
+       */
+      const action =
+        `Re-authenticate ${key} (for example \`claude auth login\` or \`codex login\`), then let the supervisor ` +
+        `schedule a fresh review of ${activity.roadmapKey}.`;
+      const escalation: HumanEscalation = {
+        roadmapKey: activity.roadmapKey,
+        reason: "HUMAN_CREDENTIAL_REQUIRED",
+        humanActionRequired: boundedDiagnostic(action),
+        detail: boundedDiagnostic(`review ${review.reviewId}: ${reason}`),
+        raisedAt: now,
+        resolved: false,
+      };
+      return {
+        ok: true,
+        patch: {
+          resources,
+          roadmap: setStatus(fresh.roadmap, activity.roadmapKey, "WAITING_FOR_HUMAN_REQUIRED", reason, action),
+          escalations: [
+            ...fresh.escalations.filter((entry) => entry.resolved || entry.roadmapKey !== activity.roadmapKey),
+            escalation,
+          ],
+          ...this.withoutClaimFor(fresh, activity),
+        },
+      };
+    }
+
+    return {
+      ok: true,
+      patch: {
+        resources,
+        roadmap: setStatus(fresh.roadmap, activity.roadmapKey, "WAITING_FOR_RESOURCE", reason),
+        ...this.withoutClaimFor(fresh, activity),
+      },
+    };
+  }
+
+  /**
+   * The roadmap half of consuming a verdict, computed against the FRESH state.
+   *
+   * Travels with the settlement in one write: an item left ACTIVE beside a
+   * completed review is the half-applied shape AC-17 refuses, and a claim left
+   * behind would have the next tick conclude its owner vanished.
+   */
+  private releaseReviewed(
+    fresh: SupervisorState,
+    activity: Activity,
+    status: "ELIGIBLE",
+    detail: string,
+  ): AlongsideVerdict {
+    if (alreadySettled(fresh, activity.id)) {
+      return { ok: true, patch: {} };
+    }
+    return {
+      ok: true,
+      patch: {
+        roadmap: setStatus(fresh.roadmap, activity.roadmapKey, status, boundedDiagnostic(detail)),
+        ...this.withoutClaimFor(fresh, activity),
+      },
+    };
+  }
+
+  /**
+   * An ACCEPTED candidate stops here, deliberately.
+   *
+   * ADR-0002 permits integration without a further human decision, and this
+   * supervisor still does not perform one: it has no integration executor, and
+   * inventing one inside a verdict consumer would put "may this be merged" and
+   * "what did the reviewer say" in the same place. What it records is the fact
+   * — reviewed, accepted, at the gate, naming the candidate — so the decision
+   * is made from durable state by whatever holds that authority.
+   */
+  private acceptedReviewed(fresh: SupervisorState, activity: Activity, commit: string): AlongsideVerdict {
+    if (alreadySettled(fresh, activity.id)) {
+      return { ok: true, patch: {} };
+    }
+    const action =
+      `Independent review accepted candidate ${commit} for ${activity.roadmapKey}. Integrate it under ADR-0002 ` +
+      "after re-checking that the reviewed tree is the tree being integrated.";
+    const escalation: HumanEscalation = {
+      roadmapKey: activity.roadmapKey,
+      reason: "HUMAN_DECISION_REQUIRED",
+      humanActionRequired: boundedDiagnostic(action),
+      detail: boundedDiagnostic(`review ${activity.review?.reviewId ?? activity.id} accepted ${commit}`),
+      raisedAt: this.deps.clock.now(),
+      resolved: false,
+    };
+    return {
+      ok: true,
+      patch: {
+        roadmap: setStatus(
+          fresh.roadmap,
+          activity.roadmapKey,
+          "WAITING_FOR_HUMAN_REQUIRED",
+          boundedDiagnostic(`accepted by independent review; candidate ${commit} is at the integration gate`),
+          // The status PRESUPPOSES this, and the parser enforces it: an item
+          // waiting on a person that does not say what the person must do is
+          // refused as corrupt. Found by writing one.
+          boundedDiagnostic(action),
+        ),
+        escalations: [
+          ...fresh.escalations.filter((entry) => entry.resolved || entry.roadmapKey !== activity.roadmapKey),
+          escalation,
+        ],
+        ...this.withoutClaimFor(fresh, activity),
+      },
+    };
+  }
+
+  /** Drops the durable claim IF it is the one this activity belongs to. */
+  private withoutClaimFor(fresh: SupervisorState, activity: Activity): Partial<SupervisorState> {
+    const claim = fresh.activeClaim;
+    if (claim === undefined) {
+      return {};
+    }
+    return canonicalActivityId(claim.roadmapKey, claim.kind, claim.attempt) === activity.id
+      ? { activeClaim: undefined }
+      : {};
+  }
+
+  /**
+   * Every conclusion a later observer draws, applied to a list — and NOTHING
+   * else.
+   *
+   * Pure, and a function of the list it is given rather than of the one read at
+   * the top of the tick, because it is recomputed on every retry attempt. That
+   * is the whole reason it exists as a function: the two writes below used to
+   * carry a list computed once, which is fine until somebody else writes first.
+   */
+  private classifyAll(
+    activities: readonly Activity[],
+    now: Timestamp,
+    probe: LivenessProbe,
+  ): TransitionVerdict {
+    let next = activities;
+    let changed = false;
+    for (const activity of activities) {
+      const verdict = classifyActivity(activity, { now, stallAfterMs: this.stallAfterMs() }, probe);
+      if (verdict === undefined) continue;
+      const recorded = recordReconciliation(next, activity.id, {
+        verdict: verdict.verdict,
+        at: now,
+        detail: boundedDiagnostic(verdict.detail),
+      });
+      if (!recorded.ok) {
+        this.log(`[supervisor] could not record a reconciliation verdict: ${recorded.problem}`);
+        continue;
+      }
+      if (recorded.changed) {
+        this.log(`[supervisor] ${verdict.verdict}: ${verdict.detail}`);
+      }
+      next = recorded.activities;
+      changed = changed || recorded.changed;
+    }
+    return { ok: true, activities: next, changed };
+  }
+
+  /**
+   * AC-20's one recovery action, recomputed against whatever the state says NOW.
+   *
+   * An item with an unresolved claim is left alone: `reconcileClaim` owns that
+   * item and is stricter, and both mechanisms firing once produced a requeue
+   * that an escalation then overrode — the right answer reached by accident,
+   * through two writes that disagreed.
+   */
+  private requeueCrashed(
+    fresh: SupervisorState,
+    now: Timestamp,
+    probe: LivenessProbe,
+  ): Partial<SupervisorState> {
+    const classified = this.classifyAll(fresh.activities ?? [], now, probe);
+    const claimed = fresh.activeClaim?.roadmapKey;
+    const requeue = new Set(
+      crashedItemsToRequeue(classified.ok ? classified.activities : (fresh.activities ?? []), fresh.roadmap).filter(
+        (key) => key !== claimed,
+      ),
+    );
+    if (requeue.size === 0) {
+      // Nothing to move, and an empty patch is what keeps an idle tick from
+      // writing the roadmap back to itself forever.
+      return {};
+    }
+    return {
+      roadmap: fresh.roadmap.map((item) => {
+        if (!requeue.has(item.key)) return item;
+        this.log(`[supervisor] returning ${item.key} to the queue: its owner crashed`);
+        /**
+         * BACKWARDS, into the queue it came from, and never anywhere else. This
+         * is the whole of AC-20 in one expression: a crash is a reason to try
+         * again and never a reason to be further along than before.
+         */
+        return { ...item, status: RECOVERY_TO_STATUS };
+      }),
+    };
+  }
+
+  /**
+   * The liveness probe for THIS tick: memoised, so every reader of one tick
+   * sees the same answer about the same lease. Outside a tick it is the raw
+   * dependency, which is what a direct caller should get.
+   */
+  private livenessProbe(): LivenessProbe | undefined {
+    return this.tickProbe ?? this.deps.liveness;
+  }
+
+  private async reconcileActivities(
+    state: SupervisorState,
+  ): Promise<{ readonly state: SupervisorState; readonly refusal?: string }> {
+    const activities = state.activities ?? [];
+    if (activities.length === 0) {
+      return { state };
+    }
+    const probe = this.livenessProbe();
+    if (probe === undefined) {
+      /**
+       * NO PROBE, WITH WORK IN FLIGHT, IS A REFUSAL (round-3 review, HIGH 2).
+       *
+       * The comment here used to claim that an unknown refuses, and the code
+       * returned the state unchanged and let the tick carry on — so an
+       * unfinished activity sat in durable state, nothing concluded anything
+       * about it, and the supervisor went and ran a DIFFERENT item to DONE. The
+       * comment described the invariant; the code did the opposite of it.
+       *
+       * A tick that cannot establish whether anything is still working must not
+       * schedule more work. It is only reached with activities present, because
+       * an installation with none has nothing to be unsure about.
+       */
+      const unfinished = activities.filter((entry) => !isTerminal(entry.state));
+      if (unfinished.length === 0) {
+        return { state };
+      }
+      const problem =
+        `${unfinished.length} activit${unfinished.length === 1 ? "y is" : "ies are"} unfinished and this supervisor ` +
+        "has no way to check whether their owners are still running; refusing to schedule further work";
+      this.log(`[supervisor] ${problem}`);
+
+      /**
+       * THE CLASSIFICATION IS RECORDED, NOT ONLY THE REFUSAL (round-6 review,
+       * HIGH 2).
+       *
+       * AC-16 asks that every non-terminal activity be classified and the
+       * classification RECORDED; refusing to schedule is the other half. This
+       * path did the second and skipped the first, so a fresh process read the
+       * activity back with `reconciliation: undefined` and learned nothing
+       * about why the Factory had stopped. A refusal that leaves no durable
+       * reason is the same defect as a log line standing in for a record.
+       */
+      /**
+       * AND THE RECORD IS WRITTEN THE WAY EVERY OTHER ONE IS (round-7 review,
+       * HIGH 3).
+       *
+       * Round 6 added the classification and wrote it with a RAW commit, so a
+       * rival supervisor advancing the state in that instant turned the refusal
+       * into a thrown `ConcurrencyError`: no AMBIGUOUS record, and no refusal
+       * either — the exception replaced the answer. A durable classification
+       * that only survives when nothing else is running is not durable, and a
+       * refusal is worth least at exactly the moment it is hardest to write.
+       *
+       * It goes through `commitActivityChange`, which re-reads and recomputes
+       * against what the state now says. The classification is recomputed with
+       * it: which activities are unfinished is a property of the FRESH list, so
+       * a rival that finished one must not have it re-marked AMBIGUOUS.
+       */
+      const blind = this.deps.clock.now();
+      const written = await this.commitActivityChange(state, "record why liveness cannot be established", (current) => {
+        let classified = current;
+        let changed = false;
+        for (const entry of current.filter((candidate) => !isTerminal(candidate.state))) {
+          const recorded = recordReconciliation(classified, entry.id, {
+            verdict: "AMBIGUOUS",
+            at: blind,
+            detail: boundedDiagnostic(
+              `activity ${JSON.stringify(entry.id)} is ${entry.state} and this supervisor has no liveness probe, ` +
+                "so whether its owner is still running cannot be established",
+            ),
+          });
+          if (!recorded.ok) {
+            return recorded;
+          }
+          classified = recorded.activities;
+          changed = changed || recorded.changed;
+        }
+        return { ok: true, activities: classified, changed };
+      });
+
+      /**
+       * FAILING TO RECORD IT IS NOT A REASON TO SAY LESS.
+       *
+       * The tick still refuses — that was never in doubt — but the refusal now
+       * carries the fact that the classification could not be made durable, so
+       * an operator reading it is not left wondering why the activity they were
+       * pointed at has no verdict on it.
+       */
+      if (!written.recorded) {
+        return {
+          state: written.state,
+          refusal: boundedDiagnostic(
+            `${problem}. Worse: the reason could not be recorded durably either ` +
+              `(${written.problem ?? "unknown reason"}), so a fresh process will find these activities ` +
+              "unclassified",
+          ),
+        };
+      }
+      return { state: written.state, refusal: boundedDiagnostic(problem) };
+    }
+
+    const now = this.deps.clock.now();
+    /**
+     * ONE TICK, ONE ANSWER ABOUT ONE LEASE (round-9 review, HIGH 1).
+     *
+     * `classifyAll` and `requeueCrashed` each asked the probe, so a process that
+     * exited between the two calls was LIVE to one and GONE to the other — and
+     * the reviewer drove exactly that: a durable `LIVE` activity beside a
+     * roadmap item requeued as crashed, written together, contradicting each
+     * other. Recomputing per attempt was the round-8 fix and remains right; what
+     * was wrong is that recomputing also re-OBSERVED.
+     *
+     * A lease is asked about once per tick and the answer is reused. It is the
+     * same rule the rest of this mechanism already follows — decide from one
+     * observation, and never let two readings of the same fact disagree inside a
+     * single decision.
+     */
+    const classified = this.classifyAll(activities, now, probe);
+    // Only the LIST is read here, to decide whether anything is AMBIGUOUS.
+    // Whether it CHANGED is decided by the write below, which recomputes the
+    // classification against whatever the state says at that moment.
+    const next = classified.ok ? classified.activities : activities;
+
+    /**
+     * AMBIGUOUS REFUSES THE TICK (round-5 review, HIGH 1).
+     *
+     * AC-16 says so in as many words, and the round-3 fix only made the
+     * NO-PROBE case refuse: with a probe that answered UNKNOWN the verdict was
+     * recorded and the tick carried on and ran a different item to DONE. An
+     * activity whose owner cannot be checked is exactly the case where a second
+     * owner must not start, and recording that fact while proceeding is not
+     * refusing — it is annotating.
+     *
+     * Checked AFTER the verdicts are written, so the refusal leaves a durable
+     * record of WHY behind it rather than only a message in a log.
+     */
+    const ambiguous = next.filter((entry) => entry.reconciliation?.verdict === "AMBIGUOUS");
+    if (ambiguous.length > 0) {
+      /**
+       * AND THIS WRITE IS RETRIED TOO (round-8 review, HIGH 1).
+       *
+       * Round 7 hardened the NO-PROBE path and left this one on a raw commit —
+       * the same defect, one branch over, in the branch that actually runs in
+       * production. A rival advancing the state here turned the refusal into a
+       * thrown `ConcurrencyError`: no durable AMBIGUOUS record, and no refusal.
+       * Fixing the case you reproduced and not its twin is how a defect comes
+       * back wearing different clothes.
+       */
+      const written = await this.commitActivityChange(
+        state,
+        "record why work in flight cannot be established",
+        (current) => this.classifyAll(current, now, probe),
+      );
+      const problem =
+        `${ambiguous.length} activit${ambiguous.length === 1 ? "y" : "ies"} cannot be established as running or ` +
+        `finished (${ambiguous.map((entry) => entry.id).join(", ")}); refusing to schedule further work`;
+      this.log(`[supervisor] ${problem}`);
+      return {
+        state: written.state,
+        refusal: boundedDiagnostic(
+          written.recorded
+            ? problem
+            : `${problem}. Worse: the reason could not be recorded durably either ` +
+                `(${written.problem ?? "unknown reason"})`,
+        ),
+      };
+    }
+
+    /**
+     * AC-19. A completion nothing has acted on is REPORTED, every tick, until
+     * something does. This is the answer to "the result has existed for hours
+     * and nobody noticed": it is read out of durable state rather than waited
+     * for, so a notification that was never delivered changes nothing.
+     */
+    for (const waiting of unobservedCompletions(next)) {
+      this.log(
+        `[supervisor] unobserved ${waiting.state} activity ${waiting.id}: ` +
+          `${waiting.completion?.outcome ?? "no outcome"}`,
+      );
+    }
+
+    /**
+     * The one recovery ACTION. Its gate lives inside the function that proposes
+     * it, with the reasoning, rather than here at the call site.
+     *
+     * AN ITEM WITH AN UNRESOLVED CLAIM IS LEFT ALONE (round-3 review, AC-20
+     * "Partial"). `reconcileClaim` owns that item and is STRICTER: a RUNNING
+     * claim whose owner is gone means the external action's outcome is
+     * unknowable, and it escalates for a human rather than re-queueing. Both
+     * mechanisms firing produced a requeue to PENDING that the escalation then
+     * overrode to BLOCKED — the right answer reached by accident, through two
+     * writes that disagreed.
+     *
+     * Precedence is explicit now: the claim decides for its own item, and this
+     * re-queues everything else.
+     */
+    const written = await this.commitActivityChange(
+      state,
+      "reconcile the work in flight",
+      (current) => this.classifyAll(current, now, probe),
+      (fresh) => ({ ok: true, patch: this.requeueCrashed(fresh, now, probe) }),
+    );
+    if (!written.recorded) {
+      const problem =
+        `work in flight could not be reconciled (${written.problem ?? "unknown reason"}); refusing to schedule ` +
+        "further work while what is running is unrecorded";
+      this.log(`[supervisor] ${problem}`);
+      return { state: written.state, refusal: boundedDiagnostic(problem) };
+    }
+
+    /**
+     * AND THE AMBIGUITY CHECK IS MADE ON WHAT WAS ACTUALLY WRITTEN (round-9
+     * review, HIGH 2).
+     *
+     * The check above reads the classification computed from the state as it
+     * was READ. The write below it recomputes against the state as it turned
+     * out to be, and a retry can therefore persist an AMBIGUOUS verdict that
+     * nothing then looks at — the reviewer ran a different item to DONE in the
+     * same tick that durably recorded one. Asking the question once, of the
+     * snapshot, is the same "decided before it was written" mistake this
+     * function keeps producing; it is now asked of the result.
+     */
+    const unresolved = (written.state.activities ?? []).filter(
+      (entry) => entry.reconciliation?.verdict === "AMBIGUOUS" && !isTerminal(entry.state),
+    );
+    if (unresolved.length > 0) {
+      const problem =
+        `${unresolved.length} activit${unresolved.length === 1 ? "y" : "ies"} cannot be established as running or ` +
+        `finished (${unresolved.map((entry) => entry.id).join(", ")}); refusing to schedule further work`;
+      this.log(`[supervisor] ${problem}`);
+      return { state: written.state, refusal: boundedDiagnostic(problem) };
+    }
+    return { state: written.state };
+  }
+
+  /**
+   * The notification kind a terminal worker run produces, or none
+   * (DEFECT-DURABLE-WORKER-RUN-ENVELOPE AC-8). A pure mapping: COMPLETED and
+   * FAILED are ordinary outcomes nobody needs paging for.
+   */
+  private workerRunNotificationKind(run: WorkerRunEnvelope): WorkerRunNotificationKind | undefined {
+    switch (run.state) {
+      case "AWAITING_CONTROLLER":
+        return "MAX_TURNS";
+      case "LOST":
+        return "LOST";
+      case "STALLED":
+        return "STALLED";
+      case "AMBIGUOUS":
+        return "AMBIGUOUS";
+      default:
+        return undefined;
+    }
+  }
+
+  /**
+   * Reconciles durable worker runs exactly the way `reconcileActivities`
+   * reconciles activities, and immediately after it, for the same reason
+   * (DEFECT-DURABLE-WORKER-RUN-ENVELOPE AC-7, AC-8, AC-10).
+   *
+   * NEVER INCREASES A LAUNCH COUNT. This function only classifies and writes a
+   * conclusion (`classifyWorkerRun`/`applyWorkerRunReconciliation`) and enqueues
+   * a deduplicated notification (`enqueueWorkerRunNotification`) — it never
+   * calls an executor, a process runner or `prepareWorkerRun`. `PREPARED` runs
+   * are left alone here for the same reason `reconcileActivities` leaves a
+   * freshly-claimed activity alone: the prepare-to-adopt window has its own
+   * stall budget, decided by whoever adopts, not by this generic sweep.
+   *
+   * AMBIGUOUS REFUSES THE WHOLE TICK, mirroring `reconcileActivities`: an
+   * unverifiable run's owner might still be alive, and scheduling a different
+   * item while that is unknown is the same risk AC-16 refuses for activities.
+   */
+  /**
+   * The completion an on-disk artifact proves, for ONE run — never a guess.
+   *
+   * Mirrors `createChildPlanAdvancer`'s own settlement exactly, because it is
+   * the same fact read from the same kind of evidence: a wrapper that finished
+   * and left a bounded, redacted, atomic result behind before whatever should
+   * have recorded it durably (a dying supervisor, a lost race) could do so.
+   */
+  private completionFromArtifact(run: WorkerRunEnvelope): WorkerRunCompletionInput | undefined {
+    if (this.deps.workerRunArtifactDir === undefined) {
+      return undefined;
+    }
+    return completionFromWorkerRunEvidence(run, this.deps.workerRunArtifactDir);
+  }
+
+  /**
+   * ARTIFACT FIRST, THEN LEASE/PID IDENTITY (AC-7's own ordering).
+   *
+   * Runs BEFORE liveness classification below, and for exactly the reason
+   * `classifyWorkerRun`'s own doc comment gives: a caller with a valid
+   * artifact should settle from it instead of asking liveness at all. Without
+   * this step a supervisor that restarts after its predecessor died the
+   * INSTANT after writing a real completion artifact — but before the CAS
+   * write that would have recorded it — reconciles a genuinely finished run
+   * as LOST, which is a wrong, discardable fact this defect exists to
+   * prevent from ever being durable.
+   */
+  private async recoverWorkerRunsFromArtifacts(state: SupervisorState): Promise<SupervisorState> {
+    if (this.deps.workerRunArtifactDir === undefined) {
+      return state;
+    }
+    let current = state;
+    for (let recoveryAttempt = 0; recoveryAttempt < 5; recoveryAttempt += 1) {
+      const runs = current.workerRuns ?? [];
+      let nextRuns = runs;
+      let changed = false;
+      for (const run of runs) {
+        if (isTerminalWorkerRunState(run.state)) continue;
+        let completion: WorkerRunCompletionInput | undefined;
+        try {
+          completion = this.completionFromArtifact(run);
+        } catch (error) {
+          const refused = applyWorkerRunReconciliation(nextRuns, run.runId, "AMBIGUOUS",
+            boundedDiagnostic(`artifact integrity refusal: ${String(error)}`), this.deps.clock.now());
+          if (refused.ok) { nextRuns = refused.runs; changed ||= refused.changed; }
+          continue;
+        }
+        if (completion === undefined) continue;
+        const applied = completeWorkerRun(nextRuns, run.runId, completion);
+        if (!applied.ok) {
+          this.log(`[supervisor] could not apply a recovered artifact completion for worker run ${run.runId}: ${applied.problem}`);
+          continue;
+        }
+        if (applied.changed) {
+          nextRuns = applied.runs;
+          changed = true;
+          this.log(`[supervisor] worker run ${run.runId}: recovered ${completion.state} from its terminal artifact`);
+        }
+      }
+      if (!changed) {
+        return current;
+      }
+      try {
+        return await this.commit(current, { ...current, workerRuns: nextRuns });
+      } catch (error) {
+        if (!isStaleSnapshot(error)) throw error;
+        const fresh = await this.deps.repository.load();
+        if (fresh === undefined) {
+          this.log("[supervisor] durable state disappeared while recovering worker runs from their artifacts");
+          return current;
+        }
+        current = fresh;
+      }
+    }
+    return current;
+  }
+
+  private async reconcileWorkerRuns(
+    initial: SupervisorState,
+  ): Promise<{ readonly state: SupervisorState; readonly refusal?: string }> {
+    const state = await this.recoverWorkerRunsFromArtifacts(initial);
+    const runs = state.workerRuns ?? [];
+    if (runs.length === 0) {
+      // Nothing to classify AND nothing that could need a notification —
+      // the one case genuinely safe to skip outright.
+      return { state };
+    }
+    const probe = this.livenessProbe();
+    const now = this.deps.clock.now();
+
+    const applyVerdicts = (
+      current: SupervisorState,
+    ): { readonly runs: readonly WorkerRunEnvelope[]; readonly notifications: readonly WorkerRunNotification[]; readonly changed: boolean } => {
+      let nextRuns = current.workerRuns ?? [];
+      let nextNotifications = current.workerRunNotifications ?? [];
+      let changed = false;
+      for (const run of nextRuns) {
+        if (run.state === "PREPARED" || isTerminalWorkerRunState(run.state)) continue;
+        const verdict =
+          probe === undefined
+            ? {
+                verdict: "AMBIGUOUS" as const,
+                detail: `worker run ${JSON.stringify(run.runId)} is ${run.state} and this supervisor has no liveness probe, so whether its owner is still running cannot be established`,
+              }
+            : classifyWorkerRun(run, { now, stallAfterMs: this.stallAfterMs() }, probe);
+        if (verdict === undefined) continue;
+        const applied = applyWorkerRunReconciliation(nextRuns, run.runId, verdict.verdict, boundedDiagnostic(verdict.detail), now);
+        if (!applied.ok) {
+          this.log(`[supervisor] could not record a worker-run reconciliation verdict: ${applied.problem}`);
+          continue;
+        }
+        if (applied.changed) {
+          nextRuns = applied.runs;
+          changed = true;
+          this.log(`[supervisor] worker run ${run.runId}: ${verdict.verdict}: ${verdict.detail}`);
+        }
+      }
+      for (const run of nextRuns) {
+        const kind = this.workerRunNotificationKind(run);
+        if (kind === undefined) continue;
+        const enq = enqueueWorkerRunNotification(nextNotifications, {
+          key: workerRunNotificationKey(run.runId, kind),
+          runId: run.runId,
+          roadmapKey: run.roadmapKey,
+          kind,
+          detail: boundedDiagnostic(run.detail ?? `worker run ${run.runId} is ${run.state}`),
+          createdAt: now,
+        });
+        if (enq.changed) {
+          nextNotifications = enq.outbox;
+          changed = true;
+        }
+      }
+      return { runs: nextRuns, notifications: nextNotifications, changed };
+    };
+
+    let current = state;
+    for (let reconcileAttempt = 0; reconcileAttempt < 5; reconcileAttempt += 1) {
+      const applied = applyVerdicts(current);
+      if (!applied.changed) {
+        current = { ...current, workerRuns: applied.runs, workerRunNotifications: applied.notifications };
+        break;
+      }
+      try {
+        current = await this.commit(current, {
+          ...current,
+          workerRuns: applied.runs,
+          workerRunNotifications: applied.notifications,
+        });
+        break;
+      } catch (error) {
+        if (!isStaleSnapshot(error)) throw error;
+        const fresh = await this.deps.repository.load();
+        if (fresh === undefined) {
+          const problem = "durable state disappeared while reconciling worker runs";
+          this.log(`[supervisor] ${problem}`);
+          return { state: current, refusal: boundedDiagnostic(problem) };
+        }
+        current = fresh;
+      }
+    }
+
+    const stillTrackable = (current.workerRuns ?? []).filter(
+      (run) => run.state !== "PREPARED" && !isTerminalWorkerRunState(run.state),
+    );
+    if (probe === undefined && stillTrackable.length > 0) {
+      const problem =
+        `${stillTrackable.length} worker run${stillTrackable.length === 1 ? "" : "s"} ${stillTrackable.length === 1 ? "is" : "are"} unfinished ` +
+        "and this supervisor has no way to check whether their owners are still running; refusing to schedule further work";
+      this.log(`[supervisor] ${problem}`);
+      return { state: current, refusal: boundedDiagnostic(problem) };
+    }
+
+    const unresolvedWorkerRuns = (current.workerRuns ?? []).filter((run) =>
+      ["PREPARED", "RUNNING", "AMBIGUOUS", "LOST", "STALLED", "AWAITING_CONTROLLER"].includes(run.state));
+    if (unresolvedWorkerRuns.length > 0) {
+      const problem =
+        `${unresolvedWorkerRuns.length} worker run${unresolvedWorkerRuns.length === 1 ? "" : "s"} cannot be established as running or ` +
+        `finished (${unresolvedWorkerRuns.map((run) => run.runId).join(", ")}); refusing to schedule further work`;
+      this.log(`[supervisor] ${problem}`);
+      return { state: current, refusal: boundedDiagnostic(problem) };
+    }
+    return { state: current };
+  }
+
   /**
    * The declared upgrade steps that apply to THIS installation (TASK-018 AC-3).
    *

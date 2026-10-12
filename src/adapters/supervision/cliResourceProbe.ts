@@ -39,7 +39,7 @@ import {
   type Classification,
 } from "../../supervision/resourceClassifier.js";
 import type { ResourceProbe } from "../../supervision/supervisorPorts.js";
-import { DEFAULT_WORKER_ENVIRONMENT_POLICY, type EnvironmentPolicy } from "../workers/environmentPolicy.js";
+import { buildWorkerEnvironment, DEFAULT_WORKER_ENVIRONMENT_POLICY, type EnvironmentPolicy } from "../workers/environmentPolicy.js";
 
 export interface CliResourceProbeDeps {
   readonly processRunner: ProcessRunner;
@@ -112,7 +112,7 @@ export function createCliResourceProbe(deps: CliResourceProbeDeps): ResourceProb
       cwd: deps.cwd,
       // Same allow-listed environment the accepted worker layer uses: a probe
       // is not a reason to hand a child process the whole environment.
-      env: buildEnv(policy),
+      env: buildWorkerEnvironment(policy),
       timeoutMs,
       maxOutputBytes: MAX_PROBE_OUTPUT_BYTES,
     });
@@ -159,15 +159,4 @@ export function createCliResourceProbe(deps: CliResourceProbeDeps): ResourceProb
       throw new ValidationError(`no zero-token probe is defined for provider "${provider}"`);
     },
   };
-}
-
-function buildEnv(policy: EnvironmentPolicy): Readonly<Record<string, string>> {
-  const env: Record<string, string> = {};
-  for (const name of policy.allowedVars) {
-    const value = process.env[name];
-    if (value !== undefined) {
-      env[name] = value;
-    }
-  }
-  return env;
 }

@@ -48,6 +48,7 @@
 import { FACTORY_ROLES, type FactoryRole } from "../../domain/role.js";
 import type { ProcessResult, ProcessRunner } from "../../ports/processRunner.js";
 import type { Worker } from "../../ports/worker.js";
+import type { DirectHostAdmissionSurface } from "../../supervision/directWorkerAdmission.js";
 import type { BuildInvocationArgs, CliInvocationPlan, CliReportedResult } from "./cliWorker.js";
 import { createCliWorker } from "./cliWorker.js";
 import { DEFAULT_WORKER_ENVIRONMENT_POLICY, type EnvironmentPolicy } from "./environmentPolicy.js";
@@ -65,6 +66,13 @@ export interface ClaudeCodeWorkerOptions {
   readonly processRunner: ProcessRunner;
   readonly environmentPolicy?: EnvironmentPolicy;
   readonly roles?: readonly FactoryRole[];
+  /** See CliWorkerAdapterConfig.maxEvidenceChars in cliWorker.ts. */
+  readonly maxEvidenceChars?: number;
+  readonly maxTurns?: number;
+  /** See CliWorkerAdapterConfig.directAdmissionChannel in cliWorker.ts. Omitted when absent; missing default fails closed there. */
+  readonly directAdmissionChannel?: DirectHostAdmissionSurface;
+  /** See CliWorkerAdapterConfig.maxTotalOutputBytes in cliWorker.ts. Omitted preserves unbounded-aggregate behavior. */
+  readonly maxTotalOutputBytes?: number;
 }
 
 /** The exact choice set `--help` documents for `--effort` on this installed CLI. */
@@ -105,23 +113,47 @@ export function permissionModeForRole(role: FactoryRole): "acceptEdits" | "plan"
  * fallback scan is kept as cheap extra defense against a format change, not
  * because it is expected to be needed.
  */
-export function extractClaudeFinalMessage(stdout: string): string | undefined {
+interface ClaudeOutputScan {
+  readonly finalMessage?: string;
+  /**
+   * See CliReportedResult.streamCorrupted in cliWorker.ts. Only the JSONL
+   * fallback scan below can observe this — the primary single-object path
+   * either parses or doesn't. Also true when the fallback scan finds more
+   * than one line carrying a `result` string: this adapter's documented
+   * contract is exactly ONE JSON object per invocation (see this file's
+   * header), so reaching this fallback at all already means that contract
+   * was violated; finding two or more independently well-formed candidate
+   * results is a second, distinct way that violation can hide an
+   * authoritative-vs-stale ambiguity behind lines that each parse cleanly on
+   * their own — the malformed-line case above catches corruption BETWEEN
+   * valid lines, this catches multiple COMPETING valid lines. Reuses the same
+   * signal/evidence channel as the malformed-line case (see
+   * cliPlannerWorker.ts) rather than adding a second one, since both mean the
+   * same thing to every consumer: the reported finalMessage cannot be trusted
+   * as the tool's one authoritative answer.
+   */
+  readonly corrupted: boolean;
+}
+
+function scanClaudeOutput(stdout: string): ClaudeOutputScan {
   const trimmed = stdout.trim();
   if (trimmed.length === 0) {
-    return undefined;
+    return { corrupted: false };
   }
   try {
     const parsed: unknown = JSON.parse(trimmed);
     if (typeof parsed === "object" && parsed !== null) {
       const result = (parsed as { result?: unknown }).result;
       if (typeof result === "string") {
-        return result;
+        return { finalMessage: result, corrupted: false };
       }
     }
   } catch {
     // Not a single JSON object — fall through to a JSONL-style scan below.
   }
   let last: string | undefined;
+  let resultLineCount = 0;
+  let corrupted = false;
   for (const line of trimmed.split("\n")) {
     const candidate = line.trim();
     if (candidate.length === 0) continue;
@@ -131,13 +163,92 @@ export function extractClaudeFinalMessage(stdout: string): string | undefined {
         const result = (event as { result?: unknown }).result;
         if (typeof result === "string") {
           last = result;
+          resultLineCount += 1;
         }
       }
     } catch {
+      // Same reasoning as Codex's JSONL scan: a later authoritative message
+      // could be hidden behind a malformed line.
+      corrupted = true;
       continue;
     }
   }
-  return last;
+  if (resultLineCount > 1) {
+    // Two or more independently valid `result` lines: this adapter's single-
+    // JSON-object contract does not permit more than one, and there is no
+    // principled way to pick between them — see this interface's doc comment.
+    corrupted = true;
+  }
+  return { ...(last === undefined ? {} : { finalMessage: last }), corrupted };
+}
+
+export function extractClaudeFinalMessage(stdout: string): string | undefined {
+  return scanClaudeOutput(stdout).finalMessage;
+}
+
+/**
+ * The subset of claude-code's structured `.result` object
+ * `WorkerRunEnvelope` is durably allowed to trust (DEFECT-DURABLE-WORKER-RUN-ENVELOPE
+ * AC-6).
+ */
+export interface ClaudeStructuredResult {
+  readonly sessionId?: string;
+  /** Present ONLY when the provider's own field said so, verbatim. Never inferred from prose. */
+  readonly terminalReason?: "MAX_TURNS";
+}
+
+/**
+ * Strictly parses claude-code's single JSON result object for `session_id`
+ * and a verified MAX_TURNS terminal reason.
+ *
+ * Deliberately STRICT, mirroring `strictClaudeFinalMessage` in
+ * reviewFinalMessage.ts rather than this file's own lenient
+ * `scanClaudeOutput`: a durable MAX_TURNS record is a stronger claim than an
+ * informational transcript, and free text must never be able to fabricate it
+ * (AC-6, and the task's own "free-text 'max turns' cannot create this state").
+ * Only a single, well-formed `type: "result"` object whose OWN
+ * `terminal_reason` field is exactly `"max_turns"` produces `MAX_TURNS`;
+ * anything else — a malformed object, a missing or different reason, or a
+ * stream this adapter's lenient JSONL fallback would otherwise have salvaged
+ * — produces `{}` rather than a guess.
+ *
+ * MEASUREMENT NOTE: the field's existence and shape (`type`, `session_id`,
+ * `terminal_reason`) were verified against the real `claude` binary (see
+ * TASK-003-worker-runner.md), which also measured `terminal_reason:
+ * "api_error"` for an unrelated failure — establishing the field is a short,
+ * snake_case reason code. The exact string for a max-turns exhaustion was NOT
+ * independently reproduced here: doing so would mean deliberately exhausting
+ * a real, paid session's turn budget, which is outside what a fake/offline
+ * test may do and outside this defect's spending boundary. `"max_turns"` is
+ * therefore an informed, closed-set match on the measured naming convention,
+ * not an independently reproduced measurement — a residual risk recorded in
+ * this defect's final report rather than hidden behind an assertion of
+ * certainty this module cannot back up.
+ */
+export function parseClaudeStructuredResult(stdout: string): ClaudeStructuredResult {
+  const trimmed = stdout.trim();
+  if (trimmed.length === 0) {
+    return {};
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return {};
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return {};
+  }
+  const row = parsed as Record<string, unknown>;
+  if (row["type"] !== "result") {
+    return {};
+  }
+  const sessionId = typeof row["session_id"] === "string" ? row["session_id"] : undefined;
+  const terminalReason = row["terminal_reason"] === "max_turns" ? ("MAX_TURNS" as const) : undefined;
+  return {
+    ...(sessionId === undefined ? {} : { sessionId }),
+    ...(terminalReason === undefined ? {} : { terminalReason }),
+  };
 }
 
 /** Pure argv-building: no I/O, directly unit-testable without spawning anything. */
@@ -160,8 +271,14 @@ export function buildClaudeInvocation(args: BuildInvocationArgs): CliInvocationP
 
 /** Pure output parsing: no I/O, directly unit-testable with a fabricated ProcessResult. */
 export function interpretClaudeOutput(processResult: ProcessResult): CliReportedResult {
-  const finalMessage = extractClaudeFinalMessage(processResult.stdout);
-  return finalMessage === undefined ? {} : { finalMessage };
+  const scan = scanClaudeOutput(processResult.stdout);
+  const structured = parseClaudeStructuredResult(processResult.stdout);
+  return {
+    ...(structured.sessionId === undefined ? {} : { providerSessionId: structured.sessionId }),
+    ...(structured.terminalReason === undefined ? {} : { terminalReason: structured.terminalReason }),
+    ...(scan.finalMessage === undefined ? {} : { finalMessage: scan.finalMessage }),
+    ...(scan.corrupted ? { streamCorrupted: true } : {}),
+  };
 }
 
 export function createClaudeCodeWorker(options: ClaudeCodeWorkerOptions): Worker {
@@ -177,7 +294,16 @@ export function createClaudeCodeWorker(options: ClaudeCodeWorkerOptions): Worker
     workspace: options.workspace,
     processRunner: options.processRunner,
     environmentPolicy: options.environmentPolicy ?? DEFAULT_WORKER_ENVIRONMENT_POLICY,
-    buildInvocation: buildClaudeInvocation,
+    ...(options.maxEvidenceChars === undefined ? {} : { maxEvidenceChars: options.maxEvidenceChars }),
+    ...(options.maxTurns === undefined ? {} : { maxTurns: options.maxTurns }),
+    ...(options.directAdmissionChannel === undefined ? {} : { directAdmissionChannel: options.directAdmissionChannel }),
+    ...(options.maxTotalOutputBytes === undefined ? {} : { maxTotalOutputBytes: options.maxTotalOutputBytes }),
+    buildInvocation: (args) => {
+      const plan = buildClaudeInvocation(args);
+      if (options.maxTurns === undefined) return plan;
+      if (!Number.isSafeInteger(options.maxTurns) || options.maxTurns < 1) throw new Error("invalid maxTurns");
+      return { ...plan, argv: [...plan.argv, "--max-turns", String(options.maxTurns)] };
+    },
     interpretOutput: interpretClaudeOutput,
   });
 }
