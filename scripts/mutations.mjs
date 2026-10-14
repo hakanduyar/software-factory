@@ -634,7 +634,7 @@ export const MUTATIONS = [
   },
   {
     id: "the reviewed digest records the wrong bytes",
-    edits: [[DIGEST, "  \"6b15d37f", "  \"000000ec"]],
+    edits: [[DIGEST, "  \"744988a0", "  \"000000ec"]],
     tests: [T_DIG],
     expect: "matches the reviewed digest",
   },

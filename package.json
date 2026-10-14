@@ -22,9 +22,14 @@
     "worker:doctor": "npm run build && node dist/src/cli/main.js worker doctor",
     "smoke:claude-worker": "npm run build && node dist/src/cli/main.js worker smoke claude",
     "smoke:codex-worker": "npm run build && node dist/src/cli/main.js worker smoke codex",
-    "smoke:workers": "npm run smoke:claude-worker && npm run smoke:codex-worker"
+    "smoke:workers": "npm run smoke:claude-worker && npm run smoke:codex-worker",
+    "postinstall": "node scripts/install-ci-provider.mjs"
+  },
+  "optionalDependencies": {
+    "@anthropic-ai/claude-code-linux-x64": "2.1.296"
   },
   "devDependencies": {
+    "@openai/codex": "0.153.4",
     "@types/node": "^22.10.2",
     "typescript": "^5.7.2",
     "yaml": "2.9.0"

@@ -45,10 +45,10 @@ import { createHash } from "node:crypto";
  * visibility property rather than a security one.
  */
 export const REVIEWED_WORKFLOW_SHA256 =
-  "6b15d37f4e5f929892f04987765c9b726296debf2aea1b726f2b222c786242a5";
+  "744988a0cd7326cba8a1f77c6bdf30227c9602d75294ca98bd020e2873dd1892";
 
 /** Its length in bytes, so a digest typo and a content change look different. */
-export const REVIEWED_WORKFLOW_BYTES = 2718;
+export const REVIEWED_WORKFLOW_BYTES = 2719;
 
 export function digestOf(source: string | Uint8Array): string {
   return createHash("sha256").update(source).digest("hex");
