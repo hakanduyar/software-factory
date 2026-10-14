@@ -491,4 +491,74 @@ describe("TASK-015 AC-1/AC-2: the supervisor authorises the set the work declare
     const roles = (inputs[0]?.authorizedResources ?? []).map((entry) => entry.role);
     assert.deepEqual(roles, ["routed"], "an executor that declared nothing got more than the routed resource");
   });
+
+  it("treats a successful explicit [] as zero authority and routes nothing", async () => {
+    const executor = declaring();
+    const probe = probeWith({ "claude-code:sonnet": { state: "AVAILABLE", billingMode: "USAGE_BILLED" } });
+    const supervisor = newSupervisor({ probe, executor, resourceCatalog: CATALOG });
+    await seedRoadmap(supervisor, [ITEM]);
+
+    await supervisor.service.tick();
+
+    assert.equal(executor.ran(), true, "explicit [] was refused or routed");
+    const input = executor.calls()[0];
+    assert.deepEqual(input?.authorizedResources, [], "explicit [] must pass an explicit empty authorization");
+    assert.equal(input?.config, undefined, "explicit [] received a routed config");
+    assert.equal(probe.probeCount("claude-code", "sonnet"), 1, "routing ran for an explicit zero declaration");
+  });
+
+  for (const bad of [null, undefined, "opus"]) {
+    it(`refuses a declaration that returns ${String(bad)} instead of an array`, async () => {
+      const executor = recordingExecutor((async () => bad) as never);
+
+      const result = await tickWith(executor);
+
+      assert.equal(result.kind, "RECOVERY_REQUIRED", `malformed declaration accepted: ${JSON.stringify(result)}`);
+      assert.equal(executor.ran(), false, "work ran after a malformed declaration");
+    });
+  }
+
+  it("refuses a declareResources that is present but not a function", async () => {
+    const executor = { ...recordingExecutor(async () => []), declareResources: null as never };
+
+    const result = await tickWith(executor);
+
+    assert.equal(result.kind, "RECOVERY_REQUIRED");
+    assert.equal(executor.ran(), false, "work ran with a non-function declaration");
+  });
+
+  it("refuses when reading the declaration property throws", async () => {
+    const executor = Object.defineProperty(recordingExecutor(async () => []), "declareResources", {
+      get: () => {
+        throw new Error("getter exploded");
+      },
+      enumerable: true,
+      configurable: true,
+    });
+
+    const result = await tickWith(executor);
+
+    assert.equal(result.kind, "RECOVERY_REQUIRED");
+    assert.equal(executor.ran(), false, "work ran after the declaration getter threw");
+  });
+
+  it("classifies the declaration it captured once and never re-reads the property", async () => {
+    const base = recordingExecutor(async () => []);
+    const declare = base.declareResources;
+    let reads = 0;
+    const executor = Object.defineProperty(base, "declareResources", {
+      get: () => (++reads === 1 ? declare : undefined),
+      enumerable: true,
+      configurable: true,
+    });
+
+    await tickWith(executor);
+
+    assert.equal(executor.ran(), true);
+    assert.deepEqual(
+      executor.calls()[0]?.authorizedResources,
+      [],
+      "a later read of the property turned an explicit [] into legacy routing",
+    );
+  });
 });

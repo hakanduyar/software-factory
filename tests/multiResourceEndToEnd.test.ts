@@ -299,3 +299,115 @@ describe("TASK-015 round-2 finding 3: an ambiguous declaration is refused", () =
     assert.equal(executor.calls().length, 0, "an unsupported model was launched");
   });
 });
+
+/**
+ * D1/D4: the REAL plan-backed executor under a REAL supervisor, with the plan
+ * reading BLOCKED for the first `blockedReads` reads and its real approved row
+ * afterwards. The first read is the declaration, so `1` models a plan that
+ * changed between declaring zero resources and the launch.
+ */
+async function planReadingBlocked(blockedReads: number) {
+  const context = await newPlanning();
+  const plan = await approvedPlan(context, "Build the thing.", {
+    constraints: [`roadmap-key: ${ITEM.key}`],
+    planner: { tool: "claude-code", model: "sonnet" },
+    execution: {
+      implementer: { tool: "claude-code", model: "opus" },
+      reviewer: { tool: "codex-cli", model: "gpt-5.6-luna" },
+      verificationCommands: [{ id: "check", executable: "node", argv: ["-e", "process.exit(0)"] }],
+      workspaceRoot: "/tmp/sf-plan-test",
+      loopBudget: { maxIterations: 2 },
+    },
+  });
+  let reads = 0;
+  const resumed: string[] = [];
+  const executor = createPlanBackedExecutor({
+    plans: {
+      async findPlanForItem() {
+        const current = await context.plans.findById(plan.id);
+        if (current === undefined) return undefined;
+        reads += 1;
+        return reads <= blockedReads
+          ? { ...current, phase: "BLOCKED" as const, failureReason: "scripted block" }
+          : current;
+      },
+    },
+    planning: {
+      async resume(planId: string): Promise<Plan> {
+        resumed.push(planId);
+        const current = await context.plans.findById(planId);
+        if (current === undefined) throw new Error("the fixture plan vanished");
+        return current;
+      },
+    },
+    state: {
+      async verifiedPhase(planId: string) {
+        return (await context.service.status(planId)).phase;
+      },
+    },
+    clock: systemClock,
+  });
+  // Real outcome capture around the genuine executor: nothing is mocked or altered.
+  const outcomes: WorkOutcome[] = [];
+  const recording = {
+    declareResources: executor.declareResources?.bind(executor),
+    async execute(input: WorkExecutionInput): Promise<WorkOutcome> {
+      const outcome = await executor.execute(input);
+      outcomes.push(outcome);
+      return outcome;
+    },
+  };
+  return { executor: recording as unknown as ScriptedExecutor, resumed, outcomes, planId: plan.id };
+}
+
+describe("TASK-014/015: explicit zero declaration with the real plan-backed executor", () => {
+  it("reports a BLOCKED plan without driving it even when every provider resource is unavailable", async () => {
+    const real = await planReadingBlocked(Number.POSITIVE_INFINITY);
+    const probe = scriptedProbe();
+    for (const entry of CATALOG) {
+      probe.set(entry.provider, entry.model, { state: "USAGE_LIMIT_REACHED", reason: "scripted", billingMode: "INCLUDED_SUBSCRIPTION" });
+    }
+    const supervisor = newSupervisor({ probe, executor: real.executor, resourceCatalog: CATALOG });
+    await seedRoadmap(supervisor, [ITEM]);
+
+    const result = await supervisor.service.tick();
+
+    assert.notEqual(
+      result.kind,
+      "WAITING_FOR_RESOURCE",
+      `an empty declaration was routed instead of reporting the plan: ${JSON.stringify(result)}`,
+    );
+    assert.deepEqual(real.resumed, [], "a BLOCKED plan was driven");
+    assert.equal(real.outcomes.length, 1, `the real executor did not run exactly once: ${JSON.stringify(result)}`);
+    const outcome = real.outcomes[0];
+    assert.ok(
+      outcome !== undefined && outcome.kind === "HUMAN_REQUIRED",
+      `the real executor did not report a human-required outcome: ${JSON.stringify(outcome)}`,
+    );
+    assert.equal(outcome.action.kind, "REVIEW_PLAN", "the BLOCKED plan was not reported as REVIEW_PLAN");
+    assert.ok(outcome.detail.includes(real.planId), "the outcome is not bound to the fixture plan id");
+    assert.match(outcome.detail, /BLOCKED/, "the outcome does not name the BLOCKED phase");
+  });
+
+  it("does not let an empty authorization launch a plan that became approved before the launch", async () => {
+    const real = await planReadingBlocked(1);
+    const supervisor = newSupervisor({ probe: healthyProbe(), executor: real.executor, resourceCatalog: CATALOG });
+    await seedRoadmap(supervisor, [ITEM]);
+
+    await supervisor.service.tick();
+
+    assert.deepEqual(real.resumed, [], "an empty authorization launched a later-approved plan");
+    assert.equal(real.outcomes.length, 1, "the real executor did not run exactly once");
+    const outcome = real.outcomes[0];
+    assert.ok(
+      outcome !== undefined && outcome.kind === "HUMAN_REQUIRED",
+      `the real executor did not report a human-required outcome: ${JSON.stringify(outcome)}`,
+    );
+    assert.equal(
+      outcome.action.kind,
+      "RECONCILE_PLAN_AUTHORIZATION",
+      `the approved plan did not reach the authorization check (early or no-plan refusal?): ${JSON.stringify(outcome)}`,
+    );
+    assert.match(outcome.detail, /explicitly empty set/, "the refusal does not carry the explicitly empty set authorization detail");
+  });
+});

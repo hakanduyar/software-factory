@@ -187,8 +187,13 @@ export interface WorkExecutor {
    * the executor re-checks what it is about to run against
    * `input.authorizedResources` at the last point before launch.
    *
-   * OPTIONAL, and its absence is today's behaviour exactly: an executor that
-   * declares nothing gets the single routed resource and nothing changes.
+   * OPTIONAL, and its ABSENCE is today's behaviour exactly: an executor with no
+   * method gets the single routed resource and nothing changes. A method that
+   * successfully returns `[]` is an EXPLICIT ZERO declaration: no model resource
+   * is routed, probed or authorised, and only the trusted local executor runs
+   * with an empty `authorizedResources`. A non-function, a non-array return
+   * (null, undefined) or a throw is a refusal, never absence and never empty
+   * authority.
    */
   declareResources?(item: RoadmapItem): Promise<readonly RequiredResource[]>;
   execute(input: WorkExecutionInput): Promise<WorkOutcome>;

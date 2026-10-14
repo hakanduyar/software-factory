@@ -1015,6 +1015,14 @@ export class SupervisorService {
      * gate, or to refuse on.
      */
     let declaredResources: readonly RequiredResource[] = [];
+    /**
+     * ABSENT METHOD versus EXPLICIT ZERO DECLARATION. No `declareResources` at
+     * all is the legacy route (the single routed resource). A method that
+     * SUCCESSFULLY returns an array, even `[]`, has stated what the work
+     * launches; `[]` means no AI resource. Set only inside the protected
+     * boundary, from the value captured once, and never read again.
+     */
+    let declaredExplicitly = false;
     try {
       /**
        * READ ONCE, INTO INERT DATA (round-3 finding 3).
@@ -1029,7 +1037,22 @@ export class SupervisorService {
        * already applies to what a worker CLAIMS: a value that can change between
        * two reads is not evidence.
        */
-      const raw = (await this.deps.executor.declareResources?.(deepFreeze(structuredClone({ ...item })))) ?? [];
+      const declare: unknown = this.deps.executor.declareResources;
+      let raw: readonly RequiredResource[] = [];
+      if (declare !== undefined) {
+        if (typeof declare !== "function") {
+          throw new Error("declareResources is present but is not a function");
+        }
+        const returned: unknown = await (declare as (declared: unknown) => Promise<unknown>).call(
+          this.deps.executor,
+          deepFreeze(structuredClone({ ...item })),
+        );
+        if (!Array.isArray(returned)) {
+          throw new Error("declareResources did not return an array");
+        }
+        raw = returned as readonly RequiredResource[];
+        declaredExplicitly = true;
+      }
       declaredResources = deepFreeze(
         [...raw].map((resource) => ({
           role: String(resource.role) as RequiredResource["role"],
@@ -1056,6 +1079,8 @@ export class SupervisorService {
       };
     }
     const declaresOwnResources = declaredResources.length > 0;
+    /** Declared successfully and empty: zero AI authority. Nothing is routed, probed or gated for a model; only the trusted local executor runs. */
+    const declaredZeroAuthority = declaredExplicitly && !declaresOwnResources;
 
     // ROUTE. Deterministic work needs no AI resource and therefore can never
     // be blocked by a provider limit — that is what keeps a shortage from
@@ -1082,7 +1107,7 @@ export class SupervisorService {
     let confirmedBillingMode: BillingMode = "UNKNOWN";
     /** The same observation, bound to its resource, for the gate (R10-FIN-1). */
     let billingObservation: BillingObservation | undefined;
-    if (requiresAi(item.workClass) && !declaresOwnResources) {
+    if (requiresAi(item.workClass) && !declaresOwnResources && !declaredZeroAuthority) {
       // Only a REVIEW must avoid the implementer; an implementation may of
       // course reuse whatever resource is best.
       const lineage =
@@ -1671,7 +1696,9 @@ export class SupervisorService {
               : {}),
           // TASK-015: the exact set, so the executor can refuse to launch
           // anything outside it at the last point before it launches.
-          ...(authorized.length === 0 ? {} : { authorizedResources: authorized }),
+          // An explicit zero declaration passes its empty authorization on
+          // purpose; an absent method still passes nothing.
+          ...(authorized.length === 0 && !declaredZeroAuthority ? {} : { authorizedResources: authorized }),
           ...(checkpoint === undefined ? {} : { checkpoint }),
         }),
       );
