@@ -47,3 +47,15 @@ Escalate when:
 - reviewer confidence is low,
 - security/architecture impact is high,
 - long-context requirement exceeds worker capability.
+
+## Latest available versions
+
+For new work, first choose the least costly model family and supported reasoning effort that adequately meet the task. Within that family, prefer the latest stable, task-appropriate version available to the current account and client. This does not make the largest model or highest effort the default. Use deterministic local tools when they are sufficient.
+
+Resolve the exact model ID and supported effort using current provider documentation and the client's available-model inventory. Record the model, effort, evidence date and source, and task-specific rationale. A public catalog alone does not establish account access, available quota, or permission to dispatch a task.
+
+If the latest suitable version is unavailable, ineligible, or incompatible with the task, record the reason and supporting evidence before selecting the smallest adequate eligible fallback. Do not silently replay an older pinned version or enable paid usage to obtain a newer model.
+
+Version selection preserves existing approval, security, testing, independent-review, ownership, and finite task-limit requirements. A model upgrade requires new configuration and verification evidence; it does not change a running agent merely because a document names a newer model. Retain historical model IDs, receipts, results, and evidence pins unchanged.
+
+This policy guides future selection; it does not claim that automatic version resolution or runtime enforcement has been implemented.
