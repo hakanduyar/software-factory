@@ -45,6 +45,14 @@ Somut devam boşluğu: `.github/workflows/verify.yml` push/PR için `npm test` �
 
 Her iş yalnız eksik davranışı tamamlar; mevcut schema/helper ve değişmemiş fingerprint kanıtları yeniden kullanılır. Finite output/time/turn/attempt sınırları iş büyüklüğüne göre ticket'ta gerekçelendirilir. Aynı path için tek yazar; kritik değişikliği yazan tek kabul mercii olamaz.
 
+### 0. Geçmiş anlamlı katkıları kaybetmeden koru — ayrık, sonlu onarım
+
+- **Sahip:** `/root/git_delivery_audit`; aktif continuation yazarının dosyalarına dokunmadan mevcut katkı/branch/commit kanıtlarını uzlaştırır.
+- **Girdi/çıktı:** dar owned değişiklik envanteri ve mevcut receipt'ler → secret/runtime artifacts hariç mantıksal katkı başına scoped branch commit; yarım işler WIP, tamamlananlar normal push/PR/review/CI/merge yolu. Önceden birleşmiş PR yeniden oluşturulmaz; eski author kimliği veya başarısızlık tarihi yeniden yazılmaz.
+- **İşlevsel AC/kontrol:** her kabul edilen katkı için kaynak path/fingerprint→commit bağlantısı, staged kapsam kontrolü ve etkilenmiş AC'nin minimum gerekli check'i vardır; unrelated değişiklik toplanmaz, boş commit yoktur. Belirsiz kaynak/sahiplik ayrı blocker/owner/next action olarak kalır. Bu bakım işi ilk claim/registration diliminin tüm Factory'yi bekleten önkoşulu değildir.
+
+**Belirsizlik/escalation:** Claude bir teknik uygulama noktasında emin değilse önce uygun minimum model/effort ile bağımsız OpenAI incelemesi alınır; bilinmeyen gerçek test/kanıtla çözülür. Malzeme etkisi olan kapsam, yetki, güvenlik veya ürün davranışı alternatifleri çözümsüzse seçenekler/kanıt/öneri ROOT'a, gerekirse insana sunulur. Worker kendi AC'sini değiştirmez; tekrar generic izin istemek veya sonsuz hazırlık döngüsü çözüm değildir. Kritik review bağımsızlığı ve iki başarısız correction sonrası C13 diagnosis/replan korunur.
+
 ### 1. Mevcut akışın gerçek boşluğunu dondur ve iki yararlı işi seç
 
 - **Sahip:** lifecycle controller; Chief sırayı yönetir, OpenAI bağımsız scope incelemesi yapar.
