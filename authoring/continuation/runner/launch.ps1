@@ -1057,7 +1057,7 @@ function Invoke-ManagedNativeCollector {
                 $ut = $vTerm.usageTelemetry
                 $utFields = @('schema','status','outputTokens','stdoutBytes','stdoutSha256','stderrBytes','stderrSha256')
                 if ($ut -isnot [PSCustomObject] -or @($ut.PSObject.Properties).Count -ne $utFields.Count) { throw 'Refusing: terminal usageTelemetry field set is not exact.' }
-                foreach ($utn in $utFields) { if (-not (& $hasProp $ut @($utn))) { throw 'Refusing: terminal usageTelemetry field set is not exact.' } }
+                $utNames = @($ut.PSObject.Properties | ForEach-Object { $_.Name }); foreach ($utn in $utFields) { if ($utNames -cnotcontains $utn) { throw 'Refusing: terminal usageTelemetry field set is not exact.' } }
                 if ($ut.schema -isnot [string] -or $ut.schema -cne 'ManagedUsageTelemetry/v1' -or $ut.status -isnot [string] -or $ut.status -cne 'RAW_SDK_RESULT_PENDING' -or $null -ne $ut.outputTokens) { throw 'Refusing: terminal usageTelemetry must be RAW_SDK_RESULT_PENDING with null outputTokens.' }
                 if (-not (& $isInt $ut.stdoutBytes) -or [long]$ut.stdoutBytes -ne [long]$vTerm.stdout.retainedBytes -or -not (& $isInt $ut.stderrBytes) -or [long]$ut.stderrBytes -ne [long]$vTerm.stderr.retainedBytes) { throw 'Refusing: terminal usageTelemetry byte counts do not match the raw stream leaves.' }
                 foreach ($utp in @(@('stdoutSha256','stdout'), @('stderrSha256','stderr'))) {
@@ -1491,7 +1491,18 @@ function Invoke-ManagedNativeCollector {
                 psiEnvironment = $psiEnv
                 comparisonResult = 'PASSED'
             }
-            if ($noStop) { $prestartCapture['childEnvironmentRemoved'] = @($childEnvRemoved) }
+            if ($noStop) {
+                $prestartCapture['childEnvironmentRemoved'] = @($childEnvRemoved)
+                $prestartCapture['psiFieldsScope'] = 'INHERITED_PRE_REMOVAL'
+                $launchPresence = [ordered]@{}; $launchEnv = [ordered]@{}
+                foreach ($lk in @('CLAUDE_CODE_EFFORT_LEVEL','CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING','MAX_THINKING_TOKENS','CLAUDE_CODE_MAX_OUTPUT_TOKENS','MAX_STRUCTURED_OUTPUT_RETRIES')) {
+                    $lp = $psi.Environment.ContainsKey($lk)
+                    $launchPresence[$lk] = $lp
+                    $launchEnv[$lk] = if ($lp) { $psi.Environment[$lk] } else { $null }
+                }
+                $prestartCapture['launchPresencePostRemoval'] = $launchPresence
+                $prestartCapture['launchEnvironmentPostRemoval'] = $launchEnv
+            }
             if ([System.IO.File]::Exists($prestartEnvPath)) { throw "Refusing: prestart-environment.json already exists; run isolation violated." }
             Write-AtomicFile $prestartEnvPath (ConvertTo-Json -InputObject $prestartCapture -Compress)
             try {
