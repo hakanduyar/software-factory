@@ -44,6 +44,8 @@ export function createLoopWorker(config: LoopWorkerConfig, options: LoopWorkerFa
       return createClaudeCodeWorker(shared);
     case "codex-cli":
       return createCodexCliWorker(shared);
+    case "ollama-cli":
+      throw new ValidationError("supervised ollama-cli admission is unavailable; no worker was constructed");
     default: {
       const exhaustive: never = config.tool;
       throw new ValidationError(`unsupported worker tool: ${String(exhaustive)}`);

@@ -37,6 +37,7 @@ import {
   parseFinancialPolicy,
   verificationCommandAction,
 } from "../src/supervision/financialSafety.js";
+import type { WorkerTool } from "../src/adapters/workers/workerModelConfig.js";
 import { planAiRunConfig, SUPPORTED_MODELS } from "../src/supervision/modelEnforcement.js";
 import { interpretClaudeAuthStatus, interpretCodexDoctorJson } from "../src/supervision/resourceClassifier.js";
 import type { RoadmapItem, SessionCheckpoint } from "../src/supervision/supervisorTypes.js";
@@ -402,20 +403,24 @@ describe("TASK-006 NEW-MODEL-1: only allowlisted models reach argv", () => {
   });
 
   it("accepts every allowlisted model, so the list is not vacuously safe", () => {
-    for (const [provider, models] of Object.entries(SUPPORTED_MODELS)) {
+    for (const provider of ["claude-code", "codex-cli"] as const satisfies readonly WorkerTool[]) {
+      const models = SUPPORTED_MODELS[provider];
       assert.ok(models.length > 0, `${provider} has no supported models`);
       for (const model of models) {
-        const result = planAiRunConfig({
-          provider: provider as "claude-code" | "codex-cli",
-          model,
-          role: "IMPLEMENTER",
-        });
+        const result = planAiRunConfig({ provider, model, role: "IMPLEMENTER" });
         assert.equal(result.ok, true, `${provider}/${model} should be launchable`);
         if (result.ok === true) {
           assert.ok(result.value.argvEvidence.includes(model), "the model reaches argv");
         }
       }
     }
+  });
+
+  it("keeps ollama-cli deliberately empty and refuses a test-only placeholder model", () => {
+    assert.equal(SUPPORTED_MODELS["ollama-cli"].length, 0);
+    const result = planAiRunConfig({ provider: "ollama-cli", model: "test-only-placeholder", role: "IMPLEMENTER" });
+    assert.equal(result.ok, false);
+    assert.ok(!("value" in result));
   });
 
   it("never records an unsupported model as merely UNVERIFIED", () => {

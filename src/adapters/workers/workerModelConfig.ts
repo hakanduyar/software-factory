@@ -9,7 +9,7 @@
  * a code change.
  */
 
-export const WORKER_TOOLS = ["claude-code", "codex-cli"] as const;
+export const WORKER_TOOLS = ["claude-code", "codex-cli", "ollama-cli"] as const;
 
 export type WorkerTool = (typeof WORKER_TOOLS)[number];
 
