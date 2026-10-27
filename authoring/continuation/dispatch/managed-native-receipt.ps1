@@ -36,6 +36,12 @@ function Get-ManagedNativeCapturedFacts {
             if ($null -eq $p) { & $fail ('MISSING_' + $n.ToUpperInvariant()) }
             return , $p.Value
         }
+        # Observation selectors must be exact ordinal NoteProperty names; the shared lookup above is case-insensitive.
+        $exactName = {
+            param($o, [string]$n)
+            foreach ($q in $o.PSObject.Properties) { if (($q.MemberType -eq [System.Management.Automation.PSMemberTypes]::NoteProperty) -and [string]::Equals($q.Name, $n, $ord)) { return $true } }
+            return $false
+        }
         $str = { param($o, [string]$n) $v = & $prop $o $n; if ($v -isnot [string]) { & $fail ('TYPE_' + $n.ToUpperInvariant()) }; return $v }
         $hex = { param($o, [string]$n) $v = & $str $o $n; if (-not (& $isHex $v)) { & $fail ('HASH_' + $n.ToUpperInvariant()) }; return $v }
         $lng = { param($o, [string]$n) $v = & $prop $o $n; if (-not (& $isInt $v)) { & $fail ('TYPE_' + $n.ToUpperInvariant()) }; return [long]$v }
@@ -199,6 +205,7 @@ function Get-ManagedNativeCapturedFacts {
         if ($maxElapsed -le 0) { & $fail 'MAXELAPSED_INVALID' }
         $maxStream = [long]0
         if ($obs) {
+            foreach ($sel in @('outputStopProfile', 'outputStopAuthority', 'maxStreamBytes')) { if (-not (& $exactName $core $sel)) { & $fail ('MISSING_' + $sel.ToUpperInvariant()) } }
             if ((& $str $core 'outputStopProfile') -cne 'observe-only-v1') { & $fail 'OBS_CORE_PROFILE' }
             if ($null -ne (& $prop $core 'maxStreamBytes')) { & $fail 'OBS_MAXSTREAM_NOT_NULL' }
         }
@@ -323,6 +330,57 @@ function Get-ManagedNativeCapturedFacts {
         if ((& $str $start 'startTimeUtc') -cne $startUtc) { & $fail 'START_TIME_MISMATCH' }
         $null = & $utc (& $str $start 'persistedUtc') 'START_PERSISTED_UTC'
 
+        # Observation: complete selector, artifact-metadata, authentication and declared-telemetry admissibility before any raw stream or artifact read.
+        if ($obs) {
+            $eArt = & $prop $term 'artifact'
+            if ((& $str $eArt 'path') -cne $artifactPath) { & $fail 'ARTIFACT_PATH_MISMATCH' }
+            $eState = & $str $eArt 'state'
+            $eSha = & $prop $eArt 'sha256'
+            $eLen = & $prop $eArt 'length'
+            if ($eState -ceq 'PRESENT') {
+                if (-not (& $isHex $eSha)) { & $fail 'ARTIFACT_SHA_INVALID' }
+                if ((-not (& $isInt $eLen)) -or ([long]$eLen -lt 0)) { & $fail 'ARTIFACT_LENGTH_INVALID' }
+            }
+            elseif ($eState -ceq 'ABSENT') {
+                if (($null -ne $eSha) -or ($null -ne $eLen)) { & $fail 'ARTIFACT_ABSENT_FIELDS' }
+                if (-not (& $absent $artifactPath)) { & $fail 'ARTIFACT_NOT_ABSENT' }
+            }
+            else { & $fail 'ARTIFACT_STATE_INADMISSIBLE' }
+        }
+        $obsAuth = $null
+        if ($obs) {
+            # Trusted sibling declarations only; nothing is loaded from the captured workingDirectory.
+            try {
+                . (Join-Path $PSScriptRoot 'managed-output-stop-authority.ps1')
+                . (Join-Path (Split-Path -Parent $PSScriptRoot) 'runner\launch.ps1')
+            } catch { & $fail 'OBS_SIBLING_UNAVAILABLE' }
+            $wd = & $str $core 'workingDirectory'
+            & $canon $wd
+            $controlRoot = [IO.Path]::Combine($wd, '.factory-data', 'chief', 'controller-runtime', 'control')
+            try { $obsAuth = Resolve-ManagedOutputStopAuthority -TicketContract $contract -CapturedTicket ([byte[]]($tk.Bytes.Clone())) -ControlRoot $controlRoot } catch { $obsAuth = $null; & $fail 'OBS_AUTH_FAILED' }
+            if (($null -eq $obsAuth) -or ($obsAuth -isnot [System.Management.Automation.PSCustomObject]) -or ($obsAuth.Schema -cne 'ManagedOutputStopAuthority/v1') -or ($obsAuth.Mode -cne 'OBSERVE_ONLY')) { & $fail 'OBS_AUTH_NOT_OBSERVE_ONLY' }
+            $authJson = ConvertTo-Json -InputObject $obsAuth -Compress -Depth 4
+            foreach ($sel in @('outputStopProfile', 'outputStopAuthority', 'usageTelemetry')) { if (-not (& $exactName $term $sel)) { & $fail ('MISSING_' + $sel.ToUpperInvariant()) } }
+            if ((& $str $term 'outputStopProfile') -cne 'observe-only-v1') { & $fail 'OBS_TERMINAL_PROFILE' }
+            foreach ($holder in @($core, $term)) {
+                $held = & $prop $holder 'outputStopAuthority'
+                if (($held -isnot [System.Management.Automation.PSCustomObject]) -or ((ConvertTo-Json -InputObject $held -Compress -Depth 4) -cne $authJson)) { & $fail 'OBS_AUTHORITY_MISMATCH' }
+            }
+            $ut = & $prop $term 'usageTelemetry'
+            if ($ut -isnot [System.Management.Automation.PSCustomObject]) { & $fail 'OBS_TELEMETRY_SHAPE' }
+            $utWant = @('schema', 'status', 'outputTokens', 'stdoutBytes', 'stdoutSha256', 'stderrBytes', 'stderrSha256')
+            $utHave = @($ut.PSObject.Properties | ForEach-Object { $_.Name })
+            if ($utHave.Count -ne $utWant.Count) { & $fail 'OBS_TELEMETRY_FIELDS' }
+            foreach ($n in $utWant) { if ($utHave -cnotcontains $n) { & $fail 'OBS_TELEMETRY_FIELDS' } }
+            if ((& $str $ut 'schema') -cne 'ManagedUsageTelemetry/v1') { & $fail 'OBS_TELEMETRY_SCHEMA' }
+            if ((& $str $ut 'status') -cne 'RAW_SDK_RESULT_PENDING') { & $fail 'OBS_TELEMETRY_STATUS' }
+            if ($null -ne (& $prop $ut 'outputTokens')) { & $fail 'OBS_TELEMETRY_TOKENS' }
+            if ((& $lng $ut 'stdoutBytes') -ne $outRet) { & $fail 'OBS_TELEMETRY_STDOUT' }
+            if ((& $lng $ut 'stderrBytes') -ne $errRet) { & $fail 'OBS_TELEMETRY_STDERR' }
+            if ((& $hex $ut 'stdoutSha256') -cne $outSha) { & $fail 'OBS_TELEMETRY_STDOUT' }
+            if ((& $hex $ut 'stderrSha256') -cne $errSha) { & $fail 'OBS_TELEMETRY_STDERR' }
+        }
+
         if ($obs) {
             $so = & $takeStream 'STDOUT' $outPath
             if (($so.Sha256 -cne $outSha) -or ($so.Length -ne $outRet)) { & $fail 'STDOUT_MISMATCH' }
@@ -365,33 +423,8 @@ function Get-ManagedNativeCapturedFacts {
         }
         else { & $fail 'ARTIFACT_STATE_INADMISSIBLE' }
 
-        $obsAuth = $null
         if ($obs) {
-            # Trusted sibling declarations only; nothing is loaded from the captured workingDirectory.
-            try {
-                . (Join-Path $PSScriptRoot 'managed-output-stop-authority.ps1')
-                . (Join-Path (Split-Path -Parent $PSScriptRoot) 'runner\launch.ps1')
-            } catch { & $fail 'OBS_SIBLING_UNAVAILABLE' }
-            $wd = & $str $core 'workingDirectory'
-            & $canon $wd
-            $controlRoot = [IO.Path]::Combine($wd, '.factory-data', 'chief', 'controller-runtime', 'control')
-            try { $obsAuth = Resolve-ManagedOutputStopAuthority -TicketContract $contract -CapturedTicket ([byte[]]($tk.Bytes.Clone())) -ControlRoot $controlRoot } catch { $obsAuth = $null; & $fail 'OBS_AUTH_FAILED' }
-            if (($null -eq $obsAuth) -or ($obsAuth -isnot [System.Management.Automation.PSCustomObject]) -or ($obsAuth.Schema -cne 'ManagedOutputStopAuthority/v1') -or ($obsAuth.Mode -cne 'OBSERVE_ONLY')) { & $fail 'OBS_AUTH_NOT_OBSERVE_ONLY' }
-            $authJson = ConvertTo-Json -InputObject $obsAuth -Compress -Depth 4
-            if ((& $str $term 'outputStopProfile') -cne 'observe-only-v1') { & $fail 'OBS_TERMINAL_PROFILE' }
-            foreach ($holder in @($core, $term)) {
-                $held = & $prop $holder 'outputStopAuthority'
-                if (($held -isnot [System.Management.Automation.PSCustomObject]) -or ((ConvertTo-Json -InputObject $held -Compress -Depth 4) -cne $authJson)) { & $fail 'OBS_AUTHORITY_MISMATCH' }
-            }
             $ut = & $prop $term 'usageTelemetry'
-            if ($ut -isnot [System.Management.Automation.PSCustomObject]) { & $fail 'OBS_TELEMETRY_SHAPE' }
-            $utWant = @('schema', 'status', 'outputTokens', 'stdoutBytes', 'stdoutSha256', 'stderrBytes', 'stderrSha256')
-            $utHave = @($ut.PSObject.Properties | ForEach-Object { $_.Name })
-            if ($utHave.Count -ne $utWant.Count) { & $fail 'OBS_TELEMETRY_FIELDS' }
-            foreach ($n in $utWant) { if ($utHave -cnotcontains $n) { & $fail 'OBS_TELEMETRY_FIELDS' } }
-            if ((& $str $ut 'schema') -cne 'ManagedUsageTelemetry/v1') { & $fail 'OBS_TELEMETRY_SCHEMA' }
-            if ((& $str $ut 'status') -cne 'RAW_SDK_RESULT_PENDING') { & $fail 'OBS_TELEMETRY_STATUS' }
-            if ($null -ne (& $prop $ut 'outputTokens')) { & $fail 'OBS_TELEMETRY_TOKENS' }
             if ((& $lng $ut 'stdoutBytes') -ne $so.Length) { & $fail 'OBS_TELEMETRY_STDOUT' }
             if ((& $lng $ut 'stderrBytes') -ne $se.Length) { & $fail 'OBS_TELEMETRY_STDERR' }
             if ((& $hex $ut 'stdoutSha256') -cne $so.Sha256) { & $fail 'OBS_TELEMETRY_STDOUT' }
