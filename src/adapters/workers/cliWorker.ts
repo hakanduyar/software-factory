@@ -213,6 +213,7 @@ export function createCliWorker(config: CliWorkerAdapterConfig): Worker {
         instructions: request.instructions,
         workspaceRoot: config.workspace.root,
         acceptanceCriteria: request.acceptanceCriteria,
+        ...(request.recalledNote === undefined ? {} : { recalledNote: request.recalledNote }),
       });
 
       const plan = config.buildInvocation({
