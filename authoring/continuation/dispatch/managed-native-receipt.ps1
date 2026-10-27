@@ -11,11 +11,16 @@ function Get-ManagedNativeCapturedFacts {
         [Parameter(Mandatory)][string]$RunId,
         [Parameter(Mandatory)][int]$Attempt,
         [switch]$ForFailedAccounting,
-        [ValidateSet('ERROR_MAX_TURNS','TOKEN_ACCOUNTING_STOP')][string]$FailureKind = 'ERROR_MAX_TURNS'
+        [ValidateSet('ERROR_MAX_TURNS','TOKEN_ACCOUNTING_STOP')][string]$FailureKind = 'ERROR_MAX_TURNS',
+        [switch]$ForOutputObservation
     )
     Set-StrictMode -Version Latest
     $ticketIssues = @()
+    $obs = $ForOutputObservation.IsPresent
+    $obsDeclared = [System.Collections.Generic.List[object]]::new()
+    $obsVerified = [System.Collections.Generic.List[object]]::new()
     $fail = { param([string]$c) throw [System.InvalidOperationException]::new('REFUSE:' + $c) }
+    $unknown = { param([string]$c) throw [System.InvalidOperationException]::new('UNKNOWN:' + $c) }
     try {
         $strict = [System.Text.UTF8Encoding]::new($false, $true)
         $ord = [System.StringComparison]::Ordinal
@@ -98,6 +103,50 @@ function Get-ManagedNativeCapturedFacts {
             if ([IO.File]::Exists($p) -or [IO.Directory]::Exists($p)) { return $false }
             return ($null -eq (Get-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue))
         }
+        # Observe-only raw leaf: fixed 64 KiB buffer, incremental SHA-256, checked running length, no length ceiling, never written.
+        $streamLeaf = {
+            param([string]$p)
+            & $canon $p
+            & $chain $p
+            $attr = $null
+            try { $attr = [IO.File]::GetAttributes($p) } catch { $attr = $null }
+            if ($null -eq $attr) { & $fail 'LEAF_UNREADABLE' }
+            $bad = [IO.FileAttributes]::Directory -bor [IO.FileAttributes]::Device -bor [IO.FileAttributes]::ReparsePoint
+            if (($attr -band $bad) -ne [IO.FileAttributes]0) { & $fail 'LEAF_NOT_ORDINARY' }
+            $fs = $null
+            try { $fs = [IO.FileStream]::new($p, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read, 4096, [IO.FileOptions]::SequentialScan) } catch { $fs = $null }
+            if ($null -eq $fs) { & $unknown 'RAW_OPEN_UNAVAILABLE' }
+            $buf = [byte[]]::new(65536)
+            $total = [long]0
+            $overflow = $false
+            $readOk = $true
+            $digest = $null
+            $ih = [System.Security.Cryptography.IncrementalHash]::CreateHash([System.Security.Cryptography.HashAlgorithmName]::SHA256)
+            try {
+                try {
+                    while ($true) {
+                        $n = $fs.Read($buf, 0, $buf.Length)
+                        if ($n -le 0) { break }
+                        if ([long]$n -gt ([long]::MaxValue - $total)) { $overflow = $true; break }
+                        $total = [long]($total + [long]$n)
+                        $ih.AppendData($buf, 0, $n)
+                    }
+                    if (-not $overflow) { $digest = [Convert]::ToHexString($ih.GetHashAndReset()).ToLowerInvariant() }
+                }
+                catch { $readOk = $false }
+            }
+            finally { $fs.Dispose(); $ih.Dispose() }
+            if (-not $readOk) { & $unknown 'RAW_READ_UNAVAILABLE' }
+            if ($overflow) { & $fail 'LEAF_LENGTH_OVERFLOW' }
+            return [pscustomobject]@{ Path = $p; Sha256 = $digest; Length = $total }
+        }
+        $invStream = [System.Collections.Generic.List[object]]::new()
+        $takeStream = {
+            param([string]$role, [string]$p)
+            $r = & $streamLeaf $p
+            $invStream.Add([pscustomobject]@{ Role = $role; Path = $p; Sha256 = $r.Sha256; Length = $r.Length })
+            return $r
+        }
         $decodeText = {
             param([string]$t, [string]$c)
             $o = $null
@@ -115,6 +164,8 @@ function Get-ManagedNativeCapturedFacts {
         }
 
         if ($Attempt -le 0) { & $fail 'ATTEMPT_INVALID' }
+        # The FailureKind default alone is not a binding; only an explicitly bound FailureKind conflicts with observation.
+        if ($obs -and ($ForFailedAccounting.IsPresent -or $PSBoundParameters.ContainsKey('FailureKind'))) { & $fail 'OBSERVE_SELECTOR_CONFLICT' }
         if ((-not (& $isHex $ExpectedManifestSha256)) -or (-not (& $isHex $ExpectedTerminalSha256))) { & $fail 'EXPECTED_HASH_INVALID' }
         & $canon $ManifestPath
         & $canon $TerminalPath
@@ -146,8 +197,16 @@ function Get-ManagedNativeCapturedFacts {
         $argv = & $prop $core 'arguments'
         $maxElapsed = & $lng $core 'maxElapsedMs'
         if ($maxElapsed -le 0) { & $fail 'MAXELAPSED_INVALID' }
-        $maxStream = & $lng $core 'maxStreamBytes'
-        if (($maxStream -le 0) -or ($maxStream -gt $streamCeil)) { & $fail 'MAXSTREAM_INVALID' }
+        $maxStream = [long]0
+        if ($obs) {
+            if ((& $str $core 'outputStopProfile') -cne 'observe-only-v1') { & $fail 'OBS_CORE_PROFILE' }
+            if ($null -ne (& $prop $core 'maxStreamBytes')) { & $fail 'OBS_MAXSTREAM_NOT_NULL' }
+        }
+        else {
+            foreach ($sel in @('outputStopProfile', 'outputStopAuthority')) { if ($null -ne $core.PSObject.Properties[$sel]) { & $fail 'OBS_OPT_IN_REQUIRED' } }
+            $maxStream = & $lng $core 'maxStreamBytes'
+            if (($maxStream -le 0) -or ($maxStream -gt $streamCeil)) { & $fail 'MAXSTREAM_INVALID' }
+        }
         $null = & $bool $core 'ackMode'
         $null = & $prop $core 'settingsApplied'
         $null = & $prop $core 'ackContext'
@@ -183,6 +242,9 @@ function Get-ManagedNativeCapturedFacts {
             $ticketIssues = @($contract.Issues)
             & $fail $contract.Code
         }
+        $contractMode = $contract.OutputStopMode
+        if ($obs) { if ($contractMode -cne 'OBSERVE_ONLY_DESCRIPTOR') { & $fail 'OBS_CONTRACT_MODE' } }
+        elseif ($contractMode -cne 'LEGACY_HARDLIMIT') { & $fail 'OBS_OPT_IN_REQUIRED' }
         $sessionId = $ticket.sessionId
         $budget = $contract.Budget
         if ($argv -isnot [object[]]) { & $fail 'ARGUMENTS_TYPE' }
@@ -238,8 +300,18 @@ function Get-ManagedNativeCapturedFacts {
         if ((& $str $tErr 'file') -cne 'stderr.bin') { & $fail 'TERMINAL_STDERR_NAME' }
         $outSha = & $hex $tOut 'sha256'; $errSha = & $hex $tErr 'sha256'
         $outRet = & $lng $tOut 'retainedBytes'; $errRet = & $lng $tErr 'retainedBytes'
-        if (($outRet -lt 0) -or ($errRet -lt 0) -or ($outRet -gt $maxStream) -or ($errRet -gt $maxStream)) { & $fail 'TERMINAL_STREAM_BYTES' }
-        if ((($outRet + $errRet) -ne $retained) -or ($retained -gt $maxStream)) { & $fail 'TERMINAL_STREAM_SUM' }
+        if ($obs) {
+            if (($outRet -lt 0) -or ($errRet -lt 0)) { & $fail 'TERMINAL_STREAM_BYTES' }
+            if ($outRet -gt ([long]::MaxValue - $errRet)) { & $fail 'TERMINAL_STREAM_SUM' }
+            if (($outRet + $errRet) -ne $retained) { & $fail 'TERMINAL_STREAM_SUM' }
+            $obsDeclared.Add([pscustomobject]@{ Role = 'STDOUT'; Path = $outPath; DeclaredSha256 = $outSha; DeclaredLength = $outRet })
+            $obsDeclared.Add([pscustomobject]@{ Role = 'STDERR'; Path = $errPath; DeclaredSha256 = $errSha; DeclaredLength = $errRet })
+        }
+        else {
+            foreach ($sel in @('outputStopProfile', 'outputStopAuthority', 'usageTelemetry')) { if ($null -ne $term.PSObject.Properties[$sel]) { & $fail 'OBS_OPT_IN_REQUIRED' } }
+            if (($outRet -lt 0) -or ($errRet -lt 0) -or ($outRet -gt $maxStream) -or ($errRet -gt $maxStream)) { & $fail 'TERMINAL_STREAM_BYTES' }
+            if ((($outRet + $errRet) -ne $retained) -or ($retained -gt $maxStream)) { & $fail 'TERMINAL_STREAM_SUM' }
+        }
 
         $sf = & $take 'START' $startPath $smallMax
         $start = & $decodeBytes $sf.Bytes 'START_JSON'
@@ -251,10 +323,20 @@ function Get-ManagedNativeCapturedFacts {
         if ((& $str $start 'startTimeUtc') -cne $startUtc) { & $fail 'START_TIME_MISMATCH' }
         $null = & $utc (& $str $start 'persistedUtc') 'START_PERSISTED_UTC'
 
-        $so = & $take 'STDOUT' $outPath $maxStream
-        if (($so.Sha256 -cne $outSha) -or ($so.Length -ne $outRet)) { & $fail 'STDOUT_MISMATCH' }
-        $se = & $take 'STDERR' $errPath $maxStream
-        if (($se.Sha256 -cne $errSha) -or ($se.Length -ne $errRet)) { & $fail 'STDERR_MISMATCH' }
+        if ($obs) {
+            $so = & $takeStream 'STDOUT' $outPath
+            if (($so.Sha256 -cne $outSha) -or ($so.Length -ne $outRet)) { & $fail 'STDOUT_MISMATCH' }
+            $obsVerified.Add([pscustomobject]@{ Role = 'STDOUT'; Path = $outPath; VerifiedSha256 = $so.Sha256; VerifiedLength = $so.Length })
+            $se = & $takeStream 'STDERR' $errPath
+            if (($se.Sha256 -cne $errSha) -or ($se.Length -ne $errRet)) { & $fail 'STDERR_MISMATCH' }
+            $obsVerified.Add([pscustomobject]@{ Role = 'STDERR'; Path = $errPath; VerifiedSha256 = $se.Sha256; VerifiedLength = $se.Length })
+        }
+        else {
+            $so = & $take 'STDOUT' $outPath $maxStream
+            if (($so.Sha256 -cne $outSha) -or ($so.Length -ne $outRet)) { & $fail 'STDOUT_MISMATCH' }
+            $se = & $take 'STDERR' $errPath $maxStream
+            if (($se.Sha256 -cne $errSha) -or ($se.Length -ne $errRet)) { & $fail 'STDERR_MISMATCH' }
+        }
 
         $art = & $prop $term 'artifact'
         if ((& $str $art 'path') -cne $artifactPath) { & $fail 'ARTIFACT_PATH_MISMATCH' }
@@ -264,8 +346,17 @@ function Get-ManagedNativeCapturedFacts {
         if ($artState -ceq 'PRESENT') {
             if (-not (& $isHex $artSha)) { & $fail 'ARTIFACT_SHA_INVALID' }
             if (-not (& $isInt $artLen)) { & $fail 'ARTIFACT_LENGTH_INVALID' }
-            $ar = & $take 'ARTIFACT' $artifactPath $maxStream
-            if (($ar.Sha256 -cne $artSha) -or ($ar.Length -ne [long]$artLen)) { & $fail 'ARTIFACT_MISMATCH' }
+            if ($obs) {
+                if ([long]$artLen -lt 0) { & $fail 'ARTIFACT_LENGTH_INVALID' }
+                $obsDeclared.Add([pscustomobject]@{ Role = 'ARTIFACT'; Path = $artifactPath; DeclaredSha256 = $artSha; DeclaredLength = [long]$artLen })
+                $ar = & $takeStream 'ARTIFACT' $artifactPath
+                if (($ar.Sha256 -cne $artSha) -or ($ar.Length -ne [long]$artLen)) { & $fail 'ARTIFACT_MISMATCH' }
+                $obsVerified.Add([pscustomobject]@{ Role = 'ARTIFACT'; Path = $artifactPath; VerifiedSha256 = $ar.Sha256; VerifiedLength = $ar.Length })
+            }
+            else {
+                $ar = & $take 'ARTIFACT' $artifactPath $maxStream
+                if (($ar.Sha256 -cne $artSha) -or ($ar.Length -ne [long]$artLen)) { & $fail 'ARTIFACT_MISMATCH' }
+            }
         }
         elseif ($artState -ceq 'ABSENT') {
             if (($null -ne $artSha) -or ($null -ne $artLen)) { & $fail 'ARTIFACT_ABSENT_FIELDS' }
@@ -274,12 +365,87 @@ function Get-ManagedNativeCapturedFacts {
         }
         else { & $fail 'ARTIFACT_STATE_INADMISSIBLE' }
 
+        $obsAuth = $null
+        if ($obs) {
+            # Trusted sibling declarations only; nothing is loaded from the captured workingDirectory.
+            try {
+                . (Join-Path $PSScriptRoot 'managed-output-stop-authority.ps1')
+                . (Join-Path (Split-Path -Parent $PSScriptRoot) 'runner\launch.ps1')
+            } catch { & $fail 'OBS_SIBLING_UNAVAILABLE' }
+            $wd = & $str $core 'workingDirectory'
+            & $canon $wd
+            $controlRoot = [IO.Path]::Combine($wd, '.factory-data', 'chief', 'controller-runtime', 'control')
+            try { $obsAuth = Resolve-ManagedOutputStopAuthority -TicketContract $contract -CapturedTicket ([byte[]]($tk.Bytes.Clone())) -ControlRoot $controlRoot } catch { $obsAuth = $null; & $fail 'OBS_AUTH_FAILED' }
+            if (($null -eq $obsAuth) -or ($obsAuth -isnot [System.Management.Automation.PSCustomObject]) -or ($obsAuth.Schema -cne 'ManagedOutputStopAuthority/v1') -or ($obsAuth.Mode -cne 'OBSERVE_ONLY')) { & $fail 'OBS_AUTH_NOT_OBSERVE_ONLY' }
+            $authJson = ConvertTo-Json -InputObject $obsAuth -Compress -Depth 4
+            if ((& $str $term 'outputStopProfile') -cne 'observe-only-v1') { & $fail 'OBS_TERMINAL_PROFILE' }
+            foreach ($holder in @($core, $term)) {
+                $held = & $prop $holder 'outputStopAuthority'
+                if (($held -isnot [System.Management.Automation.PSCustomObject]) -or ((ConvertTo-Json -InputObject $held -Compress -Depth 4) -cne $authJson)) { & $fail 'OBS_AUTHORITY_MISMATCH' }
+            }
+            $ut = & $prop $term 'usageTelemetry'
+            if ($ut -isnot [System.Management.Automation.PSCustomObject]) { & $fail 'OBS_TELEMETRY_SHAPE' }
+            $utWant = @('schema', 'status', 'outputTokens', 'stdoutBytes', 'stdoutSha256', 'stderrBytes', 'stderrSha256')
+            $utHave = @($ut.PSObject.Properties | ForEach-Object { $_.Name })
+            if ($utHave.Count -ne $utWant.Count) { & $fail 'OBS_TELEMETRY_FIELDS' }
+            foreach ($n in $utWant) { if ($utHave -cnotcontains $n) { & $fail 'OBS_TELEMETRY_FIELDS' } }
+            if ((& $str $ut 'schema') -cne 'ManagedUsageTelemetry/v1') { & $fail 'OBS_TELEMETRY_SCHEMA' }
+            if ((& $str $ut 'status') -cne 'RAW_SDK_RESULT_PENDING') { & $fail 'OBS_TELEMETRY_STATUS' }
+            if ($null -ne (& $prop $ut 'outputTokens')) { & $fail 'OBS_TELEMETRY_TOKENS' }
+            if ((& $lng $ut 'stdoutBytes') -ne $so.Length) { & $fail 'OBS_TELEMETRY_STDOUT' }
+            if ((& $lng $ut 'stderrBytes') -ne $se.Length) { & $fail 'OBS_TELEMETRY_STDERR' }
+            if ((& $hex $ut 'stdoutSha256') -cne $so.Sha256) { & $fail 'OBS_TELEMETRY_STDOUT' }
+            if ((& $hex $ut 'stderrSha256') -cne $se.Sha256) { & $fail 'OBS_TELEMETRY_STDERR' }
+        }
+
         foreach ($e in $inv) {
             if ($e.State -ceq 'FILE') {
                 $r = & $readLeaf $e.Path $e.Limit
                 if (($r.Sha256 -cne $e.Sha256) -or ($r.Length -ne $e.Length)) { & $fail 'STALE_INPUT' }
             }
             elseif (-not (& $absent $e.Path)) { & $fail 'STALE_INPUT' }
+        }
+        foreach ($e in $invStream) {
+            $r = & $streamLeaf $e.Path
+            if (($r.Sha256 -cne $e.Sha256) -or ($r.Length -ne $e.Length)) { & $fail 'STALE_INPUT' }
+        }
+
+        if ($obs) {
+            $obsCapture = [pscustomobject]@{
+                RunId = $RunId
+                Attempt = [long]$Attempt
+                RunDir = $runDir
+                SessionId = $sessionId
+                Manifest = $manifest
+                Core = $core
+                Ticket = $ticket
+                Terminal = $term
+                Start = $start
+                Budget = $budget
+                Authority = $obsAuth
+                Pid = $pid1
+                RequestSha256 = $reqSha
+                ManifestPath = $ManifestPath
+                ManifestSha256 = $mf.Sha256
+                TerminalPath = $TerminalPath
+                TerminalSha256 = $tm.Sha256
+                TicketPath = $tPath
+                TicketSha256 = $tk.Sha256
+                StartPath = $startPath
+                StartSha256 = $sf.Sha256
+                ArtifactPath = $artifactPath
+                ArtifactState = $artState
+                DeclaredReferences = $obsDeclared.ToArray()
+                VerifiedReferences = $obsVerified.ToArray()
+                StdoutLength = $so.Length
+                StderrLength = $se.Length
+                TransportExitCode = $termExit
+                SDKOutcome = 'PENDING'
+                ObservedOutputTokens = $null
+                Inputs = $inv.ToArray()
+                StreamedInputs = $invStream.ToArray()
+            }
+            return [pscustomobject]@{ Valid = $false; Code = 'OBSERVE_ONLY_TRANSPORT_CAPTURE'; Facts = $null; ObservationCapture = $obsCapture; TicketIssues = $ticketIssues }
         }
 
         $capFacts = [pscustomobject]@{
@@ -324,6 +490,10 @@ function Get-ManagedNativeCapturedFacts {
     }
     catch {
         $m = [string]$_.Exception.Message
+        if ($obs -and $m.StartsWith('UNKNOWN:', [System.StringComparison]::Ordinal) -and ($m.Length -le 56) -and ($m.Substring(8) -cmatch '^[A-Z0-9_]{1,48}$')) {
+            # Observational inability is UNKNOWN, not invalid evidence and never a completed capture; declared references are not verified ones.
+            return [pscustomobject]@{ Valid = $false; Code = 'OBSERVE_ONLY_CAPTURE_UNKNOWN'; Result = 'UNKNOWN'; Reason = $m.Substring(8); Facts = $null; ObservationCapture = $null; DeclaredReferences = $obsDeclared.ToArray(); VerifiedReferences = $obsVerified.ToArray(); TicketIssues = $ticketIssues }
+        }
         $code = 'UNEXPECTED_ERROR'
         if ($m.StartsWith('REFUSE:', [System.StringComparison]::Ordinal) -and ($m.Length -le 55) -and ($m.Substring(7) -cmatch '^[A-Z0-9_]{1,48}$')) { $code = $m.Substring(7) }
         return [pscustomobject]@{ Valid = $false; Code = $code; Facts = $null; TicketIssues = $ticketIssues }
