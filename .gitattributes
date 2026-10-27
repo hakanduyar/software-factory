@@ -3,3 +3,5 @@
 /authoring/continuation/tests/required-read-remaining-five.tests.ps1 text eol=lf
 /authoring/continuation/dispatch/managed-native-sdk-observation.ps1 text eol=lf
 /authoring/continuation/tests/sdk-observation.tests.ps1 text eol=lf
+/authoring/continuation/dispatch/managed-native-output-observation.ps1 text eol=lf
+/authoring/continuation/tests/output-observation-binding.tests.ps1 text eol=lf
