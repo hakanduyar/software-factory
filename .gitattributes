@@ -1,0 +1,3 @@
+/authoring/continuation/dispatch/required-read-packet-preflight.ps1 text eol=lf
+/authoring/continuation/tests/required-read-first-three.tests.ps1 text eol=lf
+/authoring/continuation/tests/required-read-remaining-five.tests.ps1 text eol=lf

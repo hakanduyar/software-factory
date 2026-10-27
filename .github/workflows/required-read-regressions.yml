@@ -1,0 +1,22 @@
+name: required-read regressions
+on:
+  pull_request:
+  push:
+permissions:
+  contents: read
+jobs:
+  required-read:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: "false"
+      - name: Verify accepted required-read boundaries
+        shell: pwsh
+        run: |
+          $source = Join-Path $env:GITHUB_WORKSPACE 'authoring/continuation/dispatch/required-read-packet-preflight.ps1'
+          $tests = Join-Path $env:GITHUB_WORKSPACE 'authoring/continuation/tests'
+          & (Join-Path $tests 'required-read-first-three.tests.ps1') -SourcePath $source -OutputDirectory (Join-Path $env:RUNNER_TEMP 'required-read-first-three')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & (Join-Path $tests 'required-read-remaining-five.tests.ps1') -SourcePath $source -OutputDirectory (Join-Path $env:RUNNER_TEMP 'required-read-remaining-five')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
