@@ -14,6 +14,24 @@ import type { EvidenceDraft } from "../domain/evidence.js";
 import type { RunId, WorkItemId } from "../domain/ids.js";
 import type { FactoryRole } from "../domain/role.js";
 
+/**
+ * Provider-neutral READ-ONLY reference data: the verified body of a previously
+ * accepted result note. It carries no approval, acceptance, status, release or
+ * dispatch authority. The caller MUST source it from the accepted-note recall
+ * verifier; this TypeScript structure (or a cast) is not authentication.
+ */
+export interface RecalledNoteReference {
+  readonly body: string;
+  readonly sha256: string;
+  readonly byteLength: number;
+  readonly source: {
+    readonly snapshotId: string;
+    readonly workItemId: string;
+    readonly specRevision: number;
+    readonly implementationRunId: string;
+  };
+}
+
 export interface WorkerRequest {
   readonly runId: RunId;
   readonly workItemId: WorkItemId;
@@ -21,6 +39,8 @@ export interface WorkerRequest {
   readonly title: string;
   readonly instructions: string;
   readonly acceptanceCriteria: readonly AcceptanceCriterion[];
+  /** Optional reference data forwarded into the worker prompt; absent => prompt unchanged. */
+  readonly recalledNote?: RecalledNoteReference;
 }
 
 export interface WorkerOutcome {

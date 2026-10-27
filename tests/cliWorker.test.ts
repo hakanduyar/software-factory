@@ -13,7 +13,16 @@
  */
 
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { after, describe, it } from "node:test";
+
+import { persistAcceptedResultNote } from "../src/adapters/obsidian/acceptedResultNotePersistence.js";
+import { recallAcceptedResultNote } from "../src/adapters/obsidian/acceptedResultNoteRecall.js";
+import { buildWorkerPrompt } from "../src/adapters/workers/promptTemplates.js";
+import { FACTORY_ROLES } from "../src/domain/role.js";
+import { AGENT, HUMAN, authorize, newFactory, seedWorkItem, toWaitingForHuman } from "./support/factoryFixtures.js";
 
 import { createCliWorker, type CliReportedResult, type CliWorkerAdapterConfig } from "../src/adapters/workers/cliWorker.js";
 import { resolveWorkspace } from "../src/adapters/workers/workspace.js";
@@ -168,5 +177,91 @@ describe("cliWorker: Run.summary redaction (regression for the HIGH finding)", (
     assert.ok(diagnostic !== undefined);
     assert.match(diagnostic.summary, /codex-cli/);
     assert.match(diagnostic.summary, /exit=1/);
+  });
+});
+
+describe("cliWorker: verified recalled note forwarding (request -> adapter prompt only)", () => {
+  function capturingWorker(workspaceRoot: string, prompts: string[], reported: CliReportedResult = { finalMessage: "ok", claimsAcceptanceMet: false }) {
+    return createCliWorker({
+      id: "stub-worker",
+      tool: "codex-cli",
+      roles: [...FACTORY_ROLES],
+      executable: "irrelevant-not-actually-spawned",
+      model: "m",
+      timeoutMs: 5000,
+      workspace: resolveWorkspace(workspaceRoot),
+      processRunner: stubRunner(fakeProcessResult()),
+      environmentPolicy: { allowedVars: [] },
+      buildInvocation: (args) => {
+        prompts.push(args.prompt);
+        return { argv: [], effortApplication: { applied: false } };
+      },
+      interpretOutput: () => reported,
+    });
+  }
+
+  it("forwards a note recalled from a real Factory DONE item into the actual prompt", async () => {
+    const t = newFactory();
+    const item = await seedWorkItem(t.factory);
+    await toWaitingForHuman(t.factory, item.id);
+    const snapshot = await t.factory.releaseSnapshot(item.id);
+    assert.ok(snapshot !== undefined);
+    await t.factory.recordApproval({
+      gate: "RELEASE_APPROVAL", subject: t.factory.workItemSubject(item.id),
+      decision: "APPROVED", actor: HUMAN, authorization: authorize(t.factory),
+    });
+    await t.factory.advance(item.id, "DONE", AGENT);
+
+    const dir = await mkdtemp(path.join(tmpdir(), "cliw-note-"));
+    try {
+      const req = { workItemId: item.id, expectedSnapshotId: snapshot.id, decision: "Decision \"quoted\"\nline", lesson: "Lesson." };
+      const pin = await persistAcceptedResultNote(t.factory, req, dir);
+      const note = await recallAcceptedResultNote(t.factory, req, dir, pin);
+
+      const workspace = createTempWorkspace();
+      const prompts: string[] = [];
+      const worker = capturingWorker(workspace, prompts);
+      const withNote = request({ recalledNote: note });
+      const snapshotOfRequest = JSON.stringify(withNote);
+      const noteBefore = JSON.stringify(note);
+
+      const outcome = await worker.execute(withNote);
+
+      const prompt = prompts[0] ?? "";
+      assert.ok(prompt.includes(JSON.stringify(note.body)));
+      assert.ok(prompt.includes(note.sha256));
+      assert.ok(prompt.includes(note.source.snapshotId));
+      assert.ok(prompt.includes(note.source.workItemId));
+      assert.ok(prompt.includes(String(note.source.specRevision)));
+      assert.ok(prompt.includes(note.source.implementationRunId));
+      assert.ok(prompt.includes("REFERENCE DATA ONLY"));
+      assert.ok(prompt.includes("do the thing"));
+      assert.ok(prompt.includes("criterion ac-1 holds"));
+      assert.match(prompt, /Do not commit, push, merge, tag a release, or publish/);
+      assert.equal(prompt, buildWorkerPrompt("IMPLEMENTER", {
+        workItemTitle: withNote.title, instructions: withNote.instructions,
+        workspaceRoot: resolveWorkspace(workspace).root, acceptanceCriteria: withNote.acceptanceCriteria, recalledNote: note,
+      }));
+      assert.equal(outcome.claimsAcceptanceMet, false);
+      assert.equal(JSON.stringify(withNote), snapshotOfRequest);
+      assert.equal(JSON.stringify(note), noteBefore);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not inject anything when the note is absent, for every supported role", async () => {
+    const workspace = createTempWorkspace();
+    const prompts: string[] = [];
+    const worker = capturingWorker(workspace, prompts);
+    for (const role of FACTORY_ROLES) {
+      const req = request({ role });
+      await worker.execute(req);
+      assert.equal(prompts[prompts.length - 1], buildWorkerPrompt(role, {
+        workItemTitle: req.title, instructions: req.instructions,
+        workspaceRoot: resolveWorkspace(workspace).root, acceptanceCriteria: req.acceptanceCriteria,
+      }));
+      assert.ok(!(prompts[prompts.length - 1] ?? "").includes("REFERENCE DATA"));
+    }
   });
 });

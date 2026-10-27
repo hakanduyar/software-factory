@@ -19,6 +19,7 @@
 
 import type { AcceptanceCriterion } from "../../domain/acceptanceCriterion.js";
 import type { FactoryRole } from "../../domain/role.js";
+import type { RecalledNoteReference } from "../../ports/worker.js";
 
 export interface PromptContext {
   readonly workItemTitle: string;
@@ -40,17 +41,7 @@ export interface PromptContext {
   readonly recalledNote?: RecalledNoteReference;
 }
 
-export interface RecalledNoteReference {
-  readonly body: string;
-  readonly sha256: string;
-  readonly byteLength: number;
-  readonly source: {
-    readonly snapshotId: string;
-    readonly workItemId: string;
-    readonly specRevision: number;
-    readonly implementationRunId: string;
-  };
-}
+export type { RecalledNoteReference };
 
 function scopeStatement(ctx: PromptContext): string {
   const commitLine = ctx.allowCommit === true
