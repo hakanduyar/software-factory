@@ -17,8 +17,8 @@ function result(overrides: Partial<ProcessResult> = {}): ProcessResult {
     stderr: "",
     stdoutTruncated: false,
     stderrTruncated: false,
-    startedAt: "2026-01-01T00:00:00.000Z" as ProcessResult["startedAt"],
-    finishedAt: "2026-01-01T00:00:00.000Z" as ProcessResult["finishedAt"],
+    startedAt: 0,
+    finishedAt: 0,
     durationMs: 0,
     ...overrides,
   };
