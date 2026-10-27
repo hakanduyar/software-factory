@@ -1,0 +1,20 @@
+name: Output observation binding composition
+on:
+  pull_request:
+  push:
+permissions:
+  contents: read
+jobs:
+  output-observation-binding:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: "false"
+      - name: Verify isolated binding composition
+        shell: pwsh
+        run: |
+          $source = Join-Path $env:GITHUB_WORKSPACE 'authoring/continuation/dispatch/managed-native-output-observation.ps1'
+          $tests = Join-Path $env:GITHUB_WORKSPACE 'authoring/continuation/tests/output-observation-binding.tests.ps1'
+          & $tests -SourcePath $source -OutputDirectory (Join-Path $env:RUNNER_TEMP 'output-observation-binding')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
