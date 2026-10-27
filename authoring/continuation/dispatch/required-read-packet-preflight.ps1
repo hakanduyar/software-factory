@@ -46,12 +46,23 @@ function Test-RequiredReadPacketPreflight {
     }
 
     $text = $null
+    $stream = $null
     try {
         if (-not (& $isRegular $packet)) { return & $result $false 'PACKET_UNREADABLE' 0 }
-        if ([System.IO.FileInfo]::new($packet).Length -gt $maxPacketBytes) { return & $result $false 'PACKET_TOO_LARGE' 0 }
+        $stream = [System.IO.FileStream]::new($packet, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+        $buffer = [byte[]]::new($maxPacketBytes + 1)
+        $total = 0
+        while ($total -lt $buffer.Length) {
+            $read = $stream.Read($buffer, $total, $buffer.Length - $total)
+            if ($read -le 0) { break }
+            $total += $read
+        }
+        if ($total -gt $maxPacketBytes) { return & $result $false 'PACKET_TOO_LARGE' 0 }
         $strict = [System.Text.UTF8Encoding]::new($false, $true)
-        $text = $strict.GetString([System.IO.File]::ReadAllBytes($packet))
-    } catch { return & $result $false 'PACKET_UNREADABLE' 0 }
+        $text = $strict.GetString($buffer, 0, $total)
+    } catch { return & $result $false 'PACKET_UNREADABLE' 0 } finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+    }
 
     $checked = 0
     foreach ($path in $required) {
