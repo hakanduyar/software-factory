@@ -33,7 +33,7 @@ function Get-ManagedNativeSdkObservation {
     $s = @{
         invalid = $null; unknown = $null; limited = $false; over = $false; rec = [System.IO.MemoryStream]::new()
         inMsg = $false; curCov = $false; curMax = 0L; native = 0L; starts = 0L; missing = $false
-        resultCount = 0; subtype = $null; isError = $null; reported = $null; stopReason = $null; terminalReason = $null; errors = $null
+        resultCount = 0; deltaStop = $null; subtype = $null; isError = $null; reported = $null; stopReason = $null; terminalReason = $null; errors = $null
     }
     $setBad = {
         param([string]$st, [string]$c)
@@ -96,9 +96,25 @@ function Get-ManagedNativeSdkObservation {
                 & $closeMsg
                 $s.inMsg = $true; $s.curCov = $false; $s.curMax = 0L
                 $s.starts = & $add $s.starts 1L 'RECOUNT_OVERFLOW'
+                $mp = & $prop $evt 'message'
+                if (($null -ne $mp) -and ($mp.ValueKind -eq $kind::Object)) {
+                    $mu = & $prop $mp 'usage'
+                    if (($null -ne $mu) -and ($mu.ValueKind -ne $kind::Null)) {
+                        if ($mu.ValueKind -ne $kind::Object) { & $halt 'INVALID' 'STREAM_USAGE' }
+                        $mo = & $prop $mu 'output_tokens'
+                        if (($null -ne $mo) -and ($mo.ValueKind -ne $kind::Null)) {
+                            $s.curMax = & $cntOf $mo 'STREAM_USAGE'; $s.curCov = $true
+                        }
+                    }
+                }
             }
             elseif ($t -ceq 'message_delta') {
                 if ((-not $s.inMsg) -and (-not $s.limited)) { & $halt 'INVALID' 'STREAM_ORDER' }
+                $dp = & $prop $evt 'delta'
+                if (($null -ne $dp) -and ($dp.ValueKind -eq $kind::Object)) {
+                    $dsr = & $prop $dp 'stop_reason'
+                    if (($null -ne $dsr) -and ($dsr.ValueKind -eq $kind::String)) { $s.deltaStop = $dsr.GetString() }
+                }
                 $up = & $prop $evt 'usage'
                 if (($null -ne $up) -and ($up.ValueKind -ne $kind::Null)) {
                     if ($up.ValueKind -ne $kind::Object) { & $halt 'INVALID' 'STREAM_USAGE' }
@@ -139,7 +155,7 @@ function Get-ManagedNativeSdkObservation {
                 foreach ($k in @('stop_reason', 'terminal_reason')) {
                     $kv = & $prop $evt $k
                     $val = if (($null -ne $kv) -and ($kv.ValueKind -eq $kind::String)) { $kv.GetString() } else { $null }
-                    if ($k -ceq 'stop_reason') { $s.stopReason = $val } else { $s.terminalReason = $val }
+                    if ($k -ceq 'stop_reason') { $s.stopReason = $(if ($null -ne $val) { $val } else { $s.deltaStop }) } else { $s.terminalReason = $val }
                 }
                 $er = & $prop $evt 'errors'
                 if (($null -ne $er) -and ($er.ValueKind -eq $kind::Array)) {
