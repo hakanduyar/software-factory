@@ -124,4 +124,16 @@ describe("projectAcceptedResultNote", () => {
     refused({ ...i, review: undefined as unknown as Review }, /review is missing/);
     refused(undefined as unknown as AcceptedResultNoteInput, /input/);
   });
+
+  it("refuses missing or empty review id and evidence reference", () => {
+    const i = fixture();
+    const { id: _id, ...noId } = i.review;
+    refused({ ...i, review: noId as Review }, /review\.id/);
+    refused({ ...i, review: { ...i.review, id: "" } }, /review\.id/);
+    const [e1, e2] = i.evidence as [Evidence, Evidence];
+    const { reference: _ref, ...noRef } = e1;
+    refused({ ...i, evidence: [noRef as Evidence, e2] }, /reference/);
+    refused({ ...i, evidence: [e1, { ...e2, reference: "" }] }, /reference/);
+    refused({ ...i, evidence: [{ ...e1, reference: "  " }, e2] }, /reference/);
+  });
 });

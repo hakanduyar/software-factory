@@ -109,6 +109,7 @@ export function projectAcceptedResultNote(
   checkRun(impl, "implementationRun", "IMPLEMENTER");
   checkRun(rev, "reviewerRun", "REVIEWER");
   isObject(review, "review");
+  nonEmptyString(review.id, "review.id");
 
   if (snapshot.implementationRunId !== impl.id) {
     refuse("snapshot.implementationRunId does not match implementationRun.id (stale snapshot)");
@@ -156,6 +157,7 @@ export function projectAcceptedResultNote(
   for (const e of evidence) {
     isObject(e, "evidence entry");
     nonEmptyString(e.id, "evidence.id");
+    nonEmptyString(e.reference, `evidence ${e.id} reference`);
     if (seen.has(e.id)) refuse(`duplicate evidence id ${e.id}`);
     seen.add(e.id);
     if (e.workItemId !== snapshot.workItemId) {
