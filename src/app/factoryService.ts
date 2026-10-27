@@ -65,7 +65,7 @@ import {
   type PlanBindingResolver,
 } from "../ports/planBindingResolver.js";
 import type { FactoryRepositories, FactoryStore } from "../ports/repositories.js";
-import type { Worker, WorkerOutcome } from "../ports/worker.js";
+import type { RecalledNoteReference, Worker, WorkerOutcome } from "../ports/worker.js";
 import type { WorkerRegistry } from "../ports/workerRegistry.js";
 import { evaluateGate, requireGate, type GateBinding, type GateStatus } from "../workflow/gateGuard.js";
 import {
@@ -108,6 +108,22 @@ export interface CreateWorkItemInput {
   readonly acceptanceCriteria: readonly { text: string; verificationHint: string }[];
 }
 
+function snapshotRecalledNote(note: RecalledNoteReference | undefined): RecalledNoteReference | undefined {
+  if (note === undefined) return undefined;
+  const { body, sha256, byteLength, source } = note;
+  return Object.freeze({
+    body,
+    sha256,
+    byteLength,
+    source: Object.freeze({
+      snapshotId: source.snapshotId,
+      workItemId: source.workItemId,
+      specRevision: source.specRevision,
+      implementationRunId: source.implementationRunId,
+    }),
+  });
+}
+
 export interface RunWorkerInput {
   readonly workItemId: WorkItemId;
   readonly role: FactoryRole;
@@ -115,6 +131,13 @@ export interface RunWorkerInput {
   readonly instructions: string;
   /** Required for VERIFIER/REVIEWER runs: the implementation run under examination. */
   readonly againstRunId?: RunId;
+  /**
+   * Optional caller-SELECTED read-only reference data. The caller must source it
+   * from the accepted-note recall verifier; this type/shape is not authentication.
+   * The service does not rank, search, accept or interpret it; it only forwards
+   * a frozen copy to the worker request.
+   */
+  readonly recalledNote?: RecalledNoteReference;
 }
 
 export interface VerifyAcceptanceCriteriaInput {
@@ -740,6 +763,10 @@ export class FactoryService {
       throw new ValidationError(`a ${input.role} run must name the implementation run it examines (againstRunId)`);
     }
 
+    // Snapshot synchronously (before the first await) so later caller mutation
+    // cannot change what the worker receives.
+    const recalledNote = snapshotRecalledNote(input.recalledNote);
+
     const runId = this.ids.next("run");
 
     // PHASE 1 — durable, authoritative start.
@@ -787,6 +814,7 @@ export class FactoryService {
         title: started.item.title,
         instructions: input.instructions,
         acceptanceCriteria: started.criteria,
+        ...(recalledNote === undefined ? {} : { recalledNote }),
       });
     } catch (error) {
       thrown = error;
