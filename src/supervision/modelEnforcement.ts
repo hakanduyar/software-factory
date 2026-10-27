@@ -111,6 +111,8 @@ export const SUPPORTED_CODEX_EFFORTS = Object.freeze(["low", "medium", "high", "
 export const SUPPORTED_MODELS: Readonly<Record<WorkerTool, readonly string[]>> = Object.freeze({
   "claude-code": Object.freeze(["opus", "sonnet", "haiku"]),
   "codex-cli": Object.freeze(["gpt-5.6-luna"]),
+  // Intentionally empty: supervised Ollama admission is unavailable.
+  "ollama-cli": Object.freeze([]),
 });
 
 /**
@@ -138,6 +140,9 @@ export function planAiRunConfig(request: AiRunConfigRequest): AiRunConfigResult 
     : undefined;
   if (supported === undefined) {
     return { ok: false, reason: `"${String(request.provider)}" is not a supported provider` };
+  }
+  if (request.provider === "ollama-cli") {
+    return { ok: false, reason: "supervised ollama-cli admission is unavailable; no Ollama model is supported" };
   }
   if (!supported.includes(request.model)) {
     return {
