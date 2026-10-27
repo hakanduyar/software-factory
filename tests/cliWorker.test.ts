@@ -181,7 +181,7 @@ describe("cliWorker: Run.summary redaction (regression for the HIGH finding)", (
 });
 
 describe("cliWorker: verified recalled note forwarding (request -> adapter prompt only)", () => {
-  function capturingWorker(workspaceRoot: string, prompts: string[], reported: CliReportedResult = { finalMessage: "ok", claimsAcceptanceMet: false }) {
+  function capturingWorker(workspaceRoot: string, prompts: string[], reported: CliReportedResult = { finalMessage: "ok" }) {
     return createCliWorker({
       id: "stub-worker",
       tool: "codex-cli",
