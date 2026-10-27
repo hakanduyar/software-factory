@@ -43,10 +43,12 @@ function Get-ManagedNativeOutputObservation {
         if ($v -is [int]) { [void]$sb.Append('I').Append(([int]$v).ToString([System.Globalization.CultureInfo]::InvariantCulture)).Append(';'); return }
         if ($v -is [long]) { [void]$sb.Append('L').Append(([long]$v).ToString([System.Globalization.CultureInfo]::InvariantCulture)).Append(';'); return }
         $names = [System.Collections.Generic.List[string]]::new()
-        $vals = @{}
+        # Ordinal map: keys differing only by case stay distinct and keep their own values.
+        $vals = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::Ordinal)
         if ($v -is [System.Management.Automation.PSCustomObject]) {
             foreach ($q in $v.PSObject.Properties) {
                 if ($q.MemberType -ne $noteKind) { throw [System.InvalidOperationException]::new('CANON:MEMBER') }
+                if ($vals.ContainsKey([string]$q.Name)) { throw [System.InvalidOperationException]::new('CANON:DUPLICATE') }
                 $names.Add([string]$q.Name); $vals[[string]$q.Name] = $q.Value
             }
             $tag = 'O'
@@ -54,6 +56,7 @@ function Get-ManagedNativeOutputObservation {
         elseif ($v -is [System.Collections.IDictionary]) {
             foreach ($k in $v.Keys) {
                 if ($k -isnot [string]) { throw [System.InvalidOperationException]::new('CANON:KEY') }
+                if ($vals.ContainsKey($k)) { throw [System.InvalidOperationException]::new('CANON:DUPLICATE') }
                 $names.Add($k); $vals[$k] = $v[$k]
             }
             $tag = 'D'
@@ -75,14 +78,29 @@ function Get-ManagedNativeOutputObservation {
     }
     $compared = @('RunId', 'Attempt', 'SessionId', 'ManifestPath', 'ManifestSha256', 'TerminalPath', 'TerminalSha256', 'TicketPath', 'TicketSha256',
         'StartPath', 'StartSha256', 'RequestSha256', 'ArtifactPath', 'ArtifactState', 'Authority', 'Budget',
-        'DeclaredReferences', 'VerifiedReferences', 'Inputs', 'StreamedInputs')
+        'DeclaredReferences', 'VerifiedReferences', 'Inputs', 'StreamedInputs', 'RunDir', 'Pid', 'TransportExitCode')
+    $strFields = @('RunId', 'SessionId', 'ManifestPath', 'TerminalPath', 'TicketPath', 'StartPath', 'RunDir')
+    $hexFields = @('ManifestSha256', 'TerminalSha256', 'TicketSha256', 'StartSha256', 'RequestSha256')
+    $intFields = @('Attempt', 'Pid', 'TransportExitCode')
+    # Every compared field is mandatory and typed; a missing or malformed field is INVALID, never a '-' marker that could compare equal.
+    # ArtifactPath/ArtifactState keep their real capture semantics: present, string or null.
     $snapshot = {
         param($cap)
         $st.n = 0; [void]$sb.Clear()
         foreach ($f in $compared) {
             $g = & $get $cap $f
-            [void]$sb.Append($f.Length.ToString([System.Globalization.CultureInfo]::InvariantCulture)).Append(':').Append($f).Append($(if ($g[0]) { '+' } else { '-' }))
-            if ($g[0]) { & $cn $g[1] 0 }
+            if (-not $g[0]) { & $halt 'INVALID' 'CAPTURE_INCOMPLETE' }
+            $fv = $g[1]
+            if ($strFields -ccontains $f) { if (($fv -isnot [string]) -or ($fv.Length -eq 0)) { & $halt 'INVALID' 'CAPTURE_INCOMPLETE' } }
+            elseif ($hexFields -ccontains $f) { if (-not (& $isHex $fv)) { & $halt 'INVALID' 'CAPTURE_INCOMPLETE' } }
+            elseif ($intFields -ccontains $f) { if (-not (& $isInt $fv)) { & $halt 'INVALID' 'CAPTURE_INCOMPLETE' } }
+            elseif (@('ArtifactPath', 'ArtifactState') -ccontains $f) { if (($null -ne $fv) -and ($fv -isnot [string])) { & $halt 'INVALID' 'CAPTURE_INCOMPLETE' } }
+            [void]$sb.Append($f.Length.ToString([System.Globalization.CultureInfo]::InvariantCulture)).Append(':').Append($f).Append('+')
+            try { & $cn $fv 0 }
+            catch {
+                if ([string]$_.Exception.Message -ceq 'CANON:LIMIT') { & $halt 'UNKNOWN' 'CAPTURE_COMPARE_UNAVAILABLE' }
+                & $halt 'INVALID' 'CAPTURE_INCOMPLETE'
+            }
         }
         return $sb.ToString()
     }
@@ -201,8 +219,7 @@ function Get-ManagedNativeOutputObservation {
         $leaf = @($verifiedRefs | Where-Object { $_.Role -ceq 'STDOUT' })
         if ($leaf.Count -ne 1) { & $halt 'INVALID' 'CAPTURE_STDOUT_LEAF' }
         $leaf = $leaf[0]
-        $snap1 = $null
-        try { $snap1 = & $snapshot $cap1 } catch { $snap1 = $null }
+        $snap1 = & $snapshot $cap1
         $sessionCopy = [string]$sess
 
         # ---- SDK observer over the single verified stdout leaf ----
@@ -260,13 +277,8 @@ function Get-ManagedNativeOutputObservation {
         $recStatus = 'SAME'; $recCode = $null
         try {
             $cap2 = & $capture
-            if ($null -eq $snap1) { $recStatus = 'UNKNOWN'; $recCode = 'RECAPTURE_COMPARE_UNAVAILABLE' }
-            else {
-                $snap2 = $null
-                try { $snap2 = & $snapshot $cap2 } catch { $snap2 = $null }
-                if ($null -eq $snap2) { $recStatus = 'UNKNOWN'; $recCode = 'RECAPTURE_COMPARE_UNAVAILABLE' }
-                elseif (-not [string]::Equals($snap1, $snap2, $ord)) { $recStatus = 'INVALID'; $recCode = 'RECAPTURE_CHANGED' }
-            }
+            $snap2 = & $snapshot $cap2
+            if (-not [string]::Equals($snap1, $snap2, $ord)) { $recStatus = 'INVALID'; $recCode = 'RECAPTURE_CHANGED' }
         }
         catch {
             $m = [string]$_.Exception.Message
