@@ -1,0 +1,39 @@
+# Portable export of reviewed diagnostic fixture cases; actual local SDK raw/oracles are intentionally excluded.
+param([Parameter(Mandatory)][string]$SourcePath, [Parameter(Mandatory)][string]$OutputDirectory)
+Set-StrictMode -Version Latest;$ErrorActionPreference='Stop'
+$source=$SourcePath;$sha='d5acea0544134b5ddfa305c40a151c91c61f19abc78500d5a5a30143a68e1958';if((Get-FileHash -LiteralPath $source).Hash.ToLowerInvariant()-cne$sha){throw 'SOURCE_PIN'}
+if(-not[IO.Path]::IsPathFullyQualified($OutputDirectory)-or[IO.Path]::GetFullPath($OutputDirectory)-cne$OutputDirectory-or(Test-Path -LiteralPath $OutputDirectory)){throw 'OWNED_FRESH_OUTPUT'};[void][IO.Directory]::CreateDirectory($OutputDirectory)
+$t=$null;$e=$null;$ast=[Management.Automation.Language.Parser]::ParseFile($source,[ref]$t,[ref]$e);if(@($e).Count-or$ast.EndBlock.Statements.Count-ne1-or$ast.EndBlock.Statements[0]-isnot[Management.Automation.Language.FunctionDefinitionAst]){throw 'DECLARATION_ONLY'};. $source
+$rows=[Collections.Generic.List[object]]::new();$sid='sdk-observer-fixture-session';$utf8=[Text.UTF8Encoding]::new($false)
+function StartEvent($value,[switch]$WithUsage){$message=[ordered]@{};if($WithUsage){$message.usage=[ordered]@{output_tokens=$value}};[ordered]@{type='stream_event';event=[ordered]@{type='message_start';message=$message}}}
+function DeltaEvent($value,[string]$stop='end_turn'){[ordered]@{type='stream_event';event=[ordered]@{type='message_delta';usage=[ordered]@{output_tokens=$value};delta=[ordered]@{stop_reason=$stop}}}}
+function ResultEvent($value,[bool]$isError=$false){[ordered]@{type='result';subtype=$(if($isError){'error_max_turns'}else{'success'});is_error=$isError;session_id=$sid;usage=[ordered]@{output_tokens=$value}}}
+function Fixture([string]$name,[object[]]$events){$p=Join-Path $OutputDirectory ($name+'.jsonl');$lines=@($events|ForEach-Object{$_|ConvertTo-Json -Compress -Depth 12});[IO.File]::WriteAllText($p,([string]::Join("`n",$lines)+"`n"),$utf8);return $p}
+function Check([string]$name,[string]$path,[hashtable]$expected,[string]$session=$sid,[long]$limit=1048576,[string]$hashOverride=''){
+ $pre=(Get-FileHash -LiteralPath $path).Hash.ToLowerInvariant();$len=[long](Get-Item -LiteralPath $path).Length;$pin=if($hashOverride){$hashOverride}else{$pre};$ok=$true;$error=$null;$r=$null
+ try{$out=@(Get-ManagedNativeSdkObservation -StdoutPath $path -ExpectedStdoutSha256 $pin -ExpectedStdoutLength $len -ExpectedSessionId $session -MaxRecordBytes $limit);if($out.Count-ne1){throw 'RESULT_COUNT'};$r=$out[0];if($r.Schema-cne'ManagedNativeSdkObservation/v1'-or$r.NoDispatch-ne$true-or$r.NoCompletion-ne$true){throw 'RESULT_SHAPE'};if($hashOverride){if($null-ne$r.VerifiedRaw-or$r.ObservedRaw.Sha256-cne$pre){$ok=$false}}else{if($null-eq$r.VerifiedRaw-or$r.VerifiedRaw.Sha256-cne$pre-or$r.VerifiedRaw.Length-ne$len){$ok=$false}};foreach($k in $expected.Keys){if($null-eq$expected[$k]){if($null-ne$r.$k){$ok=$false}}elseif($r.$k-cne$expected[$k]){$ok=$false}}}
+ catch{$ok=$false;$error='HARNESS_OR_FUNCTION_EXCEPTION: '+$_.Exception.GetType().FullName}
+ if((Get-FileHash -LiteralPath $path).Hash.ToLowerInvariant()-cne$pre){throw 'FIXTURE_CHANGED'}
+ $view=if($null-ne$r){$r|Select-Object Status,Code,SdkOutcome,SdkSubtype,SdkReportedOutputTokens,RecountedOutputTokens,RecountStatus,Consistency,SdkStopReason}else{$null}
+ $rows.Add([pscustomobject]@{name=$name;pass=$ok;expected=$expected;observed=$view;exception=$error;inputUnchanged=$true})
+}
+Check 'sdk-reported-only-not-assumed-zero' (Fixture 'result-only' @((ResultEvent 5))) @{Status='OBSERVED';SdkReportedOutputTokens=[long]5;RecountedOutputTokens=$null;RecountStatus='UNAVAILABLE';Consistency='UNAVAILABLE'}
+Check 'started-message-without-usage-unavailable' (Fixture 'missing-usage' @((StartEvent $null),(ResultEvent 5))) @{Status='OBSERVED';SdkReportedOutputTokens=[long]5;RecountedOutputTokens=$null;RecountStatus='UNAVAILABLE';Consistency='UNAVAILABLE'}
+Check 'typed-observed-zero' (Fixture 'typed-zero' @((StartEvent $null),(DeltaEvent 0),(ResultEvent 0))) @{Status='OBSERVED';SdkReportedOutputTokens=[long]0;RecountedOutputTokens=[long]0;RecountStatus='COMPLETE';Consistency='MATCH'}
+Check 'sdk-error-preserves-count' (Fixture 'sdk-error' @((StartEvent $null),(DeltaEvent 5),(ResultEvent 5 $true))) @{Status='OBSERVED';SdkOutcome='ERROR';SdkSubtype='error_max_turns';SdkReportedOutputTokens=[long]5;RecountedOutputTokens=[long]5;Consistency='MATCH'}
+Check 'no-result-remains-unknown' (Fixture 'no-result' @((StartEvent $null),(DeltaEvent 5))) @{Status='UNKNOWN';Code='NO_SDK_RESULT';SdkReportedOutputTokens=$null;RecountedOutputTokens=$null}
+Check 'start-only-typed-usage-is-coverage' (Fixture 'start-only' @((StartEvent 10 -WithUsage),(ResultEvent 10))) @{Status='OBSERVED';SdkReportedOutputTokens=[long]10;RecountedOutputTokens=[long]10;RecountStatus='COMPLETE';Consistency='MATCH'}
+Check 'start-maximum-cannot-be-lowered-by-delta' (Fixture 'start-max' @((StartEvent 10 -WithUsage),(DeltaEvent 5),(ResultEvent 5))) @{Status='INVALID';Code='OUTPUT_RECOUNT_MISMATCH';SdkReportedOutputTokens=$null;RecountedOutputTokens=$null}
+Check 'start-usage-type-must-be-validated' (Fixture 'start-type' @((StartEvent '10' -WithUsage),(DeltaEvent 5),(ResultEvent 5))) @{Status='INVALID';Code='STREAM_USAGE';SdkReportedOutputTokens=$null;RecountedOutputTokens=$null}
+Check 'delta-before-start-refuses' (Fixture 'bad-order' @((DeltaEvent 5),(ResultEvent 5))) @{Status='INVALID';Code='STREAM_ORDER'}
+Check 'session-mismatch-refuses' (Fixture 'bad-session' @((ResultEvent 5))) @{Status='INVALID';Code='SESSION_MISMATCH'} 'different-session'
+$dup=Join-Path $OutputDirectory 'duplicate.jsonl';[IO.File]::WriteAllText($dup,'{"type":"result","type":"result"}'+"`n",$utf8);Check 'duplicate-json-refuses' $dup @{Status='INVALID';Code='STREAM_JSON_DUPLICATE'}
+$badUtf=Join-Path $OutputDirectory 'bad-utf8.jsonl';[IO.File]::WriteAllBytes($badUtf,[byte[]](255,10));Check 'invalid-utf8-refuses' $badUtf @{Status='INVALID';Code='STREAM_UTF8'}
+$limited=Fixture 'limited-record' @((ResultEvent 5));Check 'record-memory-limit-unknown-raw-retained' $limited @{Status='UNKNOWN';Code='RECORD_OBSERVATION_LIMIT';SdkReportedOutputTokens=$null;RecountedOutputTokens=$null} $sid 16
+Check 'raw-pin-mismatch-dominates-record-limit' $limited @{Status='INVALID';Code='STDOUT_SHA256_MISMATCH';SdkReportedOutputTokens=$null;RecountedOutputTokens=$null} $sid 16 ('0'*64)
+Check 'intrinsic-message-stop-detail-retained' (Fixture 'intrinsic-stop' @((StartEvent $null),(DeltaEvent 5 'max_tokens'),(ResultEvent 5))) @{Status='OBSERVED';SdkStopReason='max_tokens';SdkReportedOutputTokens=[long]5;RecountedOutputTokens=[long]5}
+Check 'typed-start-zero-is-real-coverage' (Fixture 'start-zero' @((StartEvent 0 -WithUsage),(ResultEvent 0))) @{Status='OBSERVED';SdkReportedOutputTokens=[long]0;RecountedOutputTokens=[long]0;RecountStatus='COMPLETE';Consistency='MATCH'}
+$explicitResult=ResultEvent 5;$explicitResult['stop_reason']='end_turn'
+Check 'sdk-result-string-retains-stop-precedence' (Fixture 'result-stop-string' @((StartEvent $null),(DeltaEvent 5 'max_tokens'),$explicitResult)) @{Status='OBSERVED';SdkStopReason='end_turn';SdkReportedOutputTokens=[long]5;RecountedOutputTokens=[long]5}
+if((Get-FileHash -LiteralPath $source).Hash.ToLowerInvariant()-cne$sha){throw 'SOURCE_CHANGED'}
+$r=[pscustomobject]@{passed=@($rows|Where-Object pass).Count;failed=@($rows|Where-Object {-not$_.pass}).Count;exceptions=@($rows|Where-Object {$null-ne$_.exception}).Count;cases=$rows;sourceSha256=$sha;sourceUnchanged=$true;providerCalls=0;processCalls=0;limits='Portable synthetic SDK protocol regressions only; no actual provider, capture authority, receipt or completion proof.'};$r|ConvertTo-Json -Depth 15|Set-Content -LiteralPath (Join-Path $OutputDirectory 'results.json') -Encoding utf8;$r|Select-Object passed,failed,exceptions|ConvertTo-Json;if($r.failed){exit 1}
