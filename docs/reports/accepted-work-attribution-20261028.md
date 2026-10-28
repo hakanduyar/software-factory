@@ -11,7 +11,7 @@ All native runs: model `claude-sonnet-5-5`, effort `low`. Monetary cost: UNKNOWN
 
 | Unit | Run / payload / ticket | Raw source contribution | Accepted source hash / merge | Actual terminal status | SDK output tokens |
 |---|---|---|---|---|---|
-| PR90 native | runId `PUBLISHER_STDERR_FIX_4334de42`, attempt 1; payload `22e29007…e4f`; ticket `849f647d…93ed`; startAcknowledged=false | PR90 accepted transport `140a` | source `140a7214…75d0`; accepted-source receipt `41be8a4f…c222`; merge `2ce8b058…`(PR90; full above) | `NATURAL_EXIT`, exitCode 0 (transport outcome only) | 23679 (see §3) |
+| PR90 native | runId `PUBLISHER_STDERR_FIX_4334de42`, attempt 1; payload `22e29007…e4f`; ticket `849f647d…93ed`; startAcknowledged=false | PR90 accepted transport `140a` | source `140a7214…75d0`; accepted-source receipt `41be8a4f…c222`; merge `2ce8b058…`(PR90; full below) | `NATURAL_EXIT`, exitCode 0 (transport outcome only) | 23679 (see §3) |
 | PR92 native | runId `REGISTERED_LIFECYCLE_FAILURE_JOURNAL_17429ab4`, attempt 1; payload `ce1073dd…ef4`; ticket `5cb44869…dc3`; startAcknowledged=true | Initial journal source `b6a6`; required Cloud normalization to reach accepted `9c91`; native run not completed | source `9c91e645…5006` (Cloud-corrected); merge `f6f89e51…077ae` (PR92; full below); historical dependency `a18d8f1d…d4da` | `DEADLINE`, exitCode -1 | UNKNOWN (null) |
 
 Merge SHAs in full: PR90 `2ce8b05879ce718596e57062a3ee836368128db1`; PR92 `f6f89e5177f15f00a64bf5f5db4e3b092d9077ae`.
@@ -35,7 +35,7 @@ The test-only contribution is not source-to-accepted production work.
 
 ## 3. Status separation
 
-- **PR90 natural0:** `NATURAL_EXIT`/exit 0 is the transport outcome. Accepted product proof is separate (`independent-genuine-child-verdict.json`, appendix).
+- **PR90 natural0:** `NATURAL_EXIT`/exit 0 is the transport outcome. Accepted product/source proof is separate: it is attributed to the PR90 accepted-source receipt SHA256 `41be8a4f43c83dc0a491cd626e5965ca7ac02fbfd196b8a478c02797474fc222` (table/appendix). `independent-genuine-child-verdict.json` (`42d9…`) is genuine captured-child/accounting provenance only, not product acceptance.
 - **PR92:** native terminal remains `DEADLINE` with SDK usage UNKNOWN, even though the Cloud-corrected product merged. Failed native artifact contribution (initial `b6a6`) is distinct from the accepted Cloud correction (`9c91`).
 - **23679:** the independently accepted SDK-reported output-token count for the publisher run only. It is not total billable usage (no input/cache tokens, no billing interval).
 - **Current failed native usage is UNKNOWN, never 0.** Author-token facts not supplied are UNKNOWN.
