@@ -159,7 +159,16 @@ function Test-LifecycleFailureRecord {
     if ($Record.destination -cne $shape.destination -or $Record.operation -cne $shape.operation) { return $false }
     if ($null -eq $Record.diagnostic) { return $true }
     if ($Record.code -cnotin @('GITHUB_READ_FAILED','EDIT_AMBIGUOUS_NO_RETRY') -or $Record.diagnostic -isnot [hashtable] -or $Record.diagnostic.Count -ne 5) { return $false }
-    return [bool](Test-GitHubCliFailureDiagnostic216 ([pscustomobject]$Record.diagnostic))
+    # Persisted JSON reloads integers as Int64; admit Int32/Int64 within Int32 range, then
+    # hand a fresh typed copy to the transport validator (caller object is not mutated).
+    $d = $Record.diagnostic
+    foreach ($k in @('category','exitCode','timedOut','stderrTruncated','stderrEncoding')) { if (@($d.Keys) -cnotcontains $k) { return $false } }
+    if ($d['category'] -isnot [string] -or $d['timedOut'] -isnot [bool] -or $d['stderrTruncated'] -isnot [bool] -or $d['stderrEncoding'] -isnot [string]) { return $false }
+    $ec = $d['exitCode']
+    if ($ec -isnot [int] -and $ec -isnot [long]) { return $false }
+    if ([long]$ec -lt [long][int]::MinValue -or [long]$ec -gt [long][int]::MaxValue) { return $false }
+    $copy = [pscustomobject]@{category=[string]$d['category'];exitCode=[int]$ec;timedOut=[bool]$d['timedOut'];stderrTruncated=[bool]$d['stderrTruncated'];stderrEncoding=[string]$d['stderrEncoding']}
+    return [bool](Test-GitHubCliFailureDiagnostic216 $copy)
   } catch { return $false }
 }
 function New-LifecycleFailureRecord {
