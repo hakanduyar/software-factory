@@ -90,10 +90,92 @@ function Test-OperationalReceiptV2 {
     } catch { return $false }
 }
 
+# OperationalRunReceipt/v3: OBSERVE_ONLY pending accounting, AWAITING_CONTROLLER only. Independently reruns the shared authenticated verifier
+# from the embedded evidence and requires an exact match. Format/derivation validity does not attest host authorization and grants no
+# completion, ACK or dispatch; downstream v3 consumers remain unsupported.
+function Test-OperationalReceiptV3 {
+    param($obj)
+    try {
+        if ($null -eq $obj -or $obj -is [System.Array] -or $obj -isnot [System.Management.Automation.PSCustomObject]) { return $false }
+        $note = [System.Management.Automation.PSMemberTypes]::NoteProperty
+        $ord = [System.StringComparison]::Ordinal
+        $isInt = { param($v) ($v -is [int]) -or ($v -is [long]) }
+        $isHex = { param($v) ($v -is [string]) -and ($v -cmatch '^[0-9a-f]{64}\z') }
+        $exact = {
+            param($o, [string[]]$names)
+            if ($o -isnot [System.Management.Automation.PSCustomObject]) { return $false }
+            $ps = @($o.PSObject.Properties)
+            if ($ps.Count -ne $names.Count) { return $false }
+            foreach ($q in $ps) { if (($q.MemberType -ne $note) -or ($names -cnotcontains [string]$q.Name)) { return $false } }
+            return $true
+        }
+        $val = { param($o, [string]$n) foreach ($q in $o.PSObject.Properties) { if ([string]::Equals($q.Name, $n, $ord)) { return , $q.Value } }; return , $null }
+        $isStr = { param($v) ($v -is [string]) -and ($v.Length -gt 0) }
+
+        if (-not (& $exact $obj @('schemaVersion', 'runId', 'taskId', 'payloadSha256', 'destination', 'status', 'attempt', 'sessionId', 'historyVerified', 'budget', 'provider', 'artifact', 'updatedAt', 'evidence', 'outputStopMode', 'observePendingAccountingEvidence', 'observePendingAccounting'))) { return $false }
+        if (((& $val $obj 'schemaVersion') -isnot [string]) -or ((& $val $obj 'schemaVersion') -cne 'OperationalRunReceipt/v3')) { return $false }
+        if (((& $val $obj 'status') -isnot [string]) -or ((& $val $obj 'status') -cne 'AWAITING_CONTROLLER')) { return $false }
+        if (((& $val $obj 'outputStopMode') -isnot [string]) -or ((& $val $obj 'outputStopMode') -cne 'OBSERVE_ONLY')) { return $false }
+        if (((& $val $obj 'destination') -isnot [string]) -or ((& $val $obj 'destination') -cne 'Anthropic Claude')) { return $false }
+        $hv = & $val $obj 'historyVerified'
+        if (($hv -isnot [bool]) -or $hv) { return $false }
+        foreach ($n in @('runId', 'taskId', 'sessionId', 'updatedAt')) { if (-not (& $isStr (& $val $obj $n))) { return $false } }
+        if (-not (& $isHex (& $val $obj 'payloadSha256'))) { return $false }
+        $attempt = & $val $obj 'attempt'
+        if ((-not (& $isInt $attempt)) -or ([long]$attempt -lt 1)) { return $false }
+
+        $b = & $val $obj 'budget'
+        $p = & $val $obj 'provider'
+        $a = & $val $obj 'artifact'
+        $e = & $val $obj 'evidence'
+        if (-not ((& $exact $b @('maxOutputTokens', 'maxElapsedMs', 'maxAttempts', 'usedElapsedMs', 'usedOutputTokens', 'attemptsUsed', 'softFraction')) -and (& $exact $p @('startIdentity', 'sessionId', 'terminalReason', 'pid')) -and (& $exact $a @('complete', 'sha256', 'path')) -and (& $exact $e @('rawPath', 'rawSha256', 'ticketPath', 'ticketSha256', 'usagePath', 'usageSha256', 'nativeThinkingTokens')))) { return $false }
+        # No output ceiling or soft fraction exists in observe-only mode; nothing is clamped or carried as a finite number.
+        if (($null -ne (& $val $b 'maxOutputTokens')) -or ($null -ne (& $val $b 'softFraction'))) { return $false }
+        foreach ($n in @('maxElapsedMs', 'maxAttempts', 'usedElapsedMs', 'usedOutputTokens', 'attemptsUsed')) { if (-not (& $isInt (& $val $b $n))) { return $false } }
+        if (([long](& $val $b 'maxElapsedMs') -le 0) -or ([long](& $val $b 'maxAttempts') -le 0) -or ([long](& $val $b 'usedElapsedMs') -lt 0) -or ([long](& $val $b 'usedOutputTokens') -lt 0)) { return $false }
+        if (([long](& $val $b 'attemptsUsed') -ne [long]$attempt) -or ([long]$attempt -gt [long](& $val $b 'maxAttempts')) -or ([long](& $val $b 'usedElapsedMs') -gt [long](& $val $b 'maxElapsedMs'))) { return $false }
+        if ($null -ne (& $val $p 'startIdentity')) { return $false }
+        if ((-not (& $isStr (& $val $p 'sessionId'))) -or ((& $val $p 'sessionId') -cne (& $val $obj 'sessionId')) -or (-not (& $isStr (& $val $p 'terminalReason')))) { return $false }
+        if ((-not (& $isInt (& $val $p 'pid'))) -or ([long](& $val $p 'pid') -le 0)) { return $false }
+        $ac = & $val $a 'complete'
+        if (($ac -isnot [bool]) -or $ac -or ($null -ne (& $val $a 'sha256')) -or ($null -ne (& $val $a 'path'))) { return $false }
+        foreach ($n in @('rawPath', 'ticketPath', 'usagePath')) { if (-not (& $isStr (& $val $e $n))) { return $false } }
+        foreach ($n in @('rawSha256', 'ticketSha256', 'usageSha256')) { if (-not (& $isHex (& $val $e $n))) { return $false } }
+        if ($null -ne (& $val $e 'nativeThinkingTokens')) { return $false }
+
+        # Independent rerun of the shared verifier from the embedded evidence; Valid=false (refused or UNKNOWN) is never a receipt.
+        . (Join-Path (Split-Path -Parent $PSScriptRoot) 'dispatch\managed-native-receipt.ps1')
+        $vf = Get-ManagedObservePendingAccountingFacts -Evidence (& $val $obj 'observePendingAccountingEvidence')
+        if (($null -eq $vf) -or ($vf.Valid -isnot [bool]) -or (-not $vf.Valid) -or ($null -eq $vf.Facts)) { return $false }
+        $f = $vf.Facts
+        $id = $f.identity; $lim = $f.limits; $acct = $f.accounting
+        if (($f.anchorLabel -cne 'SELECTED_ACCOUNTING_ANCHOR') -or ($acct.anchorLabel -cne 'SELECTED_ACCOUNTING_ANCHOR')) { return $false }
+        foreach ($pair in @(@('runId', 'runId'), @('taskId', 'taskId'), @('payloadSha256', 'payloadSha256'), @('sessionId', 'sessionId'))) {
+            if ((& $val $obj $pair[0]) -cne [string]$id.($pair[1])) { return $false }
+        }
+        if (([long]$attempt -ne [long]$id.attempt) -or ([long](& $val $p 'pid') -ne [long]$id.pid) -or ((& $val $p 'terminalReason') -cne [string]$id.terminalReason)) { return $false }
+        if ((& $val $obj 'updatedAt') -cne [string]$f.timing.endedUtc) { return $false }
+        if (([long](& $val $b 'maxElapsedMs') -ne [long]$lim.maxElapsedMs) -or ([long](& $val $b 'maxAttempts') -ne [long]$lim.maxAttempts) -or ([long]$lim.priorElapsedMs -ne 0)) { return $false }
+        if ([long](& $val $b 'usedElapsedMs') -ne [long]$f.timing.usedElapsedMs) { return $false }
+        if ([long](& $val $b 'usedOutputTokens') -ne [long]$acct.usedOutputTokens) { return $false }
+        if (([string](& $val $e 'ticketPath') -cne [string]$f.references.ticket.path) -or ((& $val $e 'ticketSha256') -cne [string]$f.references.ticket.verifiedSha256)) { return $false }
+        if (([string](& $val $e 'usagePath') -cne [string]$f.stdout.path) -or ((& $val $e 'usageSha256') -cne [string]$f.stdout.sha256)) { return $false }
+        if ((ConvertTo-Json -InputObject (& $val $obj 'observePendingAccounting') -Depth 8 -Compress) -cne (ConvertTo-Json -InputObject $acct -Depth 8 -Compress)) { return $false }
+        return $true
+    } catch { return $false }
+}
+
 function Test-OperationalReceipt {
     param($obj)
     try {
         if ($null -eq $obj -or $obj -is [System.Array]) { return $false }
+        # Explicit v3 dispatch by metadata only; a v3 annotation on any other schema, or a wrong-case v3 schema, refuses and never falls back to v1/v2.
+        $v3Member = $obj.PSObject.Properties['schemaVersion']
+        $v3Names = @($obj.PSObject.Properties | Where-Object { @('observePendingAccountingEvidence', 'observePendingAccounting', 'outputStopMode') -contains [string]$_.Name })
+        $isV3 = ($null -ne $v3Member) -and ($v3Member.MemberType -eq [System.Management.Automation.PSMemberTypes]::NoteProperty) -and ($v3Member.Value -is [string]) -and ($v3Member.Value -ceq 'OperationalRunReceipt/v3')
+        if ($isV3) { return (Test-OperationalReceiptV3 $obj) }
+        if ($v3Names.Count -gt 0) { return $false }
+        if (($null -ne $v3Member) -and ($v3Member.Value -is [string]) -and ($v3Member.Value -ilike 'OperationalRunReceipt/v3*')) { return $false }
         # Inspect schemaVersion metadata before any value read; a non-NoteProperty (e.g. ScriptProperty) getter is never executed.
         $svMember = $obj.PSObject.Properties['schemaVersion']
         # Optional aggregate advisory evidence: detected by metadata only (no getter run); never silently ignored, never valid on v2.
@@ -260,6 +342,8 @@ function Read-ReceiptFiles {
         try {
             $obj = Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json -DateKind String
         } catch { $invalid++; continue }
+        # v3 observe-only pending receipts have no supported downstream consumer here; they are counted invalid, never outboxed.
+        if (($obj -is [System.Management.Automation.PSCustomObject]) -and ($null -ne $obj.PSObject.Properties['schemaVersion']) -and ($obj.schemaVersion -is [string]) -and ($obj.schemaVersion -ilike 'OperationalRunReceipt/v3*')) { $invalid++; continue }
         if (-not (Test-OperationalReceipt $obj)) { $invalid++; continue }
         $out += $obj
     }
@@ -273,7 +357,7 @@ function Read-Outbox {
     if ([string]::IsNullOrWhiteSpace($raw)) { return @() }
     $arr = ConvertFrom-Json -InputObject $raw -NoEnumerate
     if ($null -eq $arr) { throw "Outbox at '$OutboxPath' parsed to null; failing closed." }
-    if ($arr.PSObject.Properties.Name -contains 'schemaVersion' -and @('OperationalRunReceipt/v1','OperationalRunReceipt/v2') -contains $arr.schemaVersion) {
+    if ($arr.PSObject.Properties.Name -contains 'schemaVersion' -and @('OperationalRunReceipt/v1','OperationalRunReceipt/v2','OperationalRunReceipt/v3') -contains $arr.schemaVersion) {
         throw "Outbox at '$OutboxPath' resembles an OperationalRunReceipt/v1 or v2 object; refusing to risk receipt overwrite."
     }
     if ($arr -isnot [System.Array]) { $arr = @($arr) }
@@ -281,7 +365,7 @@ function Read-Outbox {
     $isInt = { param($v) if ($null -eq $v -or $v -is [bool] -or $v -is [string]) { return $false }; if (($v -is [double] -or $v -is [float] -or $v -is [decimal]) -and ($v -ne [math]::Truncate($v))) { return $false }; try { [void][int64]$v } catch { return $false }; return $true }
     foreach ($e in $arr) {
         if ($null -eq $e -or $e -is [System.Array]) { throw "Outbox contains a malformed event; failing closed." }
-        if ($e.PSObject.Properties.Name -contains 'schemaVersion' -and @('OperationalRunReceipt/v1','OperationalRunReceipt/v2') -contains $e.schemaVersion) {
+        if ($e.PSObject.Properties.Name -contains 'schemaVersion' -and @('OperationalRunReceipt/v1','OperationalRunReceipt/v2','OperationalRunReceipt/v3') -contains $e.schemaVersion) {
             throw "Outbox event resembles an OperationalRunReceipt/v1 or v2 object; refusing to risk receipt overwrite."
         }
         foreach ($f in @('taskId','runId','destination','status','payloadSha256','attempt','key','deliveryStatus')) {
