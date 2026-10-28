@@ -1,0 +1,186 @@
+[
+  {
+    "path": "authoring/observe-failed-transport/continuity/reconcile.ps1",
+    "sha256": "54d12685be0730e50c68869d024e24957b1f0a301e5a39d0530474dcd8a569bc"
+  },
+  {
+    "path": "authoring/observe-failed-transport/dispatch/continuation-step.ps1",
+    "sha256": "bc64ec6543c39fcb0f68372992fbc3b74511e6f3a7e215fcc194c8044c42a091"
+  },
+  {
+    "path": "authoring/observe-failed-transport/dispatch/controller-allocation-binding.ps1",
+    "sha256": "dd3e7a120351a841f6f5c0c75c551ac09c0eb73226b5f06c73f954cd7f0a16ac"
+  },
+  {
+    "path": "authoring/observe-failed-transport/dispatch/controller-allocation-input.p03-stage18.ps1",
+    "sha256": "6df313d7b9adc3ad3e18eda5cbaba6e0adcb79349608be25b1b46806973a68f9"
+  },
+  {
+    "path": "authoring/observe-failed-transport/dispatch/controller-allocation-marker.p03-stage17.ps1",
+    "sha256": "422a0210905be72d6bf6b29be8ca301102e954f073b71c240ae6042ec5c4fa60"
+  },
+  {
+    "path": "authoring/observe-failed-transport/dispatch/controller-allocation-planreader.p03-stage24.ps1",
+    "sha256": "172c94207a8e22e601d43414ed55d1d243d4ecc5cd23af82074424e613fcc7b3"
+  },
+  {
+    "path": "authoring/observe-failed-transport/dispatch/controller-allocation-planscope.p03-stage19.ps1",
+    "sha256": "487af2c9246752e84d0d08214954d3e674cd67022b60c0ff42e73ea51d02bea7"
+  },
+  {
+    "path": "authoring/observe-failed-transport/dispatch/controller-allocation-prestate.p03-stage27.ps1",
+    "sha256": "b637adf27fc155e92373a878d94d8241c4b0236bc8941c3d016414c59a76ee74"
+  },
+  {
+    "path": "authoring/observe-failed-transport/dispatch/controller-allocation-target.p03-stage22.ps1",
+    "sha256": "28b0c10d2ca0d2902ddddc1a82461877d60cae92aeb85fbbe6528d7c38bdee9a"
+  },
+  {
+    "path": "authoring/observe-failed-transport/dispatch/invoke-supervised.ps1",
+    "sha256": "55972f116a710e37d488c6537f87e4e81449a5febc2b15e6cc81806cd008c6ce"
+  },
+  {
+    "path": "authoring/observe-failed-transport/dispatch/managed-native-output-observation.ps1",
+    "sha256": "32b8fe6d4a3a3de77e89473066ea84d7790e59523f64b754aeffb57a69f7c81b"
+  },
+  {
+    "path": "authoring/observe-failed-transport/dispatch/managed-native-receipt.ps1",
+    "sha256": "3bb6200d64682c1e29e13a4a3b005bcdac8553d9be565a9837de4f0b84f2ea91"
+  },
+  {
+    "path": "authoring/observe-failed-transport/dispatch/managed-native-sdk-observation.ps1",
+    "sha256": "d5acea0544134b5ddfa305c40a151c91c61f19abc78500d5a5a30143a68e1958"
+  },
+  {
+    "path": "authoring/observe-failed-transport/dispatch/managed-output-stop-authority.ps1",
+    "sha256": "87b9425c49c12b1802ed9138e14679fbf3a43e3bcb3002cd054235b628d763c0"
+  },
+  {
+    "path": "authoring/observe-failed-transport/dispatch/metadata-completeness.ps1",
+    "sha256": "d102288942916d71a98d41d534da7b0da75097ebf41ce8bb3ed91fdf4895729b"
+  },
+  {
+    "path": "authoring/observe-failed-transport/dispatch/native-ticket-contract.ps1",
+    "sha256": "c70b0945759dc7684f1391b75843606fadb0803b45f845f84e42afa9a42b5c37"
+  },
+  {
+    "path": "authoring/observe-failed-transport/dispatch/packet-preflight.ps1",
+    "sha256": "26f407b80ec8470e0e7b72914e7b942077ea71a512331e53965ef72d738d8772"
+  },
+  {
+    "path": "authoring/observe-failed-transport/dispatch/receipt-adapter.ps1",
+    "sha256": "0155c44e3cd6d74b64ab19c734eb1773a3bd154021f84501eddafd31c1c9276e"
+  },
+  {
+    "path": "authoring/observe-failed-transport/dispatch/reviewed-blocked-basis.ps1",
+    "sha256": "9180228616fef3b8656740f12675dced288aefba8314139727fdfa928ccdf42f"
+  },
+  {
+    "path": "authoring/observe-failed-transport/dispatch/reviewed-blocked-budget.ps1",
+    "sha256": "08135d28b5fbde0f3e9ab1f367f769aa024572a43fcb7eb5de2b2f8bb25cb2ff"
+  },
+  {
+    "path": "authoring/observe-failed-transport/dispatch/reviewed-blocked-capture.ps1",
+    "sha256": "31ba531df2b9c8caa00d80d5a5eb3034922a79da45c1fe217daeb7e3fb72a698"
+  },
+  {
+    "path": "authoring/observe-failed-transport/dispatch/reviewed-blocked-decoded-buffers.ps1",
+    "sha256": "cf06934fdc65eaf40fb3b8a2dc8ce1809e2266cd373e858bf44e1552cde018b4"
+  },
+  {
+    "path": "authoring/observe-failed-transport/dispatch/reviewed-blocked-facts.ps1",
+    "sha256": "82374b1989cf16e8b2354f6b8e7ad844915fa86f8eb84a0bc9cfd8ab37f13b80"
+  },
+  {
+    "path": "authoring/observe-failed-transport/dispatch/reviewed-blocked-input-buffers.ps1",
+    "sha256": "47d33bec2cf5bd6a5c2e0c06a9386fd673479c12ad263a7036a7695ebe44bd0a"
+  },
+  {
+    "path": "authoring/observe-failed-transport/dispatch/reviewed-blocked-predecessor-capture.ps1",
+    "sha256": "cd9e27ed383d2e70f4566b1016acfd8cbff4e5632a57b61a092080514dc8e45b"
+  },
+  {
+    "path": "authoring/observe-failed-transport/dispatch/reviewed-blocked-predecessor-match.ps1",
+    "sha256": "896771c2e9dea46a59230aad81693421268844063d6bc1fd0386d1b18e69b398"
+  },
+  {
+    "path": "authoring/observe-failed-transport/dispatch/reviewed-blocked-settlement-inputs.ps1",
+    "sha256": "a871b14efef74eebfd601ff986c2e15aad66d11e712ed334b814a02bbe49e152"
+  },
+  {
+    "path": "authoring/observe-failed-transport/dispatch/reviewed-blocked-terminal-capture.ps1",
+    "sha256": "171d4e87b6328fc3d5ad5f52406f3f68d777d241d3224a236e746e5a2c5a05fb"
+  },
+  {
+    "path": "authoring/observe-failed-transport/host-continuation/allocation-context-capture.ps1",
+    "sha256": "2ced4e89e51d7880004f025f289d46e4691ebd0bdc4ed9fd9189712f3326fea4"
+  },
+  {
+    "path": "authoring/observe-failed-transport/host-continuation/backlog-projection.ps1",
+    "sha256": "1dfac70a2ea2e2f584ef01393f461c901d4950fe9f2c02ce14831c9cd7fd1f5d"
+  },
+  {
+    "path": "authoring/observe-failed-transport/host-continuation/persisted-successor-ack140.ps1",
+    "sha256": "e434aa773b71b92b9b64de884c5827f77122824f0147c83240cf82c694095bc7"
+  },
+  {
+    "path": "authoring/observe-failed-transport/host-continuation/registered-review-completion-capture.ps1",
+    "sha256": "ed174b41d7cdbd4cd4c684d4a6124296c71b98636f48d020776a633b8dcd2535"
+  },
+  {
+    "path": "authoring/observe-failed-transport/host-continuation/registered-review-prelaunch-capture.ps1",
+    "sha256": "3ec3f2c9f35ffdef8195bfcbda36c46e27558cb3f0b82ef5176e737231814a8c"
+  },
+  {
+    "path": "authoring/observe-failed-transport/host-continuation/registered-review-record-binding.ps1",
+    "sha256": "670949e3fa83a685d329a6e807c70a120cd78a38c5cc78c6981a279d7ed2c11a"
+  },
+  {
+    "path": "authoring/observe-failed-transport/host-continuation/registered-review-record-reader.ps1",
+    "sha256": "eebe9a02f7798efc8917e3c35d6c9d8e158d630e3c3a0007a7ebc201bb860abf"
+  },
+  {
+    "path": "authoring/observe-failed-transport/host-continuation/registered-review-replay-context.ps1",
+    "sha256": "7ba32f1c1f08972bd9c32f62b0b8ff9b83f393dd41fb55387103c297966d7efa"
+  },
+  {
+    "path": "authoring/observe-failed-transport/host-continuation/registered-useful-cycle152.ps1",
+    "sha256": "32e54da0c672a131220b74a432631781ef92cfdb49b8296047b3bb7535f02f92"
+  },
+  {
+    "path": "authoring/observe-failed-transport/host-continuation/replay-reviewed-terminal.ps1",
+    "sha256": "7536d6924443b170ef5c849bce302658aceac2b119596c40bd2f9a33f181a6ed"
+  },
+  {
+    "path": "authoring/observe-failed-transport/host-continuation/reviewed-a-association139.ps1",
+    "sha256": "af828a91d49f7d9a0d726e5f71bf8d880846efad7c8655626fe0c2b9d7ff3731"
+  },
+  {
+    "path": "authoring/observe-failed-transport/host-continuation/select-next-ready.ps1",
+    "sha256": "39d4db4acba72eda6b718c07f682e7000b70d915ca9a8dadccdf0593b4939c99"
+  },
+  {
+    "path": "authoring/observe-failed-transport/host-continuation/verified-reviewed-handoff141.ps1",
+    "sha256": "e0f9ab9decc487dd29dc7aa30d3bde15e3bc31213caf0db85405744419af23d9"
+  },
+  {
+    "path": "authoring/observe-failed-transport/projection/project-runtime.ps1",
+    "sha256": "8f51f056768cc620d2d8bf8b3e2b0e94a2b0c1f3656c499136436c4728953ad1"
+  },
+  {
+    "path": "authoring/observe-failed-transport/projection/publish-runtime.ps1",
+    "sha256": "f3804c4d21fc3fe5473afddb47f2b485e385be62398615eda713fa11f61580ca"
+  },
+  {
+    "path": "authoring/observe-failed-transport/projection/sync-github-task-status.ps1",
+    "sha256": "068655cae7c6aa7d849711b83abf4000aca5d51b86f9ca1332b597394519aab1"
+  },
+  {
+    "path": "authoring/observe-failed-transport/projection/sync-runtime-status.ps1",
+    "sha256": "4631a40d17d9dc7e08a641afff666e748fbd683fff247d7eb003bc8959c2b42e"
+  },
+  {
+    "path": "authoring/observe-failed-transport/runner/launch.ps1",
+    "sha256": "2ef86cb1b76bd870f9cec6a4c1f89bda4b4c59483ba987ada39cca45582df05e"
+  }
+]
