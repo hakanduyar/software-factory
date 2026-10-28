@@ -5,3 +5,5 @@
 /authoring/continuation/tests/sdk-observation.tests.ps1 text eol=lf
 /authoring/continuation/dispatch/managed-native-output-observation.ps1 text eol=lf
 /authoring/continuation/tests/output-observation-binding.tests.ps1 text eol=lf
+/scripts/github/github-cli-transport216.ps1 text eol=lf
+/tests/github/publisher-stderr.tests.ps1 text eol=lf
