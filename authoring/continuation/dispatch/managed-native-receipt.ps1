@@ -1200,8 +1200,45 @@ function Get-ManagedObservePendingAccountingFacts {
         $reqs = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
         $shas = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
         $paths = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        $histSession = {
+            param($h)
+            $rid = [string](& $get $h 'runId' 'OBSPA_HISTORY_SESSION')
+            $hreq = [string](& $get $h 'requestSha256' 'OBSPA_HISTORY_SESSION')
+            $htr = & $get $h 'terminalRef' 'OBSPA_HISTORY_SESSION'
+            $htp = [string](& $get $htr 'path' 'OBSPA_HISTORY_SESSION')
+            $hts = [string](& $get $htr 'sha256' 'OBSPA_HISTORY_SESSION')
+            $sha = { param([string]$t) [System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.UTF8Encoding]::new($false, $true).GetBytes($t))).ToLowerInvariant() }
+            # Pinned bytes only: terminal by its history pin, manifest by the terminal's pin, ticket by the core's pin; no scan, no added DTO property.
+            $rd = {
+                param([string]$p, [string]$s)
+                if (-not (& $isHex $s)) { & $fail 'OBSPA_HISTORY_SESSION' }
+                $x = $null
+                try { $x = Read-ManagedPinnedEvidenceJson -Reference ([pscustomobject]@{ path = $p; sha256 = $s }) -ControlRoot $controlRoot } catch { $x = $null }
+                if (($null -eq $x) -or ($x.Sha256 -cne $s) -or ($x.Value -isnot [System.Management.Automation.PSCustomObject])) { & $fail 'OBSPA_HISTORY_SESSION' }
+                return $x.Value
+            }
+            $t = & $rd $htp $hts
+            if (((& $get $t 'schema' 'OBSPA_HISTORY_SESSION') -cne 'ManagedNativeTerminal/v1') -or ((& $get $t 'runId' 'OBSPA_HISTORY_SESSION') -cne $rid) -or ((& $get $t 'requestSha256' 'OBSPA_HISTORY_SESSION') -cne $hreq)) { & $fail 'OBSPA_HISTORY_SESSION' }
+            $mp = [System.IO.Path]::Combine([System.IO.Path]::GetDirectoryName($htp), 'manifest.json')
+            $m = & $rd $mp ([string](& $get $t 'manifestSha256' 'OBSPA_HISTORY_SESSION'))
+            if (((& $get $m 'schema' 'OBSPA_HISTORY_SESSION') -cne 'ManagedNativeCollector/v1') -or ((& $get $m 'requestSha256' 'OBSPA_HISTORY_SESSION') -cne $hreq)) { & $fail 'OBSPA_HISTORY_SESSION' }
+            $canon = & $get $m 'requestCanonical' 'OBSPA_HISTORY_SESSION'
+            if (($canon -isnot [string]) -or ((& $sha $canon) -cne $hreq)) { & $fail 'OBSPA_HISTORY_SESSION' }
+            $hcore = $null
+            try { $hcore = ConvertFrom-Json -InputObject $canon -DateKind String -ErrorAction Stop } catch { $hcore = $null }
+            if (($hcore -isnot [System.Management.Automation.PSCustomObject]) -or ((& $get $hcore 'runId' 'OBSPA_HISTORY_SESSION') -cne $rid)) { & $fail 'OBSPA_HISTORY_SESSION' }
+            $ks = [string](& $get $hcore 'ticketSha256' 'OBSPA_HISTORY_SESSION')
+            if ((& $get $t 'ticketSha256' 'OBSPA_HISTORY_SESSION') -cne $ks) { & $fail 'OBSPA_HISTORY_SESSION' }
+            $tk = & $rd ([string](& $get $hcore 'ticketPath' 'OBSPA_HISTORY_SESSION')) $ks
+            $sid = & $get $tk 'sessionId' 'OBSPA_HISTORY_SESSION'
+            $g = [guid]::Empty
+            if (($sid -isnot [string]) -or (-not [guid]::TryParseExact($sid, 'D', [ref]$g))) { & $fail 'OBSPA_HISTORY_SESSION' }
+            return [string]$sid
+        }
+        $sessions = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
         foreach ($h in (& $histOf $pc.Ticket)) {
             $ht = & $get $h 'terminalRef' 'OBSPA_PREDECESSOR_HISTORY'
+            [void]$sessions.Add((& $histSession $h))
             [void]$runs.Add([string](& $get $h 'runId' 'OBSPA_PREDECESSOR_HISTORY'))
             [void]$reqs.Add([string](& $get $h 'requestSha256' 'OBSPA_PREDECESSOR_HISTORY'))
             [void]$shas.Add([string](& $get $ht 'sha256' 'OBSPA_PREDECESSOR_HISTORY'))
@@ -1212,7 +1249,9 @@ function Get-ManagedObservePendingAccountingFacts {
         $curTermPath = & $get $c 'TerminalPath' 'OBSPA_CAPTURE_FIELD'
         if ($runs.Contains($runId) -or $reqs.Contains($reqSha) -or $shas.Contains($curTermSha) -or $paths.Contains($curTermPath)) { & $fail 'OBSPA_DUPLICATE_IDENTITY' }
         if (([string]$pEv.runId -ceq $runId) -and ([long]$pEv.attempt -eq [long]$attempt)) { & $fail 'OBSPA_DUPLICATE_IDENTITY' }
-        if (($sessionId -ceq [string](& $get $pc.Ticket 'sessionId' 'OBSPA_PREDECESSOR_COUNT')) -or ((& $get $c 'ManifestSha256' 'OBSPA_CAPTURE_FIELD') -ceq [string]$pc.ManifestSha256) -or ((& $get $c 'TicketSha256' 'OBSPA_CAPTURE_FIELD') -ceq [string]$pc.TicketSha256)) { & $fail 'OBSPA_DUPLICATE_IDENTITY' }
+        [void]$sessions.Add([string](& $get $pc.Ticket 'sessionId' 'OBSPA_PREDECESSOR_COUNT'))
+        if ($sessions.Contains($sessionId)) { & $fail 'OBSPA_DUPLICATE_SESSION' }
+        if (((& $get $c 'ManifestSha256' 'OBSPA_CAPTURE_FIELD') -ceq [string]$pc.ManifestSha256) -or ((& $get $c 'TicketSha256' 'OBSPA_CAPTURE_FIELD') -ceq [string]$pc.TicketSha256)) { & $fail 'OBSPA_DUPLICATE_IDENTITY' }
 
         # ---- shared read-only observation over the captured stdout leaf ----
         $obs = Get-ManagedNativeOutputObservation -Evidence (& $mkCur)
@@ -1248,7 +1287,10 @@ function Get-ManagedObservePendingAccountingFacts {
         if ($starts -lt 1) { & $fail 'OBSPA_SDK_RECOUNT' }
         $vr = & $get $sdk 'VerifiedRaw' 'OBSPA_SDK_SHAPE'
         $leaf = @(@($c.VerifiedReferences) | Where-Object { $_.Role -ceq 'STDOUT' })
-        $oLeaf = @(@(& $get $obs 'VerifiedReferences' 'OBSPA_OBSERVATION_SHAPE') | Where-Object { $_.Role -ceq 'STDOUT' })
+        # The ordinal getter returns the reference array as one object; enumerate the array itself, then filter by exact Role.
+        $oRefs = & $get $obs 'VerifiedReferences' 'OBSPA_OBSERVATION_SHAPE'
+        if ($oRefs -isnot [object[]]) { & $fail 'OBSPA_STDOUT_LEAF' }
+        $oLeaf = @($oRefs | Where-Object { ($_ -is [System.Management.Automation.PSCustomObject]) -and ($_.Role -ceq 'STDOUT') })
         if (($leaf.Count -ne 1) -or ($oLeaf.Count -ne 1) -or ($null -eq $vr)) { & $fail 'OBSPA_STDOUT_LEAF' }
         $leaf = $leaf[0]
         if (($oLeaf[0].Path -cne $leaf.Path) -or ($oLeaf[0].VerifiedSha256 -cne $leaf.VerifiedSha256) -or ([long]$oLeaf[0].VerifiedLength -ne [long]$leaf.VerifiedLength) -or ((& $get $vr 'Path' 'OBSPA_STDOUT_LEAF') -cne $leaf.Path) -or ((& $get $vr 'Sha256' 'OBSPA_STDOUT_LEAF') -cne $leaf.VerifiedSha256) -or ((& $lng $vr 'Length' 'OBSPA_STDOUT_LEAF') -ne [long]$leaf.VerifiedLength)) { & $fail 'OBSPA_STDOUT_LEAF' }
@@ -1316,6 +1358,109 @@ function Get-ManagedObservePendingAccountingFacts {
         $code = 'OBSPA_UNEXPECTED_ERROR'
         if ($m.StartsWith('REFUSE:', $ord) -and ($m.Length -le 55) -and ($m.Substring(7) -cmatch '^[A-Z0-9_]{1,48}$')) { $code = $m.Substring(7) }
         return [pscustomobject]@{ Valid = $false; Code = $code; Result = 'REFUSED'; Facts = $null }
+    }
+}
+
+function Test-ManagedObservePendingRawDto {
+    # Read-only. Cross-checks one caller raw DTO against derived authenticated pending-accounting facts; shared by the adapter and the v3 validator.
+    # The raw DTO is crosschecked input, not provider attestation and not the captured terminal. The read bound below is an observation constraint
+    # for this small metadata file only; it never limits or stops author output.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$RawPath,
+        [AllowNull()][AllowEmptyString()][string]$ExpectedSha256,
+        [Parameter(Mandatory)]$Facts
+    )
+    Set-StrictMode -Version Latest
+    $ord = [System.StringComparison]::Ordinal
+    $fail = { param([string]$c) throw [System.InvalidOperationException]::new('REFUSE:' + $c) }
+    $isInt = { param($v) ($v -is [int]) -or ($v -is [long]) }
+    $maxBytes = 1048576
+    $readRaw = {
+        param([string]$p)
+        $q = $p
+        while (-not [string]::IsNullOrEmpty($q)) {
+            $a = $null
+            try { $a = [System.IO.File]::GetAttributes($q) } catch { $a = $null }
+            if ($null -eq $a) { & $fail 'OBSPA_RAW_UNREADABLE' }
+            if (($a -band [System.IO.FileAttributes]::ReparsePoint) -ne [System.IO.FileAttributes]0) { & $fail 'OBSPA_RAW_REPARSE' }
+            if (($q -ceq $p) -and (($a -band [System.IO.FileAttributes]::Directory) -ne [System.IO.FileAttributes]0)) { & $fail 'OBSPA_RAW_NOT_FILE' }
+            $q = [System.IO.Path]::GetDirectoryName($q)
+        }
+        $buf = [byte[]]::new($maxBytes + 1)
+        $n = 0
+        $fs = $null
+        try {
+            $fs = [System.IO.FileStream]::new($p, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+            while ($n -lt $buf.Length) {
+                $r = $fs.Read($buf, $n, $buf.Length - $n)
+                if ($r -le 0) { break }
+                $n += $r
+            }
+        } catch { & $fail 'OBSPA_RAW_UNREADABLE' } finally { if ($null -ne $fs) { $fs.Dispose() } }
+        if ($n -gt $maxBytes) { & $fail 'OBSPA_RAW_TOO_LARGE' }
+        $out = [byte[]]::new($n)
+        [System.Array]::Copy($buf, $out, $n)
+        return , $out
+    }
+    $shaOf = { param([byte[]]$b) [System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($b)).ToLowerInvariant() }
+    try {
+        if (-not [System.IO.Path]::IsPathFullyQualified($RawPath)) { & $fail 'OBSPA_RAW_PATH' }
+        $full = [System.IO.Path]::GetFullPath($RawPath)
+        foreach ($ip in @($Facts.inputPaths)) {
+            if ([string]::Equals($full, [System.IO.Path]::GetFullPath([string]$ip), [System.StringComparison]::OrdinalIgnoreCase)) { & $fail 'OBSPA_RAW_COLLIDES' }
+        }
+        $bytes = & $readRaw $full
+        $sha = & $shaOf $bytes
+        if ((-not [string]::IsNullOrEmpty($ExpectedSha256)) -and ($sha -cne $ExpectedSha256)) { & $fail 'OBSPA_RAW_PIN' }
+        $off = 0
+        if (($bytes.Length -ge 3) -and ($bytes[0] -eq 0xEF) -and ($bytes[1] -eq 0xBB) -and ($bytes[2] -eq 0xBF)) { $off = 3 }
+        $text = $null
+        try { $text = [System.Text.UTF8Encoding]::new($false, $true).GetString($bytes, $off, $bytes.Length - $off) } catch { $text = $null }
+        if ($null -eq $text) { & $fail 'OBSPA_RAW_UTF8' }
+        $jd = $null
+        try {
+            $opt = [System.Text.Json.JsonDocumentOptions]::new()
+            $opt.MaxDepth = 64
+            $opt.AllowTrailingCommas = $false
+            $opt.CommentHandling = [System.Text.Json.JsonCommentHandling]::Disallow
+            try { $jd = [System.Text.Json.JsonDocument]::Parse($text, $opt) } catch { & $fail 'OBSPA_RAW_JSON' }
+            if ($jd.RootElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { & $fail 'OBSPA_RAW_JSON' }
+            $stk = [System.Collections.Generic.Stack[System.Text.Json.JsonElement]]::new()
+            $stk.Push($jd.RootElement)
+            while ($stk.Count -gt 0) {
+                $el = $stk.Pop()
+                if ($el.ValueKind -eq [System.Text.Json.JsonValueKind]::Object) {
+                    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                    foreach ($jp in $el.EnumerateObject()) { if (-not $seen.Add($jp.Name)) { & $fail 'OBSPA_RAW_DUPLICATE' }; $stk.Push($jp.Value) }
+                }
+                elseif ($el.ValueKind -eq [System.Text.Json.JsonValueKind]::Array) { foreach ($ji in $el.EnumerateArray()) { $stk.Push($ji) } }
+            }
+        } finally { if ($null -ne $jd) { $jd.Dispose() } }
+        $raw = $null
+        try { $raw = ConvertFrom-Json -InputObject $text -DateKind String -ErrorAction Stop } catch { $raw = $null }
+        if ($raw -isnot [System.Management.Automation.PSCustomObject]) { & $fail 'OBSPA_RAW_JSON' }
+        $rn = @($raw.PSObject.Properties | ForEach-Object { $_.Name })
+        foreach ($k in @('status', 'pid', 'session', 'startUtc', 'endUtc', 'exit', 'observedOutput')) { if ($rn -cnotcontains $k) { & $fail 'OBSPA_RAW_FIELD' } }
+        $id = $Facts.identity; $acct = $Facts.accounting
+        if (($raw.status -isnot [string]) -or (@('AWAITING_CONTROLLER', 'TERMINAL') -cnotcontains $raw.status)) { & $fail 'OBSPA_RAW_STATUS' }
+        if ((-not (& $isInt $raw.pid)) -or ([long]$raw.pid -ne [long]$id.pid)) { & $fail 'OBSPA_RAW_PID' }
+        if (($raw.session -isnot [string]) -or ($raw.session -cne [string]$id.sessionId)) { & $fail 'OBSPA_RAW_SESSION' }
+        if (($raw.startUtc -isnot [string]) -or ($raw.startUtc -cne [string]$Facts.timing.startUtc) -or ($raw.endUtc -isnot [string]) -or ($raw.endUtc -cne [string]$Facts.timing.endedUtc)) { & $fail 'OBSPA_RAW_TIMES' }
+        if ((-not (& $isInt $raw.exit)) -or ([long]$raw.exit -ne 0)) { & $fail 'OBSPA_RAW_EXIT' }
+        if ((-not (& $isInt $raw.observedOutput)) -or ([long]$raw.observedOutput -ne [long]$acct.observedOutputTokens)) { & $fail 'OBSPA_RAW_OBSERVED' }
+        if (($rn -ccontains 'historicalOutput') -and ((-not (& $isInt $raw.historicalOutput)) -or ([long]$raw.historicalOutput -ne [long]$acct.historicalOutputTokens))) { & $fail 'OBSPA_RAW_HISTORY' }
+        if (($rn -ccontains 'additionalCap') -and ($null -ne $raw.additionalCap)) { & $fail 'OBSPA_RAW_CAP' }
+        # Stability through validation: the same bytes must still be on disk.
+        $again = & $readRaw $full
+        if ((& $shaOf $again) -cne $sha) { & $fail 'OBSPA_RAW_STALE' }
+        return [pscustomobject]@{ Valid = $true; Code = $null; Path = $full; Sha256 = $sha }
+    }
+    catch {
+        $m = [string]$_.Exception.Message
+        $code = 'OBSPA_RAW_UNEXPECTED'
+        if ($m.StartsWith('REFUSE:', $ord) -and ($m.Length -le 55) -and ($m.Substring(7) -cmatch '^[A-Z0-9_]{1,48}$')) { $code = $m.Substring(7) }
+        return [pscustomobject]@{ Valid = $false; Code = $code; Path = $null; Sha256 = $null }
     }
 }
 

@@ -201,25 +201,10 @@ function ConvertTo-ObserveOnlyPendingReceipt {
         }
         if ([string]::Equals($rawFull, $usageFull, $ord) -or [string]::Equals($rawFull, $ticketFull, $ord)) { return & $fail 'raw path collides with evidence path' }
 
-        # Caller raw DTO is cross-checked only; it supplies no number that reaches the receipt.
-        $rawItem = Get-Item -LiteralPath $rawFull -Force
-        if ($rawItem.PSIsContainer -or (($rawItem.Attributes -band $rp) -ne 0) -or ($rawItem.Length -gt 1048576)) { return & $fail 'raw input is not an ordinary bounded file' }
-        $rawBytes = [System.IO.File]::ReadAllBytes($rawFull)
-        $rawSha = & $sha $rawBytes
-        try { $raw = [System.Text.UTF8Encoding]::new($false, $true).GetString($rawBytes) | ConvertFrom-Json -DateKind String } catch { return & $fail 'raw not parseable JSON' }
-        if ($raw -isnot [System.Management.Automation.PSCustomObject]) { return & $fail 'raw is not an object' }
-        $rn = @($raw.PSObject.Properties.Name)
-        foreach ($k in @('status', 'pid', 'session', 'startUtc', 'endUtc', 'exit', 'observedOutput')) {
-            if ($rn -cnotcontains $k) { return & $fail "raw missing field: $k" }
-        }
-        if ((@('AWAITING_CONTROLLER', 'TERMINAL') -cnotcontains [string]$raw.status) -or ($raw.status -isnot [string])) { return & $fail 'raw status not terminal' }
-        if ((-not (& $isInt $raw.pid)) -or ([long]$raw.pid -ne [long]$id.pid)) { return & $fail 'raw pid does not match authenticated capture' }
-        if (($raw.session -isnot [string]) -or ($raw.session -cne [string]$id.sessionId)) { return & $fail 'raw session does not match authenticated capture' }
-        if (($raw.startUtc -isnot [string]) -or ($raw.startUtc -cne [string]$f.timing.startUtc) -or ($raw.endUtc -isnot [string]) -or ($raw.endUtc -cne [string]$f.timing.endedUtc)) { return & $fail 'raw times do not match authenticated capture' }
-        if ((-not (& $isInt $raw.exit)) -or ([long]$raw.exit -ne 0)) { return & $fail 'raw exit does not match authenticated capture' }
-        if ((-not (& $isInt $raw.observedOutput)) -or ([long]$raw.observedOutput -ne [long]$acct.observedOutputTokens)) { return & $fail 'raw observedOutput does not match SDK recount' }
-        if (($rn -ccontains 'historicalOutput') -and ((-not (& $isInt $raw.historicalOutput)) -or ([long]$raw.historicalOutput -ne [long]$acct.historicalOutputTokens))) { return & $fail 'raw historicalOutput does not match authenticated history' }
-        if (($rn -ccontains 'additionalCap') -and ($null -ne $raw.additionalCap)) { return & $fail 'raw additionalCap must be null in observe-only mode' }
+        # Caller raw DTO is cross-checked only (shared with the v3 validator); it supplies no number that reaches the receipt.
+        $rv = Test-ManagedObservePendingRawDto -RawPath $rawFull -ExpectedSha256 $null -Facts $f
+        if (($null -eq $rv) -or ($rv.Valid -isnot [bool]) -or (-not $rv.Valid)) { return & $fail ('raw cross-check refused: ' + $(if ($null -ne $rv) { $rv.Code } else { 'UNKNOWN' })) }
+        $rawSha = $rv.Sha256
 
         $receipt = [PSCustomObject]([ordered]@{
             schemaVersion   = 'OperationalRunReceipt/v3'
@@ -264,7 +249,8 @@ function ConvertTo-ObserveOnlyPendingReceipt {
 
         # The strict validator independently reruns the shared verifier, so it also proves capture/predecessor stability up to here.
         if (-not (Test-OperationalReceipt $receipt)) { return & $fail 'receipt failed validator' }
-        if ((& $sha ([System.IO.File]::ReadAllBytes($rawFull))) -cne $rawSha) { return & $fail 'raw input changed before write' }
+        $rv2 = Test-ManagedObservePendingRawDto -RawPath $rawFull -ExpectedSha256 $rawSha -Facts $f
+        if (($null -eq $rv2) -or ($rv2.Valid -isnot [bool]) -or (-not $rv2.Valid)) { return & $fail 'raw input changed before write' }
 
         $json = $receipt | ConvertTo-Json -Depth 10
         $bytes = $utf8.GetBytes($json)

@@ -160,6 +160,10 @@ function Test-OperationalReceiptV3 {
         if ([long](& $val $b 'usedOutputTokens') -ne [long]$acct.usedOutputTokens) { return $false }
         if (([string](& $val $e 'ticketPath') -cne [string]$f.references.ticket.path) -or ((& $val $e 'ticketSha256') -cne [string]$f.references.ticket.verifiedSha256)) { return $false }
         if (([string](& $val $e 'usagePath') -cne [string]$f.stdout.path) -or ((& $val $e 'usageSha256') -cne [string]$f.stdout.sha256)) { return $false }
+        # Reauthenticate the referenced raw DTO with the same shared rules the adapter used; rawPath/rawSha256 cannot be swapped independently.
+        $rawPathV = [string](& $val $e 'rawPath')
+        $rv = Test-ManagedObservePendingRawDto -RawPath $rawPathV -ExpectedSha256 ([string](& $val $e 'rawSha256')) -Facts $f
+        if (($null -eq $rv) -or ($rv.Valid -isnot [bool]) -or (-not $rv.Valid) -or ($rv.Path -cne $rawPathV)) { return $false }
         if ((ConvertTo-Json -InputObject (& $val $obj 'observePendingAccounting') -Depth 8 -Compress) -cne (ConvertTo-Json -InputObject $acct -Depth 8 -Compress)) { return $false }
         return $true
     } catch { return $false }
