@@ -607,10 +607,9 @@ function Invoke-ManagedNativeCollector {
             continue
         }
         if ($noStop -and $k -ceq 'MaxElapsedMs') {
-            # Observe-only author start: NO TOTAL AUTHOR DEADLINE. Only an exact null is accepted; a finite total cap is refused, never clamped, ignored or replaced.
-            if ($null -ne $v) { throw 'Refusing: MaxElapsedMs must be null (no total author deadline) in OutputStopProfile mode.' }
-            $num[$k] = $null
-            continue
+            # Decode only: exact null = NO TOTAL AUTHOR DEADLINE (never cast to 0); otherwise the historical positive typed integer below. A finite value is
+            # accepted here solely so retained finite requests replay faithfully; a FRESH author launch with a finite cap is refused before any side effect.
+            if ($null -eq $v) { $num[$k] = $null; continue }
         }
         if (($v -isnot [int] -and $v -isnot [long]) -or $v -le 0) { throw ('Refusing: ' + $k + ' must be a positive typed integer.') }
         $num[$k] = [long]$v
@@ -1215,6 +1214,7 @@ function Invoke-ManagedNativeCollector {
     if ($settingsApplied -eq $true -and -not (Test-Path -LiteralPath $manifestPath)) {
         # Capped legacy author starts are retired; legacy terminal replay (manifest present) is handled below and never launches a child.
         if (-not $noStop) { throw 'Refusing: capped legacy author starts are retired; use OutputStopProfile observe-only-v1.' }
+        if ($noStop -and $null -ne $num['MaxElapsedMs']) { throw 'Refusing: a fresh observe-only author launch must carry a null MaxElapsedMs (no total author deadline); a finite total cap is not enforced, ignored, clamped or replaced.' }
         $preTicket = $null
         try { $preTicket = [System.Text.Encoding]::UTF8.GetString($bytes['TicketPath']).TrimStart([char]0xFEFF) | ConvertFrom-Json } catch { throw 'Refusing: ticket is not valid JSON.' }
         if ($null -eq $preTicket) { throw 'Refusing: ticket is not valid JSON.' }
@@ -1299,6 +1299,7 @@ function Invoke-ManagedNativeCollector {
                 if (Test-Path -LiteralPath $f) { throw 'Refusing: orphan evidence without a manifest.' }
             }
             if ($settingsApplied -eq $true -and -not $noStop) { throw 'Refusing: capped legacy author starts are retired; use OutputStopProfile observe-only-v1.' }
+            if ($noStop -and $null -ne $num['MaxElapsedMs']) { throw 'Refusing: a fresh observe-only author launch must carry a null MaxElapsedMs (no total author deadline); a finite total cap is not enforced, ignored, clamped or replaced.' }
             Assert-NoAmbientProviderOverride
             if (-not (Test-Path -LiteralPath $exePath -PathType Leaf)) { throw 'Refusing: pinned executable is not present.' }
             $ticketJson = $null
@@ -1532,7 +1533,22 @@ function Invoke-ManagedNativeCollector {
             if ($started) {
                 try {
                     # No total author deadline (null): stream EOF is not exit. Keep observing the live child in finite slices; a slice expiring never terminates it.
-                    if ($null -eq $reason -and $null -eq $maxElapsed) { while (-not $p.HasExited) { [void]$p.WaitForExit([int]$exitWaitMs) } }
+                    # The live wait keeps servicing stdin completion/flush/close; a known stream read fault or stdin failure ends the unbounded wait: one finite slice for a natural exit, else the existing COLLECTOR_FAULT cleanup (tree kill, finite drain).
+                    if ($null -eq $reason -and $null -eq $maxElapsed) {
+                        while (-not $p.HasExited) {
+                            if (-not $inClosed -and $inTask.IsCompleted) {
+                                if ($inTask.IsFaulted) { [void]$inTask.Exception; $stdinError = $true } else { try { $stdinWriter.BaseStream.Flush() } catch { $stdinError = $true } }
+                                try { $stdinWriter.Close() } catch { $stdinError = $true }
+                                $inClosed = $true
+                            }
+                            if ($readFault -or $stdinError) {
+                                [void]$p.WaitForExit([int]$exitWaitMs)
+                                if (-not $p.HasExited) { $reason = 'COLLECTOR_FAULT'; if ($null -eq $errorCode) { $errorCode = 'StreamIoFault' } }
+                                break
+                            }
+                            [void]$p.WaitForExit(100)
+                        }
+                    }
                     elseif ($null -eq $reason -and -not $p.HasExited) { [void]$p.WaitForExit([int][Math]::Max(0, [Math]::Min([long]$exitWaitMs, $maxElapsed - $sw.ElapsedMilliseconds))) }
                     if ($null -eq $reason) { $hx = $p.HasExited; $el = [long]$sw.ElapsedMilliseconds; $reason = if ($hx) { 'NATURAL_EXIT' } elseif ($null -ne $maxElapsed -and $el -ge $maxElapsed) { 'DEADLINE' } else { 'EXIT_WAIT_TIMEOUT' }; if ($reason -ceq 'DEADLINE' -and $null -eq $deadlineObservedUtc) { $deadlineElapsedMs = $el; $deadlineObservedUtc = (Get-Date).ToUniversalTime().ToString('o'); $deadlineAlive = -not $hx } }
                     $aliveAtStop = $null; $hx2 = $p.HasExited; $aliveAtStop = -not $hx2; if (-not $hx2) { $killAttempted = $true; try { $p.Kill($true) } catch { $killErrorCode = $_.Exception.GetType().FullName; throw } }
