@@ -1,0 +1,32 @@
+name: Failed transport source integrity
+on:
+  pull_request:
+  push:
+permissions:
+  contents: read
+jobs:
+  failed-transport-source:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: "false"
+      - name: Verify exact source snapshot and parse without execution
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:GITHUB_WORKSPACE 'authoring/observe-failed-transport'
+          $manifest = @(Get-Content -LiteralPath (Join-Path $root 'source-manifest.json') -Raw | ConvertFrom-Json)
+          if ($manifest.Count -ne 46) { throw 'Unexpected source count' }
+          $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+          foreach ($entry in $manifest) {
+            if ($entry.path -cnotmatch '^authoring/observe-failed-transport/(dispatch|continuity|host-continuation|projection|runner)/[A-Za-z0-9.-]+\.ps1$' -or -not $seen.Add($entry.path)) { throw 'Invalid source path' }
+            $path = Join-Path $env:GITHUB_WORKSPACE $entry.path
+            if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $entry.sha256) { throw 'Source pin mismatch' }
+            $tokens = $null; $errors = $null
+            [void][Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
+            if (@($errors).Count -ne 0) { throw 'PowerShell parse failed' }
+          }
+          $actual = @(Get-ChildItem -LiteralPath $root -Recurse -File -Filter '*.ps1')
+          if ($actual.Count -ne $seen.Count) { throw 'Unmanifested source file' }
+          Write-Output '46 pinned declarations parsed; no runtime functions executed.'
