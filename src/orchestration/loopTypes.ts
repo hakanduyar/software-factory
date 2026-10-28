@@ -71,7 +71,8 @@ export interface LoopWorkerConfig {
   readonly tool: WorkerTool;
   readonly model: string;
   readonly effort?: string;
-  readonly timeoutMs?: number;
+  /** Author runs have no total deadline: absent/`null` mean none. A finite value is readable (audit/restart) but refused at launch. */
+  readonly timeoutMs?: number | null;
 }
 
 export interface VerificationCommandConfig {
@@ -104,8 +105,8 @@ export interface LoopBudget {
   /** Optional additional ceiling on total worker runs (implementer + verifier + reviewer) across the loop. */
   readonly maxTotalRuns?: number;
   readonly maxWallClockMs?: number;
-  /** Default per-worker timeout when a LoopWorkerConfig does not specify its own. */
-  readonly workerTimeoutMs?: number;
+  /** Default author timeout when a LoopWorkerConfig does not specify its own: absent/`null` mean no total deadline; finite is refused at launch. */
+  readonly workerTimeoutMs?: number | null;
   /** Default per-command verification timeout when a VerificationCommandConfig does not specify its own. */
   readonly verificationTimeoutMs?: number;
 }

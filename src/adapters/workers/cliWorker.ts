@@ -20,6 +20,7 @@
  *   claim (TASK-004 owns PASS/CHANGES_REQUIRED parsing).
  */
 
+import { ValidationError } from "../../domain/errors.js";
 import type { EvidenceDraft } from "../../domain/evidence.js";
 import type { ProcessResult, ProcessRunner } from "../../ports/processRunner.js";
 import type { Worker, WorkerOutcome, WorkerRequest } from "../../ports/worker.js";
@@ -57,7 +58,12 @@ export interface CliWorkerAdapterConfig {
   readonly executable: string;
   readonly model: string;
   readonly effort?: string;
-  readonly timeoutMs: number;
+  /**
+   * Author execution has no total deadline: must be `null`. Any other value
+   * (finite, malformed) is refused by `createCliWorker` before the runner is
+   * ever called.
+   */
+  readonly timeoutMs: number | null;
   readonly workspace: Workspace;
   readonly processRunner: ProcessRunner;
   readonly environmentPolicy: EnvironmentPolicy;
@@ -200,6 +206,15 @@ function buildSummary(
 }
 
 export function createCliWorker(config: CliWorkerAdapterConfig): Worker {
+  // The shared fail-closed boundary for every CLI adapter: a finite or
+  // malformed author timeout must never launch a capped author.
+  const supplied: unknown = config.timeoutMs;
+  if (supplied !== null) {
+    throw new ValidationError(
+      `CLI author worker timeoutMs must be null (no total execution deadline); got ${JSON.stringify(supplied) ?? String(supplied)}. ` +
+        "A finite author timeout is refused; no worker was constructed and no process was launched.",
+    );
+  }
   return {
     id: config.id,
     capabilities: {

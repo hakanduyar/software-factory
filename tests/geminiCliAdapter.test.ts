@@ -129,7 +129,7 @@ describe("geminiCliAdapter: pure helpers", () => {
 });
 
 describe("geminiCliAdapter: createGeminiCliWorker", () => {
-  it("runs with exact argv, cwd, filtered env, timeout; claims=false", async () => {
+  it("runs with exact argv, cwd, filtered env, null timeout; claims=false", async () => {
     const ws = workspace();
     const { runner, calls } = stubRunner(json({ response: "PASS", stats: {} }));
     const worker = createGeminiCliWorker({
@@ -137,7 +137,7 @@ describe("geminiCliAdapter: createGeminiCliWorker", () => {
       roles: ["REVIEWER"],
       workspace: ws,
       processRunner: runner,
-      timeoutMs: 1234,
+      timeoutMs: null,
       effort: "high",
     });
     assert.deepEqual([...worker.capabilities.roles], ["REVIEWER"]);
@@ -151,7 +151,7 @@ describe("geminiCliAdapter: createGeminiCliWorker", () => {
     assert.equal(call.input, undefined);
     assert.ok(!call.argv.some((a) => /yolo|approval|trust|allowed|policy/i.test(a) && a.startsWith("-")));
     assert.equal(call.cwd, ws.root);
-    assert.equal(call.timeoutMs, 1234);
+    assert.equal(call.timeoutMs, null);
     assert.equal(call.maxOutputBytes, undefined);
     assert.equal(call.env["ANTHROPIC_API_KEY"], undefined);
     assert.equal(outcome.status, "SUCCEEDED");
@@ -203,5 +203,19 @@ describe("geminiCliAdapter: createGeminiCliWorker", () => {
       assert.equal(outcome.status, expected, JSON.stringify(pr));
       assert.equal(outcome.claimsAcceptanceMet, false);
     }
+  });
+});
+
+describe("createGeminiCliWorker: finite author timeout refusal", () => {
+  it("defaults to null and refuses a finite timeout before any runner call", async () => {
+    const { runner, calls } = stubRunner(json({ response: "PASS", stats: {} }));
+    assert.throws(
+      () => createGeminiCliWorker({ model: MODEL, roles: ["REVIEWER"], workspace: workspace(), processRunner: runner, timeoutMs: 1234 }),
+      /must be null/,
+    );
+    assert.equal(calls.length, 0);
+    await createGeminiCliWorker({ model: MODEL, roles: ["REVIEWER"], workspace: workspace(), processRunner: runner }).execute(request());
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]!.timeoutMs, null);
   });
 });

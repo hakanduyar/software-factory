@@ -27,8 +27,15 @@ export interface ProcessRequest {
   readonly env: Readonly<Record<string, string>>;
   /** Written to the child's stdin, then stdin is closed. Omit to close stdin immediately. */
   readonly input?: string;
-  /** Wall-clock budget; exceeding it terminates the child (SIGTERM, then SIGKILL if needed). */
-  readonly timeoutMs: number;
+  /**
+   * Explicit and required. A finite positive number is a total wall-clock
+   * budget; exceeding it terminates the child (SIGTERM, then SIGKILL if
+   * needed). `null` means NO total execution deadline: the child runs until
+   * it exits on its own or `signal` aborts. `null` is never encoded as 0,
+   * Infinity or a huge number, and an omitted field is not a bypass — the
+   * runner rejects any other value before launching a child.
+   */
+  readonly timeoutMs: number | null;
   /** Cooperative cancellation, e.g. from the caller's own request lifecycle. */
   readonly signal?: AbortSignal;
   /** Caps captured bytes per stream; excess bytes are discarded (stream is still drained). */

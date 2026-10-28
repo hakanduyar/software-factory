@@ -15,7 +15,7 @@ import { createNodeProcessRunner } from "../src/adapters/process/nodeProcessRunn
 import { createClaudeCodeWorker } from "../src/adapters/workers/claudeCodeAdapter.js";
 import { createCodexCliWorker } from "../src/adapters/workers/codexCliAdapter.js";
 import { resolveWorkspace } from "../src/adapters/workers/workspace.js";
-import { WorkerExecutionError } from "../src/domain/errors.js";
+import { ValidationError, WorkerExecutionError } from "../src/domain/errors.js";
 import { newFactory, seedWorkItem, toImplementing } from "./support/factoryFixtures.js";
 import { fakeCliPath } from "./support/fakeCli.js";
 import { cleanupTempWorkspaces, createTempWorkspace } from "./support/tempWorkspace.js";
@@ -77,25 +77,28 @@ describe("worker runner: FactoryService integration with real process-backed ada
     assert.notEqual(runs[0]?.status, "RUNNING");
   });
 
-  it("finalizes the same run as FAILED on timeout", async () => {
+  it("refuses a finite author timeout configuration before execution: no runner call, no run, status unchanged", async () => {
     const { factory } = newFactory();
     const item = await seedWorkItem(factory);
     await toImplementing(factory, item.id);
 
-    const worker = codexWorker({
-      timeoutMs: 100,
-      environmentPolicy: { allowedVars: ["PATH"], extraVars: { FAKE_CODEX_SLEEP_MS: "5000" } },
-    });
-    factory.registerWorker(worker, ["IMPLEMENTER"]);
+    let runnerCalls = 0;
+    const countingRunner = {
+      run: async (): Promise<never> => {
+        runnerCalls += 1;
+        throw new Error("process runner must never be called");
+      },
+    };
 
-    const { run } = await factory.runWorker({
-      workItemId: item.id,
-      role: "IMPLEMENTER",
-      worker,
-      instructions: "implement the thing",
+    assert.throws(() => codexWorker({ timeoutMs: 100, processRunner: countingRunner }), (error: unknown) => {
+      assert.ok(error instanceof ValidationError);
+      assert.match(error.message, /timeoutMs must be null/);
+      return true;
     });
 
-    assert.equal(run.status, "FAILED");
+    assert.equal(runnerCalls, 0);
+    assert.equal((await factory.listRuns(item.id)).length, 0);
+    assert.equal((await factory.getWorkItem(item.id)).status, "IMPLEMENTING");
   });
 
   it("finalizes the same run as FAILED when the executable cannot be spawned at all", async () => {

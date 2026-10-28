@@ -12,7 +12,7 @@
 
 import { createClaudeCodeWorker } from "../adapters/workers/claudeCodeAdapter.js";
 import { createCodexCliWorker } from "../adapters/workers/codexCliAdapter.js";
-import { DEFAULT_WORKER_TIMEOUT_MS } from "../adapters/workers/workerModelConfig.js";
+import { normalizeAuthorTimeoutMs } from "../adapters/workers/workerModelConfig.js";
 import type { Workspace } from "../adapters/workers/workspace.js";
 import { ValidationError } from "../domain/errors.js";
 import type { FactoryRole } from "../domain/role.js";
@@ -24,7 +24,8 @@ export interface LoopWorkerFactoryOptions {
   readonly workspace: Workspace;
   readonly processRunner: ProcessRunner;
   readonly roles: readonly FactoryRole[];
-  readonly defaultTimeoutMs?: number;
+  /** Absent/`null`: no total author deadline. A finite value is refused when the worker is constructed. */
+  readonly defaultTimeoutMs?: number | null;
   readonly executable?: string;
 }
 
@@ -33,7 +34,9 @@ export function createLoopWorker(config: LoopWorkerConfig, options: LoopWorkerFa
     ...(options.executable === undefined ? {} : { executable: options.executable }),
     model: config.model,
     ...(config.effort === undefined ? {} : { effort: config.effort }),
-    timeoutMs: config.timeoutMs ?? options.defaultTimeoutMs ?? DEFAULT_WORKER_TIMEOUT_MS,
+    // Explicit null must stay null: no `??` fallback to a finite value. Finite/malformed values are
+    // refused by createCliWorker before any process runner call.
+    timeoutMs: normalizeAuthorTimeoutMs(config.timeoutMs !== undefined ? config.timeoutMs : options.defaultTimeoutMs),
     workspace: options.workspace,
     processRunner: options.processRunner,
     roles: options.roles,

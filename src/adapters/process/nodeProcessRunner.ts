@@ -17,6 +17,8 @@
  *   settlement makes every further event a no-op, so a timeout that fires
  *   microseconds before a natural exit (or vice versa) can never
  *   double-report or leave the returned Promise unresolved.
+ * - `timeoutMs: null` installs no total timer (author work has no total deadline);
+ *   a finite timeout, when given, still terminates the child.
  * - Timeout/cancellation escalate SIGTERM -> (grace period) -> SIGKILL
  *   rather than assuming the child honours SIGTERM.
  * - stdout/stderr are capped at `maxOutputBytes` per stream (default 5 MiB):
@@ -36,6 +38,13 @@ import type { ProcessRequest, ProcessResult, ProcessRunner, ProcessTerminationRe
 
 const DEFAULT_MAX_OUTPUT_BYTES = 5 * 1024 * 1024;
 const DEFAULT_KILL_GRACE_MS = 3000;
+/** setTimeout silently coerces larger delays to 1ms, which would turn a "long" budget into an instant kill. */
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+/** `null` (no total deadline) or a finite positive number the timer can represent; anything else is refused. */
+function isValidTimeoutMs(value: unknown): value is number | null {
+  return value === null || (typeof value === "number" && Number.isFinite(value) && value > 0 && value <= MAX_TIMER_DELAY_MS);
+}
 
 export interface NodeProcessRunnerOptions {
   /** Time to wait after SIGTERM before escalating to SIGKILL. Lower this in tests. */
@@ -95,6 +104,15 @@ export function createNodeProcessRunner(options: NodeProcessRunnerOptions = {}):
 
   return {
     run(request: ProcessRequest): Promise<ProcessResult> {
+      // Fail closed before any child exists: no coercion, no default deadline.
+      const requestedTimeout: unknown = request.timeoutMs;
+      if (!isValidTimeoutMs(requestedTimeout)) {
+        return Promise.reject(
+          new TypeError(
+            `ProcessRequest.timeoutMs must be null (no total deadline) or a finite positive number <= ${MAX_TIMER_DELAY_MS}; got ${String(requestedTimeout)}. No child process was launched.`,
+          ),
+        );
+      }
       const startedAt: Timestamp = Date.now();
       const maxOutputBytes = request.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
       const stdout = new BoundedCollector(maxOutputBytes);
@@ -202,7 +220,10 @@ export function createNodeProcessRunner(options: NodeProcessRunnerOptions = {}):
           finish({ terminationReason: requestedReason ?? "EXITED", exitCode: code, signal });
         });
 
-        timeoutTimer = setTimeout(() => requestTermination("TIMEOUT"), request.timeoutMs);
+        // `null` installs no total timer at all; only an explicit cancel signal can stop the child early.
+        if (requestedTimeout !== null) {
+          timeoutTimer = setTimeout(() => requestTermination("TIMEOUT"), requestedTimeout);
+        }
 
         if (request.signal !== undefined) {
           if (request.signal.aborted) {

@@ -62,7 +62,7 @@ async function setup() {
   const workspace = createTempWorkspace();
   const worker = createCliWorker({
     id: "stub-cli", tool: "codex-cli", roles: [...FACTORY_ROLES],
-    executable: "irrelevant-not-actually-spawned", model: "m", timeoutMs: 5000,
+    executable: "irrelevant-not-actually-spawned", model: "m", timeoutMs: null,
     workspace: resolveWorkspace(workspace),
     processRunner: {
       run: async () => {
