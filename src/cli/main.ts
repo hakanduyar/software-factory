@@ -63,6 +63,13 @@ Usage:
   sf github readiness ... [--reviewed]
                       Report whether that candidate is bound to remote state and
                       CI evidence well enough to integrate. Integrates nothing.
+  sf github sync-status --factory-db <path> --work-item <id> --run-id <id>
+                    --checkpoint <path> --repo <owner/name> --issue <n>
+                    --marker <marker> --state-dir <path> --pwsh <path>
+                    --repository-root <path>
+                      Publish the projected status (VERIFYING/REVIEW/BLOCKED) of a
+                      real work item and named run through the durable sync.
+                      Explicit operator mapping; DONE is refused. See --help.
   sf help             Show this message
 `;
 
@@ -436,10 +443,28 @@ async function main(argv: readonly string[]): Promise<number> {
     }
     case "github": {
       const sub = argv[1];
+      if (sub === "sync-status") {
+        const { parseGithubSyncStatusArgs, runGithubSyncStatus, SYNC_STATUS_HELP, SYNC_STATUS_USAGE } = await import("./githubStatus.js");
+        const rest = argv.slice(2);
+        if (rest.length === 1 && (rest[0] === "--help" || rest[0] === "-h")) {
+          console.log(SYNC_STATUS_HELP);
+          return 0;
+        }
+        const parsed = parseGithubSyncStatusArgs(rest);
+        if (!parsed.ok) {
+          console.error(parsed.error);
+          console.error(SYNC_STATUS_USAGE);
+          return 1;
+        }
+        return await runGithubSyncStatus(parsed.value, {
+          log: (line) => console.log(line),
+          error: (line) => console.error(line),
+        });
+      }
       const { parseGithubPublishArgs, runGithubPublish, runGithubReadiness } = await import("./github.js");
       const log = (line: string): void => console.log(line);
       const usage =
-        "Usage: sf github <publish|readiness> --roadmap-key <KEY> --head <SHA> --base <SHA> " +
+        "Usage: sf github <publish|readiness|sync-status> --roadmap-key <KEY> --head <SHA> --base <SHA> " +
         "--head-ref <BRANCH> --base-ref <BRANCH> --repo <owner/name> [--reviewed]";
 
       if (sub === "publish" || sub === "readiness") {
