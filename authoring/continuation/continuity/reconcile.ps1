@@ -115,17 +115,46 @@ function Test-OperationalReceiptV3 {
     } catch { return $false }
 }
 
+# OperationalRunReceipt/v4: OBSERVE_ONLY independently reviewed completion, COMPLETED only. Independently rederives the full completion proof
+# (registered records, ACK, artifact, review, captured accounting) from the receipt's embedded evidence and raw refs, then strictly compares.
+# The structural comparer never grants validity; this validator authenticates itself. Settlement evidence for the bound registered task only:
+# no dispatch grant and no general outbox publication (the generic readers below refuse v4).
+function Test-OperationalReceiptV4 {
+    param($obj)
+    try {
+        if ($null -eq $obj -or $obj -is [System.Array] -or $obj -isnot [System.Management.Automation.PSCustomObject]) { return $false }
+        $val = { param($o, [string]$n) foreach ($q in $o.PSObject.Properties) { if ([string]::Equals($q.Name, $n, [System.StringComparison]::Ordinal)) { return , $q.Value } }; return , $null }
+        . (Join-Path (Split-Path -Parent $PSScriptRoot) 'dispatch\managed-native-receipt.ps1')
+        # Cheap structural shape first; nothing is derived for a malformed DTO.
+        if (-not (Test-ManagedObserveReviewedReceiptV4Shape $obj)) { return $false }
+        # Independent rerun of the shared verifier from the embedded evidence only; callers cannot supply facts or skip authentication.
+        $vf = Get-ManagedObserveReviewedCompletionFacts -Evidence (& $val $obj 'observeReviewedCompletionEvidence')
+        if (($null -eq $vf) -or ($vf.Valid -isnot [bool]) -or (-not $vf.Valid) -or ($null -eq $vf.Facts)) { return $false }
+        $f = $vf.Facts
+        if (-not (Compare-ManagedObserveReviewedReceiptV4ToFacts $obj $f)) { return $false }
+        # Reauthenticate the referenced raw DTO with the same shared rules the adapter used; rawPath/rawSha256 cannot be swapped independently.
+        $e = & $val $obj 'evidence'
+        $rawPathV = [string](& $val $e 'rawPath')
+        $rv = Test-ManagedObserveReviewedRawDto -RawPath $rawPathV -ExpectedSha256 ([string](& $val $e 'rawSha256')) -Facts $f
+        if (($null -eq $rv) -or ($rv.Valid -isnot [bool]) -or (-not $rv.Valid) -or ($rv.Path -cne $rawPathV)) { return $false }
+        return $true
+    } catch { return $false }
+}
+
 function Test-OperationalReceipt {
     param($obj)
     try {
         if ($null -eq $obj -or $obj -is [System.Array]) { return $false }
         # Explicit v3 dispatch by metadata only; a v3 annotation on any other schema, or a wrong-case v3 schema, refuses and never falls back to v1/v2.
         $v3Member = $obj.PSObject.Properties['schemaVersion']
-        $v3Names = @($obj.PSObject.Properties | Where-Object { @('observePendingAccountingEvidence', 'observePendingAccounting', 'outputStopMode') -contains [string]$_.Name })
+        $v3Names = @($obj.PSObject.Properties | Where-Object { @('observePendingAccountingEvidence', 'observePendingAccounting', 'outputStopMode', 'observeReviewedCompletionEvidence', 'observeReviewedCompletion') -contains [string]$_.Name })
         $isV3 = ($null -ne $v3Member) -and ($v3Member.MemberType -eq [System.Management.Automation.PSMemberTypes]::NoteProperty) -and ($v3Member.Value -is [string]) -and ($v3Member.Value -ceq 'OperationalRunReceipt/v3')
         if ($isV3) { return (Test-OperationalReceiptV3 $obj) }
+        # Explicit v4 dispatch by metadata only, exactly like v3: never falls back to v1/v2, and a wrong-case v4 schema refuses.
+        $isV4 = ($null -ne $v3Member) -and ($v3Member.MemberType -eq [System.Management.Automation.PSMemberTypes]::NoteProperty) -and ($v3Member.Value -is [string]) -and ($v3Member.Value -ceq 'OperationalRunReceipt/v4')
+        if ($isV4) { return (Test-OperationalReceiptV4 $obj) }
         if ($v3Names.Count -gt 0) { return $false }
-        if (($null -ne $v3Member) -and ($v3Member.Value -is [string]) -and ($v3Member.Value -ilike 'OperationalRunReceipt/v3*')) { return $false }
+        if (($null -ne $v3Member) -and ($v3Member.Value -is [string]) -and (($v3Member.Value -ilike 'OperationalRunReceipt/v3*') -or ($v3Member.Value -ilike 'OperationalRunReceipt/v4*'))) { return $false }
         # Inspect schemaVersion metadata before any value read; a non-NoteProperty (e.g. ScriptProperty) getter is never executed.
         $svMember = $obj.PSObject.Properties['schemaVersion']
         # Optional aggregate advisory evidence: detected by metadata only (no getter run); never silently ignored, never valid on v2.
@@ -294,6 +323,8 @@ function Read-ReceiptFiles {
         } catch { $invalid++; continue }
         # v3 observe-only pending receipts have no supported downstream consumer here; they are counted invalid, never outboxed.
         if (($obj -is [System.Management.Automation.PSCustomObject]) -and ($null -ne $obj.PSObject.Properties['schemaVersion']) -and ($obj.schemaVersion -is [string]) -and ($obj.schemaVersion -ilike 'OperationalRunReceipt/v3*')) { $invalid++; continue }
+        # v4 reviewed-completion receipts are settlement evidence only; there is no implicit publication or adoption through the generic outbox.
+        if (($obj -is [System.Management.Automation.PSCustomObject]) -and ($null -ne $obj.PSObject.Properties['schemaVersion']) -and ($obj.schemaVersion -is [string]) -and ($obj.schemaVersion -ilike 'OperationalRunReceipt/v4*')) { $invalid++; continue }
         if (-not (Test-OperationalReceipt $obj)) { $invalid++; continue }
         $out += $obj
     }
@@ -307,7 +338,7 @@ function Read-Outbox {
     if ([string]::IsNullOrWhiteSpace($raw)) { return @() }
     $arr = ConvertFrom-Json -InputObject $raw -NoEnumerate
     if ($null -eq $arr) { throw "Outbox at '$OutboxPath' parsed to null; failing closed." }
-    if ($arr.PSObject.Properties.Name -contains 'schemaVersion' -and @('OperationalRunReceipt/v1','OperationalRunReceipt/v2','OperationalRunReceipt/v3') -contains $arr.schemaVersion) {
+    if ($arr.PSObject.Properties.Name -contains 'schemaVersion' -and @('OperationalRunReceipt/v1','OperationalRunReceipt/v2','OperationalRunReceipt/v3','OperationalRunReceipt/v4') -contains $arr.schemaVersion) {
         throw "Outbox at '$OutboxPath' resembles an OperationalRunReceipt/v1 or v2 object; refusing to risk receipt overwrite."
     }
     if ($arr -isnot [System.Array]) { $arr = @($arr) }
@@ -315,7 +346,7 @@ function Read-Outbox {
     $isInt = { param($v) if ($null -eq $v -or $v -is [bool] -or $v -is [string]) { return $false }; if (($v -is [double] -or $v -is [float] -or $v -is [decimal]) -and ($v -ne [math]::Truncate($v))) { return $false }; try { [void][int64]$v } catch { return $false }; return $true }
     foreach ($e in $arr) {
         if ($null -eq $e -or $e -is [System.Array]) { throw "Outbox contains a malformed event; failing closed." }
-        if ($e.PSObject.Properties.Name -contains 'schemaVersion' -and @('OperationalRunReceipt/v1','OperationalRunReceipt/v2','OperationalRunReceipt/v3') -contains $e.schemaVersion) {
+        if ($e.PSObject.Properties.Name -contains 'schemaVersion' -and @('OperationalRunReceipt/v1','OperationalRunReceipt/v2','OperationalRunReceipt/v3','OperationalRunReceipt/v4') -contains $e.schemaVersion) {
             throw "Outbox event resembles an OperationalRunReceipt/v1 or v2 object; refusing to risk receipt overwrite."
         }
         foreach ($f in @('taskId','runId','destination','status','payloadSha256','attempt','key','deliveryStatus')) {

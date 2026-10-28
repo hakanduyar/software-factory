@@ -1815,6 +1815,339 @@ function Test-ManagedObservePendingRawDto {
     }
 }
 
+function Get-ManagedObserveReviewedCompletionFacts {
+    # Read-only. Authenticates ONE registered, independently reviewed OBSERVE_ONLY completion for an already-captured pending-accounting run.
+    # The pending accounting facts (strict readers, captured SDK recount) are derived by Get-ManagedObservePendingAccountingFacts; the registered
+    # records (registration18, terminalBinding16, reviewCompletion9, request/core/ACK/artifact/projection) are authenticated by the installed
+    # Get-RegisteredReviewReplayContext predicate. That predicate only type-checks its handler argument; the placeholder passed here is never
+    # invoked for authentication and throws if anything ever does. No caller fact, PASS string, artifact presence or SDK success alone completes
+    # a task. Refs outside the controller evidence boundary, stale refs, ACK-false runs, absent artifacts and mismatched identities refuse; an
+    # unobservable resource state is UNKNOWN, never zero usage. Grants no dispatch, no outbox publication and no approval.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowNull()]$Evidence)
+    Set-StrictMode -Version Latest
+    $ord = [System.StringComparison]::Ordinal
+    $ordIc = [System.StringComparison]::OrdinalIgnoreCase
+    $note = [System.Management.Automation.PSMemberTypes]::NoteProperty
+    $fail = { param([string]$c) throw [System.InvalidOperationException]::new('REFUSE:' + $c) }
+    $unknown = { param([string]$c) throw [System.InvalidOperationException]::new('UNKNOWN:' + $c) }
+    $isHex = { param($v) ($v -is [string]) -and ($v -cmatch '^[0-9a-f]{64}\z') }
+    $clean = { param($v, [string]$d) if (($v -is [string]) -and ($v -cmatch '^[A-Z0-9_]{1,48}\z')) { return $v }; return $d }
+    $get = {
+        param($o, [string]$n, [string]$c)
+        if ($o -isnot [System.Management.Automation.PSCustomObject]) { & $fail $c }
+        foreach ($q in $o.PSObject.Properties) { if (($q.MemberType -eq $note) -and [string]::Equals($q.Name, $n, $ord)) { return , $q.Value } }
+        & $fail $c
+    }
+    $exact = {
+        param($o, [string[]]$names, [string]$c)
+        if ($o -isnot [System.Management.Automation.PSCustomObject]) { & $fail $c }
+        $ps = @($o.PSObject.Properties)
+        if ($ps.Count -ne $names.Count) { & $fail $c }
+        foreach ($q in $ps) { if (($q.MemberType -ne $note) -or ($names -cnotcontains [string]$q.Name)) { & $fail $c } }
+    }
+    $same = { param($a, $b) ($a -is [string]) -and ($b -is [string]) -and [string]::Equals($a, $b, $ord) }
+    $sameIc = { param($a, $b) ($a -is [string]) -and ($b -is [string]) -and [string]::Equals($a, $b, $ordIc) }
+    $refOf = {
+        param($r)
+        & $exact $r @('path', 'sha256') 'OBSRC_REF_SHAPE'
+        $p = & $get $r 'path' 'OBSRC_REF_SHAPE'
+        $s = & $get $r 'sha256' 'OBSRC_REF_PIN'
+        if (($p -isnot [string]) -or ($p.Length -eq 0) -or ($p.IndexOf([char]0) -ge 0) -or (-not [System.IO.Path]::IsPathFullyQualified($p)) -or (-not [string]::Equals([System.IO.Path]::GetFullPath($p), $p, $ord))) { & $fail 'OBSRC_REF_PATH' }
+        if (-not (& $isHex $s)) { & $fail 'OBSRC_REF_PIN' }
+        return @{ path = [string]$p; sha256 = [string]$s }
+    }
+    $refDto = { param($r) [pscustomobject]([ordered]@{ path = [string]$r.path; sha256 = [string]$r.sha256 }) }
+
+    try {
+        & $exact $Evidence @('schema', 'accountingEvidence', 'registrationRef', 'terminalBindingRef', 'reviewCompletionRef') 'OBSRC_EVIDENCE_SHAPE'
+        $evSchema = & $get $Evidence 'schema' 'OBSRC_EVIDENCE_SHAPE'
+        if (($evSchema -isnot [string]) -or ($evSchema -cne 'ManagedObserveReviewedCompletionEvidence/v1')) { & $fail 'OBSRC_EVIDENCE_SCHEMA' }
+        $acctEvidence = & $get $Evidence 'accountingEvidence' 'OBSRC_EVIDENCE_SHAPE'
+        $regRef = & $refOf (& $get $Evidence 'registrationRef' 'OBSRC_EVIDENCE_SHAPE')
+        $tbRef = & $refOf (& $get $Evidence 'terminalBindingRef' 'OBSRC_EVIDENCE_SHAPE')
+        $rcRef = & $refOf (& $get $Evidence 'reviewCompletionRef' 'OBSRC_EVIDENCE_SHAPE')
+        # Three distinct records: the same path or pin can never stand in for another role.
+        if (($regRef.path -ieq $tbRef.path) -or ($regRef.path -ieq $rcRef.path) -or ($tbRef.path -ieq $rcRef.path)) { & $fail 'OBSRC_REF_DUPLICATE' }
+
+        # ---- trusted sibling declarations only ----
+        try {
+            . (Join-Path $PSScriptRoot 'native-ticket-contract.ps1')
+            . (Join-Path $PSScriptRoot 'managed-native-sdk-observation.ps1')
+            . (Join-Path $PSScriptRoot 'managed-native-output-observation.ps1')
+            . (Join-Path (Split-Path -Parent $PSScriptRoot) 'runner\launch.ps1')
+            . (Join-Path (Split-Path -Parent $PSScriptRoot) 'continuity\reconcile.ps1')
+            . (Join-Path (Join-Path (Split-Path -Parent $PSScriptRoot) 'host-continuation') 'registered-review-replay-context.ps1')
+        } catch { & $fail 'OBSRC_SIBLING_UNAVAILABLE' }
+
+        # Pending accounting: authenticated strict readers + captured SDK recount. UNKNOWN stays UNKNOWN.
+        $pendingOf = {
+            $r = Get-ManagedObservePendingAccountingFacts -Evidence $acctEvidence
+            if ((@($r).Count -ne 1) -or ($r -isnot [System.Management.Automation.PSCustomObject])) { & $fail 'OBSRC_PENDING_SHAPE' }
+            $valid = & $get $r 'Valid' 'OBSRC_PENDING_SHAPE'
+            if ($valid -isnot [bool]) { & $fail 'OBSRC_PENDING_SHAPE' }
+            if (-not $valid) {
+                if (($null -ne $r.PSObject.Properties['Status']) -and ($r.Status -ceq 'UNKNOWN')) { & $unknown (& $clean $r.Reason 'PENDING_UNKNOWN') }
+                & $fail (& $clean (& $get $r 'Code' 'OBSRC_PENDING_SHAPE') 'OBSRC_PENDING_REFUSED')
+            }
+            $facts = & $get $r 'Facts' 'OBSRC_PENDING_SHAPE'
+            if ($facts -isnot [System.Management.Automation.PSCustomObject]) { & $fail 'OBSRC_PENDING_SHAPE' }
+            return , $facts
+        }
+        $captureOf = {
+            param($cur)
+            $r = Get-ManagedNativeCapturedFacts -ManifestPath ([string]$cur.manifestPath) -ExpectedManifestSha256 ([string]$cur.manifestSha256) -TerminalPath ([string]$cur.terminalPath) -ExpectedTerminalSha256 ([string]$cur.terminalSha256) -TicketPath ([string]$cur.ticketPath) -RunId ([string]$cur.runId) -Attempt ([int][long]$cur.attempt) -ForOutputObservation
+            if ((@($r).Count -ne 1) -or ($r -isnot [System.Management.Automation.PSCustomObject])) { & $fail 'OBSRC_CAPTURE_SHAPE' }
+            $code = & $get $r 'Code' 'OBSRC_CAPTURE_SHAPE'
+            if ($code -ceq 'OBSERVE_ONLY_CAPTURE_UNKNOWN') { & $unknown 'CAPTURE_UNKNOWN' }
+            if (($code -cne 'OBSERVE_ONLY_TRANSPORT_CAPTURE') -or ((& $get $r 'Valid' 'OBSRC_CAPTURE_SHAPE') -isnot [bool]) -or (& $get $r 'Valid' 'OBSRC_CAPTURE_SHAPE')) { & $fail (& $clean $code 'OBSRC_CAPTURE_REFUSED') }
+            $oc = & $get $r 'ObservationCapture' 'OBSRC_CAPTURE_SHAPE'
+            if ($oc -isnot [System.Management.Automation.PSCustomObject]) { & $fail 'OBSRC_CAPTURE_SHAPE' }
+            return , $oc
+        }
+
+        $pf = & $pendingOf
+        $cur = $pf.evidence.current
+        $cap1 = & $captureOf $cur
+        $core1 = & $get $cap1 'Core' 'OBSRC_CAPTURE_SHAPE'
+        $wd = & $get $core1 'workingDirectory' 'OBSRC_CAPTURE_SHAPE'
+        if (($wd -isnot [string]) -or ($wd.Length -eq 0)) { & $fail 'OBSRC_CAPTURE_SHAPE' }
+        $controlRoot = [IO.Path]::Combine($wd, '.factory-data', 'chief', 'controller-runtime', 'control')
+
+        # Every ref must be a pinned ordinary file inside the controller evidence boundary (strict descendant of ControlRoot, no reparse point).
+        $readRefs = {
+            foreach ($rf in @($regRef, $tbRef, $rcRef)) {
+                $x = $null
+                try { $x = Read-ManagedPinnedEvidenceJson -Reference ([pscustomobject]@{ path = $rf.path; sha256 = $rf.sha256 }) -ControlRoot $controlRoot } catch { $x = $null }
+                if (($null -eq $x) -or ($x.Sha256 -cne $rf.sha256) -or ($x.Path -cne $rf.path)) { & $fail 'OBSRC_REF_UNREADABLE' }
+            }
+        }
+        & $readRefs
+
+        $noHandler = { throw 'OBSRC_HANDLER_NOT_AUTHORITY' }
+        $ctxOf = {
+            $c = $null
+            try {
+                $c = Get-RegisteredReviewReplayContext -RegistrationPath $regRef.path -ExpectedRegistrationSha256 $regRef.sha256 -ExpectedTerminalBindingSha256 $tbRef.sha256 -ExpectedReviewCompletionSha256 $rcRef.sha256 -OnReviewedTerminal $noHandler
+            } catch {
+                if ([string]::Equals([string]$_.Exception.Message, 'REVIEW_PENDING', $ord)) { & $fail 'OBSRC_REVIEW_PENDING' }
+                & $fail 'OBSRC_REGISTERED_RECORD'
+            }
+            if (($c -isnot [System.Management.Automation.PSCustomObject]) -or ((& $get $c 'schema' 'OBSRC_CONTEXT_SHAPE') -cne 'RegisteredReviewReplayContext/v1')) { & $fail 'OBSRC_CONTEXT_SHAPE' }
+            return , $c
+        }
+        $ctx = & $ctxOf
+        $binding = & $get $ctx 'binding' 'OBSRC_CONTEXT_SHAPE'
+        $reg = $binding.prelaunch.registration
+        $tb = $binding.terminalBinding
+        $rc = $binding.reviewCompletion
+        $request = $ctx.request
+        $ackCtx = $ctx.startAcknowledgementContext
+        $claim = $ackCtx.SelectedClaim
+
+        # Refs bind exactly the records the registration names; the pins are the verified whole-file hashes.
+        if (-not ((& $same $binding.registrationFileSha256 $regRef.sha256) -and (& $same $binding.terminalBindingFileSha256 $tbRef.sha256) -and (& $same $binding.reviewCompletionFileSha256 $rcRef.sha256))) { & $fail 'OBSRC_REF_PIN_MISMATCH' }
+        if (-not ((& $same $reg.terminalBindingPath $tbRef.path) -and (& $same $reg.reviewCompletionPath $rcRef.path))) { & $fail 'OBSRC_REF_PATH_MISMATCH' }
+
+        # Observe-only request profile with exact null stream cap; no token policy and no structured-output enforcement.
+        if ((-not $request.ContainsKey('OutputStopProfile')) -or (-not (& $same $request['OutputStopProfile'] 'observe-only-v1'))) { & $fail 'OBSRC_REQUEST_PROFILE' }
+        if ((-not $request.ContainsKey('MaxStreamBytes')) -or ($null -ne $request['MaxStreamBytes'])) { & $fail 'OBSRC_REQUEST_STREAM' }
+        if ($request.ContainsKey('TokenAccountingPolicy') -or $request.ContainsKey('StructuredOutputProfile')) { & $fail 'OBSRC_REQUEST_PROFILE' }
+
+        # Same current8 / same captured request-core as the accounting; raw request-file SHA and canonical request SHA stay distinct.
+        $id = $pf.identity
+        $refs = $pf.references
+        if (-not ((& $same ([string]$id.runId) $reg.taskId) -and ([long]$id.attempt -eq [long]$reg.attempt))) { & $fail 'OBSRC_IDENTITY_MISMATCH' }
+        if (-not ((& $same ([string]$id.taskId) $ackCtx.TaskId) -and (& $same ([string]$id.payloadSha256) $reg.payloadSha256))) { & $fail 'OBSRC_IDENTITY_MISMATCH' }
+        if (-not ((& $sameIc ([string]$refs.ticket.path) $reg.ticketPath) -and (& $same ([string]$refs.ticket.verifiedSha256) $reg.ticketSha256))) { & $fail 'OBSRC_TICKET_MISMATCH' }
+        if (-not ((& $sameIc ([string]$refs.manifest.path) $tb.manifestPath) -and (& $same ([string]$refs.manifest.verifiedSha256) $tb.manifestSha256) -and (& $same ([string]$refs.manifest.expectedSha256) $tb.manifestSha256))) { & $fail 'OBSRC_MANIFEST_MISMATCH' }
+        if (-not ((& $sameIc ([string]$refs.terminal.path) $tb.terminalPath) -and (& $same ([string]$refs.terminal.verifiedSha256) $tb.terminalSha256) -and (& $same ([string]$refs.terminal.expectedSha256) $tb.terminalSha256))) { & $fail 'OBSRC_TERMINAL_MISMATCH' }
+        if (-not (& $same ([string]$pf.accounting.requestSha256) $tb.requestSha256)) { & $fail 'OBSRC_REQUEST_MISMATCH' }
+        if (-not (& $same ([string]$cap1.RequestSha256) $tb.requestSha256)) { & $fail 'OBSRC_REQUEST_MISMATCH' }
+        if (-not (& $same ([string]$cap1.StartSha256) $tb.startSha256)) { & $fail 'OBSRC_START_MISMATCH' }
+        if (-not (& $same ([string]$pf.timing.startUtc) ([string]$cap1.Start.startTimeUtc))) { & $fail 'OBSRC_START_MISMATCH' }
+        if (([long]$cap1.Pid -ne [long]$id.pid) -or ([long]$cap1.Start.pid -ne [long]$id.pid)) { & $fail 'OBSRC_START_MISMATCH' }
+        # Present artifact: the captured terminal artifact is the registered candidate, hash-pinned by the verified terminal binding.
+        if (-not ((& $same ([string]$refs.artifactState) 'PRESENT') -and (& $same ([string]$cap1.ArtifactState) 'PRESENT') -and (& $sameIc ([string]$cap1.ArtifactPath) $tb.candidatePath) -and (& $sameIc $tb.candidatePath $reg.candidatePath))) { & $fail 'OBSRC_ARTIFACT_MISMATCH' }
+        if (-not ((& $same $rc.candidateSha256 $tb.candidateSha256) -and (& $same $rc.terminalSha256 $tb.terminalSha256) -and (& $same $rc.terminalBindingSha256 $tbRef.sha256) -and (& $same $rc.registrationSha256 $regRef.sha256))) { & $fail 'OBSRC_REVIEW_BINDING' }
+        if (-not (& $same $rc.verdict 'PASS_SCOPED')) { & $fail 'OBSRC_REVIEW_VERDICT' }
+        $stateFile = [IO.Path]::Combine([string]$ackCtx.StateDir, 'continuation-state.json')
+        if (-not (& $sameIc ([IO.Path]::GetFullPath([string]$claim.statePath)) $stateFile)) { & $fail 'OBSRC_CLAIM_STATE' }
+
+        # ---- stability: registered records, refs, accounting and artifact are re-read after every other read ----
+        $ctx2 = & $ctxOf
+        if (-not (& $same ([string]$ctx2.fingerprint) ([string]$ctx.fingerprint))) { & $fail 'OBSRC_STALE_PROOF' }
+        & $readRefs
+        $pf2 = & $pendingOf
+        if ((ConvertTo-Json -InputObject $pf2 -Depth 12 -Compress) -cne (ConvertTo-Json -InputObject $pf -Depth 12 -Compress)) { & $fail 'OBSRC_STALE_ACCOUNTING' }
+        $cap2 = & $captureOf $pf2.evidence.current
+        if (-not ((& $same ([string]$cap2.ArtifactState) ([string]$cap1.ArtifactState)) -and (& $same ([string]$cap2.ArtifactPath) ([string]$cap1.ArtifactPath)) -and (& $same ([string]$cap2.TerminalSha256) ([string]$cap1.TerminalSha256)) -and (& $same ([string]$cap2.StartSha256) ([string]$cap1.StartSha256)))) { & $fail 'OBSRC_STALE_CAPTURE' }
+
+        $claimDto = [pscustomobject]([ordered]@{ id = [string]$claim.id; owner = [string]$claim.owner; claimId = [string]$claim.claimId; intentId = [string]$claim.intentId; receiptSha = [string]$claim.receiptSha; planSha = [string]$claim.planSha; statePath = [string]$claim.statePath })
+        $proof = [pscustomobject]([ordered]@{
+            schema = 'ManagedObserveReviewedCompletion/v1'
+            registrationRef = (& $refDto $regRef)
+            terminalBindingRef = (& $refDto $tbRef)
+            reviewCompletionRef = (& $refDto $rcRef)
+            registrationId = [string]$reg.registrationId
+            claim = $claimDto
+            stateDir = [string]$ackCtx.StateDir
+            taskId = [string]$id.taskId
+            runId = [string]$id.runId
+            attempt = [long]$id.attempt
+            pid = [long]$id.pid
+            startIdentity = [string]$pf.timing.startUtc
+            requestRawSha256 = [string]$reg.requestSha256
+            requestSha256 = [string]$tb.requestSha256
+            ticketSha256 = [string]$reg.ticketSha256
+            payloadSha256 = [string]$reg.payloadSha256
+            manifestSha256 = [string]$tb.manifestSha256
+            startSha256 = [string]$tb.startSha256
+            terminalSha256 = [string]$tb.terminalSha256
+            candidatePath = [string]$tb.candidatePath
+            candidateSha256 = [string]$tb.candidateSha256
+            reviewPath = [string]$rc.reviewPath
+            reviewSha256 = [string]$rc.reviewSha256
+            verdict = 'PASS_SCOPED'
+            ackSnapshotPath = [string]$tb.ackPath
+            ackSnapshotSha256 = [string]$tb.ackSha256
+            ackMode = $true
+            onStartedAcknowledged = $true
+            fingerprint = [string]$ctx.fingerprint
+            noDispatch = $true
+            noOutboxPublication = $true
+        })
+        $normEvidence = [pscustomobject]([ordered]@{
+            schema = 'ManagedObserveReviewedCompletionEvidence/v1'
+            accountingEvidence = $pf.evidence
+            registrationRef = (& $refDto $regRef)
+            terminalBindingRef = (& $refDto $tbRef)
+            reviewCompletionRef = (& $refDto $rcRef)
+        })
+        $paths = [System.Collections.Generic.List[string]]::new()
+        foreach ($ip in @($pf.inputPaths)) { $paths.Add([string]$ip) }
+        foreach ($ip in @($regRef.path, $tbRef.path, $rcRef.path, [string]$tb.candidatePath, [string]$rc.reviewPath, [string]$tb.ackPath, [string]$reg.requestPath, [string]$tb.startPath)) { $paths.Add($ip) }
+        $facts = [pscustomobject]([ordered]@{
+            schema = 'ManagedObserveReviewedCompletionFacts/v1'
+            evidence = $normEvidence
+            pending = $pf
+            proof = $proof
+            inputPaths = @($paths.ToArray())
+            noDispatch = $true; noOutboxPublication = $true
+        })
+        return [pscustomobject]@{ Valid = $true; Code = $null; Result = 'REVIEWED_COMPLETION'; Facts = $facts }
+    }
+    catch {
+        $m = [string]$_.Exception.Message
+        if ($m.StartsWith('UNKNOWN:', $ord) -and ($m.Length -le 56) -and ($m.Substring(8) -cmatch '^[A-Z0-9_]{1,48}$')) {
+            return [pscustomobject]@{ Valid = $false; Code = 'OBSERVE_COMPLETION_UNKNOWN'; Result = 'NONRECEIPT'; Status = 'UNKNOWN'; Reason = $m.Substring(8); Facts = $null }
+        }
+        $code = 'OBSRC_UNEXPECTED_ERROR'
+        if ($m.StartsWith('REFUSE:', $ord) -and ($m.Length -le 55) -and ($m.Substring(7) -cmatch '^[A-Z0-9_]{1,48}$')) { $code = $m.Substring(7) }
+        return [pscustomobject]@{ Valid = $false; Code = $code; Result = 'REFUSED'; Facts = $null }
+    }
+}
+
+function Test-ManagedObserveReviewedReceiptV4Shape {
+    # Pure structural check of a stored OperationalRunReceipt/v4 DTO. It derives nothing, authenticates nothing and confers no validity.
+    param($obj)
+    try {
+        if ($null -eq $obj -or $obj -is [System.Array] -or $obj -isnot [System.Management.Automation.PSCustomObject]) { return $false }
+        $note = [System.Management.Automation.PSMemberTypes]::NoteProperty
+        $ord = [System.StringComparison]::Ordinal
+        $isInt = { param($v) ($v -is [int]) -or ($v -is [long]) }
+        $isHex = { param($v) ($v -is [string]) -and ($v -cmatch '^[0-9a-f]{64}\z') }
+        $exact = {
+            param($o, [string[]]$names)
+            if ($o -isnot [System.Management.Automation.PSCustomObject]) { return $false }
+            $ps = @($o.PSObject.Properties)
+            if ($ps.Count -ne $names.Count) { return $false }
+            foreach ($q in $ps) { if (($q.MemberType -ne $note) -or ($names -cnotcontains [string]$q.Name)) { return $false } }
+            return $true
+        }
+        $val = { param($o, [string]$n) foreach ($q in $o.PSObject.Properties) { if ([string]::Equals($q.Name, $n, $ord)) { return , $q.Value } }; return , $null }
+        $isStr = { param($v) ($v -is [string]) -and ($v.Length -gt 0) }
+
+        if (-not (& $exact $obj @('schemaVersion', 'runId', 'taskId', 'payloadSha256', 'destination', 'status', 'attempt', 'sessionId', 'historyVerified', 'budget', 'provider', 'artifact', 'updatedAt', 'evidence', 'outputStopMode', 'observeReviewedCompletionEvidence', 'observePendingAccounting', 'observeReviewedCompletion'))) { return $false }
+        if (((& $val $obj 'schemaVersion') -isnot [string]) -or ((& $val $obj 'schemaVersion') -cne 'OperationalRunReceipt/v4')) { return $false }
+        if (((& $val $obj 'status') -isnot [string]) -or ((& $val $obj 'status') -cne 'COMPLETED')) { return $false }
+        if (((& $val $obj 'outputStopMode') -isnot [string]) -or ((& $val $obj 'outputStopMode') -cne 'OBSERVE_ONLY')) { return $false }
+        if (((& $val $obj 'destination') -isnot [string]) -or ((& $val $obj 'destination') -cne 'Anthropic Claude')) { return $false }
+        # Selected accounting lineage is not a universal history certification.
+        $hv = & $val $obj 'historyVerified'
+        if (($hv -isnot [bool]) -or $hv) { return $false }
+        foreach ($n in @('runId', 'taskId', 'sessionId', 'updatedAt')) { if (-not (& $isStr (& $val $obj $n))) { return $false } }
+        if (-not (& $isHex (& $val $obj 'payloadSha256'))) { return $false }
+        $attempt = & $val $obj 'attempt'
+        if ((-not (& $isInt $attempt)) -or ([long]$attempt -lt 1)) { return $false }
+
+        $b = & $val $obj 'budget'
+        $p = & $val $obj 'provider'
+        $a = & $val $obj 'artifact'
+        $e = & $val $obj 'evidence'
+        if (-not ((& $exact $b @('maxOutputTokens', 'maxElapsedMs', 'maxAttempts', 'usedElapsedMs', 'usedOutputTokens', 'attemptsUsed', 'softFraction')) -and (& $exact $p @('startIdentity', 'sessionId', 'terminalReason', 'pid')) -and (& $exact $a @('complete', 'sha256', 'path')) -and (& $exact $e @('rawPath', 'rawSha256', 'ticketPath', 'ticketSha256', 'usagePath', 'usageSha256', 'nativeThinkingTokens')))) { return $false }
+        if (($null -ne (& $val $b 'maxOutputTokens')) -or ($null -ne (& $val $b 'softFraction'))) { return $false }
+        foreach ($n in @('maxElapsedMs', 'maxAttempts', 'usedElapsedMs', 'usedOutputTokens', 'attemptsUsed')) { if (-not (& $isInt (& $val $b $n))) { return $false } }
+        if (([long](& $val $b 'maxElapsedMs') -le 0) -or ([long](& $val $b 'maxAttempts') -le 0) -or ([long](& $val $b 'usedElapsedMs') -lt 0) -or ([long](& $val $b 'usedOutputTokens') -lt 0)) { return $false }
+        if (([long](& $val $b 'attemptsUsed') -ne [long]$attempt) -or ([long]$attempt -gt [long](& $val $b 'maxAttempts')) -or ([long](& $val $b 'usedElapsedMs') -gt [long](& $val $b 'maxElapsedMs'))) { return $false }
+        if (-not (& $isStr (& $val $p 'startIdentity'))) { return $false }
+        if ((-not (& $isStr (& $val $p 'sessionId'))) -or ((& $val $p 'sessionId') -cne (& $val $obj 'sessionId')) -or (-not (& $isStr (& $val $p 'terminalReason')))) { return $false }
+        if ((-not (& $isInt (& $val $p 'pid'))) -or ([long](& $val $p 'pid') -le 0)) { return $false }
+        $ac = & $val $a 'complete'
+        if (($ac -isnot [bool]) -or (-not $ac) -or (-not (& $isHex (& $val $a 'sha256'))) -or (-not (& $isStr (& $val $a 'path')))) { return $false }
+        foreach ($n in @('rawPath', 'ticketPath', 'usagePath')) { if (-not (& $isStr (& $val $e $n))) { return $false } }
+        foreach ($n in @('rawSha256', 'ticketSha256', 'usageSha256')) { if (-not (& $isHex (& $val $e $n))) { return $false } }
+        if ($null -ne (& $val $e 'nativeThinkingTokens')) { return $false }
+        $ce = & $val $obj 'observeReviewedCompletionEvidence'
+        if (-not (& $exact $ce @('schema', 'accountingEvidence', 'registrationRef', 'terminalBindingRef', 'reviewCompletionRef'))) { return $false }
+        if (((& $val $ce 'schema') -isnot [string]) -or ((& $val $ce 'schema') -cne 'ManagedObserveReviewedCompletionEvidence/v1')) { return $false }
+        foreach ($n in @('registrationRef', 'terminalBindingRef', 'reviewCompletionRef')) {
+            $rf = & $val $ce $n
+            if ((-not (& $exact $rf @('path', 'sha256'))) -or (-not (& $isStr (& $val $rf 'path'))) -or (-not (& $isHex (& $val $rf 'sha256')))) { return $false }
+        }
+        if (((& $val $obj 'observePendingAccounting') -isnot [System.Management.Automation.PSCustomObject]) -or ((& $val $obj 'observeReviewedCompletion') -isnot [System.Management.Automation.PSCustomObject]) -or ((& $val $ce 'accountingEvidence') -isnot [System.Management.Automation.PSCustomObject])) { return $false }
+        return $true
+    } catch { return $false }
+}
+
+function Compare-ManagedObserveReviewedReceiptV4ToFacts {
+    # STRUCTURAL ONLY: compares one stored v4 receipt DTO to facts the CALLER derived itself from raw authenticated captures and records.
+    # It never reads evidence, never authenticates and confers no receipt validity, settlement or dispatch authority; callers must derive the
+    # facts internally (Get-ManagedObserveReviewedCompletionFacts) and reauthenticate the raw DTO themselves.
+    param($obj, $f)
+    try {
+        if ($null -eq $obj -or $obj -is [System.Array] -or $obj -isnot [System.Management.Automation.PSCustomObject]) { return $false }
+        if (($null -eq $f) -or ($f -isnot [System.Management.Automation.PSCustomObject])) { return $false }
+        $ord = [System.StringComparison]::Ordinal
+        $val = { param($o, [string]$n) foreach ($q in $o.PSObject.Properties) { if ([string]::Equals($q.Name, $n, $ord)) { return , $q.Value } }; return , $null }
+        $p = $f.pending
+        $pr = $f.proof
+        # Shared identity, limits, accounting and evidence comparison with the v3 pending facts the proof is bound to.
+        if (-not (Compare-ManagedObservePendingReceiptV3ToFacts $obj $p)) { return $false }
+        $prov = & $val $obj 'provider'
+        $art = & $val $obj 'artifact'
+        if (((& $val $prov 'startIdentity') -cne [string]$p.timing.startUtc) -or ((& $val $prov 'startIdentity') -cne [string]$pr.startIdentity)) { return $false }
+        if (((& $val $art 'complete') -isnot [bool]) -or (-not (& $val $art 'complete'))) { return $false }
+        if (((& $val $art 'path') -cne [string]$pr.candidatePath) -or ((& $val $art 'sha256') -cne [string]$pr.candidateSha256)) { return $false }
+        if ((ConvertTo-Json -InputObject (& $val $obj 'observeReviewedCompletionEvidence') -Depth 8 -Compress) -cne (ConvertTo-Json -InputObject $f.evidence -Depth 8 -Compress)) { return $false }
+        if ((ConvertTo-Json -InputObject (& $val $obj 'observeReviewedCompletion') -Depth 8 -Compress) -cne (ConvertTo-Json -InputObject $pr -Depth 8 -Compress)) { return $false }
+        return $true
+    } catch { return $false }
+}
+
+function Test-ManagedObserveReviewedRawDto {
+    # Read-only. Same raw-DTO cross-check as the pending path, additionally refusing any collision with the registered proof paths.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$RawPath,
+        [AllowNull()][AllowEmptyString()][string]$ExpectedSha256,
+        [Parameter(Mandatory)]$Facts
+    )
+    $p = $Facts.pending
+    $shim = [pscustomobject]([ordered]@{ identity = $p.identity; timing = $p.timing; accounting = $p.accounting; inputPaths = @($Facts.inputPaths) })
+    return Test-ManagedObservePendingRawDto -RawPath $RawPath -ExpectedSha256 $ExpectedSha256 -Facts $shim
+}
+
 function Invoke-ManagedNativePendingReceipt {
     [CmdletBinding()]
     param(

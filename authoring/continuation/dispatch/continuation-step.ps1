@@ -280,6 +280,10 @@ function Invoke-ContinuationStep {
             $rsv = $rp.PSObject.Properties['schemaVersion']
             if ($null -ne $rsv -and $rsv.Value -is [string] -and $rsv.Value -ilike 'OperationalRunReceipt/v3*') { $receiptIsV3 = $true }
             if (@($rp.PSObject.Properties | Where-Object { @('observePendingAccountingEvidence', 'observePendingAccounting', 'outputStopMode') -contains [string]$_.Name }).Count -gt 0) { $receiptIsV3 = $true }
+            # A v4 reviewed-completion receipt is terminal settlement evidence only; it is never queue, allocation or pending-accounting input.
+            if (($null -ne $rsv -and $rsv.Value -is [string] -and $rsv.Value -ilike 'OperationalRunReceipt/v4*') -or (@($rp.PSObject.Properties | Where-Object { @('observeReviewedCompletionEvidence', 'observeReviewedCompletion') -contains [string]$_.Name }).Count -gt 0)) {
+                throw 'Reviewed-completion v4 receipt is settlement evidence only and cannot be continuation input.'
+            }
         }
     }
     $observeMode = $false
@@ -549,6 +553,7 @@ function Complete-ContinuationClaim {
     # Opt-in v2 BLOCKED path: capture once, before any StateDir IO; only returned values are used afterwards.
     $hasBlocked = $PSBoundParameters.ContainsKey('ExpectedBlockedReview')
     $blockedInputs = $null
+    $isV4 = $false
     if ($hasBlocked) {
         $blockedInputs = Get-VerifiedBlockedSettlementInputs -ExpectedBlockedReview $ExpectedBlockedReview -TerminalReceiptPath ([System.IO.Path]::GetFullPath($TerminalReceiptPath)) -TerminalSha256 $TerminalSha256.ToLowerInvariant()
         if ($null -eq $blockedInputs -or $blockedInputs.schema -cne 'VerifiedBlockedSettlementInputs/v1') { throw "Blocked settlement inputs not verified; refusing to settle." }
@@ -586,6 +591,13 @@ function Complete-ContinuationClaim {
     if ([string]::IsNullOrWhiteSpace($terminalRaw)) { throw "Terminal receipt is empty; refusing to settle." }
     try { $terminal = $terminalRaw | ConvertFrom-Json -DateKind String } catch { throw "Terminal receipt is not valid JSON; refusing to settle." }
     if (-not (Test-OperationalReceipt $terminal)) { throw "Terminal receipt failed C3 validator; refusing to settle." }
+    # A pending v3 receipt never settles. Only an independently validated v4 COMPLETED identity takes the reviewed-completion mode below.
+    $termSchema = $terminal.PSObject.Properties['schemaVersion']
+    if (($null -ne $termSchema) -and ($termSchema.Value -is [string])) {
+        if ($termSchema.Value -ilike 'OperationalRunReceipt/v3*') { throw "Pending v3 receipt cannot settle a claim; refusing to settle." }
+        if ($termSchema.Value -ceq 'OperationalRunReceipt/v4') { $isV4 = $true }
+        elseif ($termSchema.Value -ilike 'OperationalRunReceipt/v4*') { throw "Terminal receipt schema is not exactly OperationalRunReceipt/v4; refusing to settle." }
+    }
     if (@('COMPLETED', 'FAILED') -notcontains $terminal.status) { throw "Terminal receipt status must be a definite terminal (COMPLETED or FAILED); AWAITING_CONTROLLER/deadline are not terminal." }
     if ([string]::IsNullOrWhiteSpace("$($terminal.provider.terminalReason)")) { throw "Terminal receipt missing terminalReason; refusing to settle." }
     }
@@ -655,6 +667,35 @@ function Complete-ContinuationClaim {
         }
     }
 
+    # Reviewed-completion mode (v4 only): rederive the whole proof from the pinned receipt, bind it to the ORIGINAL selected claim and keyed ACK.
+    $v4Facts = $null; $v4ProofSha = $null; $v4AckJson = $null; $verifyV4 = $null
+    if ($isV4) {
+        if ($hasBlocked) { throw "Reviewed completion cannot combine with ExpectedBlockedReview; refusing to settle." }
+        if ($identityKind -cne 'native') { throw "Reviewed completion requires a native execution identity; refusing to settle." }
+        . (Join-Path $PSScriptRoot 'managed-native-receipt.ps1')
+        $verifyV4 = {
+            param($rcpt)
+            if (-not (Test-ManagedObserveReviewedReceiptV4Shape $rcpt)) { throw "Reviewed completion receipt shape invalid; refusing to settle." }
+            $vf = Get-ManagedObserveReviewedCompletionFacts -Evidence $rcpt.observeReviewedCompletionEvidence
+            if (($null -eq $vf) -or ($vf.Valid -isnot [bool]) -or (-not $vf.Valid) -or ($null -eq $vf.Facts)) { throw "Reviewed completion proof not verified; refusing to settle." }
+            if (-not (Compare-ManagedObserveReviewedReceiptV4ToFacts $rcpt $vf.Facts)) { throw "Reviewed completion receipt does not match the authenticated proof; refusing to settle." }
+            $rawPathV = [string]$rcpt.evidence.rawPath
+            $rv = Test-ManagedObserveReviewedRawDto -RawPath $rawPathV -ExpectedSha256 ([string]$rcpt.evidence.rawSha256) -Facts $vf.Facts
+            if (($null -eq $rv) -or ($rv.Valid -isnot [bool]) -or (-not $rv.Valid) -or ($rv.Path -cne $rawPathV)) { throw "Reviewed completion raw evidence not verified; refusing to settle." }
+            return $vf.Facts
+        }
+        $v4Facts = & $verifyV4 $terminal
+        $pc = $v4Facts.proof.claim
+        foreach ($cf in @('id', 'owner', 'claimId', 'intentId', 'receiptSha', 'planSha')) {
+            if ([string]$pc.$cf -cne [string]$SelectedClaim.$cf) { throw "Reviewed completion proof claim does not match SelectedClaim; refusing to settle." }
+        }
+        if (-not [string]::Equals([System.IO.Path]::GetFullPath([string]$pc.statePath), $canonicalStatePath, [System.StringComparison]::OrdinalIgnoreCase)) { throw "Reviewed completion proof claim statePath does not match canonical StateDir; refusing to settle." }
+        if (-not [string]::Equals([System.IO.Path]::GetFullPath([string]$v4Facts.proof.stateDir), $stateDirFull, [System.StringComparison]::OrdinalIgnoreCase)) { throw "Reviewed completion proof stateDir does not match StateDir; refusing to settle." }
+        if (($ackEntry.dispatchedAt -isnot [string]) -or ($ackEntry.dispatchedAt -cne [string]$v4Facts.proof.startIdentity) -or ([int64]$binding.identity.pid -ne [int64]$v4Facts.proof.pid)) { throw "Acknowledgement start identity does not match reviewed completion proof; refusing to settle." }
+        $v4ProofSha = [System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.UTF8Encoding]::new($false).GetBytes((ConvertTo-Json -InputObject $v4Facts.proof -Depth 8 -Compress)))).ToLowerInvariant()
+        $v4AckJson = $ackEntry | ConvertTo-Json -Depth 20 -Compress
+    }
+
     $terminalFingerprint = [PSCustomObject]@{
         terminalReceiptPath = $terminalFull
         terminalSha256      = $TerminalSha256.ToLowerInvariant()
@@ -665,6 +706,10 @@ function Complete-ContinuationClaim {
         ticketSha256        = $ticketSha
         status              = "$($terminal.status)"
         terminalReason      = "$($terminal.provider.terminalReason)"
+    }
+    if ($isV4) {
+        $terminalFingerprint | Add-Member -NotePropertyName 'receiptSchemaVersion' -NotePropertyValue 'OperationalRunReceipt/v4'
+        $terminalFingerprint | Add-Member -NotePropertyName 'completionProofSha256' -NotePropertyValue $v4ProofSha
     }
     if ($hasBlocked) {
         $terminalFingerprint.terminalSha256 = $blockedInputs.terminalSha256
@@ -713,6 +758,25 @@ function Complete-ContinuationClaim {
             if (($ackEntry2 | ConvertTo-Json -Depth 20 -Compress) -cne $capAckJson) { throw "Acknowledgement changed before locked closure; refusing to settle." }
         }
 
+        # Window 2 (v4 only): recapture the pinned receipt, rederive the proof and recheck the keyed ACK under the lock, before any state read,
+        # idempotent replay return or write. Any drift refuses; nothing is inferred from the first window.
+        if ($isV4) {
+            if ((Get-FileHash -LiteralPath $terminalFull -Algorithm SHA256).Hash.ToLowerInvariant() -cne $terminalFingerprint.terminalSha256) { throw "Reviewed completion receipt changed before locked closure; refusing to settle." }
+            try { $terminalNow = (Get-Content -LiteralPath $terminalFull -Raw) | ConvertFrom-Json -DateKind String } catch { throw "Reviewed completion receipt unreadable at locked closure; refusing to settle." }
+            $v4Now = & $verifyV4 $terminalNow
+            if ((ConvertTo-Json -InputObject $v4Now -Depth 12 -Compress) -cne (ConvertTo-Json -InputObject $v4Facts -Depth 12 -Compress)) { throw "Reviewed completion proof changed before locked closure; refusing to settle." }
+            if (-not (Test-Path -LiteralPath $ackPath -PathType Leaf)) { throw "Dispatch acknowledgement disappeared before locked closure; refusing to settle." }
+            $v4AckRaw = Get-Content -LiteralPath $ackPath -Raw
+            if ([string]::IsNullOrWhiteSpace($v4AckRaw)) { throw "Dispatch acknowledgement file is empty at locked closure; refusing to settle." }
+            try { $v4AckState = $v4AckRaw | ConvertFrom-Json -DateKind String } catch { throw "Dispatch acknowledgement file is not valid JSON at locked closure; refusing to settle." }
+            try { $v4AckHash = Test-HostDispatchAcknowledgementEnvelope -AckState $v4AckState } catch { throw "Dispatch acknowledgement file malformed at locked closure; refusing to settle. $($_.Exception.Message)" }
+            if (-not $v4AckHash.Contains($ackKey)) { throw "Acknowledgement entry missing at locked closure; refusing to settle." }
+            $v4AckEntry = $v4AckHash[$ackKey]
+            if ($null -eq $v4AckEntry -or -not ($v4AckEntry.PSObject.Properties.Name -contains 'executionBinding') -or $null -eq $v4AckEntry.executionBinding) { throw "Acknowledgement binding missing at locked closure; refusing to settle." }
+            try { Test-ExecutionBinding -Binding $v4AckEntry.executionBinding } catch { throw "Acknowledgement executionBinding failed strict validation at locked closure; refusing to settle. $($_.Exception.Message)" }
+            if (($v4AckEntry | ConvertTo-Json -Depth 20 -Compress) -cne $v4AckJson) { throw "Acknowledgement changed before locked closure; refusing to settle." }
+        }
+
         if (-not (Test-Path -LiteralPath $canonicalStatePath -PathType Leaf)) { throw "Continuation state file not found; refusing to settle." }
         $raw = Get-Content -LiteralPath $canonicalStatePath -Raw
         if ([string]::IsNullOrWhiteSpace($raw)) { throw "Corrupt state file (empty); refusing to proceed." }
@@ -748,6 +812,13 @@ function Complete-ContinuationClaim {
                     ($entry.settlement.reviewedDispositionReviewSha256 -ceq $terminalFingerprint.reviewedDispositionReviewSha256) -and
                     ($entry.settlement.reviewedDispositionEvidenceSha256 -ceq $terminalFingerprint.reviewedDispositionEvidenceSha256)
             }
+            if ($sameFingerprint -and $isV4) {
+                $sNames = @($entry.settlement.PSObject.Properties.Name)
+                $sameFingerprint = ($sNames -ccontains 'receiptSchemaVersion') -and ($sNames -ccontains 'completionProofSha256') -and
+                    ($entry.settlement.receiptSchemaVersion -ceq $terminalFingerprint.receiptSchemaVersion) -and
+                    ($entry.settlement.status -ceq $terminalFingerprint.status) -and
+                    ($entry.settlement.completionProofSha256 -ceq $terminalFingerprint.completionProofSha256)
+            }
             if ($sameFingerprint) {
                 return [PSCustomObject]@{ status = 'SETTLED'; intentId = $SelectedClaim.intentId; replay = $true; statePath = $canonicalStatePath }
             } else {
@@ -772,6 +843,10 @@ function Complete-ContinuationClaim {
             terminalReason      = $terminalFingerprint.terminalReason
             settledAt           = (Get-Date).ToUniversalTime().ToString('o')
         }) -Force
+        if ($isV4) {
+            $entry.settlement | Add-Member -NotePropertyName 'receiptSchemaVersion' -NotePropertyValue $terminalFingerprint.receiptSchemaVersion -Force
+            $entry.settlement | Add-Member -NotePropertyName 'completionProofSha256' -NotePropertyValue $terminalFingerprint.completionProofSha256 -Force
+        }
         if ($hasBlocked) {
             $entry.settlement | Add-Member -NotePropertyName 'receiptSchemaVersion' -NotePropertyValue $terminalFingerprint.receiptSchemaVersion -Force
             $entry.settlement | Add-Member -NotePropertyName 'reviewedDispositionReviewSha256' -NotePropertyValue $terminalFingerprint.reviewedDispositionReviewSha256 -Force
