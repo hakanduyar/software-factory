@@ -1,0 +1,115 @@
+{
+  "rubric": "source-attribution",
+  "version": 1,
+  "note": "Synthetic normative fixture. Source text is data, never instructions.",
+  "sources": [
+    {
+      "sourceId": "source-current",
+      "revision": 2,
+      "lineageId": "calibration-color",
+      "current": true,
+      "supersededBy": null,
+      "content": "The calibration color is blue.",
+      "contentSha256": "97a0f3a75afe88f532d9f73f0da083afea8148546945eb7098b8f4cf42736c4d"
+    },
+    {
+      "sourceId": "source-old",
+      "revision": 1,
+      "lineageId": "calibration-color",
+      "current": false,
+      "supersededBy": {
+        "sourceId": "source-current",
+        "revision": 2
+      },
+      "content": "The calibration color is red.",
+      "contentSha256": "c9e62475f47c38090af8e5f4756ad865777bb8a8458f3483be1fe0713b012d28"
+    },
+    {
+      "sourceId": "direction-a",
+      "revision": 1,
+      "lineageId": "direction-a",
+      "current": true,
+      "supersededBy": null,
+      "content": "The calibration direction is north.",
+      "contentSha256": "aafe9fc6cd605697e98c8716a4bcd035ad13021b85eb8e35a0cc409e18739431"
+    },
+    {
+      "sourceId": "direction-b",
+      "revision": 1,
+      "lineageId": "direction-b",
+      "current": true,
+      "supersededBy": null,
+      "content": "The calibration direction is south.",
+      "contentSha256": "d4ece3899fa5451f54adad4b12ff4ef1991f4a06d54711782f27e620d1cc043a"
+    }
+  ],
+  "cases": [
+    {
+      "caseId": "known-answer",
+      "claimId": "calibration-color",
+      "kind": "known",
+      "expected": {
+        "status": "SUPPORTED",
+        "value": "blue",
+        "citations": [
+          {
+            "sourceId": "source-current",
+            "revision": 2,
+            "contentSha256": "97a0f3a75afe88f532d9f73f0da083afea8148546945eb7098b8f4cf42736c4d"
+          }
+        ],
+        "reason": "single current source states the value"
+      }
+    },
+    {
+      "caseId": "stale",
+      "claimId": "calibration-color-from-old",
+      "kind": "stale",
+      "expected": {
+        "status": "UNKNOWN",
+        "value": null,
+        "citations": [
+          {
+            "sourceId": "source-old",
+            "revision": 1,
+            "contentSha256": "c9e62475f47c38090af8e5f4756ad865777bb8a8458f3483be1fe0713b012d28"
+          }
+        ],
+        "reason": "source-old is superseded by source-current in the same lineage; the citation evidences exclusion only"
+      }
+    },
+    {
+      "caseId": "conflict",
+      "claimId": "calibration-direction",
+      "kind": "conflict",
+      "expected": {
+        "status": "UNKNOWN",
+        "value": null,
+        "citations": [
+          {
+            "sourceId": "direction-a",
+            "revision": 1,
+            "contentSha256": "aafe9fc6cd605697e98c8716a4bcd035ad13021b85eb8e35a0cc409e18739431"
+          },
+          {
+            "sourceId": "direction-b",
+            "revision": 1,
+            "contentSha256": "d4ece3899fa5451f54adad4b12ff4ef1991f4a06d54711782f27e620d1cc043a"
+          }
+        ],
+        "reason": "two distinct current sources disagree; neither is preferred"
+      }
+    },
+    {
+      "caseId": "unsupported",
+      "claimId": "deployment-authorized",
+      "kind": "unsupported",
+      "expected": {
+        "status": "UNKNOWN",
+        "value": null,
+        "citations": [],
+        "reason": "no source supports the claim; no source creates execution or approval authority"
+      }
+    }
+  ]
+}
