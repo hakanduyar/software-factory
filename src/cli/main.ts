@@ -70,6 +70,13 @@ Usage:
                       Publish the projected status (VERIFYING/REVIEW/BLOCKED) of a
                       real work item and named run through the durable sync.
                       Explicit operator mapping; DONE is refused. See --help.
+  sf github task-create --event <path> --repo hakanduyar/software-factory
+                    --marker-namespace factory-task --state-dir <path> --gh <path>
+                    --gh-sha256 <hex> --transport-temp-root <dir> --pwsh <path>
+                    --repository-root <path>
+                      Operator-only: create the GitHub issue for one explicit
+                      GitHubCreateEvent/v1 file through the durable lifecycle.
+                      Remote effect with a real gh. See --help.
   sf memory persist-accepted --factory-db <path> --work-item <id> --snapshot <id>
                     --decision <text> --lesson <text> --owned-directory <path>
                       Write a local note for an already-accepted result into an
@@ -488,10 +495,28 @@ async function main(argv: readonly string[]): Promise<number> {
           error: (line) => console.error(line),
         });
       }
+      if (sub === "task-create") {
+        const { parseGithubTaskCreateArgs, runGithubTaskCreate, TASK_CREATE_HELP, TASK_CREATE_USAGE } = await import("./githubTaskCreate.js");
+        const rest = argv.slice(2);
+        if (rest.length === 1 && (rest[0] === "--help" || rest[0] === "-h")) {
+          console.log(TASK_CREATE_HELP);
+          return 0;
+        }
+        const parsed = parseGithubTaskCreateArgs(rest);
+        if (!parsed.ok) {
+          console.error(parsed.error);
+          console.error(TASK_CREATE_USAGE);
+          return 1;
+        }
+        return await runGithubTaskCreate(parsed.value, {
+          log: (line) => console.log(line),
+          error: (line) => console.error(line),
+        });
+      }
       const { parseGithubPublishArgs, runGithubPublish, runGithubReadiness } = await import("./github.js");
       const log = (line: string): void => console.log(line);
       const usage =
-        "Usage: sf github <publish|readiness|sync-status> --roadmap-key <KEY> --head <SHA> --base <SHA> " +
+        "Usage: sf github <publish|readiness|sync-status|task-create> --roadmap-key <KEY> --head <SHA> --base <SHA> " +
         "--head-ref <BRANCH> --base-ref <BRANCH> --repo <owner/name> [--reviewed]";
 
       if (sub === "publish" || sub === "readiness") {
