@@ -61,6 +61,83 @@ function Get-ControllerAllocationInputBinding {
         $ticket = $docs[1]
 
         $cumulative = [long]$binding.cumulativeOutput
+        if ($null -ne $binding.allocation.PSObject.Properties['outputStopMode']) {
+            # OBSERVE_ONLY: the caller's marker and null fields decide nothing. The actual pending v3 receipt, the shared pending-accounting
+            # verifier, the actual next ticket contract and the anchored policy decide the mode. Trusted staged siblings only; read-only.
+            $dispatchDir = $PSScriptRoot
+            $factoryDir = Split-Path -Parent $dispatchDir
+            . (Join-Path (Join-Path $factoryDir 'continuity') 'reconcile.ps1')
+            . (Join-Path (Join-Path $factoryDir 'runner') 'launch.ps1')
+            . (Join-Path $dispatchDir 'native-ticket-contract.ps1')
+            . (Join-Path $dispatchDir 'managed-output-stop-authority.ps1')
+            . (Join-Path $dispatchDir 'managed-native-receipt.ps1')
+            $ord = [System.StringComparison]::Ordinal
+            $note = [System.Management.Automation.PSMemberTypes]::NoteProperty
+            $cget = {
+                param($o, [string]$n)
+                if ($o -isnot [System.Management.Automation.PSCustomObject]) { & $fail }
+                $m = @($o.PSObject.Properties | Where-Object { [string]::Equals($_.Name, $n, $ord) })
+                if ($m.Count -ne 1 -or $m[0].MemberType -ne $note) { & $fail }
+                return , $m[0].Value
+            }
+
+            # Current pending receipt: strict v3 validator (reruns the shared verifier) and the same shared facts; no other mode or COMPLETED shortcut.
+            if (-not (Test-OperationalReceipt $receipt)) { & $fail }
+            if ((& $cget $receipt 'schemaVersion') -cne 'OperationalRunReceipt/v3' -or (& $cget $receipt 'status') -cne 'AWAITING_CONTROLLER' -or (& $cget $receipt 'outputStopMode') -cne 'OBSERVE_ONLY') { & $fail }
+            $historyVerified = & $cget $receipt 'historyVerified'
+            if ($historyVerified -isnot [bool] -or $historyVerified) { & $fail }
+            $artifactComplete = & $cget (& $cget $receipt 'artifact') 'complete'
+            if ($artifactComplete -isnot [bool] -or $artifactComplete) { & $fail }
+            $pending = Get-ManagedObservePendingAccountingFacts -Evidence (& $cget $receipt 'observePendingAccountingEvidence')
+            if ($null -eq $pending -or $pending.Valid -isnot [bool] -or -not $pending.Valid -or $null -eq $pending.Facts) { & $fail }
+            $facts = $pending.Facts
+            $factsUsed = $facts.accounting.usedOutputTokens
+            $receiptUsed = (& $cget (& $cget $receipt 'budget') 'usedOutputTokens')
+            if (-not (& $isInteger $factsUsed) -or -not (& $isInteger $receiptUsed) -or [long]$factsUsed -lt 0 -or [long]$factsUsed -ne [long]$receiptUsed -or [long]$factsUsed -ne $cumulative) { & $fail }
+
+            # ControlRoot comes only from the authenticated recapture of the current run's own pinned evidence, never from the caller.
+            $cur = $facts.evidence.current
+            $recapture = Get-ManagedNativeCapturedFacts -ManifestPath $cur.manifestPath -ExpectedManifestSha256 $cur.manifestSha256 -TerminalPath $cur.terminalPath -ExpectedTerminalSha256 $cur.terminalSha256 -TicketPath $cur.ticketPath -RunId $cur.runId -Attempt ([int][long]$cur.attempt) -ForOutputObservation
+            if (@($recapture).Count -ne 1 -or $recapture -isnot [System.Management.Automation.PSCustomObject]) { & $fail }
+            if ((& $cget $recapture 'Valid') -isnot [bool] -or (& $cget $recapture 'Valid') -or $null -ne (& $cget $recapture 'Facts') -or (& $cget $recapture 'Code') -cne 'OBSERVE_ONLY_TRANSPORT_CAPTURE') { & $fail }
+            $oc = & $cget $recapture 'ObservationCapture'
+            if ((& $cget $oc 'RunId') -cne [string]$facts.identity.runId -or (& $cget $oc 'ManifestSha256') -cne [string]$facts.references.manifest.verifiedSha256 -or (& $cget $oc 'TicketSha256') -cne [string]$facts.references.ticket.verifiedSha256) { & $fail }
+            $wd = & $cget (& $cget $oc 'Core') 'workingDirectory'
+            if ($wd -isnot [string] -or $wd.Length -eq 0 -or $wd.Length -gt 1024 -or -not [System.IO.Path]::IsPathRooted($wd)) { & $fail }
+            if (-not [string]::Equals([System.IO.Path]::GetFullPath($wd), $wd, $ord)) { & $fail }
+            $lastChar = $wd[$wd.Length - 1]
+            if ($lastChar -eq [System.IO.Path]::DirectorySeparatorChar -or $lastChar -eq [System.IO.Path]::AltDirectorySeparatorChar) { & $fail }
+            $controlRoot = [System.IO.Path]::Combine($wd, '.factory-data', 'chief', 'controller-runtime', 'control')
+
+            # Next ticket: the captured bytes decide the mode through the native contract and the anchored policy authority.
+            $ticketBytes = $bytesList[1]
+            $contract = Test-ManagedNativeTicketContract -Ticket $ticket -ExpectedPayloadSha256 $binding.nextPayloadSha256
+            if ($null -eq $contract -or $contract.Valid -isnot [bool] -or -not $contract.Valid) { & $fail }
+            if ($contract.OutputStopMode -isnot [string] -or $contract.OutputStopMode -cne 'OBSERVE_ONLY_DESCRIPTOR' -or $null -eq $contract.OutputStops) { & $fail }
+            if ($null -ne $contract.Budget.AdditionalOutputMax -or $null -ne $contract.Budget.PhaseAggregateCeiling) { & $fail }
+            $authority = Resolve-ManagedOutputStopAuthority -TicketContract $contract -CapturedTicket ([byte[]]($ticketBytes.Clone())) -ControlRoot $controlRoot
+            if ($null -eq $authority -or $authority -isnot [System.Management.Automation.PSCustomObject] -or $authority.Schema -cne 'ManagedOutputStopAuthority/v1' -or $authority.Mode -cne 'OBSERVE_ONLY') { & $fail }
+
+            $history = $contract.Budget.HistoricalOutputTokens
+            if (-not (& $isInteger $history) -or [long]$history -ne $cumulative) { & $fail }
+            $elapsed = $contract.Budget.ElapsedMs
+            $attempts = & $cget $ticket 'maxAttempts'
+            if (-not (& $isInteger $elapsed) -or [long]$elapsed -le 0 -or -not (& $isInteger $attempts) -or [long]$attempts -le 0) { & $fail }
+
+            $scope = Get-ControllerAllocationScope -CumulativeOutput $history -Scope ([pscustomobject][ordered]@{
+                    taskId              = & $cget $ticket 'id'
+                    owner               = & $cget $ticket 'owner'
+                    ownedPaths          = & $cget $ticket 'ownedPaths'
+                    outputStopMode      = 'OBSERVE_ONLY'
+                    maxAdditionalOutput = $null
+                    aggregateCeiling    = $null
+                    maxAttempts         = $attempts
+                    maxElapsedMs        = $elapsed
+                })
+            $captured = $binding.allocation
+            if ((ConvertTo-Json -InputObject $scope -Depth 6 -Compress) -cne (ConvertTo-Json -InputObject $captured -Depth 6 -Compress)) { & $fail }
+            return $binding
+        }
         $rb = $receipt.PSObject.Properties['budget']
         if ($null -eq $rb -or $rb.Value -isnot [System.Management.Automation.PSCustomObject]) { & $fail }
         $used = $rb.Value.PSObject.Properties['usedOutputTokens']

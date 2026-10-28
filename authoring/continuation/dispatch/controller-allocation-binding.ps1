@@ -65,6 +65,16 @@ function Get-ControllerAllocationScope {
     # Metadata first: no property getter runs until the exact NoteProperty shape is proven.
     if ($null -eq $Scope -or $Scope -isnot [System.Management.Automation.PSCustomObject]) { & $fail }
     $members = @($Scope.PSObject.Properties)
+    # Exact-ordinal outputStopMode selects the explicit OBSERVE_ONLY shape; a mis-cased alias refuses and never falls back to legacy.
+    # Shape capture only: the marker and its null fields are not policy authority.
+    $markerMembers = @($members | Where-Object { [string]::Equals($_.Name, 'outputStopMode', [System.StringComparison]::OrdinalIgnoreCase) })
+    $observeOnly = $false
+    if ($markerMembers.Count -gt 0) {
+        if ($markerMembers.Count -ne 1 -or -not [string]::Equals($markerMembers[0].Name, 'outputStopMode', [System.StringComparison]::Ordinal)) { & $fail }
+        $observeOnly = $true
+        $names = @('taskId', 'owner', 'ownedPaths', 'outputStopMode', 'maxAdditionalOutput', 'aggregateCeiling', 'maxAttempts', 'maxElapsedMs')
+        $budgetNames = @('maxAttempts', 'maxElapsedMs')
+    }
     if ($members.Count -ne $names.Count) { & $fail }
     foreach ($expectedName in $names) {
         $found = @($members | Where-Object { [string]::Equals($_.Name, $expectedName, [System.StringComparison]::Ordinal) })
@@ -95,6 +105,21 @@ function Get-ControllerAllocationScope {
         if (-not (& $isInteger $values[$name]) -or [long]$values[$name] -le 0) { & $fail }
     }
     if (-not (& $isInteger $CumulativeOutput) -or [long]$CumulativeOutput -lt 0) { & $fail }
+    if ($observeOnly) {
+        # No output ceiling exists in this shape: both fields must be present and null; nothing is cast, defaulted or minted.
+        if ($values['outputStopMode'] -isnot [string] -or -not [string]::Equals($values['outputStopMode'], 'OBSERVE_ONLY', [System.StringComparison]::Ordinal)) { & $fail }
+        if ($null -ne $values['maxAdditionalOutput'] -or $null -ne $values['aggregateCeiling']) { & $fail }
+        return [pscustomobject][ordered]@{
+            taskId              = [string]::Copy($values['taskId'])
+            owner               = [string]::Copy($values['owner'])
+            ownedPaths          = [string[]]$copiedPaths
+            outputStopMode      = 'OBSERVE_ONLY'
+            maxAdditionalOutput = $null
+            aggregateCeiling    = $null
+            maxAttempts         = [long]$values['maxAttempts']
+            maxElapsedMs        = [long]$values['maxElapsedMs']
+        }
+    }
     $ceiling = [long]$values['aggregateCeiling']
     $cumulative = [long]$CumulativeOutput
     if ($cumulative -gt $ceiling) { & $fail }

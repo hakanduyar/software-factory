@@ -37,8 +37,15 @@ function Test-ContinuationStateEntry {
     if ($e.receiptPath -isnot [string] -or [string]::IsNullOrWhiteSpace($e.receiptPath)) { throw "Corrupt state entry: bad receiptPath." }
     if ($e.planPath -isnot [string] -or [string]::IsNullOrWhiteSpace($e.planPath)) { throw "Corrupt state entry: bad planPath." }
     if (-not ($e.cumulativeOutput -is [int] -or $e.cumulativeOutput -is [long]) -or $e.cumulativeOutput -lt 0) { throw "Corrupt state entry: bad cumulativeOutput." }
-    if (-not ($e.aggregateCeiling -is [int] -or $e.aggregateCeiling -is [long]) -or $e.aggregateCeiling -le 0) { throw "Corrupt state entry: bad aggregateCeiling." }
-    if (-not ($e.maxAdditionalOutput -is [int] -or $e.maxAdditionalOutput -is [long]) -or $e.maxAdditionalOutput -le 0) { throw "Corrupt state entry: bad maxAdditionalOutput." }
+    # Exact-ordinal outputStopMode selects the OBSERVE_ONLY shape (both ceilings null); any alias or other value refuses and never reads as legacy.
+    $modeProps = @($e.PSObject.Properties | Where-Object { [string]::Equals($_.Name, 'outputStopMode', [System.StringComparison]::OrdinalIgnoreCase) })
+    if ($modeProps.Count -gt 0) {
+        if ($modeProps.Count -ne 1 -or $modeProps[0].Name -cne 'outputStopMode' -or $modeProps[0].Value -isnot [string] -or $modeProps[0].Value -cne 'OBSERVE_ONLY') { throw "Corrupt state entry: bad outputStopMode." }
+        if ($null -ne $e.aggregateCeiling -or $null -ne $e.maxAdditionalOutput) { throw "Corrupt state entry: OBSERVE_ONLY entry must carry null output ceilings." }
+    } else {
+        if (-not ($e.aggregateCeiling -is [int] -or $e.aggregateCeiling -is [long]) -or $e.aggregateCeiling -le 0) { throw "Corrupt state entry: bad aggregateCeiling." }
+        if (-not ($e.maxAdditionalOutput -is [int] -or $e.maxAdditionalOutput -is [long]) -or $e.maxAdditionalOutput -le 0) { throw "Corrupt state entry: bad maxAdditionalOutput." }
+    }
     if ($e.ownedPaths -isnot [array] -or $e.ownedPaths.Count -eq 0) { throw "Corrupt state entry: bad ownedPaths." }
     foreach ($op in $e.ownedPaths) {
         if ($op -isnot [string] -or [string]::IsNullOrWhiteSpace($op) -or -not [System.IO.Path]::IsPathRooted($op)) { throw "Corrupt state entry: bad ownedPaths element." }
@@ -243,6 +250,7 @@ function Invoke-ContinuationStep {
             if ($null -ne $mk -and $mk.MemberType -eq [System.Management.Automation.PSMemberTypes]::NoteProperty) { throw $allocFail }
             $bmk = $probe.PSObject.Properties['reviewedBlockedPredecessorSha256']
             if ($null -ne $bmk -and $bmk.MemberType -eq [System.Management.Automation.PSMemberTypes]::NoteProperty) { throw $predFail }
+            if (@($probe.PSObject.Properties | Where-Object { [string]::Equals($_.Name, 'outputStopMode', [System.StringComparison]::OrdinalIgnoreCase) }).Count -gt 0) { throw $allocFail }
         }
     }
     if ($null -ne $predCapture) {
@@ -263,12 +271,32 @@ function Invoke-ContinuationStep {
         if ($ap -cne $capture.planSha256 -or $ar -cne $capture.receiptSha256) { throw $allocFail }
     }
     & $assertCapture
+    # OBSERVE_ONLY is reachable only through the full opt-in; a v3 receipt or a plan marker alone refuses before any state IO.
+    $receiptIsV3 = $false
+    if (Test-Path -LiteralPath $receiptFull -PathType Leaf) {
+        $rp = $null
+        try { $rp = (Get-Content -LiteralPath $receiptFull -Raw) | ConvertFrom-Json -DateKind String } catch { $rp = $null }
+        if ($null -ne $rp) {
+            $rsv = $rp.PSObject.Properties['schemaVersion']
+            if ($null -ne $rsv -and $rsv.Value -is [string] -and $rsv.Value -ilike 'OperationalRunReceipt/v3*') { $receiptIsV3 = $true }
+            if (@($rp.PSObject.Properties | Where-Object { @('observePendingAccountingEvidence', 'observePendingAccounting', 'outputStopMode') -contains [string]$_.Name }).Count -gt 0) { $receiptIsV3 = $true }
+        }
+    }
+    $observeMode = $false
+    if ($optIn -and $null -ne $capture.binding.allocation.PSObject.Properties['outputStopMode']) { $observeMode = $true }
+    if ($observeMode) {
+        $planMode = $capture.plan.PSObject.Properties['outputStopMode']
+        if (-not $receiptIsV3 -or $null -ne $predCapture -or $null -eq $planMode -or $planMode.Value -isnot [string] -or $planMode.Value -cne 'OBSERVE_ONLY' -or $capture.binding.allocation.outputStopMode -cne 'OBSERVE_ONLY') { throw $allocFail }
+    } elseif ($receiptIsV3) {
+        throw $allocFail
+    }
     if (-not (Test-Path -LiteralPath $stateDirFull -PathType Container)) {
         New-Item -ItemType Directory -Path $stateDirFull -Force | Out-Null
     }
     if (-not (Test-Path -LiteralPath $receiptFull -PathType Leaf)) { throw "Receipt not found: $receiptFull" }
     if (-not (Test-Path -LiteralPath $planFull -PathType Leaf)) { throw "Plan not found: $planFull" }
 
+    if (-not $observeMode) {
     $receiptDir = Join-Path $stateDirFull ("c3-receipt-" + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $receiptDir -Force | Out-Null
     try {
@@ -296,10 +324,21 @@ $sw = [Diagnostics.Stopwatch]::StartNew()
     } finally {
         Remove-Item -LiteralPath $receiptDir -Recurse -Force -ErrorAction SilentlyContinue
     }
+    }
 
     $receiptJson = Get-Content -LiteralPath $receiptFull -Raw
     $receipt = $receiptJson | ConvertFrom-Json -DateKind String
     if (-not (Test-OperationalReceipt $receipt)) { throw "Receipt failed C3 validator." }
+    if ($observeMode) {
+        # The pending v3 receipt is validated directly (strict v3 validator + shared pending facts); it never enters general reconciliation.
+        . (Join-Path $PSScriptRoot 'managed-native-receipt.ps1')
+        if ($receipt.schemaVersion -cne 'OperationalRunReceipt/v3' -or $receipt.status -cne 'AWAITING_CONTROLLER' -or $receipt.outputStopMode -cne 'OBSERVE_ONLY') { throw "OBSERVE_ONLY requires a pending v3 AWAITING_CONTROLLER receipt." }
+        if ($receipt.historyVerified -isnot [bool] -or $receipt.historyVerified -or $receipt.artifact.complete -isnot [bool] -or $receipt.artifact.complete) { throw "OBSERVE_ONLY receipt must be pending-only." }
+        $pendingFacts = Get-ManagedObservePendingAccountingFacts -Evidence $receipt.observePendingAccountingEvidence
+        if ($null -eq $pendingFacts -or $pendingFacts.Valid -isnot [bool] -or -not $pendingFacts.Valid -or $null -eq $pendingFacts.Facts) { throw "OBSERVE_ONLY pending accounting facts not verified." }
+        $usedFacts = $pendingFacts.Facts.accounting.usedOutputTokens
+        if (-not ($usedFacts -is [int] -or $usedFacts -is [long]) -or [long]$usedFacts -ne [long]$receipt.budget.usedOutputTokens -or [long]$usedFacts -ne [long]$capture.binding.cumulativeOutput) { throw "OBSERVE_ONLY cumulative output mismatch." }
+    }
     if ($receipt.status -ne 'AWAITING_CONTROLLER') {
         if (-not ($blockedAdmit -and $receipt.schemaVersion -ceq 'OperationalRunReceipt/v2' -and $receipt.status -ceq 'BLOCKED')) { throw "Receipt status must be AWAITING_CONTROLLER." }
     }
@@ -326,9 +365,13 @@ $sw = [Diagnostics.Stopwatch]::StartNew()
     foreach ($b in @('budgetKnown', 'ownershipKnown', 'quotaAllowed', 'reviewDenied')) {
         if (-not ($plan.$b -is [bool])) { throw "$b must be boolean." }
     }
-if (-not ($plan.maxAdditionalOutput -is [int] -or $plan.maxAdditionalOutput -is [long]) -or $plan.maxAdditionalOutput -le 0) { throw "maxAdditionalOutput must be positive int." }
+if ($observeMode) {
+        if ($null -ne $plan.maxAdditionalOutput -or $null -ne $plan.aggregateCeiling) { throw "OBSERVE_ONLY plan must carry null output ceilings." }
+        if ($plan.outputStopMode -isnot [string] -or $plan.outputStopMode -cne 'OBSERVE_ONLY') { throw "OBSERVE_ONLY plan marker mismatch." }
+    }
+    if (-not $observeMode -and (-not ($plan.maxAdditionalOutput -is [int] -or $plan.maxAdditionalOutput -is [long]) -or $plan.maxAdditionalOutput -le 0)) { throw "maxAdditionalOutput must be positive int." }
     if (-not ($plan.cumulativeOutput -is [int] -or $plan.cumulativeOutput -is [long]) -or $plan.cumulativeOutput -lt 0) { throw "cumulativeOutput must be nonnegative int." }
-    if (-not ($plan.aggregateCeiling -is [int] -or $plan.aggregateCeiling -is [long]) -or $plan.aggregateCeiling -le 0) { throw "aggregateCeiling must be positive int." }
+    if (-not $observeMode -and (-not ($plan.aggregateCeiling -is [int] -or $plan.aggregateCeiling -is [long]) -or $plan.aggregateCeiling -le 0)) { throw "aggregateCeiling must be positive int." }
     if ($plan.cumulativeOutput -ne $receipt.budget.usedOutputTokens) { throw "cumulativeOutput mismatch vs receipt.budget.usedOutputTokens." }
 
 if ($plan.ownedPaths -isnot [array] -or $plan.ownedPaths.Count -eq 0) { throw "ownedPaths must be a nonempty array." }
@@ -356,7 +399,7 @@ if ($plan.ownedPaths -isnot [array] -or $plan.ownedPaths.Count -eq 0) { throw "o
 
 $knownOk = $plan.budgetKnown -and $plan.ownershipKnown
     if ($plan.kind -eq 'NORMAL_REVIEW_DISPATCH' -or $plan.kind -eq 'NORMAL_AUTHOR_DISPATCH') {
-        $dispatchBudgetOk = ($plan.cumulativeOutput -le $plan.aggregateCeiling) -and ($plan.maxAdditionalOutput -le ($plan.aggregateCeiling - $plan.cumulativeOutput))
+        $dispatchBudgetOk = $observeMode -or (($plan.cumulativeOutput -le $plan.aggregateCeiling) -and ($plan.maxAdditionalOutput -le ($plan.aggregateCeiling - $plan.cumulativeOutput)))
         $blocked = (-not $knownOk) -or $plan.reviewDenied -or (-not $plan.quotaAllowed) -or (-not $dispatchBudgetOk)
         $status = if ($blocked) { 'BLOCKED' } else { 'READY' }
     } else {
@@ -404,6 +447,18 @@ foreach ($p in $state.entries.PSObject.Properties) {
 
         if ($existing) {
             if ($existing.planSha256 -cne $planSha) { throw "Receipt already consumed with a different plan (amendment requires distinct actionId and resolved prior claim)." }
+            # Recheck mode/plan/receipt/binding parity before reuse or claim: a persisted marker neither grants nor reinterprets anything.
+            $existingMode = @($existing.PSObject.Properties | Where-Object { [string]::Equals($_.Name, 'outputStopMode', [System.StringComparison]::OrdinalIgnoreCase) })
+            if ($observeMode) {
+                if ($existingMode.Count -ne 1 -or $existingMode[0].Name -cne 'outputStopMode' -or $existingMode[0].Value -cne 'OBSERVE_ONLY') { throw "Persisted entry mode does not match the OBSERVE_ONLY plan." }
+                if ($null -ne $existing.aggregateCeiling -or $null -ne $existing.maxAdditionalOutput) { throw "Persisted OBSERVE_ONLY entry carries output ceilings." }
+                if ($existing.receiptSha256 -cne $receiptSha -or $existing.actionId -cne $plan.actionId -or [long]$existing.cumulativeOutput -ne [long]$capture.binding.cumulativeOutput -or [long]$existing.cumulativeOutput -ne [long]$plan.cumulativeOutput) { throw "Persisted OBSERVE_ONLY entry does not match receipt/plan/binding." }
+                $persistedOwned = @($existing.ownedPaths)
+                if ($persistedOwned.Count -ne $canonicalOwned.Count) { throw "Persisted OBSERVE_ONLY entry ownedPaths mismatch." }
+                for ($oi = 0; $oi -lt $canonicalOwned.Count; $oi++) { if ($persistedOwned[$oi] -cne $canonicalOwned[$oi]) { throw "Persisted OBSERVE_ONLY entry ownedPaths mismatch." } }
+            } elseif ($existingMode.Count -ne 0) {
+                throw "Persisted OBSERVE_ONLY entry cannot be reinterpreted by a legacy plan."
+            }
             $entry = $existing
         } else {
             $alreadyKeyed = $entriesHash.Keys | Where-Object { $entriesHash[$_].receiptSha256 -ceq $receiptSha -and $entriesHash[$_].actionId -cne $plan.actionId }
@@ -425,6 +480,7 @@ foreach ($p in $state.entries.PSObject.Properties) {
                 claim           = $null
                 nextWake        = [PSCustomObject]@{ reason = $status; status = $status }
             }
+            if ($observeMode) { $entry | Add-Member -NotePropertyName 'outputStopMode' -NotePropertyValue 'OBSERVE_ONLY' }
             $entriesHash[$key] = $entry
         }
 

@@ -30,6 +30,15 @@ function Get-ControllerAllocationPlanScope {
 
     $binding = Get-ControllerAllocationPlanMarker -Snapshot $Snapshot -ExpectedOrigin $ExpectedOrigin -Plan $Plan
 
+    # The captured binding decides the shape. A plan outputStopMode annotation is accepted only in the explicit OBSERVE_ONLY shape and
+    # only with the exact-ordinal NoteProperty; any other spelling or presence in a legacy plan refuses and never falls back.
+    $observeOnly = ($null -ne $binding.allocation.PSObject.Properties['outputStopMode'])
+    $planMarkers = @($Plan.PSObject.Properties | Where-Object { [string]::Equals($_.Name, 'outputStopMode', [System.StringComparison]::OrdinalIgnoreCase) })
+    if ($observeOnly) {
+        if ($planMarkers.Count -ne 1 -or $planMarkers[0].MemberType -ne $noteProperty -or -not [string]::Equals($planMarkers[0].Name, 'outputStopMode', $ordinal)) { & $fail }
+    }
+    elseif ($planMarkers.Count -ne 0) { & $fail }
+
     if ($Owner -isnot [string] -or [string]::IsNullOrWhiteSpace($Owner)) { & $fail }
     if (-not [string]::Equals($Owner, $binding.allocation.owner, $ordinal)) { & $fail }
 
@@ -48,6 +57,19 @@ function Get-ControllerAllocationPlanScope {
         aggregateCeiling    = $Plan.PSObject.Properties['aggregateCeiling'].Value
         maxAttempts         = $next.PSObject.Properties['maxAttempts'].Value
         maxElapsedMs        = $next.PSObject.Properties['maxElapsedMs'].Value
+    }
+    if ($observeOnly) {
+        # Same ordered shape as the captured binding; the plan's null output fields are compared, never cast or defaulted.
+        $actualScope = [pscustomobject][ordered]@{
+            taskId              = $actualScope.taskId
+            owner               = $actualScope.owner
+            ownedPaths          = $actualScope.ownedPaths
+            outputStopMode      = $planMarkers[0].Value
+            maxAdditionalOutput = $actualScope.maxAdditionalOutput
+            aggregateCeiling    = $actualScope.aggregateCeiling
+            maxAttempts         = $actualScope.maxAttempts
+            maxElapsedMs        = $actualScope.maxElapsedMs
+        }
     }
     $cumulative = $Plan.PSObject.Properties['cumulativeOutput'].Value
     $planScope = Get-ControllerAllocationScope -Scope $actualScope -CumulativeOutput $cumulative
