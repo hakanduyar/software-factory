@@ -243,7 +243,13 @@ describe("ProcessRunner: timeoutMs null (no total deadline)", () => {
     setTimeout(() => controller.abort(), 150);
     const result = await promise;
     assert.equal(result.terminationReason, "CANCELLED");
-    assert.ok(result.signal === "SIGKILL" || result.signal === "SIGTERM");
+    if (process.platform === "win32") {
+      // Windows has no POSIX signals: the terminated child reports an exit code instead.
+      assert.ok(result.signal !== null || result.exitCode !== 0, "child must actually have been terminated");
+    } else {
+      assert.ok(result.signal === "SIGKILL" || result.signal === "SIGTERM");
+    }
+    assert.ok(result.durationMs < 5000, "abort must complete promptly rather than wait for any timer");
   });
 
   it("reports a spawn error (not success) exactly once", async () => {

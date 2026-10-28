@@ -453,10 +453,7 @@ function openStores(
     tool: plannerTool,
     model: planner.model,
     ...(planner.effort === undefined ? {} : { effort: planner.effort }),
-    // CliPlannerWorkerDeps.timeoutMs is `number` (read-only boundary): null means "no total deadline",
-    // identical to absence, so it is omitted rather than coerced. Finite values still flow through
-    // and are refused by createCliWorker.
-    ...(planner.timeoutMs === undefined || planner.timeoutMs === null ? {} : { timeoutMs: planner.timeoutMs }),
+    ...(planner.timeoutMs === undefined ? {} : { timeoutMs: planner.timeoutMs }),
     workspace,
     processRunner: createNodeProcessRunner(),
   });

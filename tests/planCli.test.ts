@@ -41,6 +41,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, describe, it } from "node:test";
 
+import { createCliPlannerWorker } from "../src/adapters/planning/cliPlannerWorker.js";
 import { createEngineeringLoopDispatcher } from "../src/adapters/planning/engineeringLoopDispatcher.js";
 import { createSqlitePlanRepository } from "../src/adapters/planning/sqlitePlanRepository.js";
 import {
@@ -52,6 +53,8 @@ import {
   runPlanStart,
   runPlanStatus,
 } from "../src/cli/plan.js";
+import { resolveWorkspace } from "../src/adapters/workers/workspace.js";
+import { createTempWorkspace, cleanupTempWorkspaces } from "./support/tempWorkspace.js";
 import { cleanupTempDbs, tempDbPath } from "./support/factoryFixtures.js";
 
 after(cleanupTempDbs);
@@ -428,3 +431,55 @@ describe("planning dispatcher — null author timeout reaches the loop service i
     assert.equal(seen?.budget.workerTimeoutMs, null);
   });
 });
+
+function resolveWorkspaceForTest() {
+  return resolveWorkspace(createTempWorkspace());
+}
+
+describe("createCliPlannerWorker — author timeout reaches the actual createWorker config", () => {
+  for (const timeoutMs of [null, undefined] as const) {
+    it(`forwards ${String(timeoutMs)} into the config handed to createWorker`, async () => {
+      let seen: Record<string, unknown> | undefined;
+      const planner = createCliPlannerWorker({
+        tool: "codex-cli",
+        model: "m",
+        ...(timeoutMs === undefined ? {} : { timeoutMs }),
+        workspace: { root: "/tmp/x" } as never,
+        processRunner: { run: async () => { throw new Error("no process"); } },
+        createWorker: (config) => {
+          seen = { ...config };
+          return {
+            id: "w",
+            capabilities: { roles: ["PLANNER"], deterministic: true },
+            execute: async () => ({ status: "FAILED", summary: "s", evidence: [], claimsAcceptanceMet: false }),
+          };
+        },
+      });
+      await planner.plan({
+        projectKey: "P", intent: "i", constraints: [], answeredQuestions: [], projectRules: [], revision: 1, attempt: 1,
+        correlationTag: "t", planId: "p",
+      } as never);
+      assert.ok(seen !== undefined);
+      if (timeoutMs === null) {
+        assert.equal(seen["timeoutMs"], null);
+        assert.ok("timeoutMs" in seen);
+      } else {
+        assert.equal("timeoutMs" in seen, false);
+      }
+    });
+  }
+
+  it("the default createWorker keeps null and refuses finite before any runner call", () => {
+    const calls: unknown[] = [];
+    const runner = { run: async (r: unknown) => { calls.push(r); throw new Error("no process"); } };
+    const base = { tool: "codex-cli" as const, model: "m", workspace: resolveWorkspaceForTest(), processRunner: runner };
+    // null constructs fine; finite is refused when the worker is built (first plan call).
+    const finite = createCliPlannerWorker({ ...base, timeoutMs: 1000 });
+    return assert.rejects(
+      finite.plan({ projectKey: "P", intent: "i", constraints: [], answeredQuestions: [], projectRules: [], revision: 1, attempt: 1, correlationTag: "t", planId: "p" } as never),
+      /must be null/,
+    ).then(() => assert.equal(calls.length, 0));
+  });
+});
+
+after(() => cleanupTempWorkspaces());

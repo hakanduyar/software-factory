@@ -46,7 +46,8 @@ export interface WorkerSmokeOptions {
   readonly executable?: string;
   readonly model?: string;
   readonly effort?: string;
-  readonly timeoutMs?: number;
+  /** Author execution has no total deadline: absent/`null` mean none; a finite value is refused by createCliWorker. */
+  readonly timeoutMs?: number | null;
 }
 
 export interface WorkerSmokeResult {
@@ -141,7 +142,7 @@ async function runSmokeInWorkspace(
   });
 
   const model = options.model ?? defaultModel(tool);
-  const timeoutMs = options.timeoutMs ?? 60_000;
+  const timeoutMs = options.timeoutMs === undefined ? null : options.timeoutMs;
   const executable = options.executable ?? defaultExecutable(tool);
   const sharedConfig = {
     executable,
@@ -155,7 +156,7 @@ async function runSmokeInWorkspace(
   const worker = tool === "claude" ? createClaudeCodeWorker(sharedConfig) : createCodexCliWorker(sharedConfig);
   factory.registerWorker(worker);
 
-  emit(`launching ${tool} (executable=${executable}, model=${model}, timeoutMs=${timeoutMs}) against ${workspace.root} ...`);
+  emit(`launching ${tool} (executable=${executable}, model=${model}, timeoutMs=${timeoutMs === null ? "none" : String(timeoutMs)}) against ${workspace.root} ...`);
 
   const { run, evidence } = await factory.runWorker({
     workItemId: item.id,

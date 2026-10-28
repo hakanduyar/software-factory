@@ -36,7 +36,7 @@ describe("runWorkerSmoke: scratch workspace cleanup", () => {
     const lines: string[] = [];
     const result = await runWorkerSmoke("codex", {
       executable: fakeCliPath("fake-codex.mjs"),
-      timeoutMs: 5000,
+      timeoutMs: null,
       log: (line) => lines.push(line),
     });
 
@@ -57,7 +57,7 @@ describe("runWorkerSmoke: scratch workspace cleanup", () => {
       runWorkerSmoke("codex", {
         executable: fakeCliPath("fake-codex.mjs"),
         processRunner: throwingRunner,
-        timeoutMs: 5000,
+        timeoutMs: null,
         log: (line) => lines.push(line),
       }),
     );
@@ -71,11 +71,40 @@ describe("runWorkerSmoke: scratch workspace cleanup", () => {
     const lines: string[] = [];
     const result = await runWorkerSmoke("codex", {
       executable: "/definitely/not/a/real/codex/binary",
-      timeoutMs: 5000,
+      timeoutMs: null,
       log: (line) => lines.push(line),
     });
 
     assert.equal(result.run.status, "FAILED");
     assert.ok(!existsSync(result.workspaceRoot), "scratch workspace must be removed after a FAILED (spawn-error) run");
+  });
+});
+
+describe("runWorkerSmoke: author timeout policy (no total deadline)", () => {
+  function recordingRunner(calls: (number | null)[]): ProcessRunner {
+    return {
+      async run(request): Promise<ProcessResult> {
+        calls.push(request.timeoutMs);
+        return { terminationReason: "EXITED", exitCode: 0, signal: null, stdout: "", stderr: "", stdoutTruncated: false, stderrTruncated: false, startedAt: 0, finishedAt: 0, durationMs: 0 };
+      },
+    };
+  }
+
+  it("propagates null to the process runner both by default and when explicit", async () => {
+    const calls: (number | null)[] = [];
+    await runWorkerSmoke("codex", { executable: "stub", processRunner: recordingRunner(calls), log: () => {} });
+    await runWorkerSmoke("claude", { executable: "stub", processRunner: recordingRunner(calls), timeoutMs: null, log: () => {} });
+    assert.deepEqual(calls, [null, null]);
+  });
+
+  it("refuses a finite timeout before any child call and still cleans up the scratch workspace", async () => {
+    const calls: (number | null)[] = [];
+    const lines: string[] = [];
+    await assert.rejects(
+      runWorkerSmoke("codex", { executable: "stub", processRunner: recordingRunner(calls), timeoutMs: 5000, log: (l) => lines.push(l) }),
+      /must be null/,
+    );
+    assert.equal(calls.length, 0);
+    assert.ok(!existsSync(extractScratchRoot(lines)));
   });
 });

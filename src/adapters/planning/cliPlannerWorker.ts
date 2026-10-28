@@ -48,7 +48,8 @@ export interface CliPlannerWorkerDeps {
   readonly tool: WorkerTool;
   readonly model: string;
   readonly effort?: string;
-  readonly timeoutMs?: number;
+  /** Author execution has no total deadline: absent/`null` mean none; explicit `null` is forwarded unchanged. A finite value is refused downstream. */
+  readonly timeoutMs?: number | null;
   readonly workspace: Workspace;
   readonly processRunner: ProcessRunner;
   /** Overridable so tests can substitute a fake factory without launching a CLI. */
