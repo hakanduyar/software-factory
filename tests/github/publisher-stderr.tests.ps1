@@ -74,4 +74,3 @@ Check 'old 5-field runner success compatibility' {
   $res=& (New-TransportFor $okRunner) 'READ' $readArgs
   Assert ($res.ok -and $res.number -eq 67 -and -not ($res.PSObject.Properties.Name -contains 'diagnostic')) 'success public shape unchanged'
 }
-
