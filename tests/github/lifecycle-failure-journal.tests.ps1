@@ -202,8 +202,14 @@ Check 'ambiguous EDIT persists sent flag and diagnostic; reload never issues a s
 }
 
 Check 'GitHub ACK then note failure preserves partial flags, destination and sanitized code' {
-  $d=New-Fixture 'partial-note';$handle=[IO.File]::Open((Join-Path $d 'vault/task.md'),[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
-  try{$res=Invoke-Fixture $d}finally{$handle.Dispose()}
+  $d=New-Fixture 'partial-note'
+  # Injected write-failure coverage (test double), not actual filesystem-lock behavior:
+  # FileShare locks block replacement on Windows only; Unix rename is still permitted.
+  $script:InjectedRealWriter=${function:Write-LifecycleAtomic};$script:InjectedFailPath=(Join-Path $d 'vault/task.md')
+  ${function:script:Write-LifecycleAtomic}={param([string]$Path,[byte[]]$Bytes)
+    if($Path -ceq $script:InjectedFailPath){throw [IO.IOException]::new('INJECTED_WRITE_FAILURE')}
+    & $script:InjectedRealWriter -Path $Path -Bytes $Bytes}
+  try{$res=Invoke-Fixture $d}finally{${function:script:Write-LifecycleAtomic}=$script:InjectedRealWriter;$script:InjectedRealWriter=$null;$script:InjectedFailPath=$null}
   Assert ((Field $res 'status') -ceq 'PENDING' -and (Field $res 'automaticRetry') -eq $false) ('public result '+($res|ConvertTo-Json -Compress -Depth 6))
   $ev=Field (ReadJournal $d).events 'update-2'
   Assert-Flags $ev $true $true $true $false
@@ -307,8 +313,13 @@ Check 'failure-record persistence inability fails closed and keeps the original 
   $d=New-Fixture 'persist-fails'
   SeedJournal $d 'LifecycleUpdateJournal/v1' @{'update-2'=(LegacyEvent (FixtureDigest $d))}
   $before=Get-LifecycleFileHash (JournalPath $d);SetMode $d 'read-fail:RATE_LIMITED'
-  $handle=[IO.File]::Open((JournalPath $d),[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
-  try{$res=Invoke-Fixture $d}finally{$handle.Dispose()}
+  # Injected write-failure coverage (test double), not actual filesystem-lock behavior:
+  # FileShare locks block replacement on Windows only; Unix rename is still permitted.
+  $script:InjectedRealWriter=${function:Write-LifecycleAtomic};$script:InjectedFailPath=(JournalPath $d)
+  ${function:script:Write-LifecycleAtomic}={param([string]$Path,[byte[]]$Bytes)
+    if($Path -ceq $script:InjectedFailPath){throw [IO.IOException]::new('INJECTED_WRITE_FAILURE')}
+    & $script:InjectedRealWriter -Path $Path -Bytes $Bytes}
+  try{$res=Invoke-Fixture $d}finally{${function:script:Write-LifecycleAtomic}=$script:InjectedRealWriter;$script:InjectedRealWriter=$null;$script:InjectedFailPath=$null}
   Assert ((Field $res 'status') -ceq 'REFUSED' -and (Field $res 'code') -ceq 'GITHUB_READ_FAILED' -and (Field $res 'automaticRetry') -eq $false) ('original outcome kept '+($res|ConvertTo-Json -Compress -Depth 6))
   Assert ((Field $res 'failureJournal') -ceq 'NOT_PERSISTED') 'no claim of successful persistence'
   Assert-FailureRecord (Field $res 'failure') 'GITHUB_READ_FAILED' 'INITIAL_READ' 'github' 'READ' 'RATE_LIMITED'
