@@ -101,7 +101,7 @@ export interface StartLoopInput {
   readonly budget?: Partial<LoopBudget>;
   /**
    * Optional explicit reference note, forwarded to IMPLEMENTER and REVIEWER
-   * prompts only. The caller MUST obtain it from the accepted-note recall
+   * worker input text only. The caller MUST obtain it from the accepted-note recall
    * verifier; shape validation here is not authentication. It is snapshotted
    * (neutral fields only) and persisted immutably: resume never re-reads or
    * substitutes a newer version, and it asserts nothing about the source

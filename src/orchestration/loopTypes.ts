@@ -237,7 +237,7 @@ export interface EngineeringLoop {
   /**
    * Optional caller-SELECTED, immutable reference data (an accepted-result
    * note body + source identity) forwarded to the IMPLEMENTER and REVIEWER
-   * worker prompts only — never to deterministic verification. Frozen at
+   * worker input text only — never to deterministic verification. Frozen at
    * start; it is never re-read, refreshed or replaced by a "latest" version
    * on resume. It is an explicit selection, NOT an assertion that the source
    * is still current or still accepted at a later time (no revocation policy
