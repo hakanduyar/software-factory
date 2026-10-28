@@ -7,3 +7,7 @@
 /authoring/continuation/tests/output-observation-binding.tests.ps1 text eol=lf
 /scripts/github/github-cli-transport216.ps1 text eol=lf
 /tests/github/publisher-stderr.tests.ps1 text eol=lf
+
+/scripts/github/task-lifecycle-mirror-consumer.ps1 text eol=lf
+/tests/github/lifecycle-failure-journal.tests.ps1 text eol=lf
+/scripts/github/lifecycle-compat/**/*.ps1 -text

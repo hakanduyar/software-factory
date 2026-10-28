@@ -1,0 +1,19 @@
+name: Lifecycle failure journal
+on:
+  pull_request:
+  push:
+permissions:
+  contents: read
+jobs:
+  lifecycle-failure-journal:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: "false"
+      - name: Verify durable failure records without remote calls
+        shell: pwsh
+        run: |
+          $root = $env:GITHUB_WORKSPACE
+          pwsh -NoProfile -File (Join-Path $root 'tests/github/lifecycle-failure-journal.tests.ps1') -ConsumerPath (Join-Path $root 'scripts/github/task-lifecycle-mirror-consumer.ps1') -TransportPath (Join-Path $root 'scripts/github/github-cli-transport216.ps1') -ReconcilePath (Join-Path $root 'scripts/github/lifecycle-compat/continuity/reconcile.ps1') -OutputDirectory (Join-Path $env:RUNNER_TEMP 'lifecycle-failure-journal')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
