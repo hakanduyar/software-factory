@@ -1193,6 +1193,39 @@ function Invoke-PublishedSettledHostContinuation {
         [AllowNull()][object]$BacklogSnapshot
     )
 
+    # Explicit exact-ordinal eleven-key observe-only reviewed completion branch. Captured once, before any I/O; the original ten-key branch is
+    # selected only when the evidence key is absent and keeps its original forwarding.
+    $obsName = 'ObserveOnlyReviewedCompletionEvidence'
+    $taObsMode = $false
+    foreach ($tk in @($TerminalArguments.Keys)) { if ($tk -is [string] -and [string]::Equals($tk, $obsName, [System.StringComparison]::Ordinal)) { $taObsMode = $true } }
+    $taObsScalars = $null
+    $taObsEvidence = $null
+    if ($taObsMode) {
+        try {
+            $obsKeys = @('RawPath', 'TicketPath', 'UsagePath', 'RunId', 'Attempt', 'MaxAttempts', 'PriorElapsedMs', 'MaxElapsedMs', 'ReceiptPath', 'CompletedNativeEvidence', $obsName)
+            if ($TerminalArguments.Count -ne $obsKeys.Count) { throw 'shape' }
+            foreach ($tk in @($TerminalArguments.Keys)) { if ($tk -isnot [string] -or $obsKeys -cnotcontains $tk) { throw 'shape' } }
+            # CompletedNativeEvidence stays a pid/start/artifact equality cross-check in 139/141 only; it is never forwarded to the adapter.
+            if ($null -eq $TerminalArguments['CompletedNativeEvidence']) { throw 'shape' }
+            $taObsScalars = @{}
+            foreach ($tk in @('RawPath', 'TicketPath', 'UsagePath', 'RunId', 'Attempt', 'MaxAttempts', 'PriorElapsedMs', 'MaxElapsedMs', 'ReceiptPath')) { $taObsScalars[$tk] = $TerminalArguments[$tk] }
+            $ev0 = $TerminalArguments[$obsName]
+            if ($ev0 -isnot [System.Management.Automation.PSCustomObject]) { throw 'shape' }
+            $evJson = ConvertTo-Json -InputObject $ev0 -Depth 100 -Compress -WarningAction Stop
+            $taObsEvidence = ConvertFrom-Json -InputObject $evJson -NoEnumerate -DateKind String -Depth 100 -WarningAction Stop
+            $evNames = @($taObsEvidence.PSObject.Properties.Name)
+            if ($taObsEvidence -isnot [System.Management.Automation.PSCustomObject] -or $evNames.Count -ne 5) { throw 'shape' }
+            foreach ($en in @('schema', 'accountingEvidence', 'registrationRef', 'terminalBindingRef', 'reviewCompletionRef')) { if ($evNames -cnotcontains $en) { throw 'shape' } }
+            if ($taObsEvidence.schema -isnot [string] -or $taObsEvidence.schema -cne 'ManagedObserveReviewedCompletionEvidence/v1') { throw 'shape' }
+        } catch {
+            return [PSCustomObject]@{
+                status     = 'RECONCILIATION_REQUIRED'
+                reason     = 'RECEIPT_INVALID'
+                dispatched = $false
+            }
+        }
+    }
+
     # Supplied backlog snapshot is validated and cloned once, before any adapter/producer/core/file I/O; only the clone is forwarded.
     $capBacklog = $PSBoundParameters.ContainsKey('BacklogSnapshot')
     $backlogCapture = $null
@@ -1285,10 +1318,18 @@ function Invoke-PublishedSettledHostContinuation {
         $pubCheckpoint = [string]$CheckpointPath; $pubVault = [string]$VaultPath; $pubEvidence = [string]$EvidenceRoot
         } } catch { $preCode = 'SYNC_CONFIG_INVALID' }
         if ($null -ne $preCode) { $preRefusal = [string]$preCode; $producer = $null; $hasLocal = $false; $hasGh = $false }
+        # A v4 reviewed-completion receipt is settlement evidence only; general outbox/publication does not support it and never claims delivery.
+        if ($taObsMode -and $null -eq $preRefusal) { $preRefusal = 'OBSERVE_REVIEWED_V4_PUBLICATION_UNSUPPORTED'; $producer = $null; $hasLocal = $false; $hasGh = $false }
     }
 
     $mandatoryKeys = @('RawPath', 'TicketPath', 'UsagePath', 'RunId', 'Attempt', 'MaxAttempts', 'PriorElapsedMs', 'MaxElapsedMs', 'ReceiptPath')
     $adapterArgs = @{}
+    if ($taObsMode) {
+        # Nine mandatory scalars plus ONLY the captured observe-only proof; CompletedNativeEvidence is deliberately omitted (mixed adapter modes refuse).
+        foreach ($key in $mandatoryKeys) { $adapterArgs[$key] = $taObsScalars[$key] }
+        $adapterArgs[$obsName] = $taObsEvidence
+    }
+    else {
     foreach ($key in $mandatoryKeys) {
         if (-not $TerminalArguments.ContainsKey($key)) {
             return [PSCustomObject]@{
@@ -1301,6 +1342,7 @@ function Invoke-PublishedSettledHostContinuation {
     }
     if ($TerminalArguments.ContainsKey('CompletedNativeEvidence')) {
         $adapterArgs['CompletedNativeEvidence'] = $TerminalArguments['CompletedNativeEvidence']
+    }
     }
 
     $adapterResult = $null

@@ -77,7 +77,7 @@ function Invoke-VerifiedReviewedHostHandoff141 {
         $pS = Join-Path $dir 'persisted-successor-ack140.ps1'
         $pH = Join-Path $dir 'select-next-ready.ps1'
         foreach ($f in $pA, $pS, $pH) { if (-not (Test-Path -LiteralPath $f -PathType Leaf)) { & $fail 'import missing' } }
-        if ((Get-FileHash -LiteralPath $pA -Algorithm SHA256).Hash.ToLowerInvariant() -cne '48bec6217d1603a663a3bb5110e640e92c00df8b65538698833e925e83c0c8e2') { & $fail 'association hash' }
+        if ((Get-FileHash -LiteralPath $pA -Algorithm SHA256).Hash.ToLowerInvariant() -cne 'af828a91d49f7d9a0d726e5f71bf8d880846efad7c8655626fe0c2b9d7ff3731') { & $fail 'association hash' }
         if ((Get-FileHash -LiteralPath $pS -Algorithm SHA256).Hash.ToLowerInvariant() -cne 'e434aa773b71b92b9b64de884c5827f77122824f0147c83240cf82c694095bc7') { & $fail 'successor hash' }
         . $pA
         . $pS
@@ -108,6 +108,24 @@ function Invoke-VerifiedReviewedHostHandoff141 {
             startIdentity = $cn['startIdentity']
             artifactPath  = $cn['artifactPath']
         }
+
+        # ---- observe-only reviewed completion evidence: typed ordinal bridge, only in the explicit eleven-key branch ----
+        $obsName = 'ObserveOnlyReviewedCompletionEvidence'
+        $obsIn = $false
+        foreach ($k in @($snap['TerminalArguments'].Keys)) { if ($k -is [string] -and [string]::Equals($k, $obsName, [StringComparison]::Ordinal)) { $obsIn = $true } }
+        $obsOut = $false
+        foreach ($k in @($ta.Keys)) { if ($k -is [string] -and [string]::Equals($k, $obsName, [StringComparison]::Ordinal)) { $obsOut = $true } }
+        if ($obsIn -ne $obsOut) { & $fail 'observe evidence presence' }
+        if ($obsOut) {
+            if ($ta.Count -ne 11) { & $fail 'terminal shape' }
+            $oe = $ta[$obsName]
+            if ($oe -isnot [System.Management.Automation.PSCustomObject]) { & $fail 'observe evidence invalid' }
+            & $exact $oe 'schema','accountingEvidence','registrationRef','terminalBindingRef','reviewCompletionRef' 'observe evidence'
+            & $same (& $get $oe 'schema') 'ManagedObserveReviewedCompletionEvidence/v1' 'observe evidence schema'
+            # The association output must be exactly the evidence the host supplied; nothing is substituted in between.
+            if ((ConvertTo-Json -InputObject $oe -Depth 100 -Compress) -cne (ConvertTo-Json -InputObject $snap['TerminalArguments'][$obsName] -Depth 100 -Compress)) { & $fail 'observe evidence changed' }
+        }
+        elseif ($ta.Count -ne 10) { & $fail 'terminal shape' }
 
         # ---- existing host, once ----
         $ha = @{}

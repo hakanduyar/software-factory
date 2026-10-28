@@ -224,7 +224,17 @@ function New-RegisteredCycleSuccessorDispatch152 {
             if ($core.workingDirectory -cne $C.paths['WorkingDirectory'] -or $core.artifactPath -cne $C.paths['ArtifactPath']) { throw 'paths' }
             if ($core.ticketPath -cne $C.paths['TicketPath'] -or $core.payloadPath -cne $C.paths['PayloadPath'] -or $core.gateTicketPath -cne $C.paths['GateTicketPath'] -or $core.settingsPath -cne $C.paths['SettingsPath']) { throw 'paths' }
             if ($core.ticketSha256 -cne $C.shas['TicketPath'] -or $core.payloadSha256 -cne $C.shas['PayloadPath'] -or $core.gateTicketSha256 -cne $C.shas['GateTicketPath'] -or $core.settingsSha256 -cne $C.shas['SettingsPath']) { throw 'hashes' }
-            if ($core.maxElapsedMs -ne $rq['MaxElapsedMs'] -or $core.maxStreamBytes -ne $rq['MaxStreamBytes']) { throw 'limits' }
+            $rqProfile = $false
+            foreach ($rk in @($rq.Keys)) { if ($rk -is [string] -and [string]::Equals($rk, 'OutputStopProfile', [StringComparison]::Ordinal)) { $rqProfile = $true } }
+            if ($rqProfile) {
+                # Observe-only B: exact profile selector, null stream cap on both sides (no numeric stand-in) and the collector-authenticated descriptor carried in the captured core.
+                if ($rq['OutputStopProfile'] -isnot [string] -or $rq['OutputStopProfile'] -cne 'observe-only-v1' -or $null -ne $rq['MaxStreamBytes']) { throw 'limits' }
+                if ($core.maxElapsedMs -ne $rq['MaxElapsedMs']) { throw 'limits' }
+                if ($null -eq $core.PSObject.Properties['maxStreamBytes'] -or $null -ne $core.maxStreamBytes) { throw 'limits' }
+                if ($null -eq $core.PSObject.Properties['outputStopProfile'] -or $core.outputStopProfile -isnot [string] -or $core.outputStopProfile -cne 'observe-only-v1') { throw 'limits' }
+                if ($null -eq $core.PSObject.Properties['outputStopAuthority'] -or $null -eq $core.outputStopAuthority) { throw 'limits' }
+            }
+            elseif ($core.maxElapsedMs -ne $rq['MaxElapsedMs'] -or $core.maxStreamBytes -ne $rq['MaxStreamBytes']) { throw 'limits' }
             if ([IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath($core.runDir)) -cne [IO.Path]::TrimEndingDirectorySeparator($C.runDir)) { throw 'rundir' }
             if ($core.ackMode -ne $true -or $core.ackContext.stateDir -cne $C.stateDir -or $core.ackContext.taskId -cne $C.ticketId) { throw 'ack' }
             foreach ($f in $fields) { if ($core.ackContext.claim.$f -cne $cl[$f]) { throw 'claim' } }
@@ -406,6 +416,21 @@ function Get-RC152Recipe {
             if ($typedContexts -isnot [object[]]) { throw 'recipe' }
             $r['HostArguments']['AllocationContexts'] = $typedContexts
         }
+        $rt0 = $null
+        if ($r['HostArguments'] -is [hashtable] -and $r['HostArguments']['TerminalArguments'] -is [hashtable]) { $rt0 = $r['HostArguments']['TerminalArguments'] }
+        if ($null -ne $rt0 -and @($rt0.Keys | Where-Object { $_ -is [string] -and $_ -ceq 'ObserveOnlyReviewedCompletionEvidence' }).Count -gt 0) {
+            # Strict ordinal typed reread of the proof from the same pinned bytes; no hashtable-to-object coercion of nested values.
+            $typed2 = Read-RC152PinnedJson $Late['recipePath'] $Late['recipeSha256'] $false
+            $typedTa = $typed2.HostArguments.PSObject.Properties['TerminalArguments'].Value
+            $typedEv = $typedTa.PSObject.Properties['ObserveOnlyReviewedCompletionEvidence'].Value
+            if (-not (Test-RC152Exact $typedEv @('schema', 'accountingEvidence', 'registrationRef', 'terminalBindingRef', 'reviewCompletionRef'))) { throw 'recipe' }
+            if ($typedEv.schema -isnot [string] -or $typedEv.schema -cne 'ManagedObserveReviewedCompletionEvidence/v1') { throw 'recipe' }
+            foreach ($rn in 'registrationRef', 'terminalBindingRef', 'reviewCompletionRef') {
+                $rf = $typedEv.PSObject.Properties[$rn].Value
+                if (-not (Test-RC152Exact $rf @('path', 'sha256')) -or -not (Test-RC152Path $rf.path) -or -not (Test-RC152Sha $rf.sha256)) { throw 'recipe' }
+            }
+            $rt0['ObserveOnlyReviewedCompletionEvidence'] = $typedEv
+        }
         return $r
     } catch {
         throw 'REGISTERED_USEFUL_CYCLE_RECIPE_INVALID'
@@ -560,8 +585,17 @@ function New-RegisteredUsefulCycleCallbacks152 {
                 foreach ($k in @($ha.Keys)) { $ha2[$k] = $ha[$k] }
                 $t0 = $ha['TerminalArguments']
                 $tnames = @('RawPath', 'TicketPath', 'UsagePath', 'RunId', 'Attempt', 'MaxAttempts', 'PriorElapsedMs', 'MaxElapsedMs', 'ReceiptPath', 'CompletedNativeEvidence')
-                if (-not $ha.ContainsKey('TerminalArguments') -or $t0 -isnot [hashtable] -or $t0.Count -ne 10) { throw 'recipe' }
+                if (-not $ha.ContainsKey('TerminalArguments') -or $t0 -isnot [hashtable]) { throw 'recipe' }
+                # Exact-ordinal branch: ten legacy keys, or the same ten plus ObserveOnlyReviewedCompletionEvidence (eleven); nothing else.
+                $obsTa = $false
+                foreach ($tk in @($t0.Keys)) { if ($tk -is [string] -and [string]::Equals($tk, 'ObserveOnlyReviewedCompletionEvidence', [StringComparison]::Ordinal)) { $obsTa = $true } }
+                if ($obsTa) { $tnames = $tnames + @('ObserveOnlyReviewedCompletionEvidence') }
+                if ($t0.Count -ne $tnames.Count) { throw 'recipe' }
                 foreach ($tk in @($t0.Keys)) { if ($tk -isnot [string] -or $tnames -cnotcontains $tk) { throw 'recipe' } }
+                if ($obsTa) {
+                    $oe0 = $t0['ObserveOnlyReviewedCompletionEvidence']
+                    if (-not (Test-RC152Exact $oe0 @('schema', 'accountingEvidence', 'registrationRef', 'terminalBindingRef', 'reviewCompletionRef')) -or $oe0.schema -isnot [string] -or $oe0.schema -cne 'ManagedObserveReviewedCompletionEvidence/v1') { throw 'recipe' }
+                }
                 $t1 = $t0['CompletedNativeEvidence']
                 if ($t1 -isnot [hashtable] -or $t1.Count -ne 3) { throw 'recipe' }
                 foreach ($tk in @($t1.Keys)) { if ($tk -isnot [string] -or @('pid', 'startIdentity', 'artifactPath') -cnotcontains $tk) { throw 'recipe' } }
