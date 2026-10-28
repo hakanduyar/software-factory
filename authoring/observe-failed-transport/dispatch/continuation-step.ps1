@@ -939,7 +939,7 @@ function Complete-ContinuationClaim {
         if ($entry.receiptSha256 -cne $SelectedClaim.receiptSha -or $entry.planSha256 -cne $SelectedClaim.planSha) { throw "Entry receipt/plan does not match SelectedClaim; refusing to settle." }
         if ($isV5) {
             # The retained claim entry is the parent receipt's claim: parent hash, run, attempt and original action must equal the failure proof.
-            if ($entry.receiptSha256 -cne [string]$v5Facts.proof.parentReceiptSha256 -or $entry.runId -cne [string]$v5Facts.proof.parentRunId -or [int64]$entry.attempt -ne [int64]$v5Facts.proof.parentAttempt -or $entry.actionId -cne [string]$v5Facts.proof.registeredActionId) { throw "Entry parent identity does not match the failed-transport proof; refusing to settle." }
+            if ($entry.receiptSha256 -cne [string]$v5Facts.proof.parentReceiptSha256 -or $entry.runId -cne [string]$v5Facts.proof.parentRunId -or [int64]$entry.attempt -ne [int64]$v5Facts.proof.parentAttempt -or $entry.actionId -cne [string]$v5Facts.proof.originalActionId -or [string]$v5Facts.proof.originalActionId -cne [string]$v5Facts.proof.claim.id -or [string]$v5Facts.proof.claim.id -cne [string]$v5Facts.proof.taskId) { throw "Entry parent identity does not match the failed-transport proof; refusing to settle." }
         }
 
         $entry.status = 'SETTLED'

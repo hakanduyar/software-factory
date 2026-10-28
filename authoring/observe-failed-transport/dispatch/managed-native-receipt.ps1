@@ -2381,7 +2381,9 @@ function Get-ManagedObserveFailedTransportFacts {
             & $exact $coreClaim $claimNames 'OBSFT_CORE_ACK'
             $claimX = & $readCtl $claimRef
             $selClaim = $claimX.Value
-            & $exact $selClaim $claimNames 'OBSFT_CLAIM_SHAPE'
+            # The selected record is the exact-10 registered selection (identity seven + kind/provider/route); the captured core carries only the exact-7.
+            # The seven identity fields are compared; kind/provider/route are typed and retained as metadata, never used as authority.
+            & $exact $selClaim ($claimNames + @('kind', 'provider', 'route')) 'OBSFT_CLAIM_SHAPE'
             $claimOut = [ordered]@{}
             foreach ($n in $claimNames) {
                 $cv = & $str $selClaim $n 'OBSFT_CLAIM_SHAPE'
@@ -2389,6 +2391,7 @@ function Get-ManagedObserveFailedTransportFacts {
                 if ((($n -ceq 'receiptSha') -or ($n -ceq 'planSha')) -and (-not (& $isHex $cv))) { & $fail 'OBSFT_CLAIM_SHAPE' }
                 $claimOut[$n] = $cv
             }
+            $selMeta = [pscustomobject]([ordered]@{ kind = (& $str $selClaim 'kind' 'OBSFT_CLAIM_SHAPE'); provider = (& $str $selClaim 'provider' 'OBSFT_CLAIM_SHAPE'); route = (& $str $selClaim 'route' 'OBSFT_CLAIM_SHAPE') })
             $claim = [pscustomobject]$claimOut
             $stateDir = & $str $ackCtx 'stateDir' 'OBSFT_CORE_ACK'
             $ctxTaskId = & $str $ackCtx 'taskId' 'OBSFT_CORE_ACK'
@@ -2396,7 +2399,9 @@ function Get-ManagedObserveFailedTransportFacts {
             if (-not (& $samePath $claim.statePath ([System.IO.Path]::Combine($stateDir, 'continuation-state.json')))) { & $fail 'OBSFT_CLAIM_STATE' }
             # Parent hash, parent run/attempt and original action are all inside the claim's intent key.
             if (-not (& $same $claim.receiptSha ([string]$par.sha256))) { & $fail 'OBSFT_CLAIM_PARENT' }
-            $wantIntent = $claim.receiptSha + '|' + [string]$par.runId + '|' + [string]$par.attempt + '|' + [string]$reg.registeredActionId
+            # The ORIGINAL action is the claim/task action (claim.id == task); the registered review action is a different, separately retained identity.
+            if (-not (& $same $claim.id $ctxTaskId)) { & $fail 'OBSFT_CLAIM_ACTION' }
+            $wantIntent = $claim.receiptSha + '|' + [string]$par.runId + '|' + [string]$par.attempt + '|' + $claim.id
             if (-not (& $same $claim.intentId $wantIntent)) { & $fail 'OBSFT_CLAIM_INTENT' }
 
             # ---- keyed start ACK snapshot: exact envelope, exactly one keyed entry, native binding equal to the actual started process ----
@@ -2439,6 +2444,8 @@ function Get-ManagedObserveFailedTransportFacts {
                 registrationId = [string]$reg.registrationId
                 registeredActionId = [string]$reg.registeredActionId
                 claim = $claim
+                selectedClaimMetadata = $selMeta
+                originalActionId = [string]$claim.id
                 stateDir = $stateDir
                 taskId = [string]$bnd.taskId
                 runId = [string]$cap.RunId
