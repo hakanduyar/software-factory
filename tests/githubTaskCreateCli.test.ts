@@ -134,7 +134,15 @@ describe("existing CLI help/dispatch", () => {
 });
 
 describe("runGithubTaskCreate prerequisites and request shape", () => {
-  it("calls the runner zero times when a prerequisite is missing or a symlink", async () => {
+  const refusedWithoutSpawn = async (name: string, a: GithubTaskCreateArgs): Promise<void> => {
+    const r = stubRunner(procResult({ stdout: engine() }));
+    const errs: string[] = [];
+    assert.equal(await runGithubTaskCreate(a, { processRunner: r, error: (l) => errs.push(l) }), 1, name);
+    assert.equal(r.requests.length, 0, name);
+    assert.match(errs.join("\n"), /PRECHECK_REFUSED/, name);
+  };
+
+  it("calls the runner zero times when a prerequisite is missing or the wrong type", async () => {
     const d = dirs();
     const cases: Array<[string, GithubTaskCreateArgs]> = [
       ["event missing", { ...d.args, eventPath: join(d.root, "nope.json") }],
@@ -143,21 +151,37 @@ describe("runGithubTaskCreate prerequisites and request shape", () => {
       ["temp root file", { ...d.args, transportTempRoot: d.args.eventPath }],
       ["entrypoint missing", { ...d.args, repositoryRoot: d.root }],
       ["pwsh missing", { ...d.args, pwshPath: join(d.root, "nope") }],
-      ["pwsh not executable", { ...d.args, pwshPath: d.args.eventPath }],
+      ["pwsh directory", { ...d.args, pwshPath: d.root }],
     ];
-    const evLink = join(d.root, "event-link.json");
-    symlinkSync(d.args.eventPath, evLink);
-    cases.push(["event symlink", { ...d.args, eventPath: evLink }]);
-    const trLink = join(d.root, "tmp-link");
-    symlinkSync(d.args.transportTempRoot, trLink);
-    cases.push(["temp root symlink", { ...d.args, transportTempRoot: trLink }]);
-    for (const [name, a] of cases) {
-      const r = stubRunner(procResult({ stdout: engine() }));
-      const errs: string[] = [];
-      assert.equal(await runGithubTaskCreate(a, { processRunner: r, error: (l) => errs.push(l) }), 1, name);
-      assert.equal(r.requests.length, 0, name);
-      assert.match(errs.join("\n"), /PRECHECK_REFUSED/);
+    if (process.platform !== "win32") {
+      // X_OK is only meaningful on POSIX permission bits.
+      cases.push(["pwsh not executable", { ...d.args, pwshPath: d.args.eventPath }]);
     }
+    for (const [name, a] of cases) await refusedWithoutSpawn(name, a);
+  });
+
+  it("refuses direct symlink inputs (event, temp root, pwsh) without spawning", async (t) => {
+    const d = dirs();
+    const link = (target: string, name: string): string | undefined => {
+      const l = join(d.root, name);
+      try {
+        symlinkSync(target, l);
+        return l;
+      } catch (e) {
+        const code = (e as NodeJS.ErrnoException).code;
+        // Only a Windows symlink-capability limit may make this test unavailable.
+        if (process.platform === "win32" && (code === "EPERM" || code === "ENOTSUP")) return undefined;
+        throw e;
+      }
+    };
+    const ev = link(d.args.eventPath, "event-link.json");
+    if (ev === undefined) {
+      t.skip("symlink creation unavailable on this Windows account");
+      return;
+    }
+    await refusedWithoutSpawn("event symlink", { ...d.args, eventPath: ev });
+    await refusedWithoutSpawn("temp root symlink", { ...d.args, transportTempRoot: link(d.args.transportTempRoot, "tmp-link") as string });
+    await refusedWithoutSpawn("pwsh symlink", { ...d.args, pwshPath: link(d.args.pwshPath, "pwsh-link") as string });
   });
 
   it("passes separate argv, the exact stdin envelope and a filtered environment", async () => {
@@ -283,7 +307,7 @@ function discoverPwsh(): string | undefined {
     if (!d.startsWith("/") || !existsSync(c)) continue;
     const probe = spawnSync(c, ["-NoProfile", "-Command", "$PSVersionTable.PSVersion.ToString()"], { encoding: "utf8", timeout: 60_000 });
     const m = /^(\d+)\.(\d+)/.exec(probe.stdout ?? "");
-    if (probe.status === 0 && m !== null && (Number(m[1]) > 7 || (Number(m[1]) === 7 && Number(m[2]) >= 6))) return c;
+    if (probe.status === 0 && m !== null && (Number(m[1]) > 7 || (Number(m[1]) === 7 && Number(m[2]) >= 6))) return realpathSync(c);
   }
   return undefined;
 }

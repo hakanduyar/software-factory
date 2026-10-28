@@ -15,7 +15,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { accessSync, constants, lstatSync, statSync } from "node:fs";
+import { accessSync, constants, lstatSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 
 import { createNodeProcessRunner } from "../adapters/process/nodeProcessRunner.js";
@@ -52,7 +52,7 @@ performs ACTUAL remote issue creation (find-before-create, then create and
 read back) for the one GitHubCreateEvent/v1 file named by --event. Every flag
 is required and may appear once. --repo and --marker-namespace accept only the
 engine's single supported configuration. --gh is pinned by --gh-sha256.
---event must be an ordinary non-symlink file; --transport-temp-root must be an
+--event and --pwsh must be ordinary non-symlink files; --transport-temp-root must be an
 existing ordinary directory; --repository-root holds the fixed entrypoint.
 The printed "outcome:" line carries the engine status; only MAPPED means an
 observed durable mapping (not DONE, acceptance, completion or a dispatch
@@ -246,8 +246,7 @@ export async function runGithubTaskCreate(
     return refuse("fixed entrypoint missing under --repository-root");
   }
   try {
-    // pwsh installs are routinely symlinked; require only that it resolves to an executable file.
-    if (!statSync(args.pwshPath).isFile()) return refuse("--pwsh is not an executable file");
+    if (!lstatSync(args.pwshPath).isFile()) return refuse("--pwsh is not an ordinary non-symlink executable file");
     accessSync(args.pwshPath, constants.X_OK);
   } catch {
     return refuse("--pwsh is not an existing executable");
