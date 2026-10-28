@@ -31,6 +31,62 @@ function Test-GitHubCliPathPin216 {
   } catch { return $false }
 }
 
+function New-GitHubCliFailureDiagnostic216 {
+  # Typed, fixed-vocabulary failure facts only. Stderr text is classified here and
+  # never returned; a category grants no permission, retry or fallback.
+  [CmdletBinding()]
+  param(
+    [int]$ExitCode,
+    [bool]$TimedOut,
+    [bool]$StdoutTruncated,
+    [bool]$StderrTruncated,
+    [AllowNull()][string]$StderrText,
+    [string]$StderrEncoding = 'NOT_OBSERVED',
+    [string]$Category = ''
+  )
+  $cat = $Category
+  if ($cat -ceq '') {
+    $cat = 'UNKNOWN'
+    if ($TimedOut) { $cat = 'TIMEOUT' }
+    elseif ($StderrEncoding -ceq 'VALID' -and -not [string]::IsNullOrEmpty($StderrText)) {
+      $t = $StderrText
+      if ($t -match 'rate limit|http 429') { $cat = 'RATE_LIMITED' }
+      elseif ($t -match 'gh auth login|not logged in|authentication|bad credentials|http 401') { $cat = 'AUTH_REQUIRED' }
+      elseif ($t -match 'http 403|forbidden|permission') { $cat = 'PERMISSION_DENIED' }
+      elseif ($t -match 'http 404|not found|could not resolve to') { $cat = 'NOT_FOUND' }
+      elseif ($t -match 'http 422|validation failed') { $cat = 'VALIDATION_FAILED' }
+      elseif ($t -match 'no such host|could not resolve host|connection refused|network is unreachable|dial tcp|tls handshake') { $cat = 'NETWORK_UNAVAILABLE' }
+    }
+    if ($cat -ceq 'UNKNOWN') {
+      if ($StdoutTruncated) { $cat = 'OUTPUT_TRUNCATED' }
+      elseif ($StderrTruncated) { $cat = 'STDERR_TRUNCATED' }
+    }
+  }
+  return [pscustomobject]@{
+    category = [string]$cat
+    exitCode = [int]$ExitCode
+    timedOut = [bool]$TimedOut
+    stderrTruncated = [bool]$StderrTruncated
+    stderrEncoding = [string]$StderrEncoding
+  }
+}
+
+function Test-GitHubCliFailureDiagnostic216 {
+  [CmdletBinding()]
+  [OutputType([bool])]
+  param($Diagnostic)
+  try {
+    if ($Diagnostic -isnot [pscustomobject]) { return $false }
+    $names = @($Diagnostic.PSObject.Properties.Name)
+    if ($names.Count -ne 5) { return $false }
+    foreach ($w in @('category', 'exitCode', 'timedOut', 'stderrTruncated', 'stderrEncoding')) { if ($names -cnotcontains $w) { return $false } }
+    if ($Diagnostic.category -isnot [string] -or $Diagnostic.exitCode -isnot [int] -or $Diagnostic.timedOut -isnot [bool] -or $Diagnostic.stderrTruncated -isnot [bool] -or $Diagnostic.stderrEncoding -isnot [string]) { return $false }
+    if ($Diagnostic.category -cnotin @('TIMEOUT', 'RATE_LIMITED', 'AUTH_REQUIRED', 'PERMISSION_DENIED', 'NOT_FOUND', 'VALIDATION_FAILED', 'NETWORK_UNAVAILABLE', 'OUTPUT_TRUNCATED', 'STDERR_TRUNCATED', 'UNAVAILABLE', 'UNKNOWN')) { return $false }
+    if ($Diagnostic.stderrEncoding -cnotin @('VALID', 'INVALID', 'NOT_OBSERVED')) { return $false }
+    return $true
+  } catch { return $false }
+}
+
 function Invoke-GitHubCliBoundedProcess216 {
   [CmdletBinding()]
   param(
@@ -111,13 +167,20 @@ function Invoke-GitHubCliBoundedProcess216 {
     if ($p.HasExited) { $code = [int]$p.ExitCode }
     $enc = if ($st[0].trunc) { [System.Text.UTF8Encoding]::new($false, $false) } else { [System.Text.UTF8Encoding]::new($false, $true) }
     try { $text = $enc.GetString($st[0].ms.ToArray()) } catch { throw 'STDOUT_ENCODING_INVALID' }
-    return [pscustomobject]@{
+    $res = [ordered]@{
       exitCode = [int]$code
       timedOut = [bool]$timedOut
       stdout = [string]$text
       stdoutTruncated = [bool]$st[0].trunc
       stderrTruncated = [bool]$st[1].trunc
     }
+    if ($code -ne 0 -or $timedOut -or $st[0].trunc -or $st[1].trunc) {
+      $errText = $null
+      $errEnc = 'INVALID'
+      try { $errText = [System.Text.UTF8Encoding]::new($false, $true).GetString($st[1].ms.ToArray()); $errEnc = 'VALID' } catch { $errText = $null }
+      $res['failureDiagnostic'] = New-GitHubCliFailureDiagnostic216 -ExitCode ([int]$code) -TimedOut ([bool]$timedOut) -StdoutTruncated ([bool]$st[0].trunc) -StderrTruncated ([bool]$st[1].trunc) -StderrText $errText -StderrEncoding $errEnc
+    }
+    return [pscustomobject]$res
   } finally {
     if ($started) {
       try { if (-not $p.HasExited) { $p.Kill($true); [void]$p.WaitForExit(5000) } } catch { }
@@ -138,6 +201,9 @@ function New-GitHubCliLifecycleTransport216 {
   $repoName = 'hakanduyar/software-factory'
   if ($Repository -cne $repoName) { throw 'CONFIG_INVALID' }
   $pinFn = ${function:Test-GitHubCliPathPin216}
+  $diagNew = ${function:New-GitHubCliFailureDiagnostic216}
+  $diagOk = ${function:Test-GitHubCliFailureDiagnostic216}
+  $diag = @{ v = $null }
   if (-not (& $pinFn -Path $GhPath -ExpectedSha256 $ExpectedGhSha256 -IsDirectory $false)) { throw 'EXECUTABLE_PIN_REFUSED' }
   if (-not (& $pinFn -Path $TempRoot -ExpectedSha256 '' -IsDirectory $true)) { throw 'TEMP_ROOT_INVALID' }
   if ($null -eq $ProcessRunner) {
@@ -159,7 +225,7 @@ function New-GitHubCliLifecycleTransport216 {
     $fb = $bad
     try {
       if ($Operation -isnot [string] -or $Request -isnot [hashtable]) { return $bad }
-      if ($Operation -cnotin @('FIND', 'CREATE', 'READ')) { return $bad }
+      if ($Operation -cnotin @('FIND', 'CREATE', 'READ', 'EDIT')) { return $bad }
       if ($Operation -ceq 'FIND') { $fb = $badFind }
       if (-not $Request.ContainsKey('repo') -or $Request['repo'] -isnot [string] -or $Request['repo'] -cne $repoName) { return $fb }
 
@@ -214,21 +280,96 @@ function New-GitHubCliLifecycleTransport216 {
       }
       $exec = {
         param([string[]]$argv)
+        $diag.v = $null
         try {
           if (-not (& $pinFn -Path $GhPath -ExpectedSha256 $ExpectedGhSha256 -IsDirectory $false)) { return $null }
           $o = @(& $runner $GhPath $argv 30000 8388608 65536)
           if ($o.Count -ne 1 -or $o[0] -isnot [pscustomobject]) { return $null }
           $r = $o[0]
           $names = @($r.PSObject.Properties.Name)
-          if ($names.Count -ne 5) { return $null }
+          $has6 = ($names.Count -eq 6)
+          if ($names.Count -ne 5 -and -not $has6) { return $null }
           foreach ($w in @('exitCode', 'timedOut', 'stdout', 'stdoutTruncated', 'stderrTruncated')) { if ($names -cnotcontains $w) { return $null } }
+          if ($has6 -and $names -cnotcontains 'failureDiagnostic') { return $null }
           if ($r.exitCode -isnot [int] -or $r.timedOut -isnot [bool] -or $r.stdout -isnot [string] -or $r.stdoutTruncated -isnot [bool] -or $r.stderrTruncated -isnot [bool]) { return $null }
-          if ($r.exitCode -ne 0 -or $r.timedOut -or $r.stdoutTruncated -or $r.stderrTruncated) { return $null }
+          if ($r.exitCode -ne 0 -or $r.timedOut -or $r.stdoutTruncated -or $r.stderrTruncated) {
+            # Failure stays failure. Only a validated, result-consistent typed
+            # diagnostic is retained; anything else is omitted or derived from flags.
+            $d = $null
+            if ($has6) {
+              $d = $r.failureDiagnostic
+              if (-not (& $diagOk $d) -or $d.exitCode -ne $r.exitCode -or $d.timedOut -ne $r.timedOut -or $d.stderrTruncated -ne $r.stderrTruncated) { $d = $null }
+            } else {
+              $d = & $diagNew -ExitCode $r.exitCode -TimedOut $r.timedOut -StdoutTruncated $r.stdoutTruncated -StderrTruncated $r.stderrTruncated -StderrText $null
+            }
+            $diag.v = $d
+            return $null
+          }
+          if ($has6) { return $null }
           if ([System.Text.Encoding]::UTF8.GetByteCount($r.stdout) -gt 8388608) { return $null }
           return $r
-        } catch { return $null }
+        } catch {
+          try { $diag.v = & $diagNew -ExitCode (-1) -TimedOut $false -StdoutTruncated $false -StderrTruncated $false -StderrText $null -Category 'UNAVAILABLE' } catch { $diag.v = $null }
+          return $null
+        }
+      }
+      $failWith = {
+        param($b)
+        if ($null -eq $diag.v) { return $b }
+        $c = [ordered]@{}
+        foreach ($pr in $b.PSObject.Properties) { $c[$pr.Name] = $pr.Value }
+        $c['diagnostic'] = $diag.v
+        return [pscustomobject]$c
       }
 
+      # EDIT is an exact compare-before-write operation. The caller must pass the
+      # complete reviewed before/after body; only one managed region may change.
+      if ($Operation -ceq 'EDIT') {
+        if ($Request.Count -ne 7) { return $bad }
+        foreach ($k in @('issueNumber','title','body','beforeTitle','beforeBody','taskId')) { if (-not $Request.ContainsKey($k)) { return $bad } }
+        $n = $Request.issueNumber
+        if (-not ($n -is [int] -or $n -is [long]) -or $n -lt 1 -or $n -gt 2147483647) { return $bad }
+        if ($Request.taskId -isnot [string] -or $Request.taskId -cnotmatch $idRx) { return $bad }
+        $marker = '<!-- factory-task-' + (& $sha $Request.taskId) + ' -->'
+        $rx = '(?m)^<!-- factory-task-status:start -->\nTask: ' + [regex]::Escape($Request.taskId) + '\n[^\r]*?\n<!-- factory-task-status:end -->(?=\n|\z)'
+        $regions = @()
+        foreach ($b in @($Request.beforeBody, $Request.body)) {
+          if ($b -isnot [string] -or [Text.Encoding]::UTF8.GetByteCount($b) -gt 1048576 -or $b.Contains("`r")) { return $bad }
+          if ([regex]::Matches($b,[regex]::Escape($marker)).Count -ne 1 -or [regex]::Matches($b,'<!-- factory-task-status:start -->').Count -ne 1 -or [regex]::Matches($b,'<!-- factory-task-status:end -->').Count -ne 1) { return $bad }
+          $matches = [regex]::Matches($b,$rx)
+          if ($matches.Count -ne 1 -or $b.IndexOf($marker,[StringComparison]::Ordinal) -gt $matches[0].Index) { return $bad }
+          $regions += $matches[0]
+        }
+        if (-not (& $createOk $Request.title ($marker + "`n`n" + $regions[1].Value))) { return $bad }
+        if (-not (& $createOk $Request.beforeTitle ($marker + "`n`n" + $regions[0].Value))) { return $bad }
+        if ($Request.body -cne ($Request.beforeBody.Substring(0,$regions[0].Index) + $regions[1].Value + $Request.beforeBody.Substring($regions[0].Index+$regions[0].Length))) { return $bad }
+        $oldVersion = [long]([regex]::Match($regions[0].Value,'(?m)^Version: ([0-9]+)$').Groups[1].Value)
+        $newVersion = [long]([regex]::Match($regions[1].Value,'(?m)^Version: ([0-9]+)$').Groups[1].Value)
+        if ($newVersion -le $oldVersion) { return $bad }
+        $read = & $exec @('issue','view',[string]$n,'--repo',$repoName,'--json','number,url,state,title,body')
+        if ($null -eq $read) { return (& $failWith $bad) }
+        $doc = $null
+        try {
+          $doc = [Text.Json.JsonDocument]::Parse($read.stdout,$jopts)
+          if ($doc.RootElement.ValueKind -ne $kObj) { return $bad }
+          $current = & $props $doc.RootElement
+          if ($null -eq $current -or $current.Count -ne 5) { return $bad }
+          foreach ($k in @('number','url','state','title','body')) { if (-not $current.ContainsKey($k)) { return $bad } }
+          $actualNumber = 0
+          if ($current.number.ValueKind -ne $kNum -or -not $current.number.TryGetInt32([ref]$actualNumber) -or $actualNumber -ne $n) { return $bad }
+          foreach ($k in @('url','state','title','body')) { if ($current[$k].ValueKind -ne $kStr) { return $bad } }
+          if ($current.url.GetString() -cne ($urlBase+[string]$n) -or $current.state.GetString() -cne 'OPEN' -or $current.title.GetString() -cne $Request.beforeTitle -or $current.body.GetString() -cne $Request.beforeBody) { return $bad }
+        } finally { if ($null -ne $doc) { $doc.Dispose() } }
+        if (-not (& $pinFn -Path $TempRoot -ExpectedSha256 '' -IsDirectory $true)) { return $bad }
+        $path = Join-Path $TempRoot ('github-cli-edit216-'+[guid]::NewGuid().ToString('N')+'.md')
+        try {
+          $stream = [IO.File]::Open($path,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+          try { $bytes=[Text.UTF8Encoding]::new($false,$true).GetBytes($Request.body); $stream.Write($bytes,0,$bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
+          $result = & $exec @('issue','edit',[string]$n,'--repo',$repoName,'--title',$Request.title,'--body-file',$path)
+          if ($null -eq $result) { return (& $failWith $bad) }
+          return [pscustomobject]@{ok=$true; number=[int]$n; url=($urlBase+[string]$n)}
+        } finally { if ([IO.File]::Exists($path)) { [IO.File]::Delete($path) } }
+      }
       if ($Operation -ceq 'READ') {
         if ($Request.Count -ne 2 -or -not $Request.ContainsKey('issueNumber')) { return $bad }
         $n = $Request['issueNumber']
@@ -236,7 +377,7 @@ function New-GitHubCliLifecycleTransport216 {
         $n = [int]$n
         $url = $urlBase + [string]$n
         $r = & $exec @('issue', 'view', [string]$n, '--repo', $repoName, '--json', 'number,url,state,title,body')
-        if ($null -eq $r) { return $bad }
+        if ($null -eq $r) { return (& $failWith $bad) }
         $doc = $null
         try {
           $doc = [System.Text.Json.JsonDocument]::Parse($r.stdout, $jopts)
@@ -261,7 +402,7 @@ function New-GitHubCliLifecycleTransport216 {
         if ($stable -isnot [string] -or $stable -cnotmatch '^factory-task-[0-9a-f]{64}\z') { return $badFind }
         if ($rendered -isnot [string] -or $rendered -cne ('<!-- ' + $stable + ' -->')) { return $badFind }
         $r = & $exec @('api', '--method', 'GET', ('repos/' + $repoName + '/issues?state=all&per_page=100'), '--paginate', '--slurp')
-        if ($null -eq $r) { return $badFind }
+        if ($null -eq $r) { return (& $failWith $badFind) }
         $doc = $null
         try {
           $doc = [System.Text.Json.JsonDocument]::Parse($r.stdout, $jopts)
@@ -328,7 +469,7 @@ function New-GitHubCliLifecycleTransport216 {
           } catch { }
         }
       }
-      if ($null -eq $r) { return $bad }
+      if ($null -eq $r) { return (& $failWith $bad) }
       $s = $r.stdout
       if ($s.EndsWith($cr + $nl, [System.StringComparison]::Ordinal)) { $s = $s.Substring(0, $s.Length - 2) }
       elseif ($s.EndsWith($nl, [System.StringComparison]::Ordinal)) { $s = $s.Substring(0, $s.Length - 1) }
