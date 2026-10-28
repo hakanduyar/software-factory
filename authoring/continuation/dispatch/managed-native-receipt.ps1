@@ -1486,14 +1486,60 @@ function Get-ManagedObservePendingAccountingFacts {
                 [void]$paths.Add($idn.termPath); [void]$mans.Add($idn.manSha); [void]$tkts.Add($idn.tkSha); [void]$sessions.Add($idn.session)
                 foreach ($hh in @($hist)) { [void]$runs.Add([string]$hh.runId); [void]$reqs.Add([string]$hh.req); [void]$shas.Add([string]$hh.sha); [void]$paths.Add([string]$hh.path); [void]$sessions.Add([string]$hh.session) }
             }
-            $rootHist = [System.Collections.Generic.List[object]]::new()
-            foreach ($h in (& $histOf $pc.Ticket)) {
-                $ht = & $get $h 'terminalRef' 'OBSPA_PREDECESSOR_HISTORY'
-                $rootHist.Add(@{ runId = [string](& $get $h 'runId' 'OBSPA_PREDECESSOR_HISTORY'); req = [string](& $get $h 'requestSha256' 'OBSPA_PREDECESSOR_HISTORY'); sha = [string](& $get $ht 'sha256' 'OBSPA_PREDECESSOR_HISTORY'); path = [string](& $get $ht 'path' 'OBSPA_PREDECESSOR_HISTORY'); session = (& $histSession $h) })
+            # Declared history of a ticket: strictly required for the legacy anchor; for observe nodes an absent aggregateAdvisory means no history
+            # (never invented from counts), a present one must be well-formed. Identities are authenticated through pinned bytes only.
+            $histOptOf = {
+                param($t)
+                $tb = & $get $t 'budget' 'OBSPA_PREDECESSOR_HISTORY'
+                $has = $false
+                foreach ($q in $tb.PSObject.Properties) { if ([string]::Equals([string]$q.Name, 'aggregateAdvisory', $ord)) { $has = $true } }
+                if (-not $has) { return , $null }
+                return , (& $histOf $t)
             }
-            & $register @{ runId = [string]$pEv.runId; attempt = [long]$pEv.attempt; req = [string]$pc.RequestSha256; termSha = [string]$pc.TerminalSha256; termPath = [string]$pc.TerminalPath; session = [string](& $get $pc.Ticket 'sessionId' 'OBSPA_PREDECESSOR_COUNT'); manSha = [string]$pc.ManifestSha256; tkSha = [string]$pc.TicketSha256 } $rootHist
+            $lineMap = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+            $aliasReq = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
+            $aliasSha = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
+            $aliasPath = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase)
+            $aliasSess = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase)
+            # One run identity maps to exactly one set of pins/session across the whole lineage; repeats must agree exactly, aliases refuse.
+            $bindEntry = {
+                param($e)
+                if ($lineMap.ContainsKey($e.runId)) {
+                    $x = $lineMap[$e.runId]
+                    if (([string]$x.req -cne [string]$e.req) -or ([string]$x.sha -cne [string]$e.sha) -or (-not [string]::Equals([string]$x.path, [string]$e.path, [StringComparison]::OrdinalIgnoreCase)) -or (-not [string]::Equals([string]$x.session, [string]$e.session, [StringComparison]::OrdinalIgnoreCase))) { & $fail 'OBSPA_HISTORY_CONFLICT' }
+                    return
+                }
+                if ($aliasReq.ContainsKey([string]$e.req) -or $aliasSha.ContainsKey([string]$e.sha) -or $aliasPath.ContainsKey([string]$e.path) -or $aliasSess.ContainsKey([string]$e.session)) { & $fail 'OBSPA_HISTORY_CONFLICT' }
+                $lineMap[$e.runId] = $e
+                $aliasReq[[string]$e.req] = $e.runId; $aliasSha[[string]$e.sha] = $e.runId; $aliasPath[[string]$e.path] = $e.runId; $aliasSess[[string]$e.session] = $e.runId
+            }
+            $histCache = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
+            $histKeep = [System.Collections.Generic.List[object]]::new()
+            $registerNode = {
+                param($idn, $tkt, [bool]$strict)
+                $hs = $null
+                if ($strict) { $hs = & $histOf $tkt } else { $hs = & $histOptOf $tkt }
+                $he = [System.Collections.Generic.List[object]]::new()
+                foreach ($h in $(if ($null -eq $hs) { @() } else { @($hs) })) {
+                    if ($null -eq $h) { & $fail 'OBSPA_HISTORY_SESSION' }
+                    $ht = & $get $h 'terminalRef' 'OBSPA_PREDECESSOR_HISTORY'
+                    $e = @{ runId = [string](& $get $h 'runId' 'OBSPA_PREDECESSOR_HISTORY'); req = [string](& $get $h 'requestSha256' 'OBSPA_PREDECESSOR_HISTORY'); sha = [string](& $get $ht 'sha256' 'OBSPA_PREDECESSOR_HISTORY'); path = [string](& $get $ht 'path' 'OBSPA_PREDECESSOR_HISTORY') }
+                    $key = $e.runId + '|' + $e.req + '|' + $e.sha + '|' + $e.path
+                    if (-not $histCache.ContainsKey($key)) {
+                        $histCache[$key] = [string](& $histSession $h)
+                        $histKeep.Add(@{ h = $h; session = $histCache[$key] })
+                    }
+                    $e.session = $histCache[$key]
+                    $he.Add($e)
+                }
+                & $register $idn $he
+                & $bindEntry @{ runId = $idn.runId; req = $idn.req; sha = $idn.termSha; path = $idn.termPath; session = $idn.session }
+                foreach ($e in $he) { & $bindEntry $e }
+            }
+            & $registerNode @{ runId = [string]$pEv.runId; attempt = [long]$pEv.attempt; req = [string]$pc.RequestSha256; termSha = [string]$pc.TerminalSha256; termPath = [string]$pc.TerminalPath; session = [string](& $get $pc.Ticket 'sessionId' 'OBSPA_PREDECESSOR_COUNT'); manSha = [string]$pc.ManifestSha256; tkSha = [string]$pc.TicketSha256 } $pc.Ticket $true
 
             $extraList = [System.Collections.Generic.List[object]]::new()
+            $kept = [System.Collections.Generic.List[object]]::new()
             foreach ($e in @($pc.Inputs)) { $extraList.Add($e) }
             $parentUsed = $priorUsed
             for ($i = $chain.Count - 2; $i -ge 0; $i--) {
@@ -1508,7 +1554,7 @@ function Get-ManagedObservePendingAccountingFacts {
                 $no = & $observeNode $nc $ape $nb.curHist
                 $nc2 = & $captureFor $ape
                 if (-not (& $sameCapture $nc2 $nc)) { & $fail 'OBSPA_STALE_ANCESTOR' }
-                & $register @{ runId = $ape.runId; attempt = [long]$ape.attempt; req = [string]$nb.reqSha; termSha = [string]$nc.TerminalSha256; termPath = [string]$nc.TerminalPath; session = [string]$nb.sessionId; manSha = [string]$nc.ManifestSha256; tkSha = [string]$nc.TicketSha256 } @()
+                & $registerNode @{ runId = $ape.runId; attempt = [long]$ape.attempt; req = [string]$nb.reqSha; termSha = [string]$nc.TerminalSha256; termPath = [string]$nc.TerminalPath; session = [string]$nb.sessionId; manSha = [string]$nc.ManifestSha256; tkSha = [string]$nc.TicketSha256 } $nb.ticket $false
                 $rp = [System.Collections.Generic.List[string]]::new()
                 for ($j = $i + 1; $j -lt $chain.Count; $j++) { $rp.Add([string]$chain[$j].pr.Path) }
                 $nf = & $buildFacts @{ c = $nc; b = $nb; o = $no; pe = $ape; anchorPr = $anchorPr; anchorEv = $anchorEv; anchorPc = $anchorPc; anchorUsed = $anchorUsed; parentPr = $parentRead; inPaths = (& $mkInPaths $nc $extraList $rp) }
@@ -1518,10 +1564,11 @@ function Get-ManagedObservePendingAccountingFacts {
                 $rawRef = Test-ManagedObservePendingRawDto -RawPath ([string](& $get $rEv 'rawPath' 'OBSPA_ANCESTOR_RAW')) -ExpectedSha256 ([string](& $get $rEv 'rawSha256' 'OBSPA_ANCESTOR_RAW')) -Facts $nf
                 if (($null -eq $rawRef) -or ($rawRef.Valid -isnot [bool]) -or (-not $rawRef.Valid) -or ($rawRef.Path -cne [string](& $get $rEv 'rawPath' 'OBSPA_ANCESTOR_RAW'))) { & $fail 'OBSPA_ANCESTOR_RAW' }
                 foreach ($e in @($nc.Inputs) + @($nc.StreamedInputs)) { $extraList.Add($e) }
+                $kept.Add(@{ pe = $ape; nc = $nc; nf = $nf; rawPath = [string](& $get $rEv 'rawPath' 'OBSPA_ANCESTOR_RAW'); rawSha = [string](& $get $rEv 'rawSha256' 'OBSPA_ANCESTOR_RAW') })
                 $parentUsed = [long]$no.used
             }
             if ($curHist -ne $parentUsed) { & $fail 'OBSPA_ANCHOR_HISTORY_MISMATCH' }
-            & $register @{ runId = $runId; attempt = [long]$attempt; req = [string]$reqSha; termSha = [string](& $get $c 'TerminalSha256' 'OBSPA_CAPTURE_FIELD'); termPath = [string](& $get $c 'TerminalPath' 'OBSPA_CAPTURE_FIELD'); session = [string]$sessionId; manSha = [string](& $get $c 'ManifestSha256' 'OBSPA_CAPTURE_FIELD'); tkSha = [string](& $get $c 'TicketSha256' 'OBSPA_CAPTURE_FIELD') } @()
+            & $registerNode @{ runId = $runId; attempt = [long]$attempt; req = [string]$reqSha; termSha = [string](& $get $c 'TerminalSha256' 'OBSPA_CAPTURE_FIELD'); termPath = [string](& $get $c 'TerminalPath' 'OBSPA_CAPTURE_FIELD'); session = [string]$sessionId; manSha = [string](& $get $c 'ManifestSha256' 'OBSPA_CAPTURE_FIELD'); tkSha = [string](& $get $c 'TicketSha256' 'OBSPA_CAPTURE_FIELD') } $ticket $false
             $extraObjs = @($extraList.ToArray())
         }
 
@@ -1534,6 +1581,18 @@ function Get-ManagedObservePendingAccountingFacts {
         foreach ($q in $chainReads) {
             $q2 = & $readRef ([string]$q.Path) ([string]$q.Sha256)
             if (($q2.Sha256 -cne $q.Sha256) -or ($q2.Length -ne $q.Length)) { & $fail 'OBSPA_STALE_PREDECESSOR' }
+        }
+        if ($isV3) {
+            # Final coverage after all later processing: every retained ancestor capture and raw DTO, and every history identity read, must be unchanged.
+            foreach ($k in $kept) {
+                $kc = & $captureFor $k.pe
+                if (-not (& $sameCapture $kc $k.nc)) { & $fail 'OBSPA_STALE_ANCESTOR' }
+                $kr = Test-ManagedObservePendingRawDto -RawPath $k.rawPath -ExpectedSha256 $k.rawSha -Facts $k.nf
+                if (($null -eq $kr) -or ($kr.Valid -isnot [bool]) -or (-not $kr.Valid) -or ($kr.Path -cne $k.rawPath)) { & $fail 'OBSPA_ANCESTOR_RAW' }
+            }
+            foreach ($hk in $histKeep) {
+                if ([string](& $histSession $hk.h) -cne [string]$hk.session) { & $fail 'OBSPA_STALE_HISTORY' }
+            }
         }
         $pcap2 = Get-ManagedNativeCapturedFacts @pcapArgs
         if (($pcap2.Valid -isnot [bool]) -or (-not $pcap2.Valid) -or ((& $inventory $pcap2.Facts) -cne (& $inventory $anchorPc))) { & $fail 'OBSPA_STALE_PREDECESSOR' }
