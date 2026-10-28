@@ -24,6 +24,7 @@ import type { ReviewId, RunId, WorkItemId } from "../domain/ids.js";
 import type { Actor } from "../domain/actor.js";
 import type { Timestamp } from "../domain/time.js";
 import type { WorkerTool } from "../adapters/workers/workerModelConfig.js";
+import type { RecalledNoteReference } from "../ports/worker.js";
 
 export const LOOP_PHASES = [
   "READY",
@@ -233,6 +234,18 @@ export interface EngineeringLoop {
   readonly verificationCommands: readonly VerificationCommandConfig[];
   readonly workspaceRoot: string;
   readonly taskInstructions: string;
+  /**
+   * Optional caller-SELECTED, immutable reference data (an accepted-result
+   * note body + source identity) forwarded to the IMPLEMENTER and REVIEWER
+   * worker input text only — never to deterministic verification. Frozen at
+   * start; it is never re-read, refreshed or replaced by a "latest" version
+   * on resume. It is an explicit selection, NOT an assertion that the source
+   * is still current or still accepted at a later time (no revocation policy
+   * exists or is invented here), and structural validation is not source
+   * authentication: the caller must have obtained it from verified recall.
+   * It carries no instruction, approval or gate authority.
+   */
+  readonly recalledNote?: RecalledNoteReference;
   readonly iterations: readonly LoopIterationRecord[];
   /** Completed claimed-action worker runs (fresh or adopted — each counted exactly once). */
   readonly totalRunCount: number;

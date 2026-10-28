@@ -20,9 +20,12 @@
  * exhausted, terminal outcome fields on an active loop...) are rejected.
  */
 
+import { createHash } from "node:crypto";
+
 import { ACTOR_KINDS, type Actor } from "../domain/actor.js";
-import { PersistenceCorruptionError } from "../domain/errors.js";
+import { PersistenceCorruptionError, ValidationError } from "../domain/errors.js";
 import { EVIDENCE_KINDS } from "../domain/evidence.js";
+import type { RecalledNoteReference } from "../ports/worker.js";
 import { WORKER_TOOLS } from "../adapters/workers/workerModelConfig.js";
 import {
   EXHAUSTION_KINDS,
@@ -167,6 +170,69 @@ function parseActor(value: unknown, context: string): Actor {
     kind: oneOf(row, "kind", ACTOR_KINDS, context),
     displayName: str(row, "displayName", context),
   };
+}
+
+const SOURCE_KEYS = ["snapshotId", "workItemId", "specRevision", "implementationRunId"] as const;
+const NOTE_KEYS = ["body", "sha256", "byteLength", "source"] as const;
+
+function isOrdinaryObject(value: unknown): value is Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+/**
+ * Validates and snapshots a recalled-note reference into a frozen, owned
+ * object holding ONLY the neutral type fields. "live" (start input) projects
+ * away the inert/kind/path wrapper fields a verified recall object carries;
+ * "saved" (persisted row) rejects any extra field. Structural validation
+ * only: body/hash/length/identity consistency is checked, but this is NOT
+ * source authentication — the caller must have obtained the value from
+ * verified recall.
+ */
+export function snapshotRecalledNoteReference(value: unknown, mode: "live" | "saved", context: string): RecalledNoteReference {
+  const fail = (message: string): never => {
+    if (mode === "live") throw new ValidationError(`${context}: ${message}`);
+    return corrupt(context, message);
+  };
+  if (!isOrdinaryObject(value)) return fail("must be an ordinary object");
+  if (mode === "saved") {
+    const extra = Object.keys(value).filter((k) => !(NOTE_KEYS as readonly string[]).includes(k));
+    if (extra.length > 0) fail(`unexpected field(s) ${JSON.stringify(extra)}`);
+  }
+  // Read each field exactly once into a local primitive.
+  const { body, sha256, byteLength, source } = value as Record<string, unknown>;
+  if (typeof body !== "string") fail(`"body" must be a string`);
+  if (typeof sha256 !== "string" || !/^[0-9a-f]{64}$/.test(sha256)) fail(`"sha256" must be 64 lowercase hex characters`);
+  if (typeof byteLength !== "number" || !Number.isSafeInteger(byteLength) || byteLength < 0) {
+    fail(`"byteLength" must be a non-negative safe integer`);
+  }
+  if (!isOrdinaryObject(source)) return fail(`"source" must be an ordinary object`);
+  if (mode === "saved") {
+    const extra = Object.keys(source).filter((k) => !(SOURCE_KEYS as readonly string[]).includes(k));
+    if (extra.length > 0) fail(`unexpected source field(s) ${JSON.stringify(extra)}`);
+  }
+  const { snapshotId, workItemId, specRevision, implementationRunId } = source as Record<string, unknown>;
+  for (const [name, v] of [["snapshotId", snapshotId], ["workItemId", workItemId], ["implementationRunId", implementationRunId]] as const) {
+    if (typeof v !== "string" || v.length === 0) fail(`source "${name}" must be a non-empty string`);
+  }
+  if (typeof specRevision !== "number" || !Number.isSafeInteger(specRevision) || specRevision < 1) {
+    fail(`source "specRevision" must be a positive safe integer`);
+  }
+  const bytes = Buffer.from(body as string, "utf8");
+  if (bytes.length !== byteLength) fail(`"byteLength" does not match the UTF-8 body length`);
+  if (createHash("sha256").update(bytes).digest("hex") !== sha256) fail(`"sha256" does not match the body`);
+  return Object.freeze({
+    body: body as string,
+    sha256: sha256 as string,
+    byteLength: byteLength as number,
+    source: Object.freeze({
+      snapshotId: snapshotId as string,
+      workItemId: workItemId as string,
+      specRevision: specRevision as number,
+      implementationRunId: implementationRunId as string,
+    }),
+  });
 }
 
 function parseBudget(value: unknown, context: string): LoopBudget {
@@ -477,6 +543,8 @@ export function parseEngineeringLoop(json: string, expected: ExpectedLoopRow): E
   const startedBy = parseActor(row.startedBy, `${context}.startedBy`);
   const workspaceRoot = str(row, "workspaceRoot", context);
   const taskInstructions = str(row, "taskInstructions", context);
+  const recalledNote =
+    row.recalledNote === undefined ? undefined : snapshotRecalledNoteReference(row.recalledNote, "saved", `${context}.recalledNote`);
   const startedAt = timestamp(row, "startedAt", context);
   const lastTransitionAt = timestamp(row, "lastTransitionAt", context);
 
@@ -568,6 +636,7 @@ export function parseEngineeringLoop(json: string, expected: ExpectedLoopRow): E
     taskInstructions,
     iterations,
     totalRunCount,
+    ...(recalledNote === undefined ? {} : { recalledNote }),
     ...(outcome === undefined ? {} : { outcome }),
     ...(failureReason === undefined ? {} : { failureReason }),
     ...(exhaustionKind === undefined ? {} : { exhaustionKind }),

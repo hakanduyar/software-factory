@@ -51,6 +51,7 @@
  * TASK-004 does not pretend to have.
  */
 
+import { snapshotRecalledNoteReference } from "./loopSerialization.js";
 import { createLoopWorker, type LoopWorkerFactoryOptions } from "./loopWorkerFactory.js";
 import { buildImplementerInstructions, buildReviewerInstructions } from "./loopPrompts.js";
 import { parseReviewVerdict } from "./reviewVerdictParser.js";
@@ -86,7 +87,7 @@ import { isTerminal, type WorkItemStatus } from "../domain/status.js";
 import type { FactoryService } from "../app/factoryService.js";
 import type { Clock } from "../ports/clock.js";
 import type { ProcessRunner } from "../ports/processRunner.js";
-import type { Worker, WorkerOutcome, WorkerRequest } from "../ports/worker.js";
+import type { RecalledNoteReference, Worker, WorkerOutcome, WorkerRequest } from "../ports/worker.js";
 
 export interface StartLoopInput {
   readonly workItemId: WorkItemId;
@@ -98,6 +99,15 @@ export interface StartLoopInput {
   readonly verificationCommands: readonly VerificationCommandConfig[];
   readonly workspace: Workspace;
   readonly budget?: Partial<LoopBudget>;
+  /**
+   * Optional explicit reference note, forwarded to IMPLEMENTER and REVIEWER
+   * worker input text only. The caller MUST obtain it from the accepted-note recall
+   * verifier; shape validation here is not authentication. It is snapshotted
+   * (neutral fields only) and persisted immutably: resume never re-reads or
+   * substitutes a newer version, and it asserts nothing about the source
+   * still being current. It is reference data, not an instruction or approval.
+   */
+  readonly recalledNote?: RecalledNoteReference;
 }
 
 export type LoopWorkerFactory = (config: LoopWorkerConfig, options: LoopWorkerFactoryOptions) => Worker;
@@ -216,6 +226,10 @@ export class EngineeringLoopService {
   // =====================================================================
 
   async start(input: StartLoopInput): Promise<EngineeringLoop> {
+    // Before the first await: validate and own a frozen neutral copy so later
+    // caller mutation cannot change the durable selection.
+    const recalledNote =
+      input.recalledNote === undefined ? undefined : snapshotRecalledNoteReference(input.recalledNote, "live", "recalledNote");
     if (input.verificationCommands.length === 0) {
       throw new ValidationError("a loop must configure at least one deterministic verification command");
     }
@@ -261,6 +275,7 @@ export class EngineeringLoopService {
       verificationCommands: input.verificationCommands,
       workspaceRoot: input.workspace.root,
       taskInstructions: input.taskInstructions,
+      ...(recalledNote === undefined ? {} : { recalledNote }),
       iterations: [],
       totalRunCount: 0,
       cancelRequested: false,
@@ -1081,6 +1096,8 @@ export class EngineeringLoopService {
         role: SLOT_ROLE[slot],
         worker: guarded,
         instructions: input.instructions,
+        // Reference data for model-backed slots only; deterministic verification never receives it.
+        ...(loop.recalledNote === undefined || slot === "verify" ? {} : { recalledNote: loop.recalledNote }),
         ...(input.againstRunId === undefined ? {} : { againstRunId: input.againstRunId }),
       });
       run = result.run;
