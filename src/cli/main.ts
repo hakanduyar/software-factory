@@ -70,6 +70,11 @@ Usage:
                       Publish the projected status (VERIFYING/REVIEW/BLOCKED) of a
                       real work item and named run through the durable sync.
                       Explicit operator mapping; DONE is refused. See --help.
+  sf memory persist-accepted --factory-db <path> --work-item <id> --snapshot <id>
+                    --decision <text> --lesson <text> --owned-directory <path>
+                      Write a local note for an already-accepted result into an
+                      owned directory and verify it by readback. Approves and
+                      dispatches nothing; not a remote ACK. See --help.
   sf help             Show this message
 `;
 
@@ -440,6 +445,28 @@ async function main(argv: readonly string[]): Promise<number> {
       }
       console.error(`Usage: sf supervise <tick|status|resources|roadmap|block>`);
       return 1;
+    }
+    case "memory": {
+      if (argv[1] !== "persist-accepted") {
+        console.error("Usage: sf memory persist-accepted ...");
+        return 1;
+      }
+      const { parsePersistAcceptedArgs, runPersistAccepted, PERSIST_ACCEPTED_HELP, PERSIST_ACCEPTED_USAGE } = await import("./acceptedNote.js");
+      const rest = argv.slice(2);
+      if (rest.length === 1 && (rest[0] === "--help" || rest[0] === "-h")) {
+        console.log(PERSIST_ACCEPTED_HELP);
+        return 0;
+      }
+      const parsed = parsePersistAcceptedArgs(rest);
+      if (!parsed.ok) {
+        console.error(parsed.error);
+        console.error(PERSIST_ACCEPTED_USAGE);
+        return 1;
+      }
+      return await runPersistAccepted(parsed.value, {
+        log: (line) => console.log(line),
+        error: (line) => console.error(line),
+      });
     }
     case "github": {
       const sub = argv[1];
