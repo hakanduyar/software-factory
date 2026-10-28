@@ -107,7 +107,7 @@ describe("sf github sync-status: real records", () => {
     assert.equal(r.requests.length, 1);
     const req = r.requests[0]!;
     assert.equal(req.executable, "/opt/pwsh/pwsh");
-    assert.deepEqual(req.argv, ["-NoProfile", "-File", "/repo/root/scripts/github/invoke-projected-task-status.ps1"]);
+    assert.deepEqual(req.argv, ["-NoProfile", "-File", join(f.args.repositoryRoot, "scripts", "github", "invoke-projected-task-status.ps1")]);
     assert.deepEqual(req.env, { PATH: "/bin" });
     const env = JSON.parse(req.input ?? "") as Record<string, unknown>;
     assert.equal(env["publicStatus"], "IN_PROGRESS");
