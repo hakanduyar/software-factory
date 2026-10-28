@@ -113,6 +113,8 @@ export const SUPPORTED_MODELS: Readonly<Record<WorkerTool, readonly string[]>> =
   "codex-cli": Object.freeze(["gpt-5.6-luna"]),
   // Intentionally empty: supervised Ollama admission is unavailable.
   "ollama-cli": Object.freeze([]),
+  // Intentionally empty: supervised Gemini CLI admission is unavailable.
+  "gemini-cli": Object.freeze([]),
 });
 
 /**
@@ -143,6 +145,9 @@ export function planAiRunConfig(request: AiRunConfigRequest): AiRunConfigResult 
   }
   if (request.provider === "ollama-cli") {
     return { ok: false, reason: "supervised ollama-cli admission is unavailable; no Ollama model is supported" };
+  }
+  if (request.provider === "gemini-cli") {
+    return { ok: false, reason: "supervised gemini-cli admission is unavailable; no Gemini model is supported" };
   }
   if (!supported.includes(request.model)) {
     return {
