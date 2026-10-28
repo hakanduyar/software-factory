@@ -27,7 +27,7 @@ import { AGENT, HUMAN, authorize, newFactory, seedWorkItem, toWaitingForHuman } 
 import { createCliWorker, type CliReportedResult, type CliWorkerAdapterConfig } from "../src/adapters/workers/cliWorker.js";
 import { resolveWorkspace } from "../src/adapters/workers/workspace.js";
 import type { AcceptanceCriterion } from "../src/domain/acceptanceCriterion.js";
-import type { ProcessResult, ProcessRunner } from "../src/ports/processRunner.js";
+import type { ProcessRequest, ProcessResult, ProcessRunner } from "../src/ports/processRunner.js";
 import type { WorkerRequest } from "../src/ports/worker.js";
 import { cleanupTempWorkspaces, createTempWorkspace } from "./support/tempWorkspace.js";
 
@@ -81,7 +81,7 @@ function makeWorker(opts: {
     roles: ["IMPLEMENTER"],
     executable: "irrelevant-not-actually-spawned",
     model: "m",
-    timeoutMs: 5000,
+    timeoutMs: null,
     workspace: resolveWorkspace(opts.workspaceRoot),
     processRunner: stubRunner(opts.processResult),
     environmentPolicy: { allowedVars: [] },
@@ -188,7 +188,7 @@ describe("cliWorker: verified recalled note forwarding (request -> adapter promp
       roles: [...FACTORY_ROLES],
       executable: "irrelevant-not-actually-spawned",
       model: "m",
-      timeoutMs: 5000,
+      timeoutMs: null,
       workspace: resolveWorkspace(workspaceRoot),
       processRunner: stubRunner(fakeProcessResult()),
       environmentPolicy: { allowedVars: [] },
@@ -264,4 +264,45 @@ describe("cliWorker: verified recalled note forwarding (request -> adapter promp
       assert.ok(!(prompts[prompts.length - 1] ?? "").includes("REFERENCE DATA"));
     }
   });
+});
+
+describe("cliWorker: author timeout policy (no total deadline)", () => {
+  function configWith(timeoutMs: unknown, calls: ProcessRequest[]): CliWorkerAdapterConfig {
+    return {
+      id: "stub-worker",
+      tool: "codex-cli",
+      roles: ["IMPLEMENTER"],
+      executable: "irrelevant-not-actually-spawned",
+      model: "m",
+      timeoutMs: timeoutMs as number | null,
+      workspace: resolveWorkspace(createTempWorkspace()),
+      processRunner: {
+        run: async (req) => {
+          calls.push(req);
+          return fakeProcessResult();
+        },
+      },
+      environmentPolicy: { allowedVars: [] },
+      buildInvocation: () => ({ argv: [], effortApplication: { applied: false } }),
+      interpretOutput: () => ({}),
+    };
+  }
+
+  it("forwards explicit null to the ProcessRunner unchanged", async () => {
+    const calls: ProcessRequest[] = [];
+    const worker = createCliWorker(configWith(null, calls));
+    await worker.execute({
+      workItemId: "wi", runId: "r", role: "IMPLEMENTER", title: "t", instructions: "i", acceptanceCriteria: [],
+    } as unknown as WorkerRequest);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]!.timeoutMs, null);
+  });
+
+  for (const bad of [5000, 1, 0, -1, "5000", Number.NaN, undefined, true]) {
+    it(`refuses author timeoutMs ${String(bad)} before the runner is ever called`, () => {
+      const calls: ProcessRequest[] = [];
+      assert.throws(() => createCliWorker(configWith(bad, calls)), /must be null/);
+      assert.equal(calls.length, 0);
+    });
+  }
 });

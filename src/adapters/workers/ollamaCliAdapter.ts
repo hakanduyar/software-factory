@@ -22,7 +22,7 @@ import type { Worker } from "../../ports/worker.js";
 import type { BuildInvocationArgs, CliInvocationPlan, CliReportedResult } from "./cliWorker.js";
 import { createCliWorker } from "./cliWorker.js";
 import { DEFAULT_WORKER_ENVIRONMENT_POLICY, type EnvironmentPolicy } from "./environmentPolicy.js";
-import { DEFAULT_WORKER_TIMEOUT_MS, type EffortApplication } from "./workerModelConfig.js";
+import { normalizeAuthorTimeoutMs, type EffortApplication } from "./workerModelConfig.js";
 import type { Workspace } from "./workspace.js";
 
 export interface OllamaCliWorkerOptions {
@@ -32,7 +32,8 @@ export interface OllamaCliWorkerOptions {
   /** Required: no default model. */
   readonly model: string;
   readonly effort?: string;
-  readonly timeoutMs?: number;
+  /** Author execution has no total deadline: absent/`null` mean none; a finite value is refused by createCliWorker. */
+  readonly timeoutMs?: number | null;
   readonly workspace: Workspace;
   readonly processRunner: ProcessRunner;
   readonly environmentPolicy?: EnvironmentPolicy;
@@ -95,7 +96,7 @@ export function createOllamaCliWorker(options: OllamaCliWorkerOptions): Worker {
     executable: options.executable ?? "ollama",
     model: options.model,
     ...(options.effort === undefined ? {} : { effort: options.effort }),
-    timeoutMs: options.timeoutMs ?? DEFAULT_WORKER_TIMEOUT_MS,
+    timeoutMs: normalizeAuthorTimeoutMs(options.timeoutMs),
     workspace: options.workspace,
     processRunner: options.processRunner,
     environmentPolicy: options.environmentPolicy ?? DEFAULT_WORKER_ENVIRONMENT_POLICY,

@@ -129,12 +129,17 @@ function optNum(value: number | undefined): string {
   return value === undefined ? "~" : `=${value}`;
 }
 
+/** Author timeout: `~` absent, `=<n>` finite (unchanged bytes), `=null` explicit no-deadline. */
+function optAuthorTimeout(value: number | null | undefined): string {
+  return value === null ? "=null" : optNum(value);
+}
+
 function canonicalWorkerConfig(config: PlannerConfig): string {
   return [
     `tool:${seg(config.tool)}`,
     `model:${seg(config.model)}`,
     `effort:${optSeg(config.effort)}`,
-    `timeoutMs:${optNum(config.timeoutMs)}`,
+    `timeoutMs:${optAuthorTimeout(config.timeoutMs)}`,
   ].join(",");
 }
 
@@ -157,7 +162,7 @@ function canonicalLoopBudget(budget: PlanExecutionConfig["loopBudget"]): string 
     `maxIterations:${optNum(budget.maxIterations)}`,
     `maxTotalRuns:${optNum(budget.maxTotalRuns)}`,
     `maxWallClockMs:${optNum(budget.maxWallClockMs)}`,
-    `workerTimeoutMs:${optNum(budget.workerTimeoutMs)}`,
+    `workerTimeoutMs:${optAuthorTimeout(budget.workerTimeoutMs)}`,
     `verificationTimeoutMs:${optNum(budget.verificationTimeoutMs)}`,
   ].join(",")}`;
 }

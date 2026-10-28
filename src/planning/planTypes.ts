@@ -108,7 +108,8 @@ export interface PlannerConfig {
   readonly tool: string;
   readonly model: string;
   readonly effort?: string;
-  readonly timeoutMs?: number;
+  /** Absent/`null`: no total author deadline. A finite historical value is readable but refused at launch. */
+  readonly timeoutMs?: number | null;
 }
 
 /**
@@ -131,7 +132,7 @@ export interface PlanExecutionConfig {
     readonly maxIterations?: number;
     readonly maxTotalRuns?: number;
     readonly maxWallClockMs?: number;
-    readonly workerTimeoutMs?: number;
+    readonly workerTimeoutMs?: number | null;
     readonly verificationTimeoutMs?: number;
   };
 }

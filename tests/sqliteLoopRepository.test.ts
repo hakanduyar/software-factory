@@ -197,3 +197,81 @@ describe("createSqliteLoopRepository", () => {
     assert.throws(() => createSqliteLoopRepository(dbPath), { code: "SCHEMA_INTEGRITY_VIOLATION" });
   });
 });
+
+describe("createSqliteLoopRepository: nullable author timeout", () => {
+  it("preserves explicit null for implementer, reviewer and budget.workerTimeoutMs across close/reopen", async () => {
+    const dbPath = tempDbPath();
+    const first = createSqliteLoopRepository(dbPath);
+    const loop = fixtureLoop({
+      budget: { maxIterations: 3, workerTimeoutMs: null },
+      implementer: { tool: "claude-code", model: "m", timeoutMs: null },
+      reviewer: { tool: "codex-cli", model: "m", timeoutMs: null },
+    });
+    await first.create(loop);
+    first.close();
+    const reopened = createSqliteLoopRepository(dbPath);
+    try {
+      const found = await reopened.findById(loop.id);
+      assert.equal(found?.implementer.timeoutMs, null);
+      assert.equal(found?.reviewer.timeoutMs, null);
+      assert.equal(found?.budget.workerTimeoutMs, null);
+      assert.ok(found !== undefined && "timeoutMs" in found.implementer);
+    } finally {
+      reopened.close();
+    }
+  });
+
+  it("keeps absent absent and historical finite values readable", async () => {
+    const repo = createSqliteLoopRepository(tempDbPath());
+    try {
+      const absent = fixtureLoop({ id: "loop-absent", workItemId: "wi-absent" });
+      const finite = fixtureLoop({
+        id: "loop-finite",
+        workItemId: "wi-finite",
+        budget: { maxIterations: 3, workerTimeoutMs: 300000, verificationTimeoutMs: 1000 },
+        implementer: { tool: "claude-code", model: "m", timeoutMs: 300000 },
+      });
+      await repo.create(absent);
+      await repo.create(finite);
+      const a = await repo.findById("loop-absent");
+      assert.equal("timeoutMs" in a!.implementer, false);
+      assert.equal("workerTimeoutMs" in a!.budget, false);
+      const f = await repo.findById("loop-finite");
+      assert.equal(f?.implementer.timeoutMs, 300000);
+      assert.equal(f?.budget.workerTimeoutMs, 300000);
+    } finally {
+      repo.close();
+    }
+  });
+
+  it("rejects malformed author scalars and a null verificationTimeoutMs", async () => {
+    for (const mutate of [
+      (row: Record<string, any>) => (row.implementer.timeoutMs = "5"),
+      (row: Record<string, any>) => (row.reviewer.timeoutMs = true),
+      (row: Record<string, any>) => (row.implementer.timeoutMs = 1.5),
+      (row: Record<string, any>) => (row.implementer.timeoutMs = 0),
+      (row: Record<string, any>) => (row.reviewer.timeoutMs = -1),
+      (row: Record<string, any>) => (row.budget.workerTimeoutMs = "x"),
+      (row: Record<string, any>) => (row.budget.verificationTimeoutMs = null),
+      (row: Record<string, any>) => (row.budget.maxTotalRuns = null),
+      (row: Record<string, any>) => (row.verificationCommands[0].timeoutMs = null),
+    ]) {
+      const dbPath = tempDbPath();
+      const repo = createSqliteLoopRepository(dbPath);
+      await repo.create(fixtureLoop());
+      repo.close();
+      const raw = new DatabaseSync(dbPath);
+      const rowInfo = raw.prepare("SELECT data FROM engineering_loops LIMIT 1").get() as { data: string };
+      const parsed = JSON.parse(rowInfo.data) as Record<string, any>;
+      mutate(parsed);
+      raw.prepare("UPDATE engineering_loops SET data = ?").run(JSON.stringify(parsed));
+      raw.close();
+      const reopened = createSqliteLoopRepository(dbPath);
+      try {
+        await assert.rejects(reopened.findById("loop-test"), { code: "PERSISTENCE_CORRUPTION" });
+      } finally {
+        reopened.close();
+      }
+    }
+  });
+});

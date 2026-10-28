@@ -122,6 +122,11 @@ function requireWorkerTool(value: string, what: string): WorkerTool {
   return tool;
 }
 
+/** Author timeout: absent stays absent, explicit `null` is preserved (no total deadline), otherwise an integer >= 1. */
+function optionalAuthorTimeout(value: unknown, field: string): number | null | undefined {
+  return value === null ? null : optionalCount(value, field, 1);
+}
+
 function optionalCount(value: unknown, field: string, minimum: number): number | undefined {
   if (value === undefined) {
     return undefined;
@@ -158,7 +163,7 @@ function validateWorkerConfig(value: unknown, field: string): PlannerConfig {
     }
     effort = row.effort;
   }
-  const timeoutMs = optionalCount(row.timeoutMs, `${field}.timeoutMs`, 1);
+  const timeoutMs = optionalAuthorTimeout(row.timeoutMs, `${field}.timeoutMs`);
 
   return {
     tool: row.tool,
@@ -218,7 +223,7 @@ function validateLoopBudget(value: unknown): NonNullable<PlanExecutionConfig["lo
   const maxIterations = optionalCount(row.maxIterations, "loopBudget.maxIterations", 1);
   const maxTotalRuns = optionalCount(row.maxTotalRuns, "loopBudget.maxTotalRuns", 1);
   const maxWallClockMs = optionalCount(row.maxWallClockMs, "loopBudget.maxWallClockMs", 1);
-  const workerTimeoutMs = optionalCount(row.workerTimeoutMs, "loopBudget.workerTimeoutMs", 1);
+  const workerTimeoutMs = optionalAuthorTimeout(row.workerTimeoutMs, "loopBudget.workerTimeoutMs");
   const verificationTimeoutMs = optionalCount(row.verificationTimeoutMs, "loopBudget.verificationTimeoutMs", 1);
   return {
     ...(maxIterations === undefined ? {} : { maxIterations }),
@@ -448,7 +453,10 @@ function openStores(
     tool: plannerTool,
     model: planner.model,
     ...(planner.effort === undefined ? {} : { effort: planner.effort }),
-    ...(planner.timeoutMs === undefined ? {} : { timeoutMs: planner.timeoutMs }),
+    // CliPlannerWorkerDeps.timeoutMs is `number` (read-only boundary): null means "no total deadline",
+    // identical to absence, so it is omitted rather than coerced. Finite values still flow through
+    // and are refused by createCliWorker.
+    ...(planner.timeoutMs === undefined || planner.timeoutMs === null ? {} : { timeoutMs: planner.timeoutMs }),
     workspace,
     processRunner: createNodeProcessRunner(),
   });

@@ -179,18 +179,30 @@ describe("codexCliAdapter: end-to-end execute() against the fake CLI", () => {
     assert.equal(outcome.claimsAcceptanceMet, false);
   });
 
-  it("reports FAILED on timeout, with evidence naming the termination reason", async () => {
+  it("refuses a finite author timeout before any process runner call, and forwards null otherwise", async () => {
     const workspace = resolveWorkspace(createTempWorkspace());
-    const worker = createCodexCliWorker({
-      executable: fakeCliPath("fake-codex.mjs"),
-      model: "m",
-      workspace,
-      processRunner: runner,
-      timeoutMs: 100,
-      environmentPolicy: { allowedVars: ["PATH"], extraVars: { FAKE_CODEX_SLEEP_MS: "5000" } },
-    });
-    const outcome = await worker.execute(request());
-    assert.equal(outcome.status, "FAILED");
-    assert.ok(outcome.evidence.some((e) => /TIMEOUT/.test(e.summary)));
+    const calls: unknown[] = [];
+    const stub = {
+      run: async (req: { timeoutMs: number | null }): Promise<ProcessResult> => {
+        calls.push(req);
+        throw new Error("must not be called");
+      },
+    };
+    assert.throws(
+      () => createCodexCliWorker({ model: "m", workspace, processRunner: stub, timeoutMs: 100 }),
+      /must be null/,
+    );
+    assert.equal(calls.length, 0);
+
+    const seen: (number | null)[] = [];
+    const recording = {
+      run: async (req: { timeoutMs: number | null }): Promise<ProcessResult> => {
+        seen.push(req.timeoutMs);
+        return { terminationReason: "EXITED", exitCode: 0, signal: null, stdout: "", stderr: "", stdoutTruncated: false, stderrTruncated: false, startedAt: 0, finishedAt: 0, durationMs: 0 };
+      },
+    };
+    await createCodexCliWorker({ model: "m", workspace, processRunner: recording }).execute(request());
+    await createCodexCliWorker({ model: "m", workspace, processRunner: recording, timeoutMs: null }).execute(request());
+    assert.deepEqual(seen, [null, null]);
   });
 });

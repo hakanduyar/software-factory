@@ -35,7 +35,7 @@ export interface EngineeringLoopDispatcherDeps {
     readonly maxIterations?: number;
     readonly maxTotalRuns?: number;
     readonly maxWallClockMs?: number;
-    readonly workerTimeoutMs?: number;
+    readonly workerTimeoutMs?: number | null;
     readonly verificationTimeoutMs?: number;
   };
 }

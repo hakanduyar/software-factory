@@ -19,7 +19,12 @@ export interface WorkerModelConfig {
   readonly model: string;
   /** Free-form reasoning/effort level. Whether the installed CLI can actually honour it is reported separately — see EffortApplication below. */
   readonly effort?: string;
-  readonly timeoutMs?: number;
+  /**
+   * Author (CLI worker) execution has no total deadline: absent or `null`
+   * both mean "no total timer". A finite value is refused by `createCliWorker`
+   * rather than silently launching a capped author.
+   */
+  readonly timeoutMs?: number | null;
 }
 
 /**
@@ -35,4 +40,16 @@ export interface EffortApplication {
   readonly reason?: string;
 }
 
-export const DEFAULT_WORKER_TIMEOUT_MS = 5 * 60 * 1000;
+/**
+ * Author-worker default: NO total execution deadline (human-selected policy).
+ * Not a number — `null` is passed through to the ProcessRunner unchanged.
+ */
+export const DEFAULT_WORKER_TIMEOUT_MS: null = null;
+
+/**
+ * Normalises an optional author timeout: absence is `null`; explicit `null`
+ * stays `null`. Deliberately not `??`-based fallback to a finite value.
+ */
+export function normalizeAuthorTimeoutMs(value: number | null | undefined): number | null {
+  return value === undefined ? DEFAULT_WORKER_TIMEOUT_MS : value;
+}

@@ -121,6 +121,19 @@ function optionalPositiveInt(row: Record<string, unknown>, field: string, contex
   return positiveInt(row, field, context);
 }
 
+/**
+ * Author-timeout scalar only (worker `timeoutMs`, budget `workerTimeoutMs`):
+ * absent stays absent, `null` is preserved exactly, and any other value must
+ * be a positive integer (historical finite values stay readable). Everything
+ * else — verification timeouts, counts — keeps `optionalPositiveInt`.
+ */
+function optionalNullableAuthorTimeout(row: Record<string, unknown>, field: string, context: string): number | null | undefined {
+  const value = row[field];
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  return positiveInt(row, field, context);
+}
+
 function oneOf<T extends string>(row: Record<string, unknown>, field: string, allowed: readonly T[], context: string): T {
   const value = row[field];
   if (typeof value !== "string" || !(allowed as readonly string[]).includes(value)) {
@@ -160,7 +173,7 @@ function parseBudget(value: unknown, context: string): LoopBudget {
   const row = asObject(value, context);
   const maxTotalRuns = optionalPositiveInt(row, "maxTotalRuns", context);
   const maxWallClockMs = optionalPositiveInt(row, "maxWallClockMs", context);
-  const workerTimeoutMs = optionalPositiveInt(row, "workerTimeoutMs", context);
+  const workerTimeoutMs = optionalNullableAuthorTimeout(row, "workerTimeoutMs", context);
   const verificationTimeoutMs = optionalPositiveInt(row, "verificationTimeoutMs", context);
   return {
     maxIterations: positiveInt(row, "maxIterations", context),
@@ -174,7 +187,7 @@ function parseBudget(value: unknown, context: string): LoopBudget {
 function parseWorkerConfig(value: unknown, context: string): LoopWorkerConfig {
   const row = asObject(value, context);
   const effort = optionalStr(row, "effort", context);
-  const timeoutMs = optionalPositiveInt(row, "timeoutMs", context);
+  const timeoutMs = optionalNullableAuthorTimeout(row, "timeoutMs", context);
   return {
     tool: oneOf(row, "tool", WORKER_TOOLS, context),
     model: str(row, "model", context),

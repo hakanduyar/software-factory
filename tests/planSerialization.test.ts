@@ -34,6 +34,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import { PersistenceCorruptionError } from "../src/domain/errors.js";
+import { createHash } from "node:crypto";
 import { approvalDigestOfPlan, computePlanContentDigest, type PlanDigestInput } from "../src/planning/planDigest.js";
 import { encodePlan, parsePlan, type PlanRowColumns } from "../src/planning/planSerialization.js";
 import {
@@ -767,5 +768,124 @@ describe("parsePlan — phase presuppositions", () => {
       basePlan({ outcome: "COMPLETED" }),
       /phase PLAN_REVIEW is not terminal but an outcome COMPLETED is recorded/,
     );
+  });
+});
+
+describe("nullable author timeout (no total deadline)", () => {
+  function withTimeouts(timeouts: { planner?: number | null; implementer?: number | null; workerTimeoutMs?: number | null }): Plan {
+    const base = executingPlan();
+    return executingPlan({
+      planner: { ...base.planner, ...(timeouts.planner === undefined ? {} : { timeoutMs: timeouts.planner }) },
+      execution: {
+        ...base.execution,
+        implementer: { ...base.execution.implementer, ...(timeouts.implementer === undefined ? {} : { timeoutMs: timeouts.implementer }) },
+        loopBudget: { maxIterations: 2, ...(timeouts.workerTimeoutMs === undefined ? {} : { workerTimeoutMs: timeouts.workerTimeoutMs }) },
+      },
+    });
+  }
+
+  it("round-trips explicit null, absent and finite distinctly", () => {
+    const nulled = withTimeouts({ planner: null, implementer: null, workerTimeoutMs: null });
+    const parsedNull = parsePlan(encodePlan(nulled), columnsOf(nulled));
+    assert.equal(parsedNull.planner.timeoutMs, null);
+    assert.equal(parsedNull.execution.implementer.timeoutMs, null);
+    assert.equal(parsedNull.execution.loopBudget?.workerTimeoutMs, null);
+
+    const absent = withTimeouts({});
+    const parsedAbsent = parsePlan(encodePlan(absent), columnsOf(absent));
+    assert.equal("timeoutMs" in parsedAbsent.planner, false);
+    assert.equal("workerTimeoutMs" in (parsedAbsent.execution.loopBudget ?? {}), false);
+
+    const finite = withTimeouts({ planner: 300000, implementer: 300000, workerTimeoutMs: 300000 });
+    const parsedFinite = parsePlan(encodePlan(finite), columnsOf(finite));
+    assert.equal(parsedFinite.execution.implementer.timeoutMs, 300000);
+    assert.equal(parsedFinite.execution.loopBudget?.workerTimeoutMs, 300000);
+  });
+
+  it("refuses malformed author scalars and null on non-author numeric fields", () => {
+    const plan = withTimeouts({ implementer: null, workerTimeoutMs: null });
+    for (const bad of ["5", true, 1.5, 0, -1]) {
+      assertCorrupt(plan, (row) => ((row.execution as Row).implementer as Row).timeoutMs = bad, /timeoutMs/);
+      assertCorrupt(plan, (row) => ((row.execution as Row).loopBudget as Row).workerTimeoutMs = bad, /workerTimeoutMs/);
+    }
+    assertCorrupt(plan, (row) => ((row.execution as Row).loopBudget as Row).verificationTimeoutMs = null, /verificationTimeoutMs/);
+    assertCorrupt(plan, (row) => ((row.execution as Row).loopBudget as Row).maxIterations = null, /maxIterations/);
+    assertCorrupt(plan, (row) => (((row.execution as Row).verificationCommands as Row[])[0] as Row).timeoutMs = null, /timeoutMs/);
+  });
+
+  // ORIGINAL algorithm, frozen here as an independent oracle (only the author-timeout segments matter).
+  const seg = (v: string): string => `${v.length}:${v}`;
+  const segList = (v: readonly string[]): string => `${v.length}[${v.map(seg).join("")}]`;
+  const optSeg = (v: string | undefined): string => (v === undefined ? "~" : `=${seg(v)}`);
+  const optNum = (v: number | undefined): string => (v === undefined ? "~" : `=${v}`);
+  function oracleWorker(c: { tool: string; model: string; effort?: string; timeoutMs?: number }): string {
+    return [`tool:${seg(c.tool)}`, `model:${seg(c.model)}`, `effort:${optSeg(c.effort)}`, `timeoutMs:${optNum(c.timeoutMs)}`].join(",");
+  }
+  function oracleApproval(plan: Plan): string {
+    const rev = plan.revisions[0]!;
+    const e = plan.execution;
+    const commands = e.verificationCommands.map((c) =>
+      [`id:${seg(c.id)}`, `executable:${seg(c.executable)}`, `argv:${segList(c.argv)}`, `cwd:${optSeg(c.cwd)}`, `timeoutMs:${optNum(c.timeoutMs)}`].join(","),
+    );
+    const b = e.loopBudget;
+    const loopBudget =
+      b === undefined
+        ? "~"
+        : `=${[
+            `maxIterations:${optNum(b.maxIterations)}`,
+            `maxTotalRuns:${optNum(b.maxTotalRuns)}`,
+            `maxWallClockMs:${optNum(b.maxWallClockMs)}`,
+            `workerTimeoutMs:${optNum(b.workerTimeoutMs as number | undefined)}`,
+            `verificationTimeoutMs:${optNum(b.verificationTimeoutMs)}`,
+          ].join(",")}`;
+    const execution = [
+      `implementer:${oracleWorker(e.implementer as never)}`,
+      `reviewer:${oracleWorker(e.reviewer as never)}`,
+      `commands:${commands.length}[${commands.map(seg).join("")}]`,
+      `workspaceRoot:${seg(e.workspaceRoot)}`,
+      `loopBudget:${loopBudget}`,
+    ].join("|");
+    const budget = [
+      `maxPlannerAttempts:${plan.budget.maxPlannerAttempts}`,
+      `maxClarificationCycles:${plan.budget.maxClarificationCycles}`,
+      `maxTotalPlannerRuns:${plan.budget.maxTotalPlannerRuns}`,
+      `maxWallClockMs:${optNum(plan.budget.maxWallClockMs)}`,
+    ].join(",");
+    const canonical = [
+      "papr-v1",
+      `projectId:${seg(plan.projectId)}`,
+      `intent:${seg(plan.intent)}`,
+      `declaredConstraints:${segList(plan.declaredConstraints)}`,
+      `budget:${seg(budget)}`,
+      `planner:${seg(oracleWorker(plan.planner as never))}`,
+      `execution:${seg(execution)}`,
+      `revision:${seg(computePlanContentDigest({
+        revision: rev.revision, summary: rev.summary, assumptions: rev.assumptions, constraints: rev.constraints, risks: rev.risks, items: rev.items,
+      }))}`,
+    ].join("|");
+    return `papr-${createHash("sha256").update(canonical).digest("hex").slice(0, 32)}`;
+  }
+
+  it("keeps every absent/finite approval digest byte-identical to the original algorithm", () => {
+    for (const plan of [
+      withTimeouts({}),
+      withTimeouts({ planner: 60000, implementer: 300000, workerTimeoutMs: 120000 }),
+      withTimeouts({ workerTimeoutMs: 1 }),
+    ]) {
+      assert.equal(approvalDigestOfPlan(plan, plan.revisions[0]!), oracleApproval(plan));
+    }
+  });
+
+  it("distinguishes explicit null from absent and from a finite value", () => {
+    const digestOf = (p: Plan): string => approvalDigestOfPlan(p, p.revisions[0]!);
+    const variants = [
+      withTimeouts({}),
+      withTimeouts({ implementer: null }),
+      withTimeouts({ implementer: 300000 }),
+      withTimeouts({ planner: null }),
+      withTimeouts({ workerTimeoutMs: null }),
+      withTimeouts({ workerTimeoutMs: 300000 }),
+    ].map(digestOf);
+    assert.equal(new Set(variants).size, variants.length);
   });
 });

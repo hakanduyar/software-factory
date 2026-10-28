@@ -99,7 +99,7 @@ describe("ollamaCliAdapter: pure helpers", () => {
 });
 
 describe("ollamaCliAdapter: createOllamaCliWorker", () => {
-  it("runs with exact argv, stdin, cwd, filtered env, timeout; claims=false", async () => {
+  it("runs with exact argv, stdin, cwd, filtered env, null timeout; claims=false", async () => {
     const ws = workspace();
     const { runner, calls } = stubRunner(result({ stdout: "PASS" }));
     const worker = createOllamaCliWorker({
@@ -107,7 +107,7 @@ describe("ollamaCliAdapter: createOllamaCliWorker", () => {
       roles: ["REVIEWER"],
       workspace: ws,
       processRunner: runner,
-      timeoutMs: 1234,
+      timeoutMs: null,
       effort: "high",
     });
     assert.deepEqual([...worker.capabilities.roles], ["REVIEWER"]);
@@ -117,7 +117,7 @@ describe("ollamaCliAdapter: createOllamaCliWorker", () => {
     assert.equal(call.executable, "ollama");
     assert.deepEqual(call.argv, ["run", "m:1"]);
     assert.equal(call.cwd, ws.root);
-    assert.equal(call.timeoutMs, 1234);
+    assert.equal(call.timeoutMs, null);
     assert.equal(call.maxOutputBytes, undefined);
     assert.ok(call.input?.includes("Do the thing."));
     assert.equal(call.env["ANTHROPIC_API_KEY"], undefined);
@@ -165,5 +165,19 @@ describe("ollamaCliAdapter: createOllamaCliWorker", () => {
       assert.equal(outcome.status, expected);
       assert.equal(outcome.claimsAcceptanceMet, false);
     }
+  });
+});
+
+describe("createOllamaCliWorker: finite author timeout refusal", () => {
+  it("defaults to null and refuses a finite timeout before any runner call", async () => {
+    const { runner, calls } = stubRunner(result({ stdout: "PASS" }));
+    assert.throws(
+      () => createOllamaCliWorker({ model: "m", roles: ["REVIEWER"], workspace: workspace(), processRunner: runner, timeoutMs: 1234 }),
+      /must be null/,
+    );
+    assert.equal(calls.length, 0);
+    await createOllamaCliWorker({ model: "m", roles: ["REVIEWER"], workspace: workspace(), processRunner: runner }).execute(request());
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]!.timeoutMs, null);
   });
 });

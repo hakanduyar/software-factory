@@ -144,6 +144,13 @@ function optionalPositiveInt(row: Record<string, unknown>, field: string, contex
   return row[field] === undefined ? undefined : positiveInt(row, field, context);
 }
 
+/** Author-timeout scalar only: absent stays absent, `null` is preserved, otherwise a positive integer. */
+function optionalNullableAuthorTimeout(row: Record<string, unknown>, field: string, context: string): number | null | undefined {
+  if (row[field] === undefined) return undefined;
+  if (row[field] === null) return null;
+  return positiveInt(row, field, context);
+}
+
 function oneOf<T extends string>(row: Record<string, unknown>, field: string, allowed: readonly T[], context: string): T {
   const value = row[field];
   if (typeof value !== "string" || !(allowed as readonly string[]).includes(value)) {
@@ -192,7 +199,7 @@ function parseBudget(value: unknown, context: string): PlanBudget {
 function parsePlannerConfig(value: unknown, context: string): PlannerConfig {
   const row = asObject(value, context);
   const effort = optionalStr(row, "effort", context);
-  const timeoutMs = optionalPositiveInt(row, "timeoutMs", context);
+  const timeoutMs = optionalNullableAuthorTimeout(row, "timeoutMs", context);
   return {
     tool: str(row, "tool", context),
     model: str(row, "model", context),
@@ -227,7 +234,7 @@ function parseExecutionConfig(value: unknown, context: string): PlanExecutionCon
     const maxIterations = optionalPositiveInt(budgetRow, "maxIterations", budgetContext);
     const maxTotalRuns = optionalPositiveInt(budgetRow, "maxTotalRuns", budgetContext);
     const maxWallClockMs = optionalPositiveInt(budgetRow, "maxWallClockMs", budgetContext);
-    const workerTimeoutMs = optionalPositiveInt(budgetRow, "workerTimeoutMs", budgetContext);
+    const workerTimeoutMs = optionalNullableAuthorTimeout(budgetRow, "workerTimeoutMs", budgetContext);
     const verificationTimeoutMs = optionalPositiveInt(budgetRow, "verificationTimeoutMs", budgetContext);
     loopBudget = {
       ...(maxIterations === undefined ? {} : { maxIterations }),

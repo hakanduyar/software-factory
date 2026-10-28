@@ -192,3 +192,21 @@ describe("claudeCodeAdapter: end-to-end execute() against a fake CLI matching th
     assert.ok(outcome.evidence.some((e) => /SPAWN_ERROR/.test(e.summary)));
   });
 });
+
+describe("claudeCodeAdapter: author timeout policy", () => {
+  it("passes null by default and explicit null, and refuses a finite timeout before any runner call", async () => {
+    const workspace = resolveWorkspace(createTempWorkspace());
+    const seen: (number | null)[] = [];
+    const runner = {
+      run: async (req: { timeoutMs: number | null }): Promise<ProcessResult> => {
+        seen.push(req.timeoutMs);
+        return { terminationReason: "EXITED", exitCode: 0, signal: null, stdout: "", stderr: "", stdoutTruncated: false, stderrTruncated: false, startedAt: 0, finishedAt: 0, durationMs: 0 };
+      },
+    };
+    assert.throws(() => createClaudeCodeWorker({ model: "m", workspace, processRunner: runner, timeoutMs: 300000 }), /must be null/);
+    assert.equal(seen.length, 0);
+    await createClaudeCodeWorker({ model: "m", workspace, processRunner: runner }).execute(request());
+    await createClaudeCodeWorker({ model: "m", workspace, processRunner: runner, timeoutMs: null }).execute(request());
+    assert.deepEqual(seen, [null, null]);
+  });
+});

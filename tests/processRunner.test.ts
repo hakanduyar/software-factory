@@ -5,6 +5,9 @@
  */
 
 import assert from "node:assert/strict";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { describe, it } from "node:test";
 
 import { createNodeProcessRunner } from "../src/adapters/process/nodeProcessRunner.js";
@@ -204,4 +207,72 @@ describe("ProcessRunner: exactly-once settlement", () => {
     );
     assert.equal(result.terminationReason, "TIMEOUT");
   });
+});
+
+describe("ProcessRunner: timeoutMs null (no total deadline)", () => {
+  // Fixed inline child: closes stdout/stderr, stays alive past the old-style threshold, then exits on its own.
+  const NULL_CHILD =
+    'process.stdout.write("hello");require("node:fs").closeSync(1);require("node:fs").closeSync(2);' +
+    "setTimeout(()=>process.exit(7),700);";
+
+  it("lets a child outlive a former small threshold and exit naturally with exact stdout/exit code", async () => {
+    const started = Date.now();
+    const result = await fastRunner.run(
+      baseRequest({ executable: process.execPath, argv: ["-e", NULL_CHILD], timeoutMs: null }),
+    );
+    const elapsed = Date.now() - started;
+    assert.equal(result.terminationReason, "EXITED");
+    assert.equal(result.exitCode, 7);
+    assert.equal(result.stdout, "hello");
+    assert.ok(elapsed >= 600, `child must have been allowed to run past 600ms, elapsed=${elapsed}`);
+    assert.ok(result.durationMs >= 600);
+  });
+
+  it("control: a finite NONAUTHOR timeout on the same child still terminates and reports TIMEOUT", async () => {
+    const result = await fastRunner.run(
+      baseRequest({ executable: process.execPath, argv: ["-e", NULL_CHILD], timeoutMs: 150 }),
+    );
+    assert.equal(result.terminationReason, "TIMEOUT");
+  });
+
+  it("still honours manual abort and reports CANCELLED", async () => {
+    const controller = new AbortController();
+    const promise = fastRunner.run(
+      baseRequest({ ...fakeCliInvocation("never-exits.mjs"), timeoutMs: null, signal: controller.signal }),
+    );
+    setTimeout(() => controller.abort(), 150);
+    const result = await promise;
+    assert.equal(result.terminationReason, "CANCELLED");
+    assert.ok(result.signal === "SIGKILL" || result.signal === "SIGTERM");
+  });
+
+  it("reports a spawn error (not success) exactly once", async () => {
+    const result = await fastRunner.run(
+      baseRequest({ executable: "/nonexistent/definitely-not-a-binary", argv: [], timeoutMs: null }),
+    );
+    assert.equal(result.terminationReason, "SPAWN_ERROR");
+    assert.equal(result.exitCode, null);
+    assert.ok(result.spawnError !== undefined);
+  });
+
+  for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 31, "5000", undefined, true]) {
+    it(`rejects invalid timeoutMs ${String(bad)} before launching any child`, async () => {
+      const dir = mkdtempSync(path.join(tmpdir(), "sf-runner-"));
+      const marker = path.join(dir, "launched");
+      try {
+        const request = {
+          executable: process.execPath,
+          argv: ["-e", `require("node:fs").writeFileSync(${JSON.stringify(marker)},"x")`],
+          cwd: REPO_ROOT,
+          env: {},
+          timeoutMs: bad,
+        } as unknown as ProcessRequest;
+        await assert.rejects(() => fastRunner.run(request), /timeoutMs must be null/);
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        assert.equal(existsSync(marker), false);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
 });

@@ -41,6 +41,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, describe, it } from "node:test";
 
+import { createEngineeringLoopDispatcher } from "../src/adapters/planning/engineeringLoopDispatcher.js";
 import { createSqlitePlanRepository } from "../src/adapters/planning/sqlitePlanRepository.js";
 import {
   runPlanAnswer,
@@ -361,5 +362,69 @@ describe("sf plan answer — --answers is validated before any store is opened",
       messageMatches(/--answers "\[0\]\.answer" must be a non-empty string/),
     );
     await assertNothingCreated(options);
+  });
+});
+
+describe("sf plan start — author timeout (--config) accepts null, absence and integers, refuses malformed", () => {
+  const SLOTS: readonly [string, (value: unknown) => Record<string, unknown>][] = [
+    ["implementer.timeoutMs", (v) => ({ implementer: { tool: "claude-code", model: "m", timeoutMs: v } })],
+    ["reviewer.timeoutMs", (v) => ({ reviewer: { tool: "codex-cli", model: "m", timeoutMs: v } })],
+    ["planner.timeoutMs", (v) => ({ planner: { tool: "codex-cli", model: "m", timeoutMs: v } })],
+    ["loopBudget.workerTimeoutMs", (v) => ({ loopBudget: { workerTimeoutMs: v } })],
+  ];
+
+  for (const [field, build] of SLOTS) {
+    it(`${field}: null passes config validation (refusal is only the missing workspace)`, async () => {
+      const options = dbOptions();
+      await assert.rejects(
+        runPlanStart(PROJECT_ID, writeIntent(), writeConfig(unusableWorkspaceConfig(build(null))), options),
+        { code: "VALIDATION" },
+      );
+      await assertNothingCreated(options);
+    });
+
+    for (const bad of ["5", true, 0, -1, 1.5]) {
+      it(`${field}: ${JSON.stringify(bad)} is refused by config validation`, async () => {
+        const options = dbOptions();
+        await assert.rejects(
+          runPlanStart(PROJECT_ID, writeIntent(), writeConfig(unusableWorkspaceConfig(build(bad))), options),
+          messageMatches(/must be an integer >= 1/),
+        );
+        await assertNothingCreated(options);
+      });
+    }
+  }
+
+  it("verificationTimeoutMs null is still refused", async () => {
+    const options = dbOptions();
+    await assert.rejects(
+      runPlanStart(PROJECT_ID, writeIntent(), writeConfig(unusableWorkspaceConfig({ loopBudget: { verificationTimeoutMs: null } })), options),
+      messageMatches(/loopBudget\.verificationTimeoutMs" must be an integer >= 1/),
+    );
+  });
+});
+
+describe("planning dispatcher — null author timeout reaches the loop service input", () => {
+  it("passes implementer/reviewer timeoutMs null and budget.workerTimeoutMs null through unchanged", async () => {
+    let seen: Record<string, any> | undefined;
+    const dispatcher = createEngineeringLoopDispatcher({
+      service: {
+        start: async (input: Record<string, any>) => {
+          seen = input;
+          return { id: "loop-1", workItemId: "wi-1", phase: "IMPLEMENTING" };
+        },
+      } as never,
+      loops: {} as never,
+      actor: { id: "orchestrator", kind: "ORCHESTRATOR", displayName: "o" } as never,
+      implementer: { tool: "claude-code", model: "m", timeoutMs: null },
+      reviewer: { tool: "codex-cli", model: "m", timeoutMs: null },
+      verificationCommands: [],
+      workspace: { root: "/tmp/x" } as never,
+      budget: { workerTimeoutMs: null },
+    });
+    await dispatcher.start({ workItemId: "wi-1", taskInstructions: "do" } as never);
+    assert.equal(seen?.implementer.timeoutMs, null);
+    assert.equal(seen?.reviewer.timeoutMs, null);
+    assert.equal(seen?.budget.workerTimeoutMs, null);
   });
 });
