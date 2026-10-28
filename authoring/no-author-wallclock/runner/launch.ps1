@@ -235,6 +235,9 @@ function Test-ResumeEligibility {
 }
 
 function Invoke-OperationalRun {
+    # Retired legacy launch entry. It delegated remaining output/elapsed budgets and --max-turns 1 to an injected ProcessRunner,
+    # i.e. an alternate NEW author launch path with artificial caps. It now fails closed before any run lock, state write or ProcessRunner call.
+    # No caller Boolean or executable override re-enables it. Receipt/event/resume-read functions remain for interpreting historical records.
     param(
         [Parameter(Mandatory)][hashtable]$RequestMetadata,
         [Parameter(Mandatory)][string]$RunDir,
@@ -242,85 +245,7 @@ function Invoke-OperationalRun {
         [hashtable]$PriorReceipt = $null,
         [bool]$IsResume = $false
     )
-    Assert-NoAmbientProviderOverride
-
-    if ($RequestMetadata.destination -ne $Script:AllowedDestination) {
-        throw "Refusing: unverified destination '$($RequestMetadata.destination)'."
-    }
-    if ($RequestMetadata.executable -ne $Script:PinnedExecutable) {
-        throw "Refusing: executable path does not match pinned native executable."
-    }
-    $expectedSha = Get-Sha256OfString $RequestMetadata.payload
-    if ($expectedSha -ne $RequestMetadata.payloadSha256) {
-        throw 'Refusing: prompt/payload SHA256 verification failed.'
-    }
-
-    $lockHandle = Lock-RunDirectory -RunDir $RunDir
-    try {
-        if ($IsResume) {
-            if (-not $PriorReceipt) { throw 'Refusing: resume requested without prior receipt.' }
-            $receipt = $PriorReceipt
-            $receipt.attempt = $receipt.attempt + 1
-        } else {
-            $receipt = New-OperationalRunReceipt -RunId $RequestMetadata.runId -TaskId $RequestMetadata.taskId `
-                -PayloadSha256 $RequestMetadata.payloadSha256 -Destination $RequestMetadata.destination `
-                -SessionId $RequestMetadata.sessionId -MaxOutputTokens $RequestMetadata.budget.maxOutputTokens `
-                -MaxElapsedMs $RequestMetadata.budget.maxElapsedMs -MaxAttempts $RequestMetadata.budget.maxAttempts
-            $receipt.attempt = 1
-        }
-        Save-Receipt -Receipt $receipt -RunDir $RunDir | Out-Null
-
-        $remainingOutputBudget = $receipt.budget.maxOutputTokens - $receipt.budget.usedOutputTokens
-        $remainingElapsedBudget = $receipt.budget.maxElapsedMs - $receipt.budget.usedElapsedMs
-        if ($remainingOutputBudget -le 0 -or $remainingElapsedBudget -le 0) {
-            throw 'Refusing: no remaining cumulative budget for this run.'
-        }
-
-        $args = @(
-            '--print','--safe-mode','--restricted','--strict-mcp-config',
-            '--setting-sources','', '--tools','',
-            '--no-chrome','--disable-slash-commands','--max-turns','1',
-            '--output-format','stream-json','--verbose','--include-partial-messages'
-        )
-        if ($IsResume) { $args += @('--resume', $receipt.sessionId) }
-        else { $args += @('--session-id', $receipt.sessionId) }
-
-        $result = & $ProcessRunner $Script:PinnedExecutable $args $RequestMetadata $remainingOutputBudget $remainingElapsedBudget
-
-        if (-not $result.ContainsKey('pid') -or [int64]$result.pid -le 0) {
-            throw 'Refusing: ProcessRunner did not report an actual PID; cannot mark RUNNING.'
-        }
-        $receipt = Apply-ProviderEvent -Receipt $receipt -Event @{ type = 'spawn'; pid = $result.pid }
-        Save-Receipt -Receipt $receipt -RunDir $RunDir | Out-Null
-
-        foreach ($evt in $result.events) {
-            $receipt = Apply-ProviderEvent -Receipt $receipt -Event $evt
-        }
-        $receipt.budget.attemptsUsed = $receipt.budget.attemptsUsed + 1
-
-        if ($result.ContainsKey('rawStdout')) {
-            Write-AtomicFile -Path (Join-Path $RunDir "attempt-$($receipt.attempt)-stdout.log") -Content $result.rawStdout
-        }
-        if ($result.ContainsKey('rawStderr')) {
-            Write-AtomicFile -Path (Join-Path $RunDir "attempt-$($receipt.attempt)-stderr.log") -Content $result.rawStderr
-        }
-
-        if ($receipt.artifact.complete -and $receipt.artifact.path) {
-            $bytes = [System.IO.File]::ReadAllBytes($receipt.artifact.path)
-            $actualSha = Get-Sha256Hex $bytes
-            if ($actualSha -ne $receipt.artifact.sha256) {
-                $receipt.status = 'FAILED'
-                $receipt.artifact.complete = $false
-                $receipt.artifact.path = $null
-                $receipt.artifact.sha256 = $null
-            }
-        }
-
-        Save-Receipt -Receipt $receipt -RunDir $RunDir | Out-Null
-        return $receipt
-    } finally {
-        $lockHandle.Close()
-    }
+    throw 'Refusing: legacy capped Invoke-OperationalRun is retired; new author launches must use the managed native collector under the observe-only no-total-deadline policy.'
 }
 
 # Opt-in managed native collector. Grants no scope/approval/quota; the caller owns Arguments.
@@ -678,6 +603,12 @@ function Invoke-ManagedNativeCollector {
         $v = $Request[$k]
         if ($noStop -and $k -ceq 'MaxStreamBytes') {
             if ($null -ne $v) { throw 'Refusing: MaxStreamBytes must be null in OutputStopProfile mode.' }
+            $num[$k] = $null
+            continue
+        }
+        if ($noStop -and $k -ceq 'MaxElapsedMs') {
+            # Observe-only author start: NO TOTAL AUTHOR DEADLINE. Only an exact null is accepted; a finite total cap is refused, never clamped, ignored or replaced.
+            if ($null -ne $v) { throw 'Refusing: MaxElapsedMs must be null (no total author deadline) in OutputStopProfile mode.' }
             $num[$k] = $null
             continue
         }
@@ -1135,7 +1066,7 @@ function Invoke-ManagedNativeCollector {
                 if ($vTerm.reason -cne 'START_PERSIST_FAILED') { throw 'Refusing: persisted terminal claims a start identity with no persisted start record.' }
                 if (-not (& $isInt $vTerm.pid) -or [long]$vTerm.pid -le 0 -or -not (& $isUtc $vTerm.startTimeUtc)) { throw 'Refusing: persisted terminal start identity is not an actual positive pid and UTC start.' }
             }
-            if (& $hasProp $vTerm 'stopFacts') { $sf = $vTerm.stopFacts; if ($null -eq $sf) { if ($null -ne $vTerm.pid -or $null -ne $vTerm.startTimeUtc) { throw 'terminal stopFacts null with started identity' } } else { if ($sf -isnot [pscustomobject]) { throw 'terminal stopFacts not an object' }; $sfNames = @('pid','startTimeUtc','deadlineObservedUtc','elapsedMs','alive','aliveAtStop','killAttempted','killErrorCode'); if (@($sf.PSObject.Properties).Count -ne $sfNames.Count) { throw 'terminal stopFacts member set mismatch' }; foreach ($sfn in $sfNames) { if (-not (& $hasProp $sf $sfn)) { throw ('terminal stopFacts missing member ' + $sfn) }; if ($sf.$sfn -is [array]) { throw ('terminal stopFacts array member ' + $sfn) } }; if ($null -eq $vTerm.pid -or $null -eq $vTerm.startTimeUtc) { throw 'terminal stopFacts without started identity' }; if (-not (& $isInt $sf.pid) -or -not (& $isInt $vTerm.pid) -or $sf.pid -le 0 -or $sf.pid -ne $vTerm.pid) { throw 'terminal stopFacts pid mismatch' }; if (-not (& $isUtc $sf.startTimeUtc) -or -not (& $isUtc $vTerm.startTimeUtc) -or $sf.startTimeUtc -cne $vTerm.startTimeUtc) { throw 'terminal stopFacts startTimeUtc mismatch' }; if (($null -eq $sf.deadlineObservedUtc) -ne ($null -eq $sf.elapsedMs)) { throw 'terminal stopFacts deadline tuple partial' }; if ($null -ne $sf.deadlineObservedUtc) { if (-not (& $isUtc $sf.deadlineObservedUtc) -or -not (& $isInt $sf.elapsedMs) -or $sf.elapsedMs -lt 0) { throw 'terminal stopFacts deadline tuple invalid' } }; if ($null -eq $sf.deadlineObservedUtc -and $null -ne $sf.alive) { throw 'terminal stopFacts alive without deadline observation' }; if ($null -ne $sf.deadlineObservedUtc -and ($vTerm.reason -cne 'DEADLINE' -or $sf.elapsedMs -lt $num['MaxElapsedMs'])) { throw 'terminal stopFacts deadline tuple inconsistent with reason or limit' }; if ($null -ne $sf.alive -and $sf.alive -isnot [bool]) { throw 'terminal stopFacts alive not boolean' }; if ($null -ne $sf.aliveAtStop -and $sf.aliveAtStop -isnot [bool]) { throw 'terminal stopFacts aliveAtStop not boolean' }; if ($sf.killAttempted -isnot [bool]) { throw 'terminal stopFacts killAttempted not boolean' }; if ($sf.killAttempted -and ($sf.aliveAtStop -isnot [bool] -or -not $sf.aliveAtStop)) { throw 'terminal stopFacts kill attempted without alive-at-stop' }; if ($null -ne $sf.killErrorCode) { if ($sf.killErrorCode -isnot [string] -or [string]::IsNullOrWhiteSpace($sf.killErrorCode) -or -not $sf.killAttempted) { throw 'terminal stopFacts killErrorCode invalid' } } } }
+            if (& $hasProp $vTerm 'stopFacts') { $sf = $vTerm.stopFacts; if ($null -eq $sf) { if ($null -ne $vTerm.pid -or $null -ne $vTerm.startTimeUtc) { throw 'terminal stopFacts null with started identity' } } else { if ($sf -isnot [pscustomobject]) { throw 'terminal stopFacts not an object' }; $sfNames = @('pid','startTimeUtc','deadlineObservedUtc','elapsedMs','alive','aliveAtStop','killAttempted','killErrorCode'); if (@($sf.PSObject.Properties).Count -ne $sfNames.Count) { throw 'terminal stopFacts member set mismatch' }; foreach ($sfn in $sfNames) { if (-not (& $hasProp $sf $sfn)) { throw ('terminal stopFacts missing member ' + $sfn) }; if ($sf.$sfn -is [array]) { throw ('terminal stopFacts array member ' + $sfn) } }; if ($null -eq $vTerm.pid -or $null -eq $vTerm.startTimeUtc) { throw 'terminal stopFacts without started identity' }; if (-not (& $isInt $sf.pid) -or -not (& $isInt $vTerm.pid) -or $sf.pid -le 0 -or $sf.pid -ne $vTerm.pid) { throw 'terminal stopFacts pid mismatch' }; if (-not (& $isUtc $sf.startTimeUtc) -or -not (& $isUtc $vTerm.startTimeUtc) -or $sf.startTimeUtc -cne $vTerm.startTimeUtc) { throw 'terminal stopFacts startTimeUtc mismatch' }; if (($null -eq $sf.deadlineObservedUtc) -ne ($null -eq $sf.elapsedMs)) { throw 'terminal stopFacts deadline tuple partial' }; if ($null -ne $sf.deadlineObservedUtc) { if (-not (& $isUtc $sf.deadlineObservedUtc) -or -not (& $isInt $sf.elapsedMs) -or $sf.elapsedMs -lt 0) { throw 'terminal stopFacts deadline tuple invalid' } }; if ($null -eq $sf.deadlineObservedUtc -and $null -ne $sf.alive) { throw 'terminal stopFacts alive without deadline observation' }; if ($null -ne $sf.deadlineObservedUtc -and ($vTerm.reason -cne 'DEADLINE' -or $null -eq $num['MaxElapsedMs'] -or $sf.elapsedMs -lt $num['MaxElapsedMs'])) { throw 'terminal stopFacts deadline tuple inconsistent with reason or limit' }; if ($null -ne $sf.alive -and $sf.alive -isnot [bool]) { throw 'terminal stopFacts alive not boolean' }; if ($null -ne $sf.aliveAtStop -and $sf.aliveAtStop -isnot [bool]) { throw 'terminal stopFacts aliveAtStop not boolean' }; if ($sf.killAttempted -isnot [bool]) { throw 'terminal stopFacts killAttempted not boolean' }; if ($sf.killAttempted -and ($sf.aliveAtStop -isnot [bool] -or -not $sf.aliveAtStop)) { throw 'terminal stopFacts kill attempted without alive-at-stop' }; if ($null -ne $sf.killErrorCode) { if ($sf.killErrorCode -isnot [string] -or [string]::IsNullOrWhiteSpace($sf.killErrorCode) -or -not $sf.killAttempted) { throw 'terminal stopFacts killErrorCode invalid' } } } }
             if ($vTerm.reason -ceq 'START_FAILED') {
                 if ($null -ne $vTerm.pid -or $null -ne $vTerm.startTimeUtc -or $vTerm.exitObserved -or $null -ne $vTerm.exitCode -or $vTerm.onStartedAcknowledged) {
                     throw 'Refusing: START_FAILED terminal must carry no start identity, no observed exit and no acknowledgement.'
@@ -1565,7 +1496,7 @@ function Invoke-ManagedNativeCollector {
                 $inClosed = $false
                 $exitSeenMs = $null
                 while (-not ($eof[0] -and $eof[1])) {
-                    if ($sw.ElapsedMilliseconds -ge $maxElapsed) { $reason = 'DEADLINE'; if ($null -eq $deadlineObservedUtc) { $deadlineElapsedMs = [long]$sw.ElapsedMilliseconds; $deadlineObservedUtc = (Get-Date).ToUniversalTime().ToString('o'); $deadlineAlive = try { -not $p.HasExited } catch { $null } }; break }
+                    if ($null -ne $maxElapsed -and $sw.ElapsedMilliseconds -ge $maxElapsed) { $reason = 'DEADLINE'; if ($null -eq $deadlineObservedUtc) { $deadlineElapsedMs = [long]$sw.ElapsedMilliseconds; $deadlineObservedUtc = (Get-Date).ToUniversalTime().ToString('o'); $deadlineAlive = try { -not $p.HasExited } catch { $null } }; break }
                     if ($p.HasExited) {
                         if ($null -eq $exitSeenMs) { $exitSeenMs = $sw.ElapsedMilliseconds }
                         elseif (($sw.ElapsedMilliseconds - $exitSeenMs) -ge $drainGraceMs) { break }
@@ -1600,8 +1531,10 @@ function Invoke-ManagedNativeCollector {
             $exitObserved = $false; $exitCode = $null
             if ($started) {
                 try {
-                    if ($null -eq $reason -and -not $p.HasExited) { [void]$p.WaitForExit([int][Math]::Max(0, [Math]::Min([long]$exitWaitMs, $maxElapsed - $sw.ElapsedMilliseconds))) }
-                    if ($null -eq $reason) { $hx = $p.HasExited; $el = [long]$sw.ElapsedMilliseconds; $reason = if ($hx) { 'NATURAL_EXIT' } elseif ($el -ge $maxElapsed) { 'DEADLINE' } else { 'EXIT_WAIT_TIMEOUT' }; if ($reason -ceq 'DEADLINE' -and $null -eq $deadlineObservedUtc) { $deadlineElapsedMs = $el; $deadlineObservedUtc = (Get-Date).ToUniversalTime().ToString('o'); $deadlineAlive = -not $hx } }
+                    # No total author deadline (null): stream EOF is not exit. Keep observing the live child in finite slices; a slice expiring never terminates it.
+                    if ($null -eq $reason -and $null -eq $maxElapsed) { while (-not $p.HasExited) { [void]$p.WaitForExit([int]$exitWaitMs) } }
+                    elseif ($null -eq $reason -and -not $p.HasExited) { [void]$p.WaitForExit([int][Math]::Max(0, [Math]::Min([long]$exitWaitMs, $maxElapsed - $sw.ElapsedMilliseconds))) }
+                    if ($null -eq $reason) { $hx = $p.HasExited; $el = [long]$sw.ElapsedMilliseconds; $reason = if ($hx) { 'NATURAL_EXIT' } elseif ($null -ne $maxElapsed -and $el -ge $maxElapsed) { 'DEADLINE' } else { 'EXIT_WAIT_TIMEOUT' }; if ($reason -ceq 'DEADLINE' -and $null -eq $deadlineObservedUtc) { $deadlineElapsedMs = $el; $deadlineObservedUtc = (Get-Date).ToUniversalTime().ToString('o'); $deadlineAlive = -not $hx } }
                     $aliveAtStop = $null; $hx2 = $p.HasExited; $aliveAtStop = -not $hx2; if (-not $hx2) { $killAttempted = $true; try { $p.Kill($true) } catch { $killErrorCode = $_.Exception.GetType().FullName; throw } }
                     $exitObserved = $p.WaitForExit($exitWaitMs)
                     if ($exitObserved) { $exitCode = $p.ExitCode }

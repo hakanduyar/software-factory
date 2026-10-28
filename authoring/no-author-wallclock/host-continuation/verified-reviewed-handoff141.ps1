@@ -77,7 +77,7 @@ function Invoke-VerifiedReviewedHostHandoff141 {
         $pS = Join-Path $dir 'persisted-successor-ack140.ps1'
         $pH = Join-Path $dir 'select-next-ready.ps1'
         foreach ($f in $pA, $pS, $pH) { if (-not (Test-Path -LiteralPath $f -PathType Leaf)) { & $fail 'import missing' } }
-        if ((Get-FileHash -LiteralPath $pA -Algorithm SHA256).Hash.ToLowerInvariant() -cne 'af828a91d49f7d9a0d726e5f71bf8d880846efad7c8655626fe0c2b9d7ff3731') { & $fail 'association hash' }
+        if ((Get-FileHash -LiteralPath $pA -Algorithm SHA256).Hash.ToLowerInvariant() -cne 'f84600c3a9a44baaa775eba3a375b5f82f6a7101f3eeb3c0f519a2436e963c3f') { & $fail 'association hash' }
         if ((Get-FileHash -LiteralPath $pS -Algorithm SHA256).Hash.ToLowerInvariant() -cne 'e434aa773b71b92b9b64de884c5827f77122824f0147c83240cf82c694095bc7') { & $fail 'successor hash' }
         . $pA
         . $pS

@@ -157,7 +157,7 @@ function ConvertTo-ObserveOnlyPendingReceipt {
         [Parameter(Mandatory)][int]$Attempt,
         [Parameter(Mandatory)][int]$MaxAttempts,
         [Parameter(Mandatory)][long]$PriorElapsedMs,
-        [Parameter(Mandatory)][long]$MaxElapsedMs,
+        [Parameter(Mandatory)][AllowNull()][Nullable[long]]$MaxElapsedMs,
         [Parameter(Mandatory)][string]$ReceiptPath,
         [AllowNull()][object]$Evidence,
         [Parameter(Mandatory)][bool]$Conflict
@@ -188,7 +188,7 @@ function ConvertTo-ObserveOnlyPendingReceipt {
         if (($Attempt -lt 1) -or ($MaxAttempts -le 0) -or ($Attempt -gt $MaxAttempts)) { return & $fail 'invalid attempt range' }
         if (-not [string]::Equals($RunId, [string]$id.runId, [System.StringComparison]::Ordinal)) { return & $fail 'runId does not match authenticated capture' }
         if (([long]$Attempt -ne [long]$id.attempt) -or ([long]$MaxAttempts -ne [long]$lim.maxAttempts)) { return & $fail 'attempt or maxAttempts does not match authenticated capture' }
-        if (([long]$MaxElapsedMs -ne [long]$lim.maxElapsedMs) -or ([long]$PriorElapsedMs -ne [long]$lim.priorElapsedMs)) { return & $fail 'elapsed limits do not match authenticated capture' }
+        if ((($null -eq $MaxElapsedMs) -ne ($null -eq $lim.maxElapsedMs)) -or (($null -ne $lim.maxElapsedMs) -and ([long]$MaxElapsedMs -ne [long]$lim.maxElapsedMs)) -or ([long]$PriorElapsedMs -ne [long]$lim.priorElapsedMs)) { return & $fail 'elapsed limits do not match authenticated capture' }
         $ticketFull = [System.IO.Path]::GetFullPath($TicketPath)
         $usageFull = [System.IO.Path]::GetFullPath($UsagePath)
         $rawFull = [System.IO.Path]::GetFullPath($RawPath)
@@ -218,7 +218,7 @@ function ConvertTo-ObserveOnlyPendingReceipt {
             historyVerified = $false
             budget          = [PSCustomObject]([ordered]@{
                 maxOutputTokens  = $null
-                maxElapsedMs     = [int64]$lim.maxElapsedMs
+                maxElapsedMs     = $(if ($null -eq $lim.maxElapsedMs) { $null } else { [int64]$lim.maxElapsedMs })
                 maxAttempts      = [int64]$lim.maxAttempts
                 usedElapsedMs    = [int64]$f.timing.usedElapsedMs
                 usedOutputTokens = [int64]$acct.usedOutputTokens
@@ -302,7 +302,7 @@ function ConvertTo-ObserveOnlyReviewedCompletionReceipt {
         [Parameter(Mandatory)][int]$Attempt,
         [Parameter(Mandatory)][int]$MaxAttempts,
         [Parameter(Mandatory)][long]$PriorElapsedMs,
-        [Parameter(Mandatory)][long]$MaxElapsedMs,
+        [Parameter(Mandatory)][AllowNull()][Nullable[long]]$MaxElapsedMs,
         [Parameter(Mandatory)][string]$ReceiptPath,
         [AllowNull()][object]$Evidence,
         [Parameter(Mandatory)][bool]$Conflict
@@ -333,7 +333,7 @@ function ConvertTo-ObserveOnlyReviewedCompletionReceipt {
         if (($Attempt -lt 1) -or ($MaxAttempts -le 0) -or ($Attempt -gt $MaxAttempts)) { return & $fail 'invalid attempt range' }
         if (-not [string]::Equals($RunId, [string]$id.runId, [System.StringComparison]::Ordinal)) { return & $fail 'runId does not match authenticated capture' }
         if (([long]$Attempt -ne [long]$id.attempt) -or ([long]$MaxAttempts -ne [long]$lim.maxAttempts)) { return & $fail 'attempt or maxAttempts does not match authenticated capture' }
-        if (([long]$MaxElapsedMs -ne [long]$lim.maxElapsedMs) -or ([long]$PriorElapsedMs -ne [long]$lim.priorElapsedMs)) { return & $fail 'elapsed limits do not match authenticated capture' }
+        if ((($null -eq $MaxElapsedMs) -ne ($null -eq $lim.maxElapsedMs)) -or (($null -ne $lim.maxElapsedMs) -and ([long]$MaxElapsedMs -ne [long]$lim.maxElapsedMs)) -or ([long]$PriorElapsedMs -ne [long]$lim.priorElapsedMs)) { return & $fail 'elapsed limits do not match authenticated capture' }
         $ticketFull = [System.IO.Path]::GetFullPath($TicketPath)
         $usageFull = [System.IO.Path]::GetFullPath($UsagePath)
         $rawFull = [System.IO.Path]::GetFullPath($RawPath)
@@ -362,7 +362,7 @@ function ConvertTo-ObserveOnlyReviewedCompletionReceipt {
             historyVerified = $false
             budget          = [PSCustomObject]([ordered]@{
                 maxOutputTokens  = $null
-                maxElapsedMs     = [int64]$lim.maxElapsedMs
+                maxElapsedMs     = $(if ($null -eq $lim.maxElapsedMs) { $null } else { [int64]$lim.maxElapsedMs })
                 maxAttempts      = [int64]$lim.maxAttempts
                 usedElapsedMs    = [int64]$p.timing.usedElapsedMs
                 usedOutputTokens = [int64]$acct.usedOutputTokens
@@ -587,7 +587,7 @@ function ConvertTo-TerminalReceipt {
         [Parameter(Mandatory)][int]$Attempt,
         [Parameter(Mandatory)][int]$MaxAttempts,
         [Parameter(Mandatory)][long]$PriorElapsedMs,
-        [Parameter(Mandatory)][long]$MaxElapsedMs,
+        [Parameter(Mandatory)][AllowNull()][Nullable[long]]$MaxElapsedMs,
         [Parameter(Mandatory)][string]$ReceiptPath,
         [PSCustomObject]$CompletedNativeEvidence,
         [AllowNull()][object]$ReviewedBlockedEvidence,
@@ -681,7 +681,7 @@ function ConvertTo-TerminalReceipt {
         if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { return & $fail "missing input: $p" $null $null }
     }
     if ($Attempt -lt 0 -or $MaxAttempts -le 0 -or $Attempt -gt $MaxAttempts) { return & $fail 'invalid attempt range' $null $null }
-    if ($PriorElapsedMs -lt 0 -or $MaxElapsedMs -le 0) { return & $fail 'invalid elapsed bounds' $null $null }
+    if ($PriorElapsedMs -lt 0 -or $null -eq $MaxElapsedMs -or $MaxElapsedMs -le 0) { return & $fail 'invalid elapsed bounds' $null $null }
 
     $verifyFiveInputs = $null
     $fiveInputPaths = @()

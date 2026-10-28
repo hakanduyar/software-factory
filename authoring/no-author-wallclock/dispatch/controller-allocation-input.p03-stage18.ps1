@@ -122,7 +122,9 @@ function Get-ControllerAllocationInputBinding {
             if (-not (& $isInteger $history) -or [long]$history -ne $cumulative) { & $fail }
             $elapsed = $contract.Budget.ElapsedMs
             $attempts = & $cget $ticket 'maxAttempts'
-            if (-not (& $isInteger $elapsed) -or [long]$elapsed -le 0 -or -not (& $isInteger $attempts) -or [long]$attempts -le 0) { & $fail }
+            # Exact null elapsed (authenticated observe-only descriptor) = no total author deadline; a finite value must be a positive typed integer. Never cast null to 0.
+            if (($null -ne $elapsed) -and (-not (& $isInteger $elapsed) -or [long]$elapsed -le 0)) { & $fail }
+            if (-not (& $isInteger $attempts) -or [long]$attempts -le 0) { & $fail }
 
             $scope = Get-ControllerAllocationScope -CumulativeOutput $history -Scope ([pscustomobject][ordered]@{
                     taskId              = & $cget $ticket 'id'

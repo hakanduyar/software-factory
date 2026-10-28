@@ -103,6 +103,7 @@ function Get-ReviewedAHostAssociation139 {
                 if (($v -isnot [int] -and $v -isnot [long]) -or $v -lt 0) { throw 'invalid' }
                 $ta[$n] = $v
             }
+            elseif ($n -eq 'MaxElapsedMs' -and $newMode -and $null -eq $v) { $ta[$n] = $null }
             else { $ta[$n] = $v; $null = & $pos $v }
         }
 

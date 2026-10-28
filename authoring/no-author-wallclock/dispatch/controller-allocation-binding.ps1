@@ -102,6 +102,8 @@ function Get-ControllerAllocationScope {
     }
 
     foreach ($name in $budgetNames) {
+        # Observe-only shape only: an exact null maxElapsedMs means NO TOTAL AUTHOR DEADLINE (never 0). A finite positive value remains valid for historical scopes.
+        if ($observeOnly -and $name -ceq 'maxElapsedMs' -and $null -eq $values[$name]) { continue }
         if (-not (& $isInteger $values[$name]) -or [long]$values[$name] -le 0) { & $fail }
     }
     if (-not (& $isInteger $CumulativeOutput) -or [long]$CumulativeOutput -lt 0) { & $fail }
@@ -117,7 +119,7 @@ function Get-ControllerAllocationScope {
             maxAdditionalOutput = $null
             aggregateCeiling    = $null
             maxAttempts         = [long]$values['maxAttempts']
-            maxElapsedMs        = [long]$values['maxElapsedMs']
+            maxElapsedMs        = $(if ($null -eq $values['maxElapsedMs']) { $null } else { [long]$values['maxElapsedMs'] })
         }
     }
     $ceiling = [long]$values['aggregateCeiling']

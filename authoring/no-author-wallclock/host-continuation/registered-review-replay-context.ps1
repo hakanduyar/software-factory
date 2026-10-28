@@ -218,7 +218,10 @@ function Get-RegisteredReviewReplayContext {
         if (-not (& $samePath (& $coreVal 'settingsPath') $settingsPath)) { throw $invalid }
         if (-not (& $eq (& $coreVal 'settingsSha256') $settingsSha)) { throw $invalid }
         if (-not (& $samePath (& $coreVal 'workingDirectory') $request['WorkingDirectory'])) { throw $invalid }
-        if ((& $natInt (& $coreVal 'maxElapsedMs')) -ne (& $natInt $request['MaxElapsedMs'])) { throw $invalid }
+        # Exact null means NO TOTAL AUTHOR DEADLINE and is valid only for the observe-only request; request and core must agree on null-ness, and finite values compare as before (no cast of null to 0).
+        $reqElapsed = $request['MaxElapsedMs']; $coreElapsed = & $coreVal 'maxElapsedMs'
+        if ($null -eq $reqElapsed -or $null -eq $coreElapsed) { if (-not $hasOsp -or $null -ne $reqElapsed -or $null -ne $coreElapsed) { throw $invalid } }
+        elseif ((& $natInt $coreElapsed) -ne (& $natInt $reqElapsed)) { throw $invalid }
         if ($hasOsp) {
             # Observe-only: no author stream cap. Request and captured core must both carry an exact null; no numeric substitute.
             if ($null -ne $request['MaxStreamBytes']) { throw $invalid }

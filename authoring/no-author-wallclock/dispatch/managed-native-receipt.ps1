@@ -207,8 +207,12 @@ function Get-ManagedNativeCapturedFacts {
         $null = & $str $core 'executable'
         $null = & $str $core 'workingDirectory'
         $argv = & $prop $core 'arguments'
-        $maxElapsed = & $lng $core 'maxElapsedMs'
-        if ($maxElapsed -le 0) { & $fail 'MAXELAPSED_INVALID' }
+        # Observe-only capture may carry an exact null maxElapsedMs (NO TOTAL AUTHOR DEADLINE); it is bound to the authenticated ticket below. Otherwise a positive typed integer is required.
+        if ($obs -and (& $exactName $core 'maxElapsedMs') -and ($null -eq (& $prop $core 'maxElapsedMs'))) { $maxElapsed = $null }
+        else {
+            $maxElapsed = & $lng $core 'maxElapsedMs'
+            if ($maxElapsed -le 0) { & $fail 'MAXELAPSED_INVALID' }
+        }
         $maxStream = [long]0
         if ($obs) {
             foreach ($sel in @('outputStopProfile', 'outputStopAuthority', 'maxStreamBytes')) { if (-not (& $exactName $core $sel)) { & $fail ('MISSING_' + $sel.ToUpperInvariant()) } }
@@ -258,6 +262,9 @@ function Get-ManagedNativeCapturedFacts {
         $contractMode = $contract.OutputStopMode
         if ($obs) { if ($contractMode -cne 'OBSERVE_ONLY_DESCRIPTOR') { & $fail 'OBS_CONTRACT_MODE' } }
         elseif ($contractMode -cne 'LEGACY_HARDLIMIT') { & $fail 'OBS_OPT_IN_REQUIRED' }
+        # A null total author ceiling must be independently derived from the authenticated ticket, never from the core marker alone; a null ticket with a finite core is also refused.
+        if (($null -eq $maxElapsed) -ne ($null -eq $contract.Budget.ElapsedMs)) { & $fail 'ELAPSED_NULL_BINDING' }
+        if (($null -eq $maxElapsed) -and $fto) { & $fail 'FAILED_STOPFACTS_ELAPSED' }
         $sessionId = $ticket.sessionId
         $budget = $contract.Budget
         if ($argv -isnot [object[]]) { & $fail 'ARGUMENTS_TYPE' }
@@ -1226,8 +1233,16 @@ function Get-ManagedObservePendingAccountingFacts {
         # Actual ticket carries top-level maxAttempts; no budget alias is assumed.
         $maxAttempts = & $lng $ticket 'maxAttempts' 'OBSPA_MAXATTEMPTS'
         if (($maxAttempts -le 0) -or ([long]$attempt -gt $maxAttempts)) { & $fail 'OBSPA_ATTEMPT_LIMIT' }
-        $maxElapsed = & $lng $core 'maxElapsedMs' 'OBSPA_MAXELAPSED'
-        if ($maxElapsed -le 0) { & $fail 'OBSPA_MAXELAPSED' }
+        # Exact null core ceiling = NO TOTAL AUTHOR DEADLINE; valid only when the independently authenticated capture Budget.ElapsedMs is also null and never for a failed (DEADLINE) current.
+        $meRaw = & $get $core 'maxElapsedMs' 'OBSPA_MAXELAPSED'
+        if ($null -eq $meRaw) {
+            if ($failedCur -or ($null -ne (& $get $cbud 'ElapsedMs' 'OBSPA_MAXELAPSED'))) { & $fail 'OBSPA_MAXELAPSED' }
+            $maxElapsed = $null
+        } else {
+            if (($null -ne (& $get $cbud 'ElapsedMs' 'OBSPA_MAXELAPSED')) -ne $true) { & $fail 'OBSPA_MAXELAPSED' }
+            $maxElapsed = & $lng $core 'maxElapsedMs' 'OBSPA_MAXELAPSED'
+            if ($maxElapsed -le 0) { & $fail 'OBSPA_MAXELAPSED' }
+        }
         $pid1 = & $lng $c 'Pid' 'OBSPA_CAPTURE_FIELD'
         if (($pid1 -le 0) -or ((& $lng $term 'pid' 'OBSPA_TERMINAL_FIELD') -ne $pid1) -or ((& $lng $start 'pid' 'OBSPA_START_FIELD') -ne $pid1)) { & $fail 'OBSPA_PID_MISMATCH' }
         $startUtc = & $str $term 'startTimeUtc' 'OBSPA_TERMINAL_FIELD'
@@ -1245,7 +1260,7 @@ function Get-ManagedObservePendingAccountingFacts {
         $dTicks = [long]($t1 - $t0)
         $usedElapsed = [long](($dTicks - ($dTicks % 10000L)) / 10000L)
         if (($dTicks % 10000L) -ne 0) { $usedElapsed = & $add $usedElapsed 1L 'OBSPA_ELAPSED_OVERFLOW' }
-        if ((-not $failedCur) -and ($usedElapsed -gt $maxElapsed)) { & $fail 'OBSPA_ELAPSED_EXCEEDS' }
+        if ((-not $failedCur) -and ($null -ne $maxElapsed) -and ($usedElapsed -gt $maxElapsed)) { & $fail 'OBSPA_ELAPSED_EXCEEDS' }
         $reqSha = & $get $c 'RequestSha256' 'OBSPA_CAPTURE_FIELD'
         if (-not (& $isHex $reqSha)) { & $fail 'OBSPA_CAPTURE_FIELD' }
         if (($null -ne (& $get $cbud 'AdditionalOutputMax' 'OBSPA_BUDGET')) -or ($null -ne (& $get $cbud 'PhaseAggregateCeiling' 'OBSPA_BUDGET'))) { & $fail 'OBSPA_BUDGET' }
@@ -1659,7 +1674,7 @@ function Get-ManagedObservePendingAccountingFacts {
             $fbase = [pscustomobject]([ordered]@{
                 Selection = (& $selectionOf $pe0)
                 Capture = $c
-                Bound = [pscustomobject]([ordered]@{ taskId = [string]$b.taskId; payloadSha256 = [string]$b.payloadSha; sessionId = [string]$b.sessionId; pid = [long]$b.pid1; startUtc = [string]$b.startUtc; endUtc = [string]$b.endUtc; terminalReason = [string]$b.termReason; exitCode = [long]$b.termExit; maxAttempts = [long]$b.maxAttempts; maxElapsedMs = [long]$b.maxElapsed; usedElapsedMs = [long]$b.usedElapsed; requestSha256 = [string]$b.reqSha; ticketSha256 = [string](& $get $b.core 'ticketSha256' 'OBSPA_CORE_FIELD') })
+                Bound = [pscustomobject]([ordered]@{ taskId = [string]$b.taskId; payloadSha256 = [string]$b.payloadSha; sessionId = [string]$b.sessionId; pid = [long]$b.pid1; startUtc = [string]$b.startUtc; endUtc = [string]$b.endUtc; terminalReason = [string]$b.termReason; exitCode = [long]$b.termExit; maxAttempts = [long]$b.maxAttempts; maxElapsedMs = $(if ($null -eq $b.maxElapsed) { $null } else { [long]$b.maxElapsed }); usedElapsedMs = [long]$b.usedElapsed; requestSha256 = [string]$b.reqSha; ticketSha256 = [string](& $get $b.core 'ticketSha256' 'OBSPA_CORE_FIELD') })
                 ParentReceipt = [pscustomobject]([ordered]@{ path = [string]$pr.Path; sha256 = [string]$pr.Sha256; schemaVersion = [string]$sv0; runId = $parentRunId; attempt = $parentAttempt })
                 Anchor = [pscustomobject]([ordered]@{ receiptPath = [string]$anchorPr.Path; receiptSha256 = [string]$anchorPr.Sha256; runId = [string]$anchorEv.runId; attempt = [long]$anchorEv.attempt; terminalPath = [string]$anchorPc.TerminalPath; terminalSha256 = [string]$anchorPc.TerminalSha256; usedOutputTokens = [long]$anchorUsed })
                 LastVerifiedParentOutputTokens = [long]$curHist
@@ -1721,9 +1736,11 @@ function Test-ManagedObservePendingReceiptV3Shape {
         if (-not ((& $exact $b @('maxOutputTokens', 'maxElapsedMs', 'maxAttempts', 'usedElapsedMs', 'usedOutputTokens', 'attemptsUsed', 'softFraction')) -and (& $exact $p @('startIdentity', 'sessionId', 'terminalReason', 'pid')) -and (& $exact $a @('complete', 'sha256', 'path')) -and (& $exact $e @('rawPath', 'rawSha256', 'ticketPath', 'ticketSha256', 'usagePath', 'usageSha256', 'nativeThinkingTokens')))) { return $false }
         # No output ceiling or soft fraction exists in observe-only mode; nothing is clamped or carried as a finite number.
         if (($null -ne (& $val $b 'maxOutputTokens')) -or ($null -ne (& $val $b 'softFraction'))) { return $false }
-        foreach ($n in @('maxElapsedMs', 'maxAttempts', 'usedElapsedMs', 'usedOutputTokens', 'attemptsUsed')) { if (-not (& $isInt (& $val $b $n))) { return $false } }
-        if (([long](& $val $b 'maxElapsedMs') -le 0) -or ([long](& $val $b 'maxAttempts') -le 0) -or ([long](& $val $b 'usedElapsedMs') -lt 0) -or ([long](& $val $b 'usedOutputTokens') -lt 0)) { return $false }
-        if (([long](& $val $b 'attemptsUsed') -ne [long]$attempt) -or ([long]$attempt -gt [long](& $val $b 'maxAttempts')) -or ([long](& $val $b 'usedElapsedMs') -gt [long](& $val $b 'maxElapsedMs'))) { return $false }
+        foreach ($n in @('maxAttempts', 'usedElapsedMs', 'usedOutputTokens', 'attemptsUsed')) { if (-not (& $isInt (& $val $b $n))) { return $false } }
+        # maxElapsedMs: exact null = no total author deadline (compared to authenticated facts elsewhere); otherwise a positive typed integer.
+        if (($null -ne (& $val $b 'maxElapsedMs')) -and (-not (& $isInt (& $val $b 'maxElapsedMs')))) { return $false }
+        if ((($null -ne (& $val $b 'maxElapsedMs')) -and ([long](& $val $b 'maxElapsedMs') -le 0)) -or ([long](& $val $b 'maxAttempts') -le 0) -or ([long](& $val $b 'usedElapsedMs') -lt 0) -or ([long](& $val $b 'usedOutputTokens') -lt 0)) { return $false }
+        if (([long](& $val $b 'attemptsUsed') -ne [long]$attempt) -or ([long]$attempt -gt [long](& $val $b 'maxAttempts')) -or (($null -ne (& $val $b 'maxElapsedMs')) -and ([long](& $val $b 'usedElapsedMs') -gt [long](& $val $b 'maxElapsedMs')))) { return $false }
         if ($null -ne (& $val $p 'startIdentity')) { return $false }
         if ((-not (& $isStr (& $val $p 'sessionId'))) -or ((& $val $p 'sessionId') -cne (& $val $obj 'sessionId')) -or (-not (& $isStr (& $val $p 'terminalReason')))) { return $false }
         if ((-not (& $isInt (& $val $p 'pid'))) -or ([long](& $val $p 'pid') -le 0)) { return $false }
@@ -1770,7 +1787,7 @@ function Compare-ManagedObservePendingReceiptV3ToFacts {
         }
         if (([long]$attempt -ne [long]$id.attempt) -or ([long](& $val $p 'pid') -ne [long]$id.pid) -or ((& $val $p 'terminalReason') -cne [string]$id.terminalReason)) { return $false }
         if ((& $val $obj 'updatedAt') -cne [string]$f.timing.endedUtc) { return $false }
-        if (([long](& $val $b 'maxElapsedMs') -ne [long]$lim.maxElapsedMs) -or ([long](& $val $b 'maxAttempts') -ne [long]$lim.maxAttempts) -or ([long]$lim.priorElapsedMs -ne 0)) { return $false }
+        if ((($null -eq (& $val $b 'maxElapsedMs')) -ne ($null -eq $lim.maxElapsedMs)) -or (($null -ne $lim.maxElapsedMs) -and ([long](& $val $b 'maxElapsedMs') -ne [long]$lim.maxElapsedMs)) -or ([long](& $val $b 'maxAttempts') -ne [long]$lim.maxAttempts) -or ([long]$lim.priorElapsedMs -ne 0)) { return $false }
         if ([long](& $val $b 'usedElapsedMs') -ne [long]$f.timing.usedElapsedMs) { return $false }
         if ([long](& $val $b 'usedOutputTokens') -ne [long]$acct.usedOutputTokens) { return $false }
         if (([string](& $val $e 'ticketPath') -cne [string]$f.references.ticket.path) -or ((& $val $e 'ticketSha256') -cne [string]$f.references.ticket.verifiedSha256)) { return $false }
@@ -2164,9 +2181,11 @@ function Test-ManagedObserveReviewedReceiptV4Shape {
         $e = & $val $obj 'evidence'
         if (-not ((& $exact $b @('maxOutputTokens', 'maxElapsedMs', 'maxAttempts', 'usedElapsedMs', 'usedOutputTokens', 'attemptsUsed', 'softFraction')) -and (& $exact $p @('startIdentity', 'sessionId', 'terminalReason', 'pid')) -and (& $exact $a @('complete', 'sha256', 'path')) -and (& $exact $e @('rawPath', 'rawSha256', 'ticketPath', 'ticketSha256', 'usagePath', 'usageSha256', 'nativeThinkingTokens')))) { return $false }
         if (($null -ne (& $val $b 'maxOutputTokens')) -or ($null -ne (& $val $b 'softFraction'))) { return $false }
-        foreach ($n in @('maxElapsedMs', 'maxAttempts', 'usedElapsedMs', 'usedOutputTokens', 'attemptsUsed')) { if (-not (& $isInt (& $val $b $n))) { return $false } }
-        if (([long](& $val $b 'maxElapsedMs') -le 0) -or ([long](& $val $b 'maxAttempts') -le 0) -or ([long](& $val $b 'usedElapsedMs') -lt 0) -or ([long](& $val $b 'usedOutputTokens') -lt 0)) { return $false }
-        if (([long](& $val $b 'attemptsUsed') -ne [long]$attempt) -or ([long]$attempt -gt [long](& $val $b 'maxAttempts')) -or ([long](& $val $b 'usedElapsedMs') -gt [long](& $val $b 'maxElapsedMs'))) { return $false }
+        foreach ($n in @('maxAttempts', 'usedElapsedMs', 'usedOutputTokens', 'attemptsUsed')) { if (-not (& $isInt (& $val $b $n))) { return $false } }
+        # maxElapsedMs: exact null = no total author deadline (compared to authenticated facts elsewhere); otherwise a positive typed integer.
+        if (($null -ne (& $val $b 'maxElapsedMs')) -and (-not (& $isInt (& $val $b 'maxElapsedMs')))) { return $false }
+        if ((($null -ne (& $val $b 'maxElapsedMs')) -and ([long](& $val $b 'maxElapsedMs') -le 0)) -or ([long](& $val $b 'maxAttempts') -le 0) -or ([long](& $val $b 'usedElapsedMs') -lt 0) -or ([long](& $val $b 'usedOutputTokens') -lt 0)) { return $false }
+        if (([long](& $val $b 'attemptsUsed') -ne [long]$attempt) -or ([long]$attempt -gt [long](& $val $b 'maxAttempts')) -or (($null -ne (& $val $b 'maxElapsedMs')) -and ([long](& $val $b 'usedElapsedMs') -gt [long](& $val $b 'maxElapsedMs')))) { return $false }
         if (-not (& $isStr (& $val $p 'startIdentity'))) { return $false }
         if ((-not (& $isStr (& $val $p 'sessionId'))) -or ((& $val $p 'sessionId') -cne (& $val $obj 'sessionId')) -or (-not (& $isStr (& $val $p 'terminalReason')))) { return $false }
         if ((-not (& $isInt (& $val $p 'pid'))) -or ([long](& $val $p 'pid') -le 0)) { return $false }
@@ -2703,7 +2722,7 @@ function Invoke-ManagedNativePendingReceipt {
         [Parameter(Mandatory)][int]$Attempt,
         [Parameter(Mandatory)][int]$MaxAttempts,
         [Parameter(Mandatory)][long]$PriorElapsedMs,
-        [Parameter(Mandatory)][long]$MaxElapsedMs
+        [Parameter(Mandatory)][AllowNull()][Nullable[long]]$MaxElapsedMs
     )
     # Load the sibling adapter first so nothing it defines can shadow later locals.
     $adapterFile = Join-Path $PSScriptRoot 'receipt-adapter.ps1'
@@ -2831,7 +2850,7 @@ function Invoke-ManagedNativePendingReceipt {
     try {
         if ($Attempt -lt 1 -or $Attempt -gt $MaxAttempts) { return & $refuse 'INVALID_ATTEMPT' }
         if ($PriorElapsedMs -lt 0) { return & $refuse 'INVALID_PRIOR_ELAPSED' }
-        if ($MaxElapsedMs -le 0) { return & $refuse 'INVALID_MAX_ELAPSED' }
+        if (($null -ne $MaxElapsedMs) -and ($MaxElapsedMs -le 0)) { return & $refuse 'INVALID_MAX_ELAPSED' }
 
         # Single facts call, strictly before any write.
         $fr = Get-ManagedNativeCapturedFacts -ManifestPath $ManifestPath -ExpectedManifestSha256 $ExpectedManifestSha256 -TerminalPath $TerminalPath -ExpectedTerminalSha256 $ExpectedTerminalSha256 -TicketPath $TicketPath -RunId $RunId -Attempt $Attempt

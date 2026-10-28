@@ -55,6 +55,8 @@ function Test-ManagedNativeTicketContract {
                     $before = $issues.Count
                     $v = & $read $budget $name
                     if ($issues.Count -ne $before) { continue }
+                    # Observe-only descriptor branch only: an exact null elapsedMs means NO TOTAL AUTHOR DEADLINE (not 0). Finite positive values remain valid for historical tickets.
+                    if ($descMode -and $name -ceq 'elapsedMs' -and $null -eq $v) { $values[$name] = $null; continue }
                     if ($v -isnot [int] -and $v -isnot [long]) { $issues.Add('TYPE_' + $name.ToUpperInvariant()); continue }
                     if (($name -ceq 'historicalOutputTokens' -and $v -lt 0) -or ($name -cne 'historicalOutputTokens' -and $v -le 0)) {
                         $issues.Add('RANGE_' + $name.ToUpperInvariant()); continue
