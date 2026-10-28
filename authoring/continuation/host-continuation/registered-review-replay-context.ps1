@@ -134,14 +134,18 @@ function Get-RegisteredReviewReplayContext {
         # ---- Raw request (119 reader) ----
         $reqRead = Read-RegisteredReviewRecord -Path $reg.requestPath -ExpectedSha256 $reg.requestSha256
         $rr = $reqRead.record
-        $reqKnown = @('RunId','Attempt','TicketPath','PayloadPath','GateTicketPath','SettingsPath','ArtifactPath','WorkingDirectory','Arguments','MaxElapsedMs','MaxStreamBytes','TokenAccountingPolicy','StructuredOutputProfile')
+        $reqKnown = @('RunId','Attempt','TicketPath','PayloadPath','GateTicketPath','SettingsPath','ArtifactPath','WorkingDirectory','Arguments','MaxElapsedMs','MaxStreamBytes','TokenAccountingPolicy','StructuredOutputProfile','OutputStopProfile')
         $reqProps = @($rr.PSObject.Properties)
-        $hasTap = $false; $hasProf = $false
+        $hasTap = $false; $hasProf = $false; $hasOsp = $false
         foreach ($p in $reqProps) {
+            # Ordinal metadata first: only plain NoteProperty members with exact-case known names; no getter runs on anything else.
+            if ($p.MemberType -ne [System.Management.Automation.PSMemberTypes]::NoteProperty) { throw $invalid }
             if ($reqKnown -cnotcontains [string]$p.Name) { throw $invalid }
-            if ([string]$p.Name -ceq 'TokenAccountingPolicy') { $hasTap = $true }; if ([string]$p.Name -ceq 'StructuredOutputProfile') { $hasProf = $true }
+            if ([string]$p.Name -ceq 'TokenAccountingPolicy') { $hasTap = $true }; if ([string]$p.Name -ceq 'StructuredOutputProfile') { $hasProf = $true }; if ([string]$p.Name -ceq 'OutputStopProfile') { $hasOsp = $true }
         }
-        if ($reqProps.Count -ne (11 + [int]$hasTap + [int]$hasProf)) { throw $invalid }
+        if ($reqProps.Count -ne (11 + [int]$hasTap + [int]$hasProf + [int]$hasOsp)) { throw $invalid }
+        # New mode is an exclusive selector, never authority: no token policy and no structured/schema/report/max-turn output enforcement.
+        if ($hasOsp -and ($hasTap -or $hasProf)) { throw $invalid }
         $request = @{}
         foreach ($p in $reqProps) {
             $n = [string]$p.Name
@@ -153,6 +157,7 @@ function Get-RegisteredReviewReplayContext {
                 foreach ($q in @($v.PSObject.Properties)) { $ht[[string]$q.Name] = $q.Value }
                 $request[$n] = $ht
             }
+            elseif ($n -ceq 'OutputStopProfile') { if ($v -isnot [string] -or $v -cne 'observe-only-v1') { throw $invalid }; $request[$n] = [string]$v }
             elseif ($n -ceq 'StructuredOutputProfile') { if ($v -isnot [string] -or $v -cne 'canonical8-v1') { throw $invalid }; $request[$n] = [string]$v } elseif ($n -ceq 'Arguments') {
                 if ($v -isnot [object[]]) { throw $invalid }
                 $a = [object[]]::new($v.Count)
@@ -214,7 +219,18 @@ function Get-RegisteredReviewReplayContext {
         if (-not (& $eq (& $coreVal 'settingsSha256') $settingsSha)) { throw $invalid }
         if (-not (& $samePath (& $coreVal 'workingDirectory') $request['WorkingDirectory'])) { throw $invalid }
         if ((& $natInt (& $coreVal 'maxElapsedMs')) -ne (& $natInt $request['MaxElapsedMs'])) { throw $invalid }
-        if ((& $natInt (& $coreVal 'maxStreamBytes')) -ne (& $natInt $request['MaxStreamBytes'])) { throw $invalid }
+        if ($hasOsp) {
+            # Observe-only: no author stream cap. Request and captured core must both carry an exact null; no numeric substitute.
+            if ($null -ne $request['MaxStreamBytes']) { throw $invalid }
+            if ($null -ne (& $coreVal 'maxStreamBytes')) { throw $invalid }
+            if (-not (& $eq (& $coreVal 'outputStopProfile') 'observe-only-v1')) { throw $invalid }
+            if (-not (& $hasName $core 'outputStopAuthority')) { throw $invalid }
+        }
+        else {
+            # Legacy and structured-output requests must not carry any observe-only descriptor in the captured core.
+            if ((& $hasName $core 'outputStopProfile') -or (& $hasName $core 'outputStopAuthority')) { throw $invalid }
+            if ((& $natInt (& $coreVal 'maxStreamBytes')) -ne (& $natInt $request['MaxStreamBytes'])) { throw $invalid }
+        }
         if ((& $hasName $core 'tokenAccountingPolicy') -ne $hasTap) { throw $invalid }
         if ((& $hasName $core 'nativeStructuredOutput') -ne $hasProf) { throw $invalid }
         if ($hasProf) {
@@ -327,6 +343,38 @@ function Get-RegisteredReviewReplayContext {
         if (-not (& $eq (& $get $artifact 'path') $reg.candidatePath)) { throw $invalid }
         if (-not (& $eq (& $lower64 (& $get $artifact 'sha256')) $candSha)) { throw $invalid }
         if ((& $natInt (& $get $artifact 'length')) -ne [long]$candBytes.Length) { throw $invalid }
+
+        # ---- Observe-only: authenticate the captured contract and fixed output-stop authority; selector and nulls are never authority ----
+        if ($hasOsp) {
+            foreach ($f in @('outputStopProfile', 'outputStopAuthority', 'usageTelemetry')) {
+                if (-not (& $hasName $term $f)) { throw $invalid }
+            }
+            if (-not (& $eq (& $get $term 'outputStopProfile') 'observe-only-v1')) { throw $invalid }
+            . (Join-Path (Join-Path (Split-Path -Parent $PSScriptRoot) 'dispatch') 'managed-native-receipt.ps1')
+            $capRes = Get-ManagedNativeCapturedFacts -ManifestPath $tb.manifestPath -ExpectedManifestSha256 $tb.manifestSha256 `
+                -TerminalPath $tb.terminalPath -ExpectedTerminalSha256 $tb.terminalSha256 -TicketPath $reg.ticketPath `
+                -RunId $taskId -Attempt ([int]$attempt) -ForOutputObservation
+            if (@($capRes).Count -ne 1 -or $capRes -isnot [System.Management.Automation.PSCustomObject]) { throw $invalid }
+            if ($capRes.Valid -isnot [bool] -or $capRes.Valid -or $null -ne $capRes.Facts) { throw $invalid }
+            if (-not (& $eq $capRes.Code 'OBSERVE_ONLY_TRANSPORT_CAPTURE')) { throw $invalid }
+            $oc = $capRes.ObservationCapture
+            if ($oc -isnot [System.Management.Automation.PSCustomObject]) { throw $invalid }
+            if (-not (& $eq $oc.RunId $taskId) -or [long]$oc.Attempt -ne $attempt) { throw $invalid }
+            if (-not (& $eq $oc.ManifestSha256 $tb.manifestSha256) -or -not (& $eq $oc.TerminalSha256 $tb.terminalSha256)) { throw $invalid }
+            if (-not (& $eq $oc.TicketSha256 $reg.ticketSha256) -or -not (& $eq $oc.TicketPath $reg.ticketPath)) { throw $invalid }
+            if (-not (& $eq $oc.RequestSha256 $canonSha)) { throw $invalid }
+            $ocAuth = $oc.Authority
+            if ($ocAuth -isnot [System.Management.Automation.PSCustomObject] -or -not (& $eq $ocAuth.Schema 'ManagedOutputStopAuthority/v1') -or -not (& $eq $ocAuth.Mode 'OBSERVE_ONLY')) { throw $invalid }
+            $authJson = ConvertTo-Json -InputObject $ocAuth -Compress -Depth 4
+            foreach ($holder in @($core, $term, $oc.Core, $oc.Terminal)) {
+                $held = & $get $holder 'outputStopAuthority'
+                if ($held -isnot [System.Management.Automation.PSCustomObject] -or (ConvertTo-Json -InputObject $held -Compress -Depth 4) -cne $authJson) { throw $invalid }
+            }
+            foreach ($holder in @($core, $oc.Core)) {
+                if (-not (& $eq (& $get $holder 'outputStopProfile') 'observe-only-v1') -or $null -ne (& $get $holder 'maxStreamBytes')) { throw $invalid }
+            }
+            if (-not (& $eq (& $get $oc.Ticket 'payloadSha256') $reg.payloadSha256)) { throw $invalid }
+        }
 
         # ---- Immutable ACK snapshot ----
         $ackRead = Read-RegisteredReviewRecord -Path $tb.ackPath -ExpectedSha256 $tb.ackSha256
