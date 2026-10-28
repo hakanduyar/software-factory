@@ -20,11 +20,10 @@
  *   C. dynamically — all three required full-loop scenarios (clean PASS;
  *      CHANGES_REQUIRED → remediate → PASS; verification failure →
  *      remediate → PASS) complete with zero stdin listener registrations;
- *   D. dynamically — a worker whose underlying process would otherwise hang
- *      forever (simulating an unanswerable interactive prompt) fails closed
- *      via the existing bounded timeout/SIGKILL mechanism and the loop
- *      proceeds through its ordinary budget/exhaustion policy, never asking
- *      the human and never hanging;
+ *   D. dynamically — under the human no-total-author-duration policy, a finite
+ *      author timeout configuration is refused before any child can launch:
+ *      the loop fails closed (FAILED, BLOCKED work item, zero runs, zero
+ *      process-runner calls), never asking the human and never hanging;
  *   E. the explicit governance/recovery gates this invariant does NOT
  *      remove — `cancel()` and `RECOVERY_REQUIRED` — remain reachable and
  *      still require an explicit human/operator action.
@@ -55,7 +54,6 @@ import {
   createScriptedReviewerWorker,
 } from "../src/orchestration/scriptedLoopWorkers.js";
 import { authorize, newFactory, seedWorkItem, toReady, type TestFactory } from "./support/factoryFixtures.js";
-import { fakeCliPath } from "./support/fakeCli.js";
 import { cleanupTempWorkspaces, createTempWorkspace } from "./support/tempWorkspace.js";
 
 after(cleanupTempWorkspaces);
@@ -308,41 +306,42 @@ describe("C. dynamic — all three required full-loop scenarios complete with ze
   });
 });
 
-describe("D. dynamic — an unanswerable-interactive-prompt hang fails closed, never hangs, never asks the human", () => {
-  it("a worker whose underlying process never exits (simulating a stuck approval prompt) times out, is recorded FAILED, and the loop proceeds to EXHAUSTED — bounded, not indefinite", async () => {
+describe("D. dynamic — a finite author timeout configuration is refused before any child launches", () => {
+  it("fails the loop closed with a timeout-policy reason, zero factory runs and zero process-runner calls", async () => {
     const fx = newFactory();
     const item = await seedWorkItem(fx.factory);
     await toReady(fx.factory, item.id);
 
-    // The real Claude adapter, pointed at a fixture that ignores SIGTERM and
-    // never exits on its own (tests/fixtures/fake-clis/never-exits.mjs) —
-    // exactly what an unexpectedly-hung interactive approval prompt would
-    // look like from the orchestrator's side: a child process that stops
-    // producing output and never terminates. A short worker timeoutMs plus
-    // the process runner's short killGraceMs (100ms, configured above) bound
-    // the whole thing well under the test's own timeout.
-    const hangingImplementer: LoopWorkerFactory = (config, options) =>
+    let runnerCalls = 0;
+    const countingRunner = {
+      run: async (): Promise<never> => {
+        runnerCalls += 1;
+        throw new Error("process runner must never be called for a refused author configuration");
+      },
+    };
+
+    // The real Claude adapter constructor with a finite author timeout: refused by the shared
+    // createCliWorker boundary before any process runner call. No process of any kind is spawned.
+    const cappedImplementer: LoopWorkerFactory = (config, options) =>
       createClaudeCodeWorker({
-        executable: fakeCliPath("never-exits.mjs"),
+        executable: "irrelevant-not-actually-spawned",
         model: config.model,
         timeoutMs: 150,
         workspace: options.workspace,
-        processRunner: options.processRunner,
+        processRunner: countingRunner,
         roles: options.roles,
       });
 
-    const service = makeService(fx, createInMemoryLoopRepository(), { implementerFactory: hangingImplementer });
-
-    const startedAt = Date.now();
+    const service = makeService(fx, createInMemoryLoopRepository(), { implementerFactory: cappedImplementer });
     const loop = await service.start(baseInput(item.id, { budget: { maxIterations: 1 } }));
-    const elapsedMs = Date.now() - startedAt;
 
-    assert.equal(loop.phase, "EXHAUSTED", "a hung worker must fail closed into the normal budget/exhaustion policy, never PASS, never a hang");
-    assert.equal(loop.iterations[0]?.implementerOutcome, "FAILED");
-    assert.ok(elapsedMs < 5000, `must resolve within a bounded time (timeout+killGrace), took ${elapsedMs}ms — a true hang would exceed this easily`);
+    assert.equal(loop.phase, "FAILED", "a refused author configuration must fail the loop closed, never PASS, never hang");
+    assert.match(loop.failureReason ?? "", /timeoutMs must be null/);
+    assert.equal(runnerCalls, 0, "no child process may be launched");
+    assert.equal((await fx.factory.listRuns(item.id)).length, 0, "no factory run may be created");
 
     const finalItem = await fx.factory.getWorkItem(item.id);
-    assert.equal(finalItem.status, "BLOCKED", "the WorkItem is left for a human to look at — not silently retried forever, not silently passed");
+    assert.equal(finalItem.status, "BLOCKED", "the WorkItem is left for a human to look at — not silently retried, not silently passed");
   });
 });
 
