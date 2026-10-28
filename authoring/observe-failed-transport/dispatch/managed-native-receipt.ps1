@@ -12,11 +12,16 @@ function Get-ManagedNativeCapturedFacts {
         [Parameter(Mandatory)][int]$Attempt,
         [switch]$ForFailedAccounting,
         [ValidateSet('ERROR_MAX_TURNS','TOKEN_ACCOUNTING_STOP')][string]$FailureKind = 'ERROR_MAX_TURNS',
-        [switch]$ForOutputObservation
+        [switch]$ForOutputObservation,
+        [switch]$ForFailedTransportObservation
     )
     Set-StrictMode -Version Latest
     $ticketIssues = @()
-    $obs = $ForOutputObservation.IsPresent
+    # Explicit failed-transport opt-in: same observe-only authentication and raw-stream reads, but only an authenticated DEADLINE terminal with a nonzero typed exit.
+    $fto = $ForFailedTransportObservation.IsPresent
+    $sfv = $null
+    $onAck = $false
+    $obs = $ForOutputObservation.IsPresent -or $fto
     $obsDeclared = [System.Collections.Generic.List[object]]::new()
     $obsVerified = [System.Collections.Generic.List[object]]::new()
     $fail = { param([string]$c) throw [System.InvalidOperationException]::new('REFUSE:' + $c) }
@@ -170,6 +175,7 @@ function Get-ManagedNativeCapturedFacts {
         }
 
         if ($Attempt -le 0) { & $fail 'ATTEMPT_INVALID' }
+        if ($fto -and ($ForOutputObservation.IsPresent -or $ForFailedAccounting.IsPresent -or $PSBoundParameters.ContainsKey('FailureKind'))) { & $fail 'FAILED_TRANSPORT_SELECTOR_CONFLICT' }
         # The FailureKind default alone is not a binding; only an explicitly bound FailureKind conflicts with observation.
         if ($obs -and ($ForFailedAccounting.IsPresent -or $PSBoundParameters.ContainsKey('FailureKind'))) { & $fail 'OBSERVE_SELECTOR_CONFLICT' }
         if ((-not (& $isHex $ExpectedManifestSha256)) -or (-not (& $isHex $ExpectedTerminalSha256))) { & $fail 'EXPECTED_HASH_INVALID' }
@@ -287,7 +293,7 @@ function Get-ManagedNativeCapturedFacts {
         $t1 = & $utc (& $str $term 'endedUtc') 'TERMINAL_ENDED_UTC'
         if ($t1 -lt $t0) { & $fail 'TERMINAL_TIME_ORDER' }
         if (($FailureKind -ceq 'TOKEN_ACCOUNTING_STOP') -and (-not $ForFailedAccounting)) { & $fail 'TERMINAL_FAILUREKIND' }
-        $wantReason = if ($FailureKind -ceq 'TOKEN_ACCOUNTING_STOP') { 'TOKEN_ACCOUNTING_STOP' } else { 'NATURAL_EXIT' }
+        $wantReason = if ($fto) { 'DEADLINE' } elseif ($FailureKind -ceq 'TOKEN_ACCOUNTING_STOP') { 'TOKEN_ACCOUNTING_STOP' } else { 'NATURAL_EXIT' }
         if ((& $str $term 'reason') -cne $wantReason) { & $fail 'TERMINAL_REASON' }
         if ($null -ne (& $prop $term 'errorCode')) { & $fail 'TERMINAL_ERRORCODE' }
         if ((& $bool $term 'definitive') -ne $true) { & $fail 'TERMINAL_NOT_DEFINITIVE' }
@@ -295,9 +301,9 @@ function Get-ManagedNativeCapturedFacts {
         if ((& $bool $term 'drainComplete') -ne $true) { & $fail 'TERMINAL_DRAIN_INCOMPLETE' }
         if ((& $bool $term 'stdinError') -ne $false) { & $fail 'TERMINAL_STDIN_ERROR' }
         $termExit = & $lng $term 'exitCode'
-        if ($ForFailedAccounting) { if ($termExit -eq 0) { & $fail 'TERMINAL_EXITCODE' } }
+        if ($ForFailedAccounting -or $fto) { if ($termExit -eq 0) { & $fail 'TERMINAL_EXITCODE' } }
         elseif ($termExit -ne 0) { & $fail 'TERMINAL_EXITCODE' }
-        $null = & $bool $term 'onStartedAcknowledged'
+        $onAck = & $bool $term 'onStartedAcknowledged'
         $observed = & $lng $term 'observedBytes'
         $retained = & $lng $term 'retainedBytes'
         if (($observed -lt 0) -or ($retained -lt 0) -or ($observed -ne $retained)) { & $fail 'TERMINAL_BYTES' }
@@ -329,6 +335,33 @@ function Get-ManagedNativeCapturedFacts {
         if ((& $lng $start 'pid') -ne $pid1) { & $fail 'START_PID_MISMATCH' }
         if ((& $str $start 'startTimeUtc') -cne $startUtc) { & $fail 'START_TIME_MISMATCH' }
         $null = & $utc (& $str $start 'persistedUtc') 'START_PERSISTED_UTC'
+
+        # Failed-transport opt-in: the captured stopFacts must be exact, coherent with the started identity and with the actual finite deadline.
+        if ($fto) {
+            if (-not (& $exactName $term 'stopFacts')) { & $fail 'MISSING_STOPFACTS' }
+            $sfv = & $prop $term 'stopFacts'
+            if ($sfv -isnot [System.Management.Automation.PSCustomObject]) { & $fail 'FAILED_STOPFACTS_SHAPE' }
+            $sfNames = @('pid', 'startTimeUtc', 'deadlineObservedUtc', 'elapsedMs', 'alive', 'aliveAtStop', 'killAttempted', 'killErrorCode')
+            $sfProps = @($sfv.PSObject.Properties)
+            if ($sfProps.Count -ne $sfNames.Count) { & $fail 'FAILED_STOPFACTS_SHAPE' }
+            foreach ($q in $sfProps) { if (($q.MemberType -ne [System.Management.Automation.PSMemberTypes]::NoteProperty) -or ($sfNames -cnotcontains [string]$q.Name)) { & $fail 'FAILED_STOPFACTS_SHAPE' } }
+            if ((& $lng $sfv 'pid') -ne $pid1) { & $fail 'FAILED_STOPFACTS_PID' }
+            if ((& $str $sfv 'startTimeUtc') -cne $startUtc) { & $fail 'FAILED_STOPFACTS_START' }
+            $sfDeadline = & $prop $sfv 'deadlineObservedUtc'
+            $sfElapsed = & $prop $sfv 'elapsedMs'
+            if (($sfDeadline -isnot [string]) -or (-not (& $isInt $sfElapsed)) -or ([long]$sfElapsed -lt 0)) { & $fail 'FAILED_STOPFACTS_DEADLINE' }
+            $tDeadline = & $utc $sfDeadline 'FAILED_STOPFACTS_DEADLINE'
+            if ([long]$sfElapsed -lt $maxElapsed) { & $fail 'FAILED_STOPFACTS_ELAPSED' }
+            if (($tDeadline -lt $t0) -or ($tDeadline -gt $t1)) { & $fail 'FAILED_STOPFACTS_ORDER' }
+            $sfAlive = & $prop $sfv 'alive'
+            $sfAliveStop = & $prop $sfv 'aliveAtStop'
+            $sfKill = & $prop $sfv 'killAttempted'
+            $sfKillErr = & $prop $sfv 'killErrorCode'
+            if (($sfAlive -isnot [bool]) -or ($sfAliveStop -isnot [bool]) -or ($sfKill -isnot [bool])) { & $fail 'FAILED_STOPFACTS_TYPE' }
+            if ($sfKill -and (-not $sfAliveStop)) { & $fail 'FAILED_STOPFACTS_TREE' }
+            if ($sfAlive -and (-not $sfKill)) { & $fail 'FAILED_STOPFACTS_TREE' }
+            if ($null -ne $sfKillErr) { if (($sfKillErr -isnot [string]) -or [string]::IsNullOrWhiteSpace($sfKillErr) -or (-not $sfKill)) { & $fail 'FAILED_STOPFACTS_KILLERROR' } }
+        }
 
         # Observation: complete selector, artifact-metadata, authentication and declared-telemetry admissibility before any raw stream or artifact read.
         if ($obs) {
@@ -473,10 +506,17 @@ function Get-ManagedNativeCapturedFacts {
                 StdoutLength = $so.Length
                 StderrLength = $se.Length
                 TransportExitCode = $termExit
-                SDKOutcome = 'PENDING'
+                SDKOutcome = $(if ($fto) { 'UNKNOWN' } else { 'PENDING' })
                 ObservedOutputTokens = $null
                 Inputs = $inv.ToArray()
                 StreamedInputs = $invStream.ToArray()
+            }
+            if ($fto) {
+                # Distinct non-success capture: the terminal facts are preserved verbatim; no usage, completion or success is implied.
+                Add-Member -InputObject $obsCapture -NotePropertyName 'TerminalReason' -NotePropertyValue ([string](& $str $term 'reason'))
+                Add-Member -InputObject $obsCapture -NotePropertyName 'StopFacts' -NotePropertyValue $sfv
+                Add-Member -InputObject $obsCapture -NotePropertyName 'OnStartedAcknowledged' -NotePropertyValue $onAck
+                return [pscustomobject]@{ Valid = $false; Code = 'OBSERVE_ONLY_FAILED_TRANSPORT_CAPTURE'; Facts = $null; ObservationCapture = $obsCapture; TicketIssues = $ticketIssues }
             }
             return [pscustomobject]@{ Valid = $false; Code = 'OBSERVE_ONLY_TRANSPORT_CAPTURE'; Facts = $null; ObservationCapture = $obsCapture; TicketIssues = $ticketIssues }
         }
@@ -1008,8 +1048,10 @@ function Get-ManagedObservePendingAccountingFacts {
     # ticket already carried observePredecessorReceipt {path,sha256} naming it; the chain is then authenticated bottom-up to a legacy v1 anchor,
     # whose original postlaunch SELECTED_ACCOUNTING_ANCHOR provenance is preserved at the root. This verifier authenticates referenced data
     # only, never operator authorization, and grants no completion, ACK, acceptance or dispatch.
+    # -FailedTransportCurrent (internal to Get-ManagedObserveFailedTransportFacts): the CURRENT node is an authenticated DEADLINE failed transport
+    # capture instead of a successful observation; the parent/ancestry authentication is the same code and the result is a base for the failed facts.
     [CmdletBinding()]
-    param([Parameter(Mandatory)][AllowNull()]$Evidence)
+    param([Parameter(Mandatory)][AllowNull()]$Evidence, [switch]$FailedTransportCurrent)
     Set-StrictMode -Version Latest
     $ord = [System.StringComparison]::Ordinal
     $note = [System.Management.Automation.PSMemberTypes]::NoteProperty
@@ -1123,6 +1165,7 @@ function Get-ManagedObservePendingAccountingFacts {
         if (($r.path -cne $path) -or ($r.sha256 -cne $sha)) { & $fail 'OBSPA_TICKET_PREDECESSOR_MISMATCH' }
     }
 
+    $F = $FailedTransportCurrent.IsPresent
     try {
         $pe0 = & $parseEv $Evidence
         $mPath = $pe0.mPath; $mSha = $pe0.mSha; $tPath = $pe0.tPath; $tSha = $pe0.tSha; $kPath = $pe0.kPath; $runId = $pe0.runId
@@ -1140,15 +1183,20 @@ function Get-ManagedObservePendingAccountingFacts {
         } catch { & $fail 'OBSPA_SIBLING_UNAVAILABLE' }
 
         $captureFor = {
-            param($pe)
-            $r = Get-ManagedNativeCapturedFacts -ManifestPath $pe.mPath -ExpectedManifestSha256 $pe.mSha -TerminalPath $pe.tPath -ExpectedTerminalSha256 $pe.tSha -TicketPath $pe.kPath -RunId $pe.runId -Attempt $pe.attempt -ForOutputObservation
+            param($pe, [bool]$failedCur = $false)
+            if ($failedCur) {
+                $r = Get-ManagedNativeCapturedFacts -ManifestPath $pe.mPath -ExpectedManifestSha256 $pe.mSha -TerminalPath $pe.tPath -ExpectedTerminalSha256 $pe.tSha -TicketPath $pe.kPath -RunId $pe.runId -Attempt $pe.attempt -ForFailedTransportObservation
+            } else {
+                $r = Get-ManagedNativeCapturedFacts -ManifestPath $pe.mPath -ExpectedManifestSha256 $pe.mSha -TerminalPath $pe.tPath -ExpectedTerminalSha256 $pe.tSha -TicketPath $pe.kPath -RunId $pe.runId -Attempt $pe.attempt -ForOutputObservation
+            }
             if ((@($r).Count -ne 1) -or ($r -isnot [System.Management.Automation.PSCustomObject])) { & $fail 'OBSPA_CAPTURE_SHAPE' }
             $valid = & $get $r 'Valid' 'OBSPA_CAPTURE_SHAPE'
             $code = & $get $r 'Code' 'OBSPA_CAPTURE_SHAPE'
             $facts = & $get $r 'Facts' 'OBSPA_CAPTURE_SHAPE'
             if (($valid -isnot [bool]) -or $valid -or ($null -ne $facts)) { & $fail (& $clean $code 'OBSPA_CAPTURE_REFUSED') }
             if ($code -ceq 'OBSERVE_ONLY_CAPTURE_UNKNOWN') { & $unknown 'CAPTURE_UNKNOWN' }
-            if ($code -cne 'OBSERVE_ONLY_TRANSPORT_CAPTURE') { & $fail (& $clean $code 'OBSPA_CAPTURE_REFUSED') }
+            $wantCode = if ($failedCur) { 'OBSERVE_ONLY_FAILED_TRANSPORT_CAPTURE' } else { 'OBSERVE_ONLY_TRANSPORT_CAPTURE' }
+            if ($code -cne $wantCode) { & $fail (& $clean $code 'OBSPA_CAPTURE_REFUSED') }
             $oc = & $get $r 'ObservationCapture' 'OBSPA_CAPTURE_SHAPE'
             if ($oc -isnot [System.Management.Automation.PSCustomObject]) { & $fail 'OBSPA_CAPTURE_SHAPE' }
             return , $oc
@@ -1156,7 +1204,7 @@ function Get-ManagedObservePendingAccountingFacts {
 
         # Identity, limits and timing of one captured node (verbatim derivation, parameterised so ancestry nodes reuse it).
         $bindNode = {
-            param($c, $pe)
+            param($c, $pe, [bool]$failedCur = $false)
             $runId = $pe.runId; $attempt = $pe.attempt; $mPath = $pe.mPath; $mSha = $pe.mSha; $tPath = $pe.tPath; $tSha = $pe.tSha; $kPath = $pe.kPath
         if (((& $get $c 'RunId' 'OBSPA_CAPTURE_FIELD') -cne $runId) -or ((& $lng $c 'Attempt' 'OBSPA_CAPTURE_FIELD') -ne [long]$attempt)) { & $fail 'OBSPA_IDENTITY_MISMATCH' }
         foreach ($p in @(@('ManifestPath', $mPath), @('ManifestSha256', $mSha), @('TerminalPath', $tPath), @('TerminalSha256', $tSha), @('TicketPath', $kPath))) {
@@ -1186,19 +1234,23 @@ function Get-ManagedObservePendingAccountingFacts {
         $endUtc = & $str $term 'endedUtc' 'OBSPA_TERMINAL_FIELD'
         if ((& $str $start 'startTimeUtc' 'OBSPA_START_FIELD') -cne $startUtc) { & $fail 'OBSPA_START_MISMATCH' }
         $termReason = & $str $term 'reason' 'OBSPA_TERMINAL_FIELD'
-        if (($termReason -cne 'NATURAL_EXIT') -or ((& $lng $term 'exitCode' 'OBSPA_TERMINAL_FIELD') -ne 0) -or ((& $lng $c 'TransportExitCode' 'OBSPA_CAPTURE_FIELD') -ne 0)) { & $fail 'OBSPA_TERMINAL_STATE' }
+        $termExit = & $lng $term 'exitCode' 'OBSPA_TERMINAL_FIELD'
+        if ($failedCur) {
+            if (($termReason -cne 'DEADLINE') -or ($termExit -eq 0) -or ((& $lng $c 'TransportExitCode' 'OBSPA_CAPTURE_FIELD') -ne $termExit)) { & $fail 'OBSPA_TERMINAL_STATE' }
+        }
+        elseif (($termReason -cne 'NATURAL_EXIT') -or ($termExit -ne 0) -or ((& $lng $c 'TransportExitCode' 'OBSPA_CAPTURE_FIELD') -ne 0)) { & $fail 'OBSPA_TERMINAL_STATE' }
         $t0 = & $ticks $startUtc 'OBSPA_START_UTC'
         $t1 = & $ticks $endUtc 'OBSPA_END_UTC'
         if ($t1 -lt $t0) { & $fail 'OBSPA_TIME_ORDER' }
         $dTicks = [long]($t1 - $t0)
         $usedElapsed = [long](($dTicks - ($dTicks % 10000L)) / 10000L)
         if (($dTicks % 10000L) -ne 0) { $usedElapsed = & $add $usedElapsed 1L 'OBSPA_ELAPSED_OVERFLOW' }
-        if ($usedElapsed -gt $maxElapsed) { & $fail 'OBSPA_ELAPSED_EXCEEDS' }
+        if ((-not $failedCur) -and ($usedElapsed -gt $maxElapsed)) { & $fail 'OBSPA_ELAPSED_EXCEEDS' }
         $reqSha = & $get $c 'RequestSha256' 'OBSPA_CAPTURE_FIELD'
         if (-not (& $isHex $reqSha)) { & $fail 'OBSPA_CAPTURE_FIELD' }
         if (($null -ne (& $get $cbud 'AdditionalOutputMax' 'OBSPA_BUDGET')) -or ($null -ne (& $get $cbud 'PhaseAggregateCeiling' 'OBSPA_BUDGET'))) { & $fail 'OBSPA_BUDGET' }
         $curHist = & $cnt (& $get $cbud 'HistoricalOutputTokens' 'OBSPA_BUDGET') 'OBSPA_BUDGET'
-            return @{ ticket = $ticket; core = $core; term = $term; start = $start; cbud = $cbud; taskId = $taskId; payloadSha = $payloadSha; sessionId = $sessionId; maxAttempts = $maxAttempts; maxElapsed = $maxElapsed; pid1 = $pid1; startUtc = $startUtc; endUtc = $endUtc; termReason = $termReason; usedElapsed = $usedElapsed; reqSha = $reqSha; curHist = $curHist }
+            return @{ ticket = $ticket; core = $core; term = $term; start = $start; cbud = $cbud; taskId = $taskId; payloadSha = $payloadSha; sessionId = $sessionId; maxAttempts = $maxAttempts; maxElapsed = $maxElapsed; pid1 = $pid1; startUtc = $startUtc; endUtc = $endUtc; termReason = $termReason; termExit = [long]$termExit; usedElapsed = $usedElapsed; reqSha = $reqSha; curHist = $curHist }
         }
 
         # Shared read-only SDK observation of one captured node; null/UNKNOWN never becomes zero.
@@ -1250,8 +1302,8 @@ function Get-ManagedObservePendingAccountingFacts {
         }
         $sameCapture = { param($x, $y) (& $sig $x) -ceq (& $sig $y) }
 
-        $c = & $captureFor $pe0
-        $b = & $bindNode $c $pe0
+        $c = & $captureFor $pe0 $F
+        $b = & $bindNode $c $pe0 $F
         $ticket = $b.ticket; $core = $b.core; $term = $b.term; $taskId = $b.taskId; $payloadSha = $b.payloadSha; $sessionId = $b.sessionId
         $maxAttempts = $b.maxAttempts; $maxElapsed = $b.maxElapsed; $pid1 = $b.pid1; $startUtc = $b.startUtc; $endUtc = $b.endUtc
         $termReason = $b.termReason; $usedElapsed = $b.usedElapsed; $reqSha = $b.reqSha; $curHist = $b.curHist
@@ -1273,7 +1325,7 @@ function Get-ManagedObservePendingAccountingFacts {
         $sv0 = & $get $rcpt0 'schemaVersion' 'OBSPA_PREDECESSOR_UNSUPPORTED'
         $isV3 = ($sv0 -is [string]) -and ($sv0 -ceq 'OperationalRunReceipt/v3')
         # Parent binding exists only if the ACTUAL captured current ticket already carried it. A v3 parent requires it; a legacy anchor may omit it.
-        & $ticketBound $ticket $prePath $preSha $isV3
+        & $ticketBound $ticket $prePath $preSha ($isV3 -or $F)
 
         # Legacy v1 advisory anchor authentication (unchanged logic), parameterised by one pinned read.
         $authAnchor = {
@@ -1572,11 +1624,12 @@ function Get-ManagedObservePendingAccountingFacts {
             $extraObjs = @($extraList.ToArray())
         }
 
-        # ---- shared read-only observation over the captured stdout leaf ----
-        $o = & $observeNode $c $pe0 $curHist
+        # ---- shared read-only observation over the captured stdout leaf (a failed transport has no SDK success to observe; its usage stays UNKNOWN) ----
+        $o = $null
+        if (-not $F) { $o = & $observeNode $c $pe0 $curHist }
 
         # ---- stability: recapture current, re-read every pinned receipt and recapture the legacy anchor ----
-        $c2 = & $captureFor $pe0
+        $c2 = & $captureFor $pe0 $F
         if (-not (& $sameCapture $c2 $c)) { & $fail 'OBSPA_STALE_CURRENT' }
         foreach ($q in $chainReads) {
             $q2 = & $readRef ([string]$q.Path) ([string]$q.Sha256)
@@ -1599,6 +1652,21 @@ function Get-ManagedObservePendingAccountingFacts {
 
         $receiptPaths = @($chainReads | ForEach-Object { [string]$_.Path })
         if (-not $isV3) { $receiptPaths = @([string]$pr.Path) }
+        if ($F) {
+            # Failed-transport base: authenticated parent lineage and current capture only. No count is derived for the current node.
+            $parentRunId = if ($isV3) { [string]$chain[0].pe.runId } else { [string]$anchorEv.runId }
+            $parentAttempt = if ($isV3) { [long]$chain[0].pe.attempt } else { [long]$anchorEv.attempt }
+            $fbase = [pscustomobject]([ordered]@{
+                Selection = (& $selectionOf $pe0)
+                Capture = $c
+                Bound = [pscustomobject]([ordered]@{ taskId = [string]$b.taskId; payloadSha256 = [string]$b.payloadSha; sessionId = [string]$b.sessionId; pid = [long]$b.pid1; startUtc = [string]$b.startUtc; endUtc = [string]$b.endUtc; terminalReason = [string]$b.termReason; exitCode = [long]$b.termExit; maxAttempts = [long]$b.maxAttempts; maxElapsedMs = [long]$b.maxElapsed; usedElapsedMs = [long]$b.usedElapsed; requestSha256 = [string]$b.reqSha; ticketSha256 = [string](& $get $b.core 'ticketSha256' 'OBSPA_CORE_FIELD') })
+                ParentReceipt = [pscustomobject]([ordered]@{ path = [string]$pr.Path; sha256 = [string]$pr.Sha256; schemaVersion = [string]$sv0; runId = $parentRunId; attempt = $parentAttempt })
+                Anchor = [pscustomobject]([ordered]@{ receiptPath = [string]$anchorPr.Path; receiptSha256 = [string]$anchorPr.Sha256; runId = [string]$anchorEv.runId; attempt = [long]$anchorEv.attempt; terminalPath = [string]$anchorPc.TerminalPath; terminalSha256 = [string]$anchorPc.TerminalSha256; usedOutputTokens = [long]$anchorUsed })
+                LastVerifiedParentOutputTokens = [long]$curHist
+                InPaths = @((& $mkInPaths $c $extraObjs $receiptPaths).ToArray())
+            })
+            return [pscustomobject]@{ Valid = $true; Code = $null; Result = 'FAILED_TRANSPORT_BASE'; Facts = $null; Base = $fbase }
+        }
         $facts = & $buildFacts @{ c = $c; b = $b; o = $o; pe = $pe0; anchorPr = $anchorPr; anchorEv = $anchorEv; anchorPc = $anchorPc; anchorUsed = $anchorUsed; parentPr = $pr; inPaths = (& $mkInPaths $c $extraObjs $receiptPaths) }
         return [pscustomobject]@{ Valid = $true; Code = $null; Result = 'PENDING_ACCOUNTING'; Facts = $facts }
     }
@@ -1720,7 +1788,8 @@ function Test-ManagedObservePendingRawDto {
     param(
         [Parameter(Mandatory)][string]$RawPath,
         [AllowNull()][AllowEmptyString()][string]$ExpectedSha256,
-        [Parameter(Mandatory)]$Facts
+        [Parameter(Mandatory)]$Facts,
+        [switch]$FailedTransport
     )
     Set-StrictMode -Version Latest
     $ord = [System.StringComparison]::Ordinal
@@ -1798,9 +1867,17 @@ function Test-ManagedObservePendingRawDto {
         if ((-not (& $isInt $raw.pid)) -or ([long]$raw.pid -ne [long]$id.pid)) { & $fail 'OBSPA_RAW_PID' }
         if (($raw.session -isnot [string]) -or ($raw.session -cne [string]$id.sessionId)) { & $fail 'OBSPA_RAW_SESSION' }
         if (($raw.startUtc -isnot [string]) -or ($raw.startUtc -cne [string]$Facts.timing.startUtc) -or ($raw.endUtc -isnot [string]) -or ($raw.endUtc -cne [string]$Facts.timing.endedUtc)) { & $fail 'OBSPA_RAW_TIMES' }
+        if ($FailedTransport) {
+            # Failed transport: the raw record carries the actual nonzero native exit; observed output stays null (UNKNOWN), never a number.
+            if ((-not (& $isInt $raw.exit)) -or ([long]$raw.exit -eq 0) -or ([long]$raw.exit -ne [long]$id.exitCode)) { & $fail 'OBSPA_RAW_EXIT' }
+            if ($null -ne $raw.observedOutput) { & $fail 'OBSPA_RAW_OBSERVED' }
+            if (($rn -ccontains 'historicalOutput') -and ((-not (& $isInt $raw.historicalOutput)) -or ([long]$raw.historicalOutput -ne [long]$acct.lastVerifiedParentOutputTokens))) { & $fail 'OBSPA_RAW_HISTORY' }
+        }
+        else {
         if ((-not (& $isInt $raw.exit)) -or ([long]$raw.exit -ne 0)) { & $fail 'OBSPA_RAW_EXIT' }
         if ((-not (& $isInt $raw.observedOutput)) -or ([long]$raw.observedOutput -ne [long]$acct.observedOutputTokens)) { & $fail 'OBSPA_RAW_OBSERVED' }
         if (($rn -ccontains 'historicalOutput') -and ((-not (& $isInt $raw.historicalOutput)) -or ([long]$raw.historicalOutput -ne [long]$acct.historicalOutputTokens))) { & $fail 'OBSPA_RAW_HISTORY' }
+        }
         if (($rn -ccontains 'additionalCap') -and ($null -ne $raw.additionalCap)) { & $fail 'OBSPA_RAW_CAP' }
         # Stability through validation: the same bytes must still be on disk.
         $again = & $readRaw $full
@@ -2146,6 +2223,462 @@ function Test-ManagedObserveReviewedRawDto {
     $p = $Facts.pending
     $shim = [pscustomobject]([ordered]@{ identity = $p.identity; timing = $p.timing; accounting = $p.accounting; inputPaths = @($Facts.inputPaths) })
     return Test-ManagedObservePendingRawDto -RawPath $RawPath -ExpectedSha256 $ExpectedSha256 -Facts $shim
+}
+
+function Get-ManagedObserveFailedTransportFacts {
+    # Read-only. Authenticates ONE failed OBSERVE_ONLY native transport (terminal DEADLINE, nonzero typed exit) joined to its selected parent receipt,
+    # its registration, its selected claim and its actual keyed start ACK. HUMAN-SELECTED narrow disposition AUTHENTICATED_FAILED_TERMINAL: the facts
+    # preserve the actual failure and the last VERIFIED parent total; the current and cumulative counts stay UNKNOWN (null, never zero) and no SDK
+    # success, completion, dispatch, retry or successor authority is derived. The parent chain is authenticated by the same machinery as pending
+    # accounting (SELECTED_ACCOUNTING_ANCHOR lineage preserved). This verifier authenticates referenced data only, never external human authority.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowNull()]$Evidence)
+    Set-StrictMode -Version Latest
+    $ord = [System.StringComparison]::Ordinal
+    $ordIc = [System.StringComparison]::OrdinalIgnoreCase
+    $note = [System.Management.Automation.PSMemberTypes]::NoteProperty
+    $fail = { param([string]$c) throw [System.InvalidOperationException]::new('REFUSE:' + $c) }
+    $unknown = { param([string]$c) throw [System.InvalidOperationException]::new('UNKNOWN:' + $c) }
+    $isHex = { param($v) ($v -is [string]) -and ($v -cmatch '^[0-9a-f]{64}\z') }
+    $clean = { param($v, [string]$d) if (($v -is [string]) -and ($v -cmatch '^[A-Z0-9_]{1,48}\z')) { return $v }; return $d }
+    $get = {
+        param($o, [string]$n, [string]$c)
+        if ($o -isnot [System.Management.Automation.PSCustomObject]) { & $fail $c }
+        foreach ($q in $o.PSObject.Properties) { if (($q.MemberType -eq $note) -and [string]::Equals($q.Name, $n, $ord)) { return , $q.Value } }
+        & $fail $c
+    }
+    $exact = {
+        param($o, [string[]]$names, [string]$c)
+        if ($o -isnot [System.Management.Automation.PSCustomObject]) { & $fail $c }
+        $ps = @($o.PSObject.Properties)
+        if ($ps.Count -ne $names.Count) { & $fail $c }
+        foreach ($q in $ps) { if (($q.MemberType -ne $note) -or ($names -cnotcontains [string]$q.Name)) { & $fail $c } }
+    }
+    $same = { param($a, $b) ($a -is [string]) -and ($b -is [string]) -and [string]::Equals($a, $b, $ord) }
+    $samePath = {
+        param($a, $b)
+        if (($a -isnot [string]) -or ($b -isnot [string]) -or ($a.Length -eq 0) -or ($b.Length -eq 0)) { return $false }
+        return [string]::Equals([System.IO.Path]::TrimEndingDirectorySeparator([System.IO.Path]::GetFullPath($a)), [System.IO.Path]::TrimEndingDirectorySeparator([System.IO.Path]::GetFullPath($b)), $ordIc)
+    }
+    $json = { param($o) ConvertTo-Json -InputObject $o -Depth 12 -Compress }
+    $shaText = { param([string]$t) [System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.UTF8Encoding]::new($false).GetBytes($t))).ToLowerInvariant() }
+    $str = { param($o, [string]$n, [string]$c) $v = & $get $o $n $c; if (($v -isnot [string]) -or ($v.Length -eq 0) -or ([string]::IsNullOrWhiteSpace($v))) { & $fail $c }; return $v }
+    $posInt = { param($v, [string]$c) if ((($v -isnot [int]) -and ($v -isnot [long])) -or ([long]$v -le 0)) { & $fail $c }; return [long]$v }
+    $refOf = {
+        param($r)
+        & $exact $r @('path', 'sha256') 'OBSFT_REF_SHAPE'
+        $p = & $get $r 'path' 'OBSFT_REF_SHAPE'
+        $s = & $get $r 'sha256' 'OBSFT_REF_PIN'
+        if (($p -isnot [string]) -or ($p.Length -eq 0) -or ($p.IndexOf([char]0) -ge 0) -or (-not [System.IO.Path]::IsPathFullyQualified($p)) -or (-not [string]::Equals([System.IO.Path]::GetFullPath($p), $p, $ord))) { & $fail 'OBSFT_REF_PATH' }
+        if (-not (& $isHex $s)) { & $fail 'OBSFT_REF_PIN' }
+        return @{ path = [string]$p; sha256 = [string]$s }
+    }
+    $refDto = { param($r) [pscustomobject]([ordered]@{ path = [string]$r.path; sha256 = [string]$r.sha256 }) }
+
+    try {
+        & $exact $Evidence @('schema', 'current', 'predecessorReceipt', 'registrationRef', 'selectedClaimRef', 'acknowledgementsRef') 'OBSFT_EVIDENCE_SHAPE'
+        $evSchema = & $get $Evidence 'schema' 'OBSFT_EVIDENCE_SHAPE'
+        if (($evSchema -isnot [string]) -or ($evSchema -cne 'ManagedObserveFailedTransportEvidence/v1')) { & $fail 'OBSFT_EVIDENCE_SCHEMA' }
+        $curDto = & $get $Evidence 'current' 'OBSFT_EVIDENCE_SHAPE'
+        $preDto = & $get $Evidence 'predecessorReceipt' 'OBSFT_EVIDENCE_SHAPE'
+        $preRef = & $refOf $preDto
+        $regRef = & $refOf (& $get $Evidence 'registrationRef' 'OBSFT_EVIDENCE_SHAPE')
+        $claimRef = & $refOf (& $get $Evidence 'selectedClaimRef' 'OBSFT_EVIDENCE_SHAPE')
+        $ackRef = & $refOf (& $get $Evidence 'acknowledgementsRef' 'OBSFT_EVIDENCE_SHAPE')
+        # Four distinct records: the same path can never stand in for another role.
+        $roleRefs = @($preRef, $regRef, $claimRef, $ackRef)
+        for ($i = 0; $i -lt $roleRefs.Count; $i++) {
+            for ($j = $i + 1; $j -lt $roleRefs.Count; $j++) {
+                if ([string]::Equals([string]$roleRefs[$i].path, [string]$roleRefs[$j].path, $ordIc)) { & $fail 'OBSFT_REF_DUPLICATE' }
+            }
+        }
+        $pendEv = [pscustomobject]([ordered]@{ schema = 'ManagedObservePendingAccountingEvidence/v1'; current = $curDto; predecessorReceipt = $preDto })
+
+        # ---- trusted sibling declarations only; nothing is loaded from the captured workingDirectory ----
+        try {
+            . (Join-Path (Split-Path -Parent $PSScriptRoot) 'runner\launch.ps1')
+            . (Join-Path (Join-Path (Split-Path -Parent $PSScriptRoot) 'host-continuation') 'registered-review-record-reader.ps1')
+            . (Join-Path (Join-Path (Split-Path -Parent $PSScriptRoot) 'host-continuation') 'registered-review-prelaunch-capture.ps1')
+        } catch { & $fail 'OBSFT_SIBLING_UNAVAILABLE' }
+
+        # Parent lineage + failed current capture: the shared pending-accounting derivation in its failed-transport mode.
+        $baseOf = {
+            $r = Get-ManagedObservePendingAccountingFacts -Evidence $pendEv -FailedTransportCurrent
+            if ((@($r).Count -ne 1) -or ($r -isnot [System.Management.Automation.PSCustomObject])) { & $fail 'OBSFT_BASE_SHAPE' }
+            $valid = & $get $r 'Valid' 'OBSFT_BASE_SHAPE'
+            if ($valid -isnot [bool]) { & $fail 'OBSFT_BASE_SHAPE' }
+            if (-not $valid) {
+                if (($null -ne $r.PSObject.Properties['Status']) -and ($r.Status -ceq 'UNKNOWN')) { & $unknown (& $clean $r.Reason 'BASE_UNKNOWN') }
+                & $fail (& $clean (& $get $r 'Code' 'OBSFT_BASE_SHAPE') 'OBSFT_BASE_REFUSED')
+            }
+            $bs = & $get $r 'Base' 'OBSFT_BASE_SHAPE'
+            if ($bs -isnot [System.Management.Automation.PSCustomObject]) { & $fail 'OBSFT_BASE_SHAPE' }
+            return , $bs
+        }
+
+        $claimNames = @('id', 'owner', 'claimId', 'intentId', 'receiptSha', 'planSha', 'statePath')
+        $reqNames = @('RunId', 'Attempt', 'TicketPath', 'PayloadPath', 'GateTicketPath', 'SettingsPath', 'ArtifactPath', 'WorkingDirectory', 'Arguments', 'MaxElapsedMs', 'MaxStreamBytes', 'OutputStopProfile')
+        $noHandler = { throw 'OBSFT_HANDLER_NOT_AUTHORITY' }
+
+        # Registration, selected claim and keyed ACK bound to the authenticated base. Run twice (before and after the second base) and compared.
+        $bindAll = {
+            param($bs)
+            $cap = & $get $bs 'Capture' 'OBSFT_BASE_SHAPE'
+            $bnd = & $get $bs 'Bound' 'OBSFT_BASE_SHAPE'
+            $par = & $get $bs 'ParentReceipt' 'OBSFT_BASE_SHAPE'
+            $core = & $get $cap 'Core' 'OBSFT_BASE_SHAPE'
+            $term = & $get $cap 'Terminal' 'OBSFT_BASE_SHAPE'
+            $wd = & $str $core 'workingDirectory' 'OBSFT_BASE_SHAPE'
+            $controlRoot = [System.IO.Path]::Combine($wd, '.factory-data', 'chief', 'controller-runtime', 'control')
+            $readCtl = {
+                param($rf)
+                $x = $null
+                try { $x = Read-ManagedPinnedEvidenceJson -Reference ([pscustomobject]@{ path = $rf.path; sha256 = $rf.sha256 }) -ControlRoot $controlRoot } catch { $x = $null }
+                if (($null -eq $x) -or ($x.Sha256 -cne $rf.sha256) -or ($x.Path -cne $rf.path) -or ($x.Value -isnot [System.Management.Automation.PSCustomObject])) { & $fail 'OBSFT_REF_UNREADABLE' }
+                return , $x
+            }
+            if (-not ((& $get $term 'onStartedAcknowledged' 'OBSFT_TERMINAL') -is [bool])) { & $fail 'OBSFT_TERMINAL' }
+            if ((& $get $term 'onStartedAcknowledged' 'OBSFT_TERMINAL') -ne $true) { & $fail 'OBSFT_START_NOT_ACKNOWLEDGED' }
+            $ackMode = & $get $core 'ackMode' 'OBSFT_CORE_ACK'
+            if (($ackMode -isnot [bool]) -or (-not $ackMode)) { & $fail 'OBSFT_CORE_ACK' }
+
+            # ---- registration: pinned control record naming the same captured request, ticket, payload, run directory and run ----
+            $regX = & $readCtl $regRef
+            $pre = $null
+            try { $pre = Get-RegisteredReviewPrelaunchCapture -Registration $regX.Value -ExpectedRegistrationSha256 $regRef.sha256 -OnReviewedTerminal $noHandler } catch { $pre = $null }
+            if (($null -eq $pre) -or ($pre.registration -isnot [System.Management.Automation.PSCustomObject])) { & $fail 'OBSFT_REGISTRATION' }
+            $reg = $pre.registration
+            if (-not (& $same ([string]$reg.taskId) ([string]$cap.RunId))) { & $fail 'OBSFT_REG_IDENTITY' }
+            if ([long]$reg.attempt -ne [long]$cap.Attempt) { & $fail 'OBSFT_REG_IDENTITY' }
+            if (-not ((& $samePath ([string]$reg.ticketPath) ([string]$cap.TicketPath)) -and (& $same ([string]$reg.ticketSha256) ([string]$cap.TicketSha256)))) { & $fail 'OBSFT_REG_TICKET' }
+            if (-not ((& $same ([string]$reg.payloadSha256) ([string]$bnd.payloadSha256)) -and (& $samePath ([string]$reg.payloadPath) ([string](& $get $core 'payloadPath' 'OBSFT_BASE_SHAPE'))))) { & $fail 'OBSFT_REG_PAYLOAD' }
+            if (-not (& $samePath ([string]$reg.candidatePath) ([string]$cap.ArtifactPath))) { & $fail 'OBSFT_REG_ARTIFACT' }
+            if (-not (& $samePath ([string]$reg.runDir) ([string]$cap.RunDir))) { & $fail 'OBSFT_REG_RUNDIR' }
+            if ([string]::IsNullOrWhiteSpace([string]$reg.registeredActionId)) { & $fail 'OBSFT_REG_ACTION' }
+
+            # ---- raw request file named by the registration (raw-file SHA stays distinct from the canonical request SHA) ----
+            $reqRead = $null
+            try { $reqRead = Read-RegisteredReviewRecord -Path ([string]$reg.requestPath) -ExpectedSha256 ([string]$reg.requestSha256) } catch { $reqRead = $null }
+            if ($null -eq $reqRead) { & $fail 'OBSFT_REQUEST_UNREADABLE' }
+            $rq = $reqRead.record
+            & $exact $rq $reqNames 'OBSFT_REQUEST_SHAPE'
+            if (-not (& $same ([string](& $get $rq 'RunId' 'OBSFT_REQUEST_SHAPE')) ([string]$reg.taskId))) { & $fail 'OBSFT_REQUEST_BINDING' }
+            if ((& $posInt (& $get $rq 'Attempt' 'OBSFT_REQUEST_SHAPE') 'OBSFT_REQUEST_BINDING') -ne [long]$reg.attempt) { & $fail 'OBSFT_REQUEST_BINDING' }
+            if (-not ((& $same ([string](& $get $rq 'TicketPath' 'OBSFT_REQUEST_SHAPE')) ([string]$reg.ticketPath)) -and (& $same ([string](& $get $rq 'PayloadPath' 'OBSFT_REQUEST_SHAPE')) ([string]$reg.payloadPath)) -and (& $same ([string](& $get $rq 'ArtifactPath' 'OBSFT_REQUEST_SHAPE')) ([string]$reg.candidatePath)))) { & $fail 'OBSFT_REQUEST_BINDING' }
+            if (-not ((& $samePath ([string](& $get $rq 'GateTicketPath' 'OBSFT_REQUEST_SHAPE')) ([string](& $get $core 'gateTicketPath' 'OBSFT_BASE_SHAPE'))) -and (& $samePath ([string](& $get $rq 'SettingsPath' 'OBSFT_REQUEST_SHAPE')) ([string](& $get $core 'settingsPath' 'OBSFT_BASE_SHAPE'))) -and (& $samePath ([string](& $get $rq 'WorkingDirectory' 'OBSFT_REQUEST_SHAPE')) $wd))) { & $fail 'OBSFT_REQUEST_BINDING' }
+            $rqElapsed = & $get $rq 'MaxElapsedMs' 'OBSFT_REQUEST_SHAPE'
+            if ((($rqElapsed -isnot [int]) -and ($rqElapsed -isnot [long])) -or ([long]$rqElapsed -ne [long]$bnd.maxElapsedMs)) { & $fail 'OBSFT_REQUEST_BINDING' }
+            if (($null -ne (& $get $rq 'MaxStreamBytes' 'OBSFT_REQUEST_SHAPE')) -or (-not (& $same ([string](& $get $rq 'OutputStopProfile' 'OBSFT_REQUEST_SHAPE')) 'observe-only-v1'))) { & $fail 'OBSFT_REQUEST_PROFILE' }
+            $rqArgs = & $get $rq 'Arguments' 'OBSFT_REQUEST_SHAPE'
+            $coreArgs = & $get $core 'arguments' 'OBSFT_BASE_SHAPE'
+            if (($rqArgs -isnot [object[]]) -or ($coreArgs -isnot [object[]]) -or ($rqArgs.Length -ne $coreArgs.Length)) { & $fail 'OBSFT_REQUEST_BINDING' }
+            for ($ai = 0; $ai -lt $rqArgs.Length; $ai++) { if (-not (& $same ([string]$rqArgs[$ai]) ([string]$coreArgs[$ai]))) { & $fail 'OBSFT_REQUEST_BINDING' } }
+
+            # ---- selected claim: pinned immutable selection evidence equal to the claim the ACTUAL captured core launched under ----
+            $ackCtx = & $get $core 'ackContext' 'OBSFT_CORE_ACK'
+            & $exact $ackCtx @('stateDir', 'taskId', 'claim') 'OBSFT_CORE_ACK'
+            $coreClaim = & $get $ackCtx 'claim' 'OBSFT_CORE_ACK'
+            & $exact $coreClaim $claimNames 'OBSFT_CORE_ACK'
+            $claimX = & $readCtl $claimRef
+            $selClaim = $claimX.Value
+            & $exact $selClaim $claimNames 'OBSFT_CLAIM_SHAPE'
+            $claimOut = [ordered]@{}
+            foreach ($n in $claimNames) {
+                $cv = & $str $selClaim $n 'OBSFT_CLAIM_SHAPE'
+                if (-not (& $same $cv ([string](& $get $coreClaim $n 'OBSFT_CORE_ACK')))) { & $fail 'OBSFT_CLAIM_BINDING' }
+                if ((($n -ceq 'receiptSha') -or ($n -ceq 'planSha')) -and (-not (& $isHex $cv))) { & $fail 'OBSFT_CLAIM_SHAPE' }
+                $claimOut[$n] = $cv
+            }
+            $claim = [pscustomobject]$claimOut
+            $stateDir = & $str $ackCtx 'stateDir' 'OBSFT_CORE_ACK'
+            $ctxTaskId = & $str $ackCtx 'taskId' 'OBSFT_CORE_ACK'
+            if (-not (& $same $ctxTaskId ([string]$bnd.taskId))) { & $fail 'OBSFT_CLAIM_BINDING' }
+            if (-not (& $samePath $claim.statePath ([System.IO.Path]::Combine($stateDir, 'continuation-state.json')))) { & $fail 'OBSFT_CLAIM_STATE' }
+            # Parent hash, parent run/attempt and original action are all inside the claim's intent key.
+            if (-not (& $same $claim.receiptSha ([string]$par.sha256))) { & $fail 'OBSFT_CLAIM_PARENT' }
+            $wantIntent = $claim.receiptSha + '|' + [string]$par.runId + '|' + [string]$par.attempt + '|' + [string]$reg.registeredActionId
+            if (-not (& $same $claim.intentId $wantIntent)) { & $fail 'OBSFT_CLAIM_INTENT' }
+
+            # ---- keyed start ACK snapshot: exact envelope, exactly one keyed entry, native binding equal to the actual started process ----
+            $ackX = & $readCtl $ackRef
+            $ackRoot = $ackX.Value
+            & $exact $ackRoot @('schema', 'acknowledgements') 'OBSFT_ACK_SHAPE'
+            if (-not (& $same ([string](& $get $ackRoot 'schema' 'OBSFT_ACK_SHAPE')) 'host-dispatch-acknowledgement/v1')) { & $fail 'OBSFT_ACK_SHAPE' }
+            $acks = & $get $ackRoot 'acknowledgements' 'OBSFT_ACK_SHAPE'
+            if ($acks -isnot [System.Management.Automation.PSCustomObject]) { & $fail 'OBSFT_ACK_SHAPE' }
+            $ackKey = $claim.intentId + '|' + $claim.claimId
+            $found = [System.Collections.Generic.List[object]]::new()
+            foreach ($ap in @($acks.PSObject.Properties)) { if ([string]::Equals([string]$ap.Name, $ackKey, $ord)) { $found.Add($ap.Value) } }
+            if ($found.Count -ne 1) { & $fail 'OBSFT_ACK_ENTRY' }
+            $entry = $found[0]
+            & $exact $entry @('schema', 'recordedAt', 'entryId', 'owner', 'claimId', 'intentId', 'dispatchedAt', 'executionBinding') 'OBSFT_ACK_SHAPE'
+            if (-not (& $same ([string](& $get $entry 'schema' 'OBSFT_ACK_SHAPE')) 'host-dispatch-acknowledgement/v1')) { & $fail 'OBSFT_ACK_SHAPE' }
+            $parsedAt = [datetime]::MinValue
+            foreach ($tf in @('recordedAt', 'dispatchedAt')) {
+                $tv = & $str $entry $tf 'OBSFT_ACK_SHAPE'
+                if (-not [datetime]::TryParse($tv, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind, [ref]$parsedAt)) { & $fail 'OBSFT_ACK_SHAPE' }
+            }
+            if (-not (& $same ([string](& $get $entry 'dispatchedAt' 'OBSFT_ACK_SHAPE')) ([string]$bnd.startUtc))) { & $fail 'OBSFT_ACK_START' }
+            if (-not ((& $same ([string](& $get $entry 'entryId' 'OBSFT_ACK_SHAPE')) $claim.id) -and (& $same ([string](& $get $entry 'owner' 'OBSFT_ACK_SHAPE')) $claim.owner) -and (& $same ([string](& $get $entry 'claimId' 'OBSFT_ACK_SHAPE')) $claim.claimId) -and (& $same ([string](& $get $entry 'intentId' 'OBSFT_ACK_SHAPE')) $claim.intentId))) { & $fail 'OBSFT_ACK_CLAIM' }
+            $eb = & $get $entry 'executionBinding' 'OBSFT_ACK_SHAPE'
+            & $exact $eb @('schema', 'taskId', 'ticketSha256', 'payloadSha256', 'runId', 'attempt', 'receiptSha', 'planSha', 'identity') 'OBSFT_ACK_BINDING'
+            if (-not (& $same ([string](& $get $eb 'schema' 'OBSFT_ACK_BINDING')) 'host-dispatch-execution-binding/v1')) { & $fail 'OBSFT_ACK_BINDING' }
+            if (-not ((& $same ([string](& $get $eb 'taskId' 'OBSFT_ACK_BINDING')) ([string]$bnd.taskId)) -and (& $same ([string](& $get $eb 'ticketSha256' 'OBSFT_ACK_BINDING')) ([string]$cap.TicketSha256)) -and (& $same ([string](& $get $eb 'payloadSha256' 'OBSFT_ACK_BINDING')) ([string]$bnd.payloadSha256)) -and (& $same ([string](& $get $eb 'runId' 'OBSFT_ACK_BINDING')) ([string]$cap.RunId)) -and (& $same ([string](& $get $eb 'receiptSha' 'OBSFT_ACK_BINDING')) $claim.receiptSha) -and (& $same ([string](& $get $eb 'planSha' 'OBSFT_ACK_BINDING')) $claim.planSha))) { & $fail 'OBSFT_ACK_BINDING' }
+            if ((& $posInt (& $get $eb 'attempt' 'OBSFT_ACK_BINDING') 'OBSFT_ACK_BINDING') -ne [long]$cap.Attempt) { & $fail 'OBSFT_ACK_BINDING' }
+            $ident = & $get $eb 'identity' 'OBSFT_ACK_BINDING'
+            & $exact $ident @('kind', 'pid', 'startIdentity') 'OBSFT_ACK_IDENTITY'
+            if (-not (& $same ([string](& $get $ident 'kind' 'OBSFT_ACK_IDENTITY')) 'native')) { & $fail 'OBSFT_ACK_IDENTITY' }
+            if ((& $posInt (& $get $ident 'pid' 'OBSFT_ACK_IDENTITY') 'OBSFT_ACK_IDENTITY') -ne [long]$bnd.pid) { & $fail 'OBSFT_ACK_IDENTITY' }
+            if (-not (& $same ([string](& $get $ident 'startIdentity' 'OBSFT_ACK_IDENTITY')) ([string]$bnd.startUtc))) { & $fail 'OBSFT_ACK_IDENTITY' }
+
+            return [pscustomobject]([ordered]@{
+                schema = 'ManagedObserveFailedTransportProof/v1'
+                registrationRef = (& $refDto $regRef)
+                selectedClaimRef = (& $refDto $claimRef)
+                acknowledgementsRef = (& $refDto $ackRef)
+                registrationId = [string]$reg.registrationId
+                registeredActionId = [string]$reg.registeredActionId
+                claim = $claim
+                stateDir = $stateDir
+                taskId = [string]$bnd.taskId
+                runId = [string]$cap.RunId
+                attempt = [long]$cap.Attempt
+                pid = [long]$bnd.pid
+                startIdentity = [string]$bnd.startUtc
+                requestRawSha256 = [string]$reg.requestSha256
+                requestSha256 = [string]$cap.RequestSha256
+                ticketSha256 = [string]$cap.TicketSha256
+                payloadSha256 = [string]$bnd.payloadSha256
+                manifestSha256 = [string]$cap.ManifestSha256
+                startSha256 = [string]$cap.StartSha256
+                terminalSha256 = [string]$cap.TerminalSha256
+                parentReceiptSha256 = [string]$par.sha256
+                parentRunId = [string]$par.runId
+                parentAttempt = [long]$par.attempt
+                ackKey = $ackKey
+                ackEntrySha256 = (& $shaText (ConvertTo-Json -InputObject $entry -Depth 20 -Compress))
+                ackMode = $true
+                onStartedAcknowledged = $true
+                requestPath = [string]$reg.requestPath
+                noDispatch = $true; noRetry = $true
+            })
+        }
+
+        $base1 = & $baseOf
+        $proof1 = & $bindAll $base1
+        # ---- stability: the whole parent/capture derivation and every registered record are reauthenticated after all other reads ----
+        $base2 = & $baseOf
+        if ((& $json $base2) -cne (& $json $base1)) { & $fail 'OBSFT_STALE_BASE' }
+        $proof2 = & $bindAll $base2
+        if ((& $json $proof2) -cne (& $json $proof1)) { & $fail 'OBSFT_STALE_PROOF' }
+
+        $cap = $base1.Capture
+        $bnd = $base1.Bound
+        $par = $base1.ParentReceipt
+        $anchor = $base1.Anchor
+        $term = $cap.Terminal
+        $sfv = $cap.StopFacts
+        $refRole = {
+            param([string]$role)
+            $d = @(@($cap.DeclaredReferences) | Where-Object { $_.Role -ceq $role })
+            $v = @(@($cap.VerifiedReferences) | Where-Object { $_.Role -ceq $role })
+            if (($d.Count -ne 1) -or ($v.Count -ne 1)) { & $fail 'OBSFT_REFERENCE' }
+            return [pscustomobject]([ordered]@{ path = [string]$v[0].Path; declaredSha256 = [string]$d[0].DeclaredSha256; declaredLength = [long]$d[0].DeclaredLength; verifiedSha256 = [string]$v[0].VerifiedSha256; verifiedLength = [long]$v[0].VerifiedLength })
+        }
+        $stdoutRef = & $refRole 'STDOUT'
+        $stderrRef = & $refRole 'STDERR'
+        $stopOut = [pscustomobject]([ordered]@{
+            pid = [long](& $get $sfv 'pid' 'OBSFT_STOPFACTS')
+            startTimeUtc = [string](& $get $sfv 'startTimeUtc' 'OBSFT_STOPFACTS')
+            deadlineObservedUtc = [string](& $get $sfv 'deadlineObservedUtc' 'OBSFT_STOPFACTS')
+            elapsedMs = [long](& $get $sfv 'elapsedMs' 'OBSFT_STOPFACTS')
+            alive = [bool](& $get $sfv 'alive' 'OBSFT_STOPFACTS')
+            aliveAtStop = [bool](& $get $sfv 'aliveAtStop' 'OBSFT_STOPFACTS')
+            killAttempted = [bool](& $get $sfv 'killAttempted' 'OBSFT_STOPFACTS')
+            killErrorCode = $(if ($null -eq (& $get $sfv 'killErrorCode' 'OBSFT_STOPFACTS')) { $null } else { [string](& $get $sfv 'killErrorCode' 'OBSFT_STOPFACTS') })
+        })
+        $failure = [pscustomobject]([ordered]@{
+            reason = 'DEADLINE'
+            exitCode = [long]$bnd.exitCode
+            definitive = $true; exitObserved = $true; drainComplete = $true; stdinError = $false
+            onStartedAcknowledged = $true
+            errorCode = $null
+            stopFacts = $stopOut
+        })
+        $identity = [pscustomobject]([ordered]@{ taskId = [string]$bnd.taskId; payloadSha256 = [string]$bnd.payloadSha256; runId = [string]$cap.RunId; attempt = [long]$cap.Attempt; sessionId = [string]$bnd.sessionId; pid = [long]$bnd.pid; terminalReason = 'DEADLINE'; exitCode = [long]$bnd.exitCode; startIdentity = [string]$bnd.startUtc })
+        $references = [pscustomobject]([ordered]@{
+            manifest = [pscustomobject]([ordered]@{ path = [string]$cap.ManifestPath; expectedSha256 = [string]$cap.ManifestSha256; verifiedSha256 = [string]$cap.ManifestSha256 })
+            terminal = [pscustomobject]([ordered]@{ path = [string]$cap.TerminalPath; expectedSha256 = [string]$cap.TerminalSha256; verifiedSha256 = [string]$cap.TerminalSha256 })
+            start = [pscustomobject]([ordered]@{ path = [string]$cap.StartPath; verifiedSha256 = [string]$cap.StartSha256 })
+            ticket = [pscustomobject]([ordered]@{ path = [string]$cap.TicketPath; expectedSha256 = [string]$bnd.ticketSha256; verifiedSha256 = [string]$cap.TicketSha256 })
+            predecessorReceipt = [pscustomobject]([ordered]@{ path = [string]$preRef.path; expectedSha256 = [string]$preRef.sha256; verifiedSha256 = [string]$par.sha256 })
+            stdout = $stdoutRef
+            stderr = $stderrRef
+            artifactState = [string]$cap.ArtifactState
+        })
+        $accounting = [pscustomobject]([ordered]@{
+            schema = 'ManagedObserveFailedTransportAccounting/v1'
+            disposition = 'AUTHENTICATED_FAILED_TERMINAL'
+            anchorLabel = 'SELECTED_ACCOUNTING_ANCHOR'
+            anchor = $anchor
+            parent = [pscustomobject]([ordered]@{ receiptPath = [string]$par.path; receiptSha256 = [string]$par.sha256; schemaVersion = [string]$par.schemaVersion; runId = [string]$par.runId; attempt = [long]$par.attempt; verifiedOutputTokens = [long]$base1.LastVerifiedParentOutputTokens })
+            lastVerifiedParentOutputTokens = [long]$base1.LastVerifiedParentOutputTokens
+            currentOutputTokens = $null
+            cumulativeOutputTokens = $null
+            accountingStatus = 'UNKNOWN'
+            sdkOutcome = 'UNKNOWN'
+            accountingUnresolved = $true
+            requestSha256 = [string]$bnd.requestSha256
+            startUtc = [string]$bnd.startUtc
+            endedUtc = [string]$bnd.endUtc
+            identity = $identity
+            failure = $failure
+            references = $references
+            noAcceptedUsage = $true; noCompletion = $true; noDispatch = $true; noRetry = $true
+        })
+        $normEvidence = [pscustomobject]([ordered]@{
+            schema = 'ManagedObserveFailedTransportEvidence/v1'
+            current = $base1.Selection.current
+            predecessorReceipt = $base1.Selection.predecessorReceipt
+            registrationRef = (& $refDto $regRef)
+            selectedClaimRef = (& $refDto $claimRef)
+            acknowledgementsRef = (& $refDto $ackRef)
+        })
+        $paths = [System.Collections.Generic.List[string]]::new()
+        foreach ($ip in @($base1.InPaths)) { $paths.Add([string]$ip) }
+        foreach ($ip in @($regRef.path, $claimRef.path, $ackRef.path, [string]$proof1.requestPath)) { $paths.Add([string]$ip) }
+        $facts = [pscustomobject]([ordered]@{
+            schema = 'ManagedObserveFailedTransportFacts/v1'
+            evidence = $normEvidence
+            anchorLabel = 'SELECTED_ACCOUNTING_ANCHOR'
+            identity = $identity
+            limits = [pscustomobject]([ordered]@{ maxElapsedMs = [long]$bnd.maxElapsedMs; maxAttempts = [long]$bnd.maxAttempts; priorElapsedMs = 0L; maxOutputTokens = $null; softFraction = $null })
+            timing = [pscustomobject]([ordered]@{ startUtc = [string]$bnd.startUtc; endedUtc = [string]$bnd.endUtc; usedElapsedMs = [long]$bnd.usedElapsedMs })
+            accounting = $accounting
+            proof = $proof1
+            stdout = [pscustomobject]([ordered]@{ path = [string]$stdoutRef.path; sha256 = [string]$stdoutRef.verifiedSha256; length = [long]$stdoutRef.verifiedLength })
+            inputPaths = @($paths.ToArray())
+            noCompletion = $true; noDispatch = $true; noRetry = $true
+        })
+        return [pscustomobject]@{ Valid = $true; Code = $null; Result = 'FAILED_TRANSPORT'; Facts = $facts }
+    }
+    catch {
+        $m = [string]$_.Exception.Message
+        if ($m.StartsWith('UNKNOWN:', $ord) -and ($m.Length -le 56) -and ($m.Substring(8) -cmatch '^[A-Z0-9_]{1,48}$')) {
+            return [pscustomobject]@{ Valid = $false; Code = 'OBSERVE_FAILED_TRANSPORT_UNKNOWN'; Result = 'NONRECEIPT'; Status = 'UNKNOWN'; Reason = $m.Substring(8); Facts = $null }
+        }
+        $code = 'OBSFT_UNEXPECTED_ERROR'
+        if ($m.StartsWith('REFUSE:', $ord) -and ($m.Length -le 55) -and ($m.Substring(7) -cmatch '^[A-Z0-9_]{1,48}$')) { $code = $m.Substring(7) }
+        return [pscustomobject]@{ Valid = $false; Code = $code; Result = 'REFUSED'; Facts = $null }
+    }
+}
+
+function Test-ManagedObserveFailedTransportReceiptV5Shape {
+    # Pure structural check of a stored OperationalRunReceipt/v5 DTO (FAILED only, null counts, incomplete artifact). It derives nothing,
+    # authenticates nothing and confers no receipt validity, settlement or dispatch authority by itself.
+    param($obj)
+    try {
+        if ($null -eq $obj -or $obj -is [System.Array] -or $obj -isnot [System.Management.Automation.PSCustomObject]) { return $false }
+        $note = [System.Management.Automation.PSMemberTypes]::NoteProperty
+        $ord = [System.StringComparison]::Ordinal
+        $isInt = { param($v) ($v -is [int]) -or ($v -is [long]) }
+        $isHex = { param($v) ($v -is [string]) -and ($v -cmatch '^[0-9a-f]{64}\z') }
+        $exact = {
+            param($o, [string[]]$names)
+            if ($o -isnot [System.Management.Automation.PSCustomObject]) { return $false }
+            $ps = @($o.PSObject.Properties)
+            if ($ps.Count -ne $names.Count) { return $false }
+            foreach ($q in $ps) { if (($q.MemberType -ne $note) -or ($names -cnotcontains [string]$q.Name)) { return $false } }
+            return $true
+        }
+        $val = { param($o, [string]$n) foreach ($q in $o.PSObject.Properties) { if ([string]::Equals($q.Name, $n, $ord)) { return , $q.Value } }; return , $null }
+        $isStr = { param($v) ($v -is [string]) -and ($v.Length -gt 0) }
+
+        if (-not (& $exact $obj @('schemaVersion', 'runId', 'taskId', 'payloadSha256', 'destination', 'status', 'attempt', 'sessionId', 'historyVerified', 'budget', 'provider', 'artifact', 'updatedAt', 'evidence', 'outputStopMode', 'observeFailedTransportEvidence', 'observeFailedTransportAccounting', 'observeFailedTransport'))) { return $false }
+        if (((& $val $obj 'schemaVersion') -isnot [string]) -or ((& $val $obj 'schemaVersion') -cne 'OperationalRunReceipt/v5')) { return $false }
+        if (((& $val $obj 'status') -isnot [string]) -or ((& $val $obj 'status') -cne 'FAILED')) { return $false }
+        if (((& $val $obj 'outputStopMode') -isnot [string]) -or ((& $val $obj 'outputStopMode') -cne 'OBSERVE_ONLY')) { return $false }
+        if (((& $val $obj 'destination') -isnot [string]) -or ((& $val $obj 'destination') -cne 'Anthropic Claude')) { return $false }
+        $hv = & $val $obj 'historyVerified'
+        if (($hv -isnot [bool]) -or $hv) { return $false }
+        foreach ($n in @('runId', 'taskId', 'sessionId', 'updatedAt')) { if (-not (& $isStr (& $val $obj $n))) { return $false } }
+        if (-not (& $isHex (& $val $obj 'payloadSha256'))) { return $false }
+        $attempt = & $val $obj 'attempt'
+        if ((-not (& $isInt $attempt)) -or ([long]$attempt -lt 1)) { return $false }
+
+        $b = & $val $obj 'budget'
+        $p = & $val $obj 'provider'
+        $a = & $val $obj 'artifact'
+        $e = & $val $obj 'evidence'
+        if (-not ((& $exact $b @('maxOutputTokens', 'maxElapsedMs', 'maxAttempts', 'usedElapsedMs', 'usedOutputTokens', 'attemptsUsed', 'softFraction')) -and (& $exact $p @('startIdentity', 'sessionId', 'terminalReason', 'pid')) -and (& $exact $a @('complete', 'sha256', 'path')) -and (& $exact $e @('rawPath', 'rawSha256', 'ticketPath', 'ticketSha256', 'usagePath', 'usageSha256', 'nativeThinkingTokens')))) { return $false }
+        # Unknown stays null: no ceiling, no soft fraction and, unlike the pending/completed shapes, no used-output count at all (never 0).
+        if (($null -ne (& $val $b 'maxOutputTokens')) -or ($null -ne (& $val $b 'softFraction')) -or ($null -ne (& $val $b 'usedOutputTokens'))) { return $false }
+        foreach ($n in @('maxElapsedMs', 'maxAttempts', 'usedElapsedMs', 'attemptsUsed')) { if (-not (& $isInt (& $val $b $n))) { return $false } }
+        if (([long](& $val $b 'maxElapsedMs') -le 0) -or ([long](& $val $b 'maxAttempts') -le 0) -or ([long](& $val $b 'usedElapsedMs') -lt 0)) { return $false }
+        if (([long](& $val $b 'attemptsUsed') -ne [long]$attempt) -or ([long]$attempt -gt [long](& $val $b 'maxAttempts'))) { return $false }
+        if (-not (& $isStr (& $val $p 'startIdentity'))) { return $false }
+        if ((-not (& $isStr (& $val $p 'sessionId'))) -or ((& $val $p 'sessionId') -cne (& $val $obj 'sessionId')) -or ((& $val $p 'terminalReason') -isnot [string]) -or ((& $val $p 'terminalReason') -cne 'DEADLINE')) { return $false }
+        if ((-not (& $isInt (& $val $p 'pid'))) -or ([long](& $val $p 'pid') -le 0)) { return $false }
+        $ac = & $val $a 'complete'
+        if (($ac -isnot [bool]) -or $ac -or ($null -ne (& $val $a 'sha256')) -or ($null -ne (& $val $a 'path'))) { return $false }
+        foreach ($n in @('rawPath', 'ticketPath', 'usagePath')) { if (-not (& $isStr (& $val $e $n))) { return $false } }
+        foreach ($n in @('rawSha256', 'ticketSha256', 'usageSha256')) { if (-not (& $isHex (& $val $e $n))) { return $false } }
+        if ($null -ne (& $val $e 'nativeThinkingTokens')) { return $false }
+        $ce = & $val $obj 'observeFailedTransportEvidence'
+        if (-not (& $exact $ce @('schema', 'current', 'predecessorReceipt', 'registrationRef', 'selectedClaimRef', 'acknowledgementsRef'))) { return $false }
+        if (((& $val $ce 'schema') -isnot [string]) -or ((& $val $ce 'schema') -cne 'ManagedObserveFailedTransportEvidence/v1')) { return $false }
+        foreach ($n in @('predecessorReceipt', 'registrationRef', 'selectedClaimRef', 'acknowledgementsRef')) {
+            $rf = & $val $ce $n
+            if ((-not (& $exact $rf @('path', 'sha256'))) -or (-not (& $isStr (& $val $rf 'path'))) -or (-not (& $isHex (& $val $rf 'sha256')))) { return $false }
+        }
+        if (((& $val $ce 'current') -isnot [System.Management.Automation.PSCustomObject]) -or ((& $val $obj 'observeFailedTransportAccounting') -isnot [System.Management.Automation.PSCustomObject]) -or ((& $val $obj 'observeFailedTransport') -isnot [System.Management.Automation.PSCustomObject])) { return $false }
+        return $true
+    } catch { return $false }
+}
+
+function Compare-ManagedObserveFailedTransportReceiptV5ToFacts {
+    # STRUCTURAL ONLY: compares one stored v5 receipt DTO to facts the CALLER derived itself from raw authenticated captures and records.
+    # It never reads evidence, never authenticates and confers no receipt validity, settlement or dispatch authority; callers must derive the
+    # facts internally (Get-ManagedObserveFailedTransportFacts) and reauthenticate the raw DTO themselves.
+    param($obj, $f)
+    try {
+        if ($null -eq $obj -or $obj -is [System.Array] -or $obj -isnot [System.Management.Automation.PSCustomObject]) { return $false }
+        if (($null -eq $f) -or ($f -isnot [System.Management.Automation.PSCustomObject])) { return $false }
+        $ord = [System.StringComparison]::Ordinal
+        $val = { param($o, [string]$n) foreach ($q in $o.PSObject.Properties) { if ([string]::Equals($q.Name, $n, $ord)) { return , $q.Value } }; return , $null }
+        $json = { param($o) ConvertTo-Json -InputObject $o -Depth 12 -Compress }
+        $id = $f.identity; $lim = $f.limits; $acct = $f.accounting
+        if (($f.anchorLabel -cne 'SELECTED_ACCOUNTING_ANCHOR') -or ($acct.anchorLabel -cne 'SELECTED_ACCOUNTING_ANCHOR')) { return $false }
+        if (($acct.accountingStatus -cne 'UNKNOWN') -or ($acct.sdkOutcome -cne 'UNKNOWN') -or ($acct.accountingUnresolved -ne $true) -or ($null -ne $acct.currentOutputTokens) -or ($null -ne $acct.cumulativeOutputTokens)) { return $false }
+        $attempt = & $val $obj 'attempt'
+        $b = & $val $obj 'budget'
+        $p = & $val $obj 'provider'
+        $e = & $val $obj 'evidence'
+        foreach ($pair in @(@('runId', 'runId'), @('taskId', 'taskId'), @('payloadSha256', 'payloadSha256'), @('sessionId', 'sessionId'))) {
+            if ((& $val $obj $pair[0]) -cne [string]$id.($pair[1])) { return $false }
+        }
+        if (([long]$attempt -ne [long]$id.attempt) -or ([long](& $val $p 'pid') -ne [long]$id.pid) -or ((& $val $p 'terminalReason') -cne [string]$id.terminalReason) -or ((& $val $p 'startIdentity') -cne [string]$id.startIdentity)) { return $false }
+        if ((& $val $obj 'updatedAt') -cne [string]$f.timing.endedUtc) { return $false }
+        if (([long](& $val $b 'maxElapsedMs') -ne [long]$lim.maxElapsedMs) -or ([long](& $val $b 'maxAttempts') -ne [long]$lim.maxAttempts) -or ([long]$lim.priorElapsedMs -ne 0)) { return $false }
+        if ([long](& $val $b 'usedElapsedMs') -ne [long]$f.timing.usedElapsedMs) { return $false }
+        if (([string](& $val $e 'ticketPath') -cne [string]$acct.references.ticket.path) -or ((& $val $e 'ticketSha256') -cne [string]$acct.references.ticket.verifiedSha256)) { return $false }
+        if (([string](& $val $e 'usagePath') -cne [string]$f.stdout.path) -or ((& $val $e 'usageSha256') -cne [string]$f.stdout.sha256)) { return $false }
+        if ((& $json (& $val $obj 'observeFailedTransportAccounting')) -cne (& $json $acct)) { return $false }
+        if ((& $json (& $val $obj 'observeFailedTransportEvidence')) -cne (& $json $f.evidence)) { return $false }
+        if ((& $json (& $val $obj 'observeFailedTransport')) -cne (& $json $f.proof)) { return $false }
+        return $true
+    } catch { return $false }
+}
+
+function Test-ManagedObserveFailedTransportRawDto {
+    # Read-only. Same raw-DTO cross-check as the pending path, with the failed-transport rules (actual nonzero exit, observed output null).
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$RawPath,
+        [AllowNull()][AllowEmptyString()][string]$ExpectedSha256,
+        [Parameter(Mandatory)]$Facts
+    )
+    return Test-ManagedObservePendingRawDto -RawPath $RawPath -ExpectedSha256 $ExpectedSha256 -Facts $Facts -FailedTransport
 }
 
 function Invoke-ManagedNativePendingReceipt {

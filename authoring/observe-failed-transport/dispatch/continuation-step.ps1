@@ -78,6 +78,24 @@ function Test-ContinuationStateEntry {
         }
         if ($e.settlement.terminalSha256 -notmatch '^[0-9a-f]{64}$') { throw "Corrupt state entry: bad settlement.terminalSha256." }
         if ($e.settlement.ticketSha256 -notmatch '^[0-9a-fA-F]{64}$') { throw "Corrupt state entry: bad settlement.ticketSha256." }
+        # Failed-transport settlement (v5) is schema-specific: it must keep its FAILED/UNKNOWN facts and can never read as a completion.
+        $sAll = @($e.settlement.PSObject.Properties.Name)
+        $ftNames = @('failureDisposition', 'accountingUnresolved', 'accountingStatus', 'lastVerifiedParentOutputTokens', 'parentReceiptSha256', 'failureProofSha256')
+        $hasFtSchema = ($sAll -ccontains 'receiptSchemaVersion') -and ($e.settlement.receiptSchemaVersion -is [string]) -and ($e.settlement.receiptSchemaVersion -ceq 'OperationalRunReceipt/v5')
+        $hasFtField = $false
+        foreach ($ftn in $ftNames) { if ($sAll -ccontains $ftn) { $hasFtField = $true } }
+        if ($hasFtField -and -not $hasFtSchema) { throw "Corrupt state entry: failed-transport settlement fields without the v5 schema." }
+        if ($hasFtSchema) {
+            foreach ($ftn in $ftNames) { if (-not ($sAll -ccontains $ftn)) { throw "Corrupt state entry: failed-transport settlement missing '$ftn'." } }
+            if ($sAll -cnotcontains 'status' -or $e.settlement.status -isnot [string] -or $e.settlement.status -cne 'FAILED') { throw "Corrupt state entry: failed-transport settlement must be FAILED." }
+            if ($sAll -cnotcontains 'terminalReason' -or $e.settlement.terminalReason -isnot [string] -or $e.settlement.terminalReason -cne 'DEADLINE') { throw "Corrupt state entry: failed-transport settlement terminalReason." }
+            if ($e.settlement.failureDisposition -isnot [string] -or $e.settlement.failureDisposition -cne 'AUTHENTICATED_FAILED_TERMINAL') { throw "Corrupt state entry: bad failureDisposition." }
+            if ($e.settlement.accountingUnresolved -isnot [bool] -or -not $e.settlement.accountingUnresolved) { throw "Corrupt state entry: failed-transport accounting must stay unresolved." }
+            if ($e.settlement.accountingStatus -isnot [string] -or $e.settlement.accountingStatus -cne 'UNKNOWN') { throw "Corrupt state entry: failed-transport accounting must stay UNKNOWN." }
+            if (-not ($e.settlement.lastVerifiedParentOutputTokens -is [int] -or $e.settlement.lastVerifiedParentOutputTokens -is [long]) -or $e.settlement.lastVerifiedParentOutputTokens -lt 0) { throw "Corrupt state entry: bad lastVerifiedParentOutputTokens." }
+            if ($e.settlement.parentReceiptSha256 -isnot [string] -or $e.settlement.parentReceiptSha256 -cnotmatch '^[0-9a-f]{64}$') { throw "Corrupt state entry: bad parentReceiptSha256." }
+            if ($e.settlement.failureProofSha256 -isnot [string] -or $e.settlement.failureProofSha256 -cnotmatch '^[0-9a-f]{64}$') { throw "Corrupt state entry: bad failureProofSha256." }
+        }
     } elseif (($e.PSObject.Properties.Name -contains 'settlement') -and $null -ne $e.settlement) {
         throw "Corrupt state entry: settlement present without SETTLED status."
     }
@@ -280,6 +298,10 @@ function Invoke-ContinuationStep {
             $rsv = $rp.PSObject.Properties['schemaVersion']
             if ($null -ne $rsv -and $rsv.Value -is [string] -and $rsv.Value -ilike 'OperationalRunReceipt/v3*') { $receiptIsV3 = $true }
             if (@($rp.PSObject.Properties | Where-Object { @('observePendingAccountingEvidence', 'observePendingAccounting', 'outputStopMode') -contains [string]$_.Name }).Count -gt 0) { $receiptIsV3 = $true }
+            # A v5 failed-transport receipt is terminal settlement evidence only; it is never a new continuation candidate and refuses before any state IO.
+            if (($null -ne $rsv -and $rsv.Value -is [string] -and $rsv.Value -ilike 'OperationalRunReceipt/v5*') -or (@($rp.PSObject.Properties | Where-Object { @('observeFailedTransportEvidence', 'observeFailedTransportAccounting', 'observeFailedTransport') -contains [string]$_.Name }).Count -gt 0)) {
+                throw 'Failed-transport v5 receipt is settlement evidence only and cannot be continuation input.'
+            }
             # A v4 reviewed-completion receipt is terminal settlement evidence only; it is never queue, allocation or pending-accounting input.
             if (($null -ne $rsv -and $rsv.Value -is [string] -and $rsv.Value -ilike 'OperationalRunReceipt/v4*') -or (@($rp.PSObject.Properties | Where-Object { @('observeReviewedCompletionEvidence', 'observeReviewedCompletion') -contains [string]$_.Name }).Count -gt 0)) {
                 throw 'Reviewed-completion v4 receipt is settlement evidence only and cannot be continuation input.'
@@ -547,11 +569,19 @@ function Complete-ContinuationClaim {
         [Parameter(Mandatory)][PSCustomObject]$SelectedClaim,
         [Parameter(Mandatory)][string]$TerminalReceiptPath,
         [Parameter(Mandatory)][string]$TerminalSha256,
-        [AllowNull()][object]$ExpectedBlockedReview
+        [AllowNull()][object]$ExpectedBlockedReview,
+        [AllowNull()][object]$ExpectedFailedTransportEvidence
     )
 
     # Opt-in v2 BLOCKED path: capture once, before any StateDir IO; only returned values are used afterwards.
     $hasBlocked = $PSBoundParameters.ContainsKey('ExpectedBlockedReview')
+    # Explicit failed-transport opt-in (v5 only): the host-supplied expected evidence is mandatory for a v5 terminal and meaningless for any other.
+    $hasFailedTransport = $PSBoundParameters.ContainsKey('ExpectedFailedTransportEvidence')
+    $isV5 = $false
+    if ($hasFailedTransport) {
+        if ($hasBlocked) { throw "Failed-transport settlement cannot combine with ExpectedBlockedReview; refusing to settle." }
+        if ($null -eq $ExpectedFailedTransportEvidence) { throw "ExpectedFailedTransportEvidence is null; refusing to settle." }
+    }
     $blockedInputs = $null
     $isV4 = $false
     if ($hasBlocked) {
@@ -597,7 +627,11 @@ function Complete-ContinuationClaim {
         if ($termSchema.Value -ilike 'OperationalRunReceipt/v3*') { throw "Pending v3 receipt cannot settle a claim; refusing to settle." }
         if ($termSchema.Value -ceq 'OperationalRunReceipt/v4') { $isV4 = $true }
         elseif ($termSchema.Value -ilike 'OperationalRunReceipt/v4*') { throw "Terminal receipt schema is not exactly OperationalRunReceipt/v4; refusing to settle." }
+        if ($termSchema.Value -ceq 'OperationalRunReceipt/v5') { $isV5 = $true }
+        elseif ($termSchema.Value -ilike 'OperationalRunReceipt/v5*') { throw "Terminal receipt schema is not exactly OperationalRunReceipt/v5; refusing to settle." }
     }
+    if ($isV5 -and -not $hasFailedTransport) { throw "Failed-transport v5 receipt requires explicit ExpectedFailedTransportEvidence; refusing to settle." }
+    if ($hasFailedTransport -and -not $isV5) { throw "ExpectedFailedTransportEvidence requires an OperationalRunReceipt/v5 terminal; refusing to settle." }
     if (@('COMPLETED', 'FAILED') -notcontains $terminal.status) { throw "Terminal receipt status must be a definite terminal (COMPLETED or FAILED); AWAITING_CONTROLLER/deadline are not terminal." }
     if ([string]::IsNullOrWhiteSpace("$($terminal.provider.terminalReason)")) { throw "Terminal receipt missing terminalReason; refusing to settle." }
     }
@@ -696,6 +730,40 @@ function Complete-ContinuationClaim {
         $v4AckJson = $ackEntry | ConvertTo-Json -Depth 20 -Compress
     }
 
+    # Failed-transport mode (v5 only): rederive the whole failure proof from the pinned receipt and the host-supplied expected evidence, bind it to the
+    # ORIGINAL selected claim and keyed ACK. Nothing here classifies the run as completed or grants a next action.
+    $v5Facts = $null; $v5ProofSha = $null; $v5AckJson = $null; $verifyV5 = $null
+    if ($isV5) {
+        if ($identityKind -cne 'native') { throw "Failed-transport settlement requires a native execution identity; refusing to settle." }
+        . (Join-Path $PSScriptRoot 'managed-native-receipt.ps1')
+        $verifyV5 = {
+            param($rcpt)
+            if (-not (Test-ManagedObserveFailedTransportReceiptV5Shape $rcpt)) { throw "Failed-transport receipt shape invalid; refusing to settle." }
+            $vf = Get-ManagedObserveFailedTransportFacts -Evidence $rcpt.observeFailedTransportEvidence
+            if (($null -eq $vf) -or ($vf.Valid -isnot [bool]) -or (-not $vf.Valid) -or ($null -eq $vf.Facts)) { throw "Failed-transport proof not verified; refusing to settle." }
+            if (-not (Compare-ManagedObserveFailedTransportReceiptV5ToFacts $rcpt $vf.Facts)) { throw "Failed-transport receipt does not match the authenticated proof; refusing to settle." }
+            $rawPathV = [string]$rcpt.evidence.rawPath
+            $rv = Test-ManagedObserveFailedTransportRawDto -RawPath $rawPathV -ExpectedSha256 ([string]$rcpt.evidence.rawSha256) -Facts $vf.Facts
+            if (($null -eq $rv) -or ($rv.Valid -isnot [bool]) -or (-not $rv.Valid) -or ($rv.Path -cne $rawPathV)) { throw "Failed-transport raw evidence not verified; refusing to settle." }
+            # The host-supplied expectation is independently authenticated and must equal the evidence stored in the receipt exactly.
+            $ex = Get-ManagedObserveFailedTransportFacts -Evidence $ExpectedFailedTransportEvidence
+            if (($null -eq $ex) -or ($ex.Valid -isnot [bool]) -or (-not $ex.Valid) -or ($null -eq $ex.Facts)) { throw "Expected failed-transport evidence not verified; refusing to settle." }
+            if ((ConvertTo-Json -InputObject $ex.Facts -Depth 12 -Compress) -cne (ConvertTo-Json -InputObject $vf.Facts -Depth 12 -Compress)) { throw "Expected failed-transport evidence does not match the receipt; refusing to settle." }
+            return $vf.Facts
+        }
+        $v5Facts = & $verifyV5 $terminal
+        $pc = $v5Facts.proof.claim
+        foreach ($cf in @('id', 'owner', 'claimId', 'intentId', 'receiptSha', 'planSha')) {
+            if ([string]$pc.$cf -cne [string]$SelectedClaim.$cf) { throw "Failed-transport proof claim does not match SelectedClaim; refusing to settle." }
+        }
+        if (-not [string]::Equals([System.IO.Path]::GetFullPath([string]$pc.statePath), $canonicalStatePath, [System.StringComparison]::OrdinalIgnoreCase)) { throw "Failed-transport proof claim statePath does not match canonical StateDir; refusing to settle." }
+        if (-not [string]::Equals([System.IO.Path]::GetFullPath([string]$v5Facts.proof.stateDir), $stateDirFull, [System.StringComparison]::OrdinalIgnoreCase)) { throw "Failed-transport proof stateDir does not match StateDir; refusing to settle." }
+        if (($ackEntry.dispatchedAt -isnot [string]) -or ($ackEntry.dispatchedAt -cne [string]$v5Facts.proof.startIdentity) -or ([int64]$binding.identity.pid -ne [int64]$v5Facts.proof.pid)) { throw "Acknowledgement start identity does not match failed-transport proof; refusing to settle." }
+        $v5AckJson = ConvertTo-Json -InputObject $ackEntry -Depth 20 -Compress
+        if ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.UTF8Encoding]::new($false).GetBytes($v5AckJson))).ToLowerInvariant() -cne [string]$v5Facts.proof.ackEntrySha256) { throw "Acknowledgement entry does not match the failed-transport proof snapshot; refusing to settle." }
+        $v5ProofSha = [System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.UTF8Encoding]::new($false).GetBytes((ConvertTo-Json -InputObject ([ordered]@{ proof = $v5Facts.proof; accounting = $v5Facts.accounting }) -Depth 12 -Compress)))).ToLowerInvariant()
+    }
+
     $terminalFingerprint = [PSCustomObject]@{
         terminalReceiptPath = $terminalFull
         terminalSha256      = $TerminalSha256.ToLowerInvariant()
@@ -710,6 +778,12 @@ function Complete-ContinuationClaim {
     if ($isV4) {
         $terminalFingerprint | Add-Member -NotePropertyName 'receiptSchemaVersion' -NotePropertyValue 'OperationalRunReceipt/v4'
         $terminalFingerprint | Add-Member -NotePropertyName 'completionProofSha256' -NotePropertyValue $v4ProofSha
+    }
+    if ($isV5) {
+        $terminalFingerprint | Add-Member -NotePropertyName 'receiptSchemaVersion' -NotePropertyValue 'OperationalRunReceipt/v5'
+        $terminalFingerprint | Add-Member -NotePropertyName 'failureProofSha256' -NotePropertyValue $v5ProofSha
+        $terminalFingerprint | Add-Member -NotePropertyName 'parentReceiptSha256' -NotePropertyValue ([string]$v5Facts.proof.parentReceiptSha256)
+        $terminalFingerprint | Add-Member -NotePropertyName 'lastVerifiedParentOutputTokens' -NotePropertyValue ([int64]$v5Facts.accounting.lastVerifiedParentOutputTokens)
     }
     if ($hasBlocked) {
         $terminalFingerprint.terminalSha256 = $blockedInputs.terminalSha256
@@ -777,6 +851,25 @@ function Complete-ContinuationClaim {
             if (($v4AckEntry | ConvertTo-Json -Depth 20 -Compress) -cne $v4AckJson) { throw "Acknowledgement changed before locked closure; refusing to settle." }
         }
 
+        # Window 2 (v5 only): recapture the pinned receipt, rederive the whole failure proof (parent, capture, registration, claim, ACK, raw DTO) and
+        # recheck the live keyed ACK under the lock, before any state read, idempotent replay return or write. Any drift refuses.
+        if ($isV5) {
+            if ((Get-FileHash -LiteralPath $terminalFull -Algorithm SHA256).Hash.ToLowerInvariant() -cne $terminalFingerprint.terminalSha256) { throw "Failed-transport receipt changed before locked closure; refusing to settle." }
+            try { $terminalNow = (Get-Content -LiteralPath $terminalFull -Raw) | ConvertFrom-Json -DateKind String } catch { throw "Failed-transport receipt unreadable at locked closure; refusing to settle." }
+            $v5Now = & $verifyV5 $terminalNow
+            if ((ConvertTo-Json -InputObject $v5Now -Depth 12 -Compress) -cne (ConvertTo-Json -InputObject $v5Facts -Depth 12 -Compress)) { throw "Failed-transport proof changed before locked closure; refusing to settle." }
+            if (-not (Test-Path -LiteralPath $ackPath -PathType Leaf)) { throw "Dispatch acknowledgement disappeared before locked closure; refusing to settle." }
+            $v5AckRaw = Get-Content -LiteralPath $ackPath -Raw
+            if ([string]::IsNullOrWhiteSpace($v5AckRaw)) { throw "Dispatch acknowledgement file is empty at locked closure; refusing to settle." }
+            try { $v5AckState = $v5AckRaw | ConvertFrom-Json -DateKind String } catch { throw "Dispatch acknowledgement file is not valid JSON at locked closure; refusing to settle." }
+            try { $v5AckHash = Test-HostDispatchAcknowledgementEnvelope -AckState $v5AckState } catch { throw "Dispatch acknowledgement file malformed at locked closure; refusing to settle. $($_.Exception.Message)" }
+            if (-not $v5AckHash.Contains($ackKey)) { throw "Acknowledgement entry missing at locked closure; refusing to settle." }
+            $v5AckEntry = $v5AckHash[$ackKey]
+            if ($null -eq $v5AckEntry -or -not ($v5AckEntry.PSObject.Properties.Name -contains 'executionBinding') -or $null -eq $v5AckEntry.executionBinding) { throw "Acknowledgement binding missing at locked closure; refusing to settle." }
+            try { Test-ExecutionBinding -Binding $v5AckEntry.executionBinding } catch { throw "Acknowledgement executionBinding failed strict validation at locked closure; refusing to settle. $($_.Exception.Message)" }
+            if ((ConvertTo-Json -InputObject $v5AckEntry -Depth 20 -Compress) -cne $v5AckJson) { throw "Acknowledgement changed before locked closure; refusing to settle." }
+        }
+
         if (-not (Test-Path -LiteralPath $canonicalStatePath -PathType Leaf)) { throw "Continuation state file not found; refusing to settle." }
         $raw = Get-Content -LiteralPath $canonicalStatePath -Raw
         if ([string]::IsNullOrWhiteSpace($raw)) { throw "Corrupt state file (empty); refusing to proceed." }
@@ -819,6 +912,21 @@ function Complete-ContinuationClaim {
                     ($entry.settlement.status -ceq $terminalFingerprint.status) -and
                     ($entry.settlement.completionProofSha256 -ceq $terminalFingerprint.completionProofSha256)
             }
+            if ($sameFingerprint -and $isV5) {
+                $sNames = @($entry.settlement.PSObject.Properties.Name)
+                $sameFingerprint = ($sNames -ccontains 'receiptSchemaVersion') -and ($sNames -ccontains 'failureProofSha256') -and ($sNames -ccontains 'failureDisposition') -and ($sNames -ccontains 'accountingUnresolved') -and ($sNames -ccontains 'parentReceiptSha256') -and ($sNames -ccontains 'lastVerifiedParentOutputTokens') -and
+                    ($entry.settlement.receiptSchemaVersion -ceq $terminalFingerprint.receiptSchemaVersion) -and
+                    ($entry.settlement.status -ceq $terminalFingerprint.status) -and
+                    ($entry.settlement.failureProofSha256 -ceq $terminalFingerprint.failureProofSha256) -and
+                    ($entry.settlement.parentReceiptSha256 -ceq $terminalFingerprint.parentReceiptSha256) -and
+                    ([int64]$entry.settlement.lastVerifiedParentOutputTokens -eq $terminalFingerprint.lastVerifiedParentOutputTokens) -and
+                    ($entry.settlement.failureDisposition -ceq 'AUTHENTICATED_FAILED_TERMINAL') -and
+                    ($entry.settlement.accountingUnresolved -eq $true)
+            }
+            if ($sameFingerprint -and $isV5) {
+                # Identical failure replay: the same persisted settlement and retained claim, no write, no provider.
+                return [PSCustomObject]@{ status = 'SETTLED'; intentId = $SelectedClaim.intentId; replay = $true; statePath = $canonicalStatePath; disposition = 'FAILED'; accountingUnresolved = $true; settlement = $entry.settlement; claim = $entry.claim }
+            }
             if ($sameFingerprint) {
                 return [PSCustomObject]@{ status = 'SETTLED'; intentId = $SelectedClaim.intentId; replay = $true; statePath = $canonicalStatePath }
             } else {
@@ -829,6 +937,10 @@ function Complete-ContinuationClaim {
         if ($entry.status -ne 'CLAIMED' -or $null -eq $entry.claim) { throw "Entry is not actively CLAIMED; refusing to settle." }
         if ($entry.claim.claimId -cne $SelectedClaim.claimId -or $entry.claim.owner -cne $SelectedClaim.owner) { throw "Entry claim does not match SelectedClaim owner/claimId; refusing to settle." }
         if ($entry.receiptSha256 -cne $SelectedClaim.receiptSha -or $entry.planSha256 -cne $SelectedClaim.planSha) { throw "Entry receipt/plan does not match SelectedClaim; refusing to settle." }
+        if ($isV5) {
+            # The retained claim entry is the parent receipt's claim: parent hash, run, attempt and original action must equal the failure proof.
+            if ($entry.receiptSha256 -cne [string]$v5Facts.proof.parentReceiptSha256 -or $entry.runId -cne [string]$v5Facts.proof.parentRunId -or [int64]$entry.attempt -ne [int64]$v5Facts.proof.parentAttempt -or $entry.actionId -cne [string]$v5Facts.proof.registeredActionId) { throw "Entry parent identity does not match the failed-transport proof; refusing to settle." }
+        }
 
         $entry.status = 'SETTLED'
         $entry | Add-Member -NotePropertyName 'settlement' -NotePropertyValue ([PSCustomObject]@{
@@ -847,6 +959,15 @@ function Complete-ContinuationClaim {
             $entry.settlement | Add-Member -NotePropertyName 'receiptSchemaVersion' -NotePropertyValue $terminalFingerprint.receiptSchemaVersion -Force
             $entry.settlement | Add-Member -NotePropertyName 'completionProofSha256' -NotePropertyValue $terminalFingerprint.completionProofSha256 -Force
         }
+        if ($isV5) {
+            $entry.settlement | Add-Member -NotePropertyName 'receiptSchemaVersion' -NotePropertyValue $terminalFingerprint.receiptSchemaVersion -Force
+            $entry.settlement | Add-Member -NotePropertyName 'failureDisposition' -NotePropertyValue 'AUTHENTICATED_FAILED_TERMINAL' -Force
+            $entry.settlement | Add-Member -NotePropertyName 'accountingUnresolved' -NotePropertyValue $true -Force
+            $entry.settlement | Add-Member -NotePropertyName 'accountingStatus' -NotePropertyValue 'UNKNOWN' -Force
+            $entry.settlement | Add-Member -NotePropertyName 'lastVerifiedParentOutputTokens' -NotePropertyValue $terminalFingerprint.lastVerifiedParentOutputTokens -Force
+            $entry.settlement | Add-Member -NotePropertyName 'parentReceiptSha256' -NotePropertyValue $terminalFingerprint.parentReceiptSha256 -Force
+            $entry.settlement | Add-Member -NotePropertyName 'failureProofSha256' -NotePropertyValue $terminalFingerprint.failureProofSha256 -Force
+        }
         if ($hasBlocked) {
             $entry.settlement | Add-Member -NotePropertyName 'receiptSchemaVersion' -NotePropertyValue $terminalFingerprint.receiptSchemaVersion -Force
             $entry.settlement | Add-Member -NotePropertyName 'reviewedDispositionReviewSha256' -NotePropertyValue $terminalFingerprint.reviewedDispositionReviewSha256 -Force
@@ -859,6 +980,9 @@ function Complete-ContinuationClaim {
         ($state | ConvertTo-Json -Depth 20) | Set-Content -LiteralPath $tmpPath -NoNewline
         Move-Item -LiteralPath $tmpPath -Destination $canonicalStatePath -Force
 
+        if ($isV5) {
+            return [PSCustomObject]@{ status = 'SETTLED'; intentId = $SelectedClaim.intentId; replay = $false; statePath = $canonicalStatePath; disposition = 'FAILED'; accountingUnresolved = $true; settlement = $entry.settlement; claim = $entry.claim }
+        }
         [PSCustomObject]@{ status = 'SETTLED'; intentId = $SelectedClaim.intentId; replay = $false; statePath = $canonicalStatePath }
     } finally {
         $fs.Close()
