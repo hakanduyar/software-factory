@@ -15,17 +15,5 @@ jobs:
         shell: pwsh
         run: |
           $tests = Join-Path $env:GITHUB_WORKSPACE 'tests/github/publisher-stderr.tests.ps1'
-          & $tests -EvidenceRoot (Join-Path $env:RUNNER_TEMP 'publisher-diagnostics')
+          pwsh -NoProfile -File $tests -EvidenceRoot (Join-Path $env:RUNNER_TEMP 'publisher-diagnostics')
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Diagnose synthetic legacy-success fixture after failure
-        if: failure()
-        shell: pwsh
-        run: |
-          $tests = Join-Path $env:GITHUB_WORKSPACE 'tests/github/publisher-stderr.tests.ps1'
-          try { . $tests -EvidenceRoot (Join-Path $env:RUNNER_TEMP 'publisher-diagnostic-only') } catch { Write-Output ('fixtureFailure=' + $_.Exception.Message) }
-          $calls = @{ count = 0 }
-          $fixtureJson = $goodJson
-          $probeRunner = { param($e,$a,$d,$o,$m) $calls.count++; [pscustomobject]@{exitCode=[int]0;timedOut=$false;stdout=$fixtureJson;stdoutTruncated=$false;stderrTruncated=$false} }.GetNewClosure()
-          $probe = New-TransportFor $probeRunner
-          $observed = & $probe 'READ' $readArgs
-          [pscustomobject]@{powershell=[string]$PSVersionTable.PSVersion;calls=$calls.count;result=$observed;fixtureLength=$fixtureJson.Length;requestNumberType=$readArgs.issueNumber.GetType().FullName} | ConvertTo-Json -Depth 5 -Compress
