@@ -67,13 +67,23 @@ export interface CliWorkerAdapterConfig {
   readonly workspace: Workspace;
   readonly processRunner: ProcessRunner;
   readonly environmentPolicy: EnvironmentPolicy;
-  readonly maxOutputBytes?: number;
-  /** Evidence transcript text is bounded independently of raw process-output bounding. Default 4000. */
-  readonly maxEvidenceChars?: number;
+  /**
+   * Author raw output has no artificial ceiling: must be `null` or omitted.
+   * Any finite/malformed value is refused by `createCliWorker` before the
+   * runner is ever called. (Typed `number | null` only so a bad value is a
+   * runtime refusal, not silently ignored.)
+   */
+  readonly maxOutputBytes?: number | null;
+  /**
+   * Author transcript/raw-diagnostic evidence is retained in full (redacted).
+   * Must be `null` or omitted; finite/malformed values are refused at construction.
+   */
+  readonly maxEvidenceChars?: number | null;
   readonly buildInvocation: (args: BuildInvocationArgs) => CliInvocationPlan;
   readonly interpretOutput: (processResult: ProcessResult) => CliReportedResult;
 }
 
+/** Used only for the concise display summary; never for evidence channels. */
 function truncate(text: string, maxChars: number): { text: string; truncated: boolean } {
   if (text.length <= maxChars) {
     return { text, truncated: false };
@@ -123,7 +133,6 @@ function buildEvidence(
   request: WorkerRequest,
   processResult: ProcessResult,
   safeMessage: string | undefined,
-  maxEvidenceChars: number,
 ): EvidenceDraft[] {
   const evidence: EvidenceDraft[] = [
     {
@@ -159,21 +168,19 @@ function buildEvidence(
   // `safeMessage` is already redacted by the caller (see safeFinalMessage);
   // the raw fallback is redacted here.
   if (safeMessage !== undefined && safeMessage.length > 0) {
-    const { text, truncated } = truncate(safeMessage, maxEvidenceChars);
     evidence.push({
       kind: "NOTE",
-      summary: truncated ? `${text}\n(evidence text truncated to ${maxEvidenceChars} chars)` : text,
+      summary: safeMessage,
       reference: `cli://${tool}/run/${request.runId}/transcript`,
     });
   } else {
     const rawFallback = processResult.stdout.length > 0 ? processResult.stdout : processResult.stderr;
     if (rawFallback.length > 0) {
-      const { text, truncated } = truncate(redactSecrets(rawFallback), maxEvidenceChars);
       evidence.push({
         kind: "NOTE",
         summary:
           `UNPARSED RAW OUTPUT (diagnostic only — the tool's structured output contract was not satisfied):\n` +
-          (truncated ? `${text}\n(evidence text truncated to ${maxEvidenceChars} chars)` : text),
+          redactSecrets(rawFallback),
         reference: `cli://${tool}/run/${request.runId}/raw-output`,
       });
     }
@@ -215,6 +222,18 @@ export function createCliWorker(config: CliWorkerAdapterConfig): Worker {
         "A finite author timeout is refused; no worker was constructed and no process was launched.",
     );
   }
+  for (const [name, value] of [
+    ["maxOutputBytes", config.maxOutputBytes],
+    ["maxEvidenceChars", config.maxEvidenceChars],
+  ] as const) {
+    const suppliedLimit: unknown = value;
+    if (suppliedLimit !== undefined && suppliedLimit !== null) {
+      throw new ValidationError(
+        `CLI author worker ${name} must be null or omitted (no artificial author output ceiling); got ${JSON.stringify(suppliedLimit) ?? String(suppliedLimit)}. ` +
+          "A finite author limit is refused; no worker was constructed and no process was launched.",
+      );
+    }
+  }
   return {
     id: config.id,
     capabilities: {
@@ -248,7 +267,7 @@ export function createCliWorker(config: CliWorkerAdapterConfig): Worker {
         env,
         timeoutMs: config.timeoutMs,
         ...(plan.input === undefined ? {} : { input: plan.input }),
-        ...(config.maxOutputBytes === undefined ? {} : { maxOutputBytes: config.maxOutputBytes }),
+        maxOutputBytes: null,
       });
 
       const reported = config.interpretOutput(processResult);
@@ -256,12 +275,11 @@ export function createCliWorker(config: CliWorkerAdapterConfig): Worker {
       // buildSummary/buildEvidence never read reported.finalMessage directly.
       const safeMessage = safeFinalMessage(reported);
       const succeeded = processResult.terminationReason === "EXITED" && processResult.exitCode === 0;
-      const maxEvidenceChars = config.maxEvidenceChars ?? 4000;
 
       return {
         status: succeeded ? "SUCCEEDED" : "FAILED",
         summary: buildSummary(config.tool, config.model, request, processResult, safeMessage, succeeded),
-        evidence: buildEvidence(config.tool, config.model, plan.effortApplication, request, processResult, safeMessage, maxEvidenceChars),
+        evidence: buildEvidence(config.tool, config.model, plan.effortApplication, request, processResult, safeMessage),
         // TASK-003 explicitly defers PASS/CHANGES_REQUIRED text parsing to TASK-004;
         // free-form model text is never trusted as a claim in the meantime.
         claimsAcceptanceMet: false,
