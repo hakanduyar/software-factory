@@ -152,7 +152,7 @@ describe("geminiCliAdapter: createGeminiCliWorker", () => {
     assert.ok(!call.argv.some((a) => /yolo|approval|trust|allowed|policy/i.test(a) && a.startsWith("-")));
     assert.equal(call.cwd, ws.root);
     assert.equal(call.timeoutMs, null);
-    assert.equal(call.maxOutputBytes, undefined);
+    assert.equal(call.maxOutputBytes, null);
     assert.equal(call.env["ANTHROPIC_API_KEY"], undefined);
     assert.equal(outcome.status, "SUCCEEDED");
     assert.equal(outcome.claimsAcceptanceMet, false);
