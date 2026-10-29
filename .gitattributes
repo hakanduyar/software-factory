@@ -15,3 +15,6 @@
 /tests/github/lifecycle-initial-read-retry.tests.ps1 text eol=lf
 
 /tests/github/lifecycle-verified-complete.tests.ps1 text eol=lf
+
+/scripts/github/enqueue-canonical-lifecycle-complete.ps1 text eol=lf
+/tests/github/canonical-complete-enqueue.tests.ps1 text eol=lf
