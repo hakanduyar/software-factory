@@ -14,7 +14,7 @@ $ErrorActionPreference='Stop'
 Set-StrictMode -Version Latest
 
 # Accepted production pins preserved inside the test admission fixture.
-$AcceptedTransportSha256='140a72148cf074a378262d35d940d865ff29abffafe74d2e70e5c3e243ff75d0'
+$AcceptedTransportSha256='a5b09457e7735eec768b16cefbb8343a97fca55f2b00b0af2b4dbbbf932791e1'
 $AcceptedReconcileSha256='a18d8f1d5ef0ef8bba11580d2cbdabcc60937489195c88d9f406c551a443d4da'
 
 function Stop-Harness([string]$Message){throw [InvalidOperationException]::new('HARNESS: '+$Message)}
