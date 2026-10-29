@@ -457,7 +457,7 @@ function ConvertTo-ObserveOnlyFailedTransportReceipt {
         [Parameter(Mandatory)][int]$Attempt,
         [Parameter(Mandatory)][int]$MaxAttempts,
         [Parameter(Mandatory)][long]$PriorElapsedMs,
-        [Parameter(Mandatory)][long]$MaxElapsedMs,
+        [Parameter(Mandatory)][AllowNull()][Nullable[long]]$MaxElapsedMs,
         [Parameter(Mandatory)][string]$ReceiptPath,
         [AllowNull()][object]$Evidence,
         [Parameter(Mandatory)][bool]$Conflict
@@ -479,6 +479,8 @@ function ConvertTo-ObserveOnlyFailedTransportReceipt {
     if ($unkSelect) {
         return ConvertTo-ObserveOnlyUnknownFailedReceipt -RawPath $RawPath -TicketPath $TicketPath -UsagePath $UsagePath -RunId $RunId -Attempt $Attempt -MaxAttempts $MaxAttempts -PriorElapsedMs $PriorElapsedMs -MaxElapsedMs $MaxElapsedMs -ReceiptPath $ReceiptPath -Evidence $Evidence -Conflict $Conflict
     }
+    # The v5 route keeps its finite-deadline semantics: a null total author duration is never cast, defaulted or relabelled here.
+    if ($null -eq $MaxElapsedMs) { return & $fail 'failed transport v5 requires a finite MaxElapsedMs' }
     $temp = $null
     try {
         . (Join-Path $PSScriptRoot 'managed-native-receipt.ps1')
@@ -755,7 +757,7 @@ function ConvertTo-ObserveOnlyUnknownFailedReceipt {
         [Parameter(Mandatory)][int]$Attempt,
         [Parameter(Mandatory)][int]$MaxAttempts,
         [Parameter(Mandatory)][long]$PriorElapsedMs,
-        [Parameter(Mandatory)][long]$MaxElapsedMs,
+        [Parameter(Mandatory)][AllowNull()][Nullable[long]]$MaxElapsedMs,
         [Parameter(Mandatory)][string]$ReceiptPath,
         [AllowNull()][object]$Evidence,
         [Parameter(Mandatory)][bool]$Conflict
@@ -784,7 +786,8 @@ function ConvertTo-ObserveOnlyUnknownFailedReceipt {
         if (($Attempt -lt 1) -or ($MaxAttempts -le 0) -or ($Attempt -gt $MaxAttempts)) { return & $fail 'invalid attempt range' }
         if (-not [string]::Equals($RunId, [string]$id.runId, [System.StringComparison]::Ordinal)) { return & $fail 'runId does not match authenticated capture' }
         if (([long]$Attempt -ne [long]$id.attempt) -or ([long]$MaxAttempts -ne [long]$lim.maxAttempts)) { return & $fail 'attempt or maxAttempts does not match authenticated capture' }
-        if (([long]$MaxElapsedMs -ne [long]$lim.maxElapsedMs) -or ([long]$PriorElapsedMs -ne [long]$lim.priorElapsedMs)) { return & $fail 'elapsed limits do not match authenticated capture' }
+        # A null total author duration stays null: it must match the authenticated capture exactly and is never cast to 0.
+        if ((($null -eq $MaxElapsedMs) -ne ($null -eq $lim.maxElapsedMs)) -or (($null -ne $lim.maxElapsedMs) -and ([long]$MaxElapsedMs -ne [long]$lim.maxElapsedMs)) -or ([long]$PriorElapsedMs -ne [long]$lim.priorElapsedMs)) { return & $fail 'elapsed limits do not match authenticated capture' }
         $ticketFull = [System.IO.Path]::GetFullPath($TicketPath)
         $usageFull = [System.IO.Path]::GetFullPath($UsagePath)
         $rawFull = [System.IO.Path]::GetFullPath($RawPath)
@@ -817,7 +820,7 @@ function ConvertTo-ObserveOnlyUnknownFailedReceipt {
             historyVerified = $false
             budget          = [PSCustomObject]([ordered]@{
                 maxOutputTokens  = $null
-                maxElapsedMs     = [int64]$lim.maxElapsedMs
+                maxElapsedMs     = $(if ($null -eq $lim.maxElapsedMs) { $null } else { [int64]$lim.maxElapsedMs })
                 maxAttempts      = [int64]$lim.maxAttempts
                 usedElapsedMs    = [int64]$f.timing.usedElapsedMs
                 usedOutputTokens = $null

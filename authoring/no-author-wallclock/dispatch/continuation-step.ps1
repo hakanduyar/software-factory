@@ -118,7 +118,8 @@ function Test-ContinuationStateEntry {
             if ($hasFtSchema -or ($sAll -ccontains 'lastVerifiedParentOutputTokens')) { throw "Corrupt state entry: UNKNOWN failed settlement cannot carry a v5 parent total." }
             foreach ($v7n in $v7Names) { if (-not ($sAll -ccontains $v7n)) { throw "Corrupt state entry: UNKNOWN failed settlement missing '$v7n'." } }
             if ($sAll -cnotcontains 'status' -or $e.settlement.status -isnot [string] -or $e.settlement.status -cne 'FAILED') { throw "Corrupt state entry: UNKNOWN failed settlement must be FAILED." }
-            if ($sAll -cnotcontains 'terminalReason' -or $e.settlement.terminalReason -isnot [string] -or $e.settlement.terminalReason -cne 'DEADLINE') { throw "Corrupt state entry: UNKNOWN failed settlement terminalReason." }
+            # Reason-specific failed modes only: a finite DEADLINE, or an actual NATURAL_EXIT with a nonzero typed exit (the null total duration case). Nothing else.
+            if ($sAll -cnotcontains 'terminalReason' -or $e.settlement.terminalReason -isnot [string] -or ($e.settlement.terminalReason -cne 'DEADLINE' -and $e.settlement.terminalReason -cne 'NATURAL_EXIT')) { throw "Corrupt state entry: UNKNOWN failed settlement terminalReason." }
             if ($e.settlement.failureDisposition -isnot [string] -or $e.settlement.failureDisposition -cne 'AUTHENTICATED_FAILED_TERMINAL') { throw "Corrupt state entry: bad failureDisposition." }
             if ($e.settlement.accountingUnresolved -isnot [bool] -or -not $e.settlement.accountingUnresolved) { throw "Corrupt state entry: UNKNOWN failed accounting must stay unresolved." }
             if ($e.settlement.accountingStatus -isnot [string] -or $e.settlement.accountingStatus -cne 'UNKNOWN') { throw "Corrupt state entry: UNKNOWN failed accounting must stay UNKNOWN." }
@@ -337,6 +338,7 @@ function Invoke-ContinuationStep {
     if ($optIn -and $null -ne $capture.binding.allocation.PSObject.Properties['accountingStatus']) { $unknownMode = $true }
     $receiptIsFailedRoot = $false
     $receiptIsUnkPending = $false
+    $receiptIsUnkFailed = $false
     # OBSERVE_ONLY is reachable only through the full opt-in; a v3 receipt or a plan marker alone refuses before any state IO.
     $receiptIsV3 = $false
     if (Test-Path -LiteralPath $receiptFull -PathType Leaf) {
@@ -344,18 +346,42 @@ function Invoke-ContinuationStep {
         try { $rp = (Get-Content -LiteralPath $receiptFull -Raw) | ConvertFrom-Json -DateKind String } catch { $rp = $null }
         if ($null -ne $rp) {
             $rsv = $rp.PSObject.Properties['schemaVersion']
+            # Exact schema-specific discrimination: outputStopMode alone is the v3 marker only when the schema is not one of the exact v5/v6/v7 schemas, and a marker never
+            # authenticates anything. Evidence membership must be exactly the schema's own group (mixed groups and mis-cased aliases refuse below).
+            $rpNames = @($rp.PSObject.Properties | ForEach-Object { [string]$_.Name })
+            $rsvText = $null
+            if ($null -ne $rsv -and $rsv.MemberType -eq [System.Management.Automation.PSMemberTypes]::NoteProperty -and $rsv.Value -is [string]) { $rsvText = [string]$rsv.Value }
+            $isExactUnkSchema = ($null -ne $rsvText) -and (@('OperationalRunReceipt/v5', 'OperationalRunReceipt/v6', 'OperationalRunReceipt/v7') -ccontains $rsvText)
+            $evGroups = @{
+                v3 = @('observePendingAccountingEvidence', 'observePendingAccounting')
+                v4 = @('observeReviewedCompletionEvidence', 'observeReviewedCompletion')
+                v5 = @('observeFailedTransportEvidence', 'observeFailedTransportAccounting', 'observeFailedTransport')
+                v6 = @('observeUnknownContinuationEvidence', 'observeUnknownContinuationAccounting')
+                v7 = @('observeUnknownFailedEvidence', 'observeUnknownFailedAccounting', 'observeUnknownFailed')
+            }
+            $groupExact = {
+                param([string]$want)
+                foreach ($gk in $evGroups.Keys) {
+                    $have = @($rpNames | Where-Object { $evGroups[$gk] -ccontains $_ }).Count
+                    if ($gk -ceq $want) { if ($have -ne $evGroups[$gk].Count) { return $false } }
+                    elseif ($have -ne 0) { return $false }
+                }
+                return $true
+            }
             if ($null -ne $rsv -and $rsv.Value -is [string] -and $rsv.Value -ilike 'OperationalRunReceipt/v3*') { $receiptIsV3 = $true }
-            if (@($rp.PSObject.Properties | Where-Object { @('observePendingAccountingEvidence', 'observePendingAccounting', 'outputStopMode') -contains [string]$_.Name }).Count -gt 0) { $receiptIsV3 = $true }
+            if (@($rp.PSObject.Properties | Where-Object { @('observePendingAccountingEvidence', 'observePendingAccounting') -contains [string]$_.Name }).Count -gt 0) { $receiptIsV3 = $true }
+            if (($rpNames -contains 'outputStopMode') -and -not $isExactUnkSchema) { $receiptIsV3 = $true }
             # A v5 failed-transport receipt is terminal settlement evidence only; it is never a new continuation candidate and refuses before any state IO. The single
             # exception is the explicit UNKNOWN-history shape, where the exact v5 failed root is the retained parent of the human-authorized continuation.
             if (($null -ne $rsv -and $rsv.Value -is [string] -and $rsv.Value -ilike 'OperationalRunReceipt/v5*') -or (@($rp.PSObject.Properties | Where-Object { @('observeFailedTransportEvidence', 'observeFailedTransportAccounting', 'observeFailedTransport') -contains [string]$_.Name }).Count -gt 0)) {
-                if ($unknownMode -and $null -ne $rsv -and $rsv.Value -is [string] -and $rsv.Value -ceq 'OperationalRunReceipt/v5') { $receiptIsFailedRoot = $true }
+                if ($unknownMode -and $null -ne $rsv -and $rsv.Value -is [string] -and $rsv.Value -ceq 'OperationalRunReceipt/v5' -and (& $groupExact 'v5')) { $receiptIsFailedRoot = $true }
                 else { throw 'Failed-transport v5 receipt is settlement evidence only and cannot be continuation input.' }
             }
-            # v6 (UNKNOWN-history pending) is continuation input only inside the explicit UNKNOWN allocation; v7 (UNKNOWN-history failed) is failed evidence only and never input.
+            # v6 (UNKNOWN-history pending) and v7 (UNKNOWN-history FAILED, which stays failed evidence) are continuation parents only inside the explicit UNKNOWN allocation with exact schema-specific evidence.
             if (($null -ne $rsv -and $rsv.Value -is [string] -and ($rsv.Value -ilike 'OperationalRunReceipt/v6*' -or $rsv.Value -ilike 'OperationalRunReceipt/v7*')) -or (@($rp.PSObject.Properties | Where-Object { @('observeUnknownContinuationEvidence', 'observeUnknownContinuationAccounting', 'observeUnknownFailedEvidence', 'observeUnknownFailedAccounting', 'observeUnknownFailed') -contains [string]$_.Name }).Count -gt 0)) {
-                if ($unknownMode -and $null -ne $rsv -and $rsv.Value -is [string] -and $rsv.Value -ceq 'OperationalRunReceipt/v6') { $receiptIsUnkPending = $true }
-                else { throw 'UNKNOWN-history v6/v7 receipts are not supported continuation input here (v7 is failed evidence only).' }
+                if ($unknownMode -and $null -ne $rsv -and $rsv.Value -is [string] -and $rsv.Value -ceq 'OperationalRunReceipt/v6' -and (& $groupExact 'v6')) { $receiptIsUnkPending = $true }
+                elseif ($unknownMode -and $null -ne $rsv -and $rsv.Value -is [string] -and $rsv.Value -ceq 'OperationalRunReceipt/v7' -and (& $groupExact 'v7')) { $receiptIsUnkFailed = $true }
+                else { throw 'UNKNOWN-history v6/v7 receipts are not supported continuation input outside the explicit UNKNOWN allocation with exact schema-specific evidence.' }
             }
             # A v4 reviewed-completion receipt is terminal settlement evidence only; it is never queue, allocation or pending-accounting input.
             if (($null -ne $rsv -and $rsv.Value -is [string] -and $rsv.Value -ilike 'OperationalRunReceipt/v4*') -or (@($rp.PSObject.Properties | Where-Object { @('observeReviewedCompletionEvidence', 'observeReviewedCompletion') -contains [string]$_.Name }).Count -gt 0)) {
@@ -368,7 +394,7 @@ function Invoke-ContinuationStep {
     if ($observeMode) {
         $planMode = $capture.plan.PSObject.Properties['outputStopMode']
         if ($unknownMode) {
-            if ($receiptIsV3 -or -not ($receiptIsFailedRoot -or $receiptIsUnkPending) -or $null -ne $predCapture -or $null -eq $planMode -or $planMode.Value -isnot [string] -or $planMode.Value -cne 'OBSERVE_ONLY' -or $capture.binding.allocation.outputStopMode -cne 'OBSERVE_ONLY') { throw $allocFail }
+            if ($receiptIsV3 -or -not ($receiptIsFailedRoot -or $receiptIsUnkPending -or $receiptIsUnkFailed) -or $null -ne $predCapture -or $null -eq $planMode -or $planMode.Value -isnot [string] -or $planMode.Value -cne 'OBSERVE_ONLY' -or $capture.binding.allocation.outputStopMode -cne 'OBSERVE_ONLY') { throw $allocFail }
         }
         elseif (-not $receiptIsV3 -or $null -ne $predCapture -or $null -eq $planMode -or $planMode.Value -isnot [string] -or $planMode.Value -cne 'OBSERVE_ONLY' -or $capture.binding.allocation.outputStopMode -cne 'OBSERVE_ONLY') { throw $allocFail }
     } elseif ($receiptIsV3) {
@@ -427,6 +453,14 @@ $sw = [Diagnostics.Stopwatch]::StartNew()
             $unkSubtotal = $unkFacts.Facts.accounting.lastVerifiedParentOutputTokens
             $unkFailurePath = $receiptFull
             $unkFailureSha = $unkReceiptSha
+        } elseif ($receiptIsUnkFailed) {
+            # An authenticated v7 FAILED receipt is a valid immediate parent as admitted; it stays failed evidence (never pending/completed) and keeps the failed root.
+            if ($receipt.schemaVersion -cne 'OperationalRunReceipt/v7' -or $receipt.status -cne 'FAILED') { throw "UNKNOWN-history failed parent must be the v7 FAILED receipt." }
+            $unkFacts = Get-ManagedObserveUnknownFailedFacts -Evidence $receipt.observeUnknownFailedEvidence
+            if ($null -eq $unkFacts -or $unkFacts.Valid -isnot [bool] -or -not $unkFacts.Valid -or $null -eq $unkFacts.Facts) { throw "UNKNOWN-history failed parent facts not verified." }
+            $unkSubtotal = $unkFacts.Facts.accounting.lastVerifiedSubtotal
+            $unkFailurePath = [string]$unkFacts.Facts.accounting.unresolvedFailure.receipt.path
+            $unkFailureSha = [string]$unkFacts.Facts.accounting.unresolvedFailure.receipt.sha256
         } else {
             if ($receipt.schemaVersion -cne 'OperationalRunReceipt/v6' -or $receipt.status -cne 'AWAITING_CONTROLLER') { throw "UNKNOWN-history continuation requires a v6 AWAITING_CONTROLLER receipt." }
             $unkFacts = Get-ManagedObserveUnknownContinuationFacts -Evidence $receipt.observeUnknownContinuationEvidence
@@ -451,7 +485,7 @@ $sw = [Diagnostics.Stopwatch]::StartNew()
         if (-not ($usedFacts -is [int] -or $usedFacts -is [long]) -or [long]$usedFacts -ne [long]$receipt.budget.usedOutputTokens -or [long]$usedFacts -ne [long]$capture.binding.cumulativeOutput) { throw "OBSERVE_ONLY cumulative output mismatch." }
     }
     if ($receipt.status -ne 'AWAITING_CONTROLLER') {
-        if (-not (($blockedAdmit -and $receipt.schemaVersion -ceq 'OperationalRunReceipt/v2' -and $receipt.status -ceq 'BLOCKED') -or ($unknownMode -and $receiptIsFailedRoot -and $receipt.schemaVersion -ceq 'OperationalRunReceipt/v5' -and $receipt.status -ceq 'FAILED'))) { throw "Receipt status must be AWAITING_CONTROLLER." }
+        if (-not (($blockedAdmit -and $receipt.schemaVersion -ceq 'OperationalRunReceipt/v2' -and $receipt.status -ceq 'BLOCKED') -or ($unknownMode -and $receiptIsFailedRoot -and $receipt.schemaVersion -ceq 'OperationalRunReceipt/v5' -and $receipt.status -ceq 'FAILED') -or ($unknownMode -and $receiptIsUnkFailed -and $receipt.schemaVersion -ceq 'OperationalRunReceipt/v7' -and $receipt.status -ceq 'FAILED'))) { throw "Receipt status must be AWAITING_CONTROLLER." }
     }
 
     $sha256 = [System.Security.Cryptography.SHA256]::Create()

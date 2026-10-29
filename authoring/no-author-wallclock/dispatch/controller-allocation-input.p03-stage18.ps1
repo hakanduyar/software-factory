@@ -90,7 +90,8 @@ function Get-ControllerAllocationInputBinding {
                 $unkSchema = & $cget $receipt 'schemaVersion'
                 $unkIsV5 = ($unkSchema -is [string]) -and ($unkSchema -ceq 'OperationalRunReceipt/v5')
                 $unkIsV6 = ($unkSchema -is [string]) -and ($unkSchema -ceq 'OperationalRunReceipt/v6')
-                if (-not ($unkIsV5 -or $unkIsV6)) { & $fail }
+                $unkIsV7 = ($unkSchema -is [string]) -and ($unkSchema -ceq 'OperationalRunReceipt/v7')
+                if (-not ($unkIsV5 -or $unkIsV6 -or $unkIsV7)) { & $fail }
                 if (-not (Test-OperationalReceipt $receipt)) { & $fail }
                 if ((& $cget $receipt 'outputStopMode') -cne 'OBSERVE_ONLY') { & $fail }
                 $historyVerified = & $cget $receipt 'historyVerified'
@@ -109,6 +110,18 @@ function Get-ControllerAllocationInputBinding {
                     $unkCur = $unkFacts.evidence.current
                     $unkRecapture = Get-ManagedNativeCapturedFacts -ManifestPath $unkCur.manifestPath -ExpectedManifestSha256 $unkCur.manifestSha256 -TerminalPath $unkCur.terminalPath -ExpectedTerminalSha256 $unkCur.terminalSha256 -TicketPath $unkCur.ticketPath -RunId $unkCur.runId -Attempt ([int][long]$unkCur.attempt) -ForFailedTransportObservation
                     $unkWantCode = 'OBSERVE_ONLY_FAILED_TRANSPORT_CAPTURE'
+                } elseif ($unkIsV7) {
+                    # An authenticated v7 FAILED receipt is a valid immediate parent as admitted; it stays failed evidence and keeps the original unresolved failed root.
+                    if ((& $cget $receipt 'status') -cne 'FAILED') { & $fail }
+                    $unkRes = Get-ManagedObserveUnknownFailedFacts -Evidence (& $cget $receipt 'observeUnknownFailedEvidence')
+                    if ($null -eq $unkRes -or $unkRes.Valid -isnot [bool] -or -not $unkRes.Valid -or $null -eq $unkRes.Facts) { & $fail }
+                    $unkFacts = $unkRes.Facts
+                    $unkSubtotal = $unkFacts.accounting.lastVerifiedSubtotal
+                    $unkFailurePath = [string]$unkFacts.accounting.unresolvedFailure.receipt.path
+                    $unkFailureSha = [string]$unkFacts.accounting.unresolvedFailure.receipt.sha256
+                    $unkCur = $unkFacts.evidence.current
+                    $unkRecapture = Get-ManagedNativeCapturedFacts -ManifestPath $unkCur.manifestPath -ExpectedManifestSha256 $unkCur.manifestSha256 -TerminalPath $unkCur.terminalPath -ExpectedTerminalSha256 $unkCur.terminalSha256 -TicketPath $unkCur.ticketPath -RunId $unkCur.runId -Attempt ([int][long]$unkCur.attempt) -ForUnknownFailedObservation
+                    $unkWantCode = 'OBSERVE_ONLY_UNKNOWN_FAILED_CAPTURE'
                 } else {
                     if ((& $cget $receipt 'status') -cne 'AWAITING_CONTROLLER') { & $fail }
                     $unkRes = Get-ManagedObserveUnknownContinuationFacts -Evidence (& $cget $receipt 'observeUnknownContinuationEvidence')
