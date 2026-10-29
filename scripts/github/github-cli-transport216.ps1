@@ -225,7 +225,7 @@ function New-GitHubCliLifecycleTransport216 {
     $fb = $bad
     try {
       if ($Operation -isnot [string] -or $Request -isnot [hashtable]) { return $bad }
-      if ($Operation -cnotin @('FIND', 'CREATE', 'READ', 'EDIT')) { return $bad }
+      if ($Operation -cnotin @('FIND', 'CREATE', 'READ', 'EDIT', 'CLOSE')) { return $bad }
       if ($Operation -ceq 'FIND') { $fb = $badFind }
       if (-not $Request.ContainsKey('repo') -or $Request['repo'] -isnot [string] -or $Request['repo'] -cne $repoName) { return $fb }
 
@@ -260,7 +260,9 @@ function New-GitHubCliLifecycleTransport216 {
         $true
       }
       $createOk = {
-        param($title, $body)
+        # $terminal admits Next action NONE only together with Status ACCEPTED_SCOPED, and only
+        # for the verified-complete EDIT after-body and CLOSE; CREATE never passes it.
+        param($title, $body, [bool]$terminal = $false)
         if (-not (& $textOk $title 1 160)) { return $false }
         if ($body -isnot [string]) { return $false }
         $ln = $body.Split($nl)
@@ -274,7 +276,7 @@ function New-GitHubCliLifecycleTransport216 {
         $ver = 0L
         if (-not [long]::TryParse($ln[4].Substring(9), [ref]$ver)) { return $false }
         if (-not $ln[5].StartsWith('Status: ', [System.StringComparison]::Ordinal) -or $ln[5].Substring(8) -cnotin @('IN_PROGRESS', 'WAITING_FOR_REVIEW', 'BLOCKED', 'ACCEPTED_SCOPED')) { return $false }
-        if (-not $ln[6].StartsWith('Next action: ', [System.StringComparison]::Ordinal) -or $ln[6].Substring(13) -cnotin @('RUN_FOCUSED_CHECKS', 'INDEPENDENT_REVIEW', 'RESUME_AUTHORIZED_WORK', 'WAIT_FOR_DEPENDENCY')) { return $false }
+        if (-not $ln[6].StartsWith('Next action: ', [System.StringComparison]::Ordinal) -or ($ln[6].Substring(13) -cnotin @('RUN_FOCUSED_CHECKS', 'INDEPENDENT_REVIEW', 'RESUME_AUTHORIZED_WORK', 'WAIT_FOR_DEPENDENCY') -and -not ($terminal -and $ln[6].Substring(13) -ceq 'NONE' -and $ln[5].Substring(8) -ceq 'ACCEPTED_SCOPED'))) { return $false }
         if (-not $ln[7].StartsWith('Summary: ', [System.StringComparison]::Ordinal) -or -not (& $textOk $ln[7].Substring(9) 0 512)) { return $false }
         $true
       }
@@ -340,7 +342,7 @@ function New-GitHubCliLifecycleTransport216 {
           if ($matches.Count -ne 1 -or $b.IndexOf($marker,[StringComparison]::Ordinal) -gt $matches[0].Index) { return $bad }
           $regions += $matches[0]
         }
-        if (-not (& $createOk $Request.title ($marker + "`n`n" + $regions[1].Value))) { return $bad }
+        if (-not (& $createOk $Request.title ($marker + "`n`n" + $regions[1].Value) $true)) { return $bad }
         if (-not (& $createOk $Request.beforeTitle ($marker + "`n`n" + $regions[0].Value))) { return $bad }
         if ($Request.body -cne ($Request.beforeBody.Substring(0,$regions[0].Index) + $regions[1].Value + $Request.beforeBody.Substring($regions[0].Index+$regions[0].Length))) { return $bad }
         $oldVersion = [long]([regex]::Match($regions[0].Value,'(?m)^Version: ([0-9]+)$').Groups[1].Value)
@@ -369,6 +371,42 @@ function New-GitHubCliLifecycleTransport216 {
           if ($null -eq $result) { return (& $failWith $bad) }
           return [pscustomobject]@{ok=$true; number=[int]$n; url=($urlBase+[string]$n)}
         } finally { if ([IO.File]::Exists($path)) { [IO.File]::Delete($path) } }
+      }
+      # CLOSE is an exact compare-before-write transition of one mapped issue. The caller
+      # passes the complete desired terminal title/body; the issue must be OPEN and already
+      # carry exactly that content. It never reopens, creates, searches or retries.
+      if ($Operation -ceq 'CLOSE') {
+        if ($Request.Count -ne 5) { return $bad }
+        foreach ($k in @('issueNumber','title','body','taskId')) { if (-not $Request.ContainsKey($k)) { return $bad } }
+        $n = $Request.issueNumber
+        if (-not ($n -is [int] -or $n -is [long]) -or $n -lt 1 -or $n -gt 2147483647) { return $bad }
+        if ($Request.taskId -isnot [string] -or $Request.taskId -cnotmatch $idRx) { return $bad }
+        $marker = '<!-- factory-task-' + (& $sha $Request.taskId) + ' -->'
+        $rx = '(?m)^<!-- factory-task-status:start -->\nTask: ' + [regex]::Escape($Request.taskId) + '\n[^\r]*?\n<!-- factory-task-status:end -->(?=\n|\z)'
+        $b = $Request.body
+        if ($b -isnot [string] -or [Text.Encoding]::UTF8.GetByteCount($b) -gt 1048576 -or $b.Contains("`r")) { return $bad }
+        if ([regex]::Matches($b,[regex]::Escape($marker)).Count -ne 1 -or [regex]::Matches($b,'<!-- factory-task-status:start -->').Count -ne 1 -or [regex]::Matches($b,'<!-- factory-task-status:end -->').Count -ne 1) { return $bad }
+        $matches = [regex]::Matches($b,$rx)
+        if ($matches.Count -ne 1 -or $b.IndexOf($marker,[StringComparison]::Ordinal) -gt $matches[0].Index) { return $bad }
+        if (-not (& $createOk $Request.title ($marker + "`n`n" + $matches[0].Value) $true)) { return $bad }
+        if ($matches[0].Value -cnotmatch '(?m)^Status: ACCEPTED_SCOPED\nNext action: NONE\n') { return $bad }
+        $read = & $exec @('issue','view',[string]$n,'--repo',$repoName,'--json','number,url,state,title,body')
+        if ($null -eq $read) { return (& $failWith $bad) }
+        $doc = $null
+        try {
+          $doc = [Text.Json.JsonDocument]::Parse($read.stdout,$jopts)
+          if ($doc.RootElement.ValueKind -ne $kObj) { return $bad }
+          $current = & $props $doc.RootElement
+          if ($null -eq $current -or $current.Count -ne 5) { return $bad }
+          foreach ($k in @('number','url','state','title','body')) { if (-not $current.ContainsKey($k)) { return $bad } }
+          $actualNumber = 0
+          if ($current.number.ValueKind -ne $kNum -or -not $current.number.TryGetInt32([ref]$actualNumber) -or $actualNumber -ne $n) { return $bad }
+          foreach ($k in @('url','state','title','body')) { if ($current[$k].ValueKind -ne $kStr) { return $bad } }
+          if ($current.url.GetString() -cne ($urlBase+[string]$n) -or $current.state.GetString() -cne 'OPEN' -or $current.title.GetString() -cne $Request.title -or $current.body.GetString() -cne $Request.body) { return $bad }
+        } finally { if ($null -ne $doc) { $doc.Dispose() } }
+        $result = & $exec @('issue','close',[string]$n,'--repo',$repoName,'--reason','completed')
+        if ($null -eq $result) { return (& $failWith $bad) }
+        return [pscustomobject]@{ok=$true; operation='CLOSE'; number=[int]$n; url=($urlBase+[string]$n)}
       }
       if ($Operation -ceq 'READ') {
         if ($Request.Count -ne 2 -or -not $Request.ContainsKey('issueNumber')) { return $bad }

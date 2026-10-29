@@ -53,7 +53,7 @@ function New-TaskLifecycleMirrorPacket {
      $Fields.idempotencyKey -isnot [string] -or $Fields.idempotencyKey -cnotmatch '^[A-Za-z0-9._:-]{1,128}\z' -or
      -not ($Fields.canonicalRevision -is [int] -or $Fields.canonicalRevision -is [long]) -or $Fields.canonicalRevision -lt 1 -or
      $Fields.eventType -cnotin @('CREATE','UPDATE','COMPLETE') -or $Fields.publicStatus -cnotin @('IN_PROGRESS','WAITING_FOR_REVIEW','BLOCKED','ACCEPTED_SCOPED') -or
-     $Fields.nextAction -cnotin @('RUN_FOCUSED_CHECKS','INDEPENDENT_REVIEW','RESUME_AUTHORIZED_WORK','WAIT_FOR_DEPENDENCY')){throw 'PACKET_INVALID'}
+     ($Fields.nextAction -cnotin @('RUN_FOCUSED_CHECKS','INDEPENDENT_REVIEW','RESUME_AUTHORIZED_WORK','WAIT_FOR_DEPENDENCY') -and -not ($Fields.eventType -ceq 'COMPLETE' -and $Fields.nextAction -ceq 'NONE'))){throw 'PACKET_INVALID'}
   if($Fields.destinations -isnot [array] -or $Fields.destinations.Count -ne 2 -or $Fields.destinations[0] -cne 'github' -or $Fields.destinations[1] -cne 'note'){throw 'DESTINATIONS_INVALID'}
   $cred='(?i)sk-[A-Za-z0-9]{8}|ghp|github pat|access token|refresh token|oauth token|bearer|password|secret|api key|(?<![A-Za-z0-9])[A-Za-z0-9]{32,}(?![A-Za-z0-9])|\.factory-data|\b(?:windows|users|home)\b'
   foreach($item in @(@($Fields.publicTitle,1,160),@($Fields.publicSummary,0,512))){
@@ -78,7 +78,8 @@ function Set-LifecycleRegion {
   $Body.Substring(0,$m[0].Index)+$Region+$Body.Substring($m[0].Index+$m[0].Length)
 }
 function Set-LifecycleNoteFields {
-  param([string]$Before,$Packet,$Mapping)
+  param([string]$Before,$Packet,$Mapping,[switch]$Terminal)
+  # -Terminal is used only by the COMPLETE entrypoint: it also writes Issue state CLOSED.
   # Existing notes own only these generated header fields inside their task
   # markers. H1, frozen acceptance criteria and prose are byte preserved.
   $nl=if($Before.Contains("`r`n")){"`r`n"}else{"`n"}
@@ -106,7 +107,7 @@ function Set-LifecycleNoteFields {
     if($count -ne $expected){throw 'NOTE_DUPLICATE_FIELD'}
   }
   $oldHeader=($lines[0..($headerCount-1)] -join $nl)
-  $newHeader=@(('Task: '+$Packet.taskId),('Status: '+$Packet.publicStatus),('GitHub: '+$Mapping.url),'Issue state: OPEN',('Canonical version: '+$Packet.canonicalRevision),('Next action: '+$Packet.nextAction),('Title: '+$Packet.publicTitle),('Summary: '+$Packet.publicSummary)) -join $nl
+  $newHeader=@(('Task: '+$Packet.taskId),('Status: '+$Packet.publicStatus),('GitHub: '+$Mapping.url),$(if($Terminal){'Issue state: CLOSED'}else{'Issue state: OPEN'}),('Canonical version: '+$Packet.canonicalRevision),('Next action: '+$Packet.nextAction),('Title: '+$Packet.publicTitle),('Summary: '+$Packet.publicSummary)) -join $nl
   $Before.Substring(0,$offset)+$newHeader+$Before.Substring($offset+$oldHeader.Length)
 }
 function Write-LifecycleAtomic {
@@ -557,6 +558,242 @@ function Invoke-AdmittedTaskLifecycleUpdate {
         if($null -ne $rec){$out['failure']=$rec}
       }
     }
+    return [pscustomobject]$out
+  }finally{if($publisherLease){$publisherLease.Dispose()};if($canonicalLease){$canonicalLease.Dispose()}}
+}
+
+# ---------------------------------------------------------------------------------
+# Verified auto-close (COMPLETE) capability. Opt-in and separate from the UPDATE
+# entrypoint above: own release/review/native schemas, own journal file. Nothing here
+# issues approval or authenticates external facts; the exact host invocation must be
+# admitted by a human, and the pinned receipts are only as true as their external
+# independent reviewer made them (origin and task/revision/candidate mapping).
+# ---------------------------------------------------------------------------------
+function Test-LifecycleStr { param($Value,[string]$Expected) return ($Value -is [string] -and [string]::Equals($Value,$Expected,[StringComparison]::Ordinal)) }
+function Test-LifecyclePositiveInt { param($Value) return ((Test-LifecycleIntegral $Value) -and [long]$Value -ge 1 -and [long]$Value -le $script:LifecycleSafeInteger) }
+function Test-LifecycleCommit { param($Value) return ($Value -is [string] -and $Value -cmatch '^[0-9a-f]{40}\z' -and $Value -cne ('0'*40)) }
+function Get-LifecycleReceiptField {
+  # Exact-case presence is required; descriptive extra fields are inert.
+  param($Receipt,[string]$Name)
+  if($Receipt -isnot [hashtable] -or @($Receipt.Keys) -cnotcontains $Name){throw 'RECEIPT_INVALID'}
+  return $Receipt[$Name]
+}
+function Read-LifecycleCompletionProof {
+  # LifecycleCompletionProof/v1. Re-authenticates both receipt pins on every call and
+  # returns a normalized value so a later call can be compared for drift.
+  param($Pin,$Packet)
+  Assert-LifecyclePin $Pin
+  $o=Read-LifecycleJson $Pin.path
+  try{Assert-LifecycleKeys $o @('schema','taskId','canonicalRevision','candidateCommit','minimumFocusedTests','sourceReview','delivery')}catch{throw 'PROOF_INVALID'}
+  if(-not (Test-LifecycleStr $o.schema 'LifecycleCompletionProof/v1')){throw 'PROOF_INVALID'}
+  if(-not (Test-LifecycleStr $o.taskId $Packet.taskId) -or -not (Test-LifecyclePositiveInt $o.canonicalRevision) -or [long]$o.canonicalRevision -ne [long]$Packet.canonicalRevision){throw 'PROOF_BINDING'}
+  if(-not (Test-LifecycleCommit $o.candidateCommit) -or -not (Test-LifecyclePositiveInt $o.minimumFocusedTests)){throw 'PROOF_INVALID'}
+  Assert-LifecyclePin $o.sourceReview
+  Assert-LifecyclePin $o.delivery
+  if($o.sourceReview.path -ceq $o.delivery.path){throw 'PROOF_INVALID'}
+  $rv=Read-LifecycleJson $o.sourceReview.path
+  $dv=Read-LifecycleJson $o.delivery.path
+  if(-not (Test-LifecycleStr (Get-LifecycleReceiptField $rv 'schema') 'IndependentComponentReview/v1') -or -not (Test-LifecycleStr (Get-LifecycleReceiptField $dv 'schema') 'IndependentDeliveryReceipt/v1')){throw 'RECEIPT_UNSUPPORTED'}
+  $rvCommit=Get-LifecycleReceiptField $rv 'commit'
+  if(-not (Test-LifecycleStr (Get-LifecycleReceiptField $rv 'decision') 'ACCEPT_SCOPED_SOURCE') -or -not (Test-LifecycleCommit $rvCommit)){throw 'RECEIPT_INVALID'}
+  $head=Get-LifecycleReceiptField $dv 'head'; $merge=Get-LifecycleReceiptField $dv 'merge'; $pr=Get-LifecycleReceiptField $dv 'pr'
+  $checks=Get-LifecycleReceiptField $dv 'checks'; $focused=Get-LifecycleReceiptField $dv 'focusedTests'
+  if(-not (Test-LifecycleCommit $head) -or -not (Test-LifecycleCommit $merge) -or $pr -isnot [string] -or $pr -cnotmatch '^https://github\.com/hakanduyar/software-factory/pull/[1-9][0-9]{0,8}\z'){throw 'RECEIPT_INVALID'}
+  if(-not (Test-LifecycleStr (Get-LifecycleReceiptField $dv 'requiredChecks') 'ALL_SUCCESS') -or -not (Test-LifecycleStr (Get-LifecycleReceiptField $dv 'normalTypecheck') 'PASS') -or -not (Test-LifecycleStr (Get-LifecycleReceiptField $dv 'normalBuild') 'PASS')){throw 'RECEIPT_INVALID'}
+  if(-not (Test-LifecyclePositiveInt $checks) -or -not (Test-LifecyclePositiveInt $focused)){throw 'RECEIPT_INVALID'}
+  if(-not (Test-LifecycleStr (Get-LifecycleReceiptField $dv 'sourceReviewSha256') $o.sourceReview.sha256)){throw 'PROOF_MISMATCH'}
+  if($head -cne $rvCommit -or $rvCommit -cne $o.candidateCommit){throw 'PROOF_MISMATCH'}
+  if([long]$focused -lt [long]$o.minimumFocusedTests){throw 'PROOF_TESTS_INSUFFICIENT'}
+  return [ordered]@{taskId=[string]$o.taskId;canonicalRevision=[long]$o.canonicalRevision;candidateCommit=[string]$o.candidateCommit;minimumFocusedTests=[long]$o.minimumFocusedTests;sourceReviewSha256=[string]$o.sourceReview.sha256;deliverySha256=[string]$o.delivery.sha256;merge=[string]$merge;pr=[string]$pr;checks=[long]$checks;focusedTests=[long]$focused;proofSha256=(Get-LifecycleFileHash $Pin.path)}
+}
+function Test-LifecycleCompleteBinding {
+  # Shared admission-document binding to the exact release/packet/proof.
+  param($Doc,$Release,$Packet,$Proof)
+  return ((Test-LifecycleStr $Doc.completionProofSha256 $Release.completionProof.sha256) -and (Test-LifecycleStr $Doc.taskId $Packet.taskId) -and (Test-LifecyclePositiveInt $Doc.canonicalRevision) -and [long]$Doc.canonicalRevision -eq [long]$Packet.canonicalRevision -and (Test-LifecycleStr $Doc.candidateCommit $Proof.candidateCommit))
+}
+function Assert-LifecycleCompleteEvent {
+  # Exact LifecycleCompleteJournal/v1 event; a valid record never grants permission.
+  param($E)
+  try{
+    Assert-LifecycleKeys $E @('taskId','canonicalRevision','digest','proofSha256','editSent','editAck','closeSent','closeAck','noteSent','noteAck')
+    if($E.taskId -isnot [string] -or -not (Test-LifecyclePositiveInt $E.canonicalRevision) -or $E.digest -isnot [string] -or $E.digest -cnotmatch '^[0-9a-f]{64}\z' -or $E.proofSha256 -isnot [string] -or $E.proofSha256 -cnotmatch '^[0-9a-f]{64}\z'){throw 'x'}
+    foreach($k in @('editSent','editAck','closeSent','closeAck','noteSent','noteAck')){if($E[$k] -isnot [bool]){throw 'x'}}
+  }catch{throw 'JOURNAL_CORRUPT'}
+}
+function Invoke-DurableGitHubTaskComplete {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)][string]$ReleasePath,
+    [Parameter(Mandatory)][string]$ExpectedReleaseSha256,
+    [Parameter(Mandatory)][string]$ExpectedReviewSha256,
+    [Parameter(Mandatory)][string]$ExpectedNativeRequestSha256,
+    [Parameter(Mandatory)][string]$ReconcilePath,
+    [scriptblock]$ProcessRunner
+  )
+  # Separate from Invoke-AdmittedTaskLifecycleUpdate: UPDATE packets never reach here
+  # and a COMPLETE packet never reaches there. No approval boolean, scheduler or retry.
+  $ErrorActionPreference='Stop'; $canonicalLease=$null; $publisherLease=$null
+  $phase='PREFLIGHT'; $diagBox=@{v=$null}
+  try {
+    foreach($h in @($ExpectedReleaseSha256,$ExpectedReviewSha256,$ExpectedNativeRequestSha256)){if($h -cnotmatch '^[0-9a-f]{64}\z'){throw 'ADMISSION_PIN_MISSING'}}
+    Assert-LifecyclePath $ReleasePath ''
+    if((Get-LifecycleFileHash $ReleasePath) -cne $ExpectedReleaseSha256){throw 'RELEASE_DRIFT'}
+    $r=Read-LifecycleJson $ReleasePath
+    Assert-LifecycleKeys $r @('schema','packet','canonical','mapping','beforeIssue','beforeNote','review','nativeRequest','consumer','transport','executable','completionProof','stateDir','vaultRoot','notePath','outboxPath','journalPath','canonicalLease','publisherLease','tempRoot','outboxSha256','recovery')
+    if(-not (Test-LifecycleStr $r.schema 'TaskLifecycleCompleteRelease/v1') -or $r.recovery -isnot [string] -or $r.recovery -cnotin @('INITIAL','RECONCILE_MISSING')){throw 'RELEASE_INVALID'}
+    $pinKeys=@('packet','canonical','mapping','beforeIssue','beforeNote','review','nativeRequest','consumer','transport','executable','completionProof')
+    foreach($k in $pinKeys){Assert-LifecyclePin $r[$k]}
+    if($r.consumer.path -cne $script:LifecycleConsumerSource -or $r.transport.path -cne (Join-Path (Split-Path $script:LifecycleConsumerSource) 'github-cli-transport216.ps1')){throw 'SOURCE_BINDING'}
+    if($r.review.sha256 -cne $ExpectedReviewSha256 -or $r.nativeRequest.sha256 -cne $ExpectedNativeRequestSha256){throw 'ADMISSION_BINDING'}
+    $p=New-TaskLifecycleMirrorPacket (Read-LifecycleJson $r.packet.path)
+    if($p.eventType -cne 'COMPLETE' -or $p.publicStatus -cne 'ACCEPTED_SCOPED' -or $p.nextAction -cne 'NONE'){throw 'UNSUPPORTED_EVENT'}
+    $proof=Read-LifecycleCompletionProof $r.completionProof $p
+    $proofJson=ConvertTo-Json $proof -Compress
+    $proofNow={ if((ConvertTo-Json (Read-LifecycleCompletionProof $r.completionProof $p) -Compress) -cne $proofJson){throw 'PROOF_DRIFT'} }
+    $review=Read-LifecycleJson $r.review.path
+    Assert-LifecycleKeys $review @('schema','decision','packetSha256','consumerSha256','transportSha256','completionProofSha256','taskId','canonicalRevision','candidateCommit')
+    if(-not (Test-LifecycleStr $review.schema 'LifecycleCompleteIndependentReview/v1') -or -not (Test-LifecycleStr $review.decision 'ADMIT') -or -not (Test-LifecycleStr $review.packetSha256 $r.packet.sha256) -or -not (Test-LifecycleStr $review.consumerSha256 $r.consumer.sha256) -or -not (Test-LifecycleStr $review.transportSha256 $r.transport.sha256) -or -not (Test-LifecycleCompleteBinding $review $r $p $proof)){throw 'REVIEW_BINDING'}
+    $native=Read-LifecycleJson $r.nativeRequest.path
+    Assert-LifecycleKeys $native @('schema','action','packetSha256','reviewSha256','consumerSha256','transportSha256','executableSha256','completionProofSha256','taskId','canonicalRevision','candidateCommit','stateDir','notePath','outboxPath')
+    if(-not (Test-LifecycleStr $native.schema 'LifecycleCompleteNativeRequest/v1') -or -not (Test-LifecycleStr $native.action 'COMPLETE') -or -not (Test-LifecycleStr $native.packetSha256 $r.packet.sha256) -or -not (Test-LifecycleStr $native.reviewSha256 $r.review.sha256) -or -not (Test-LifecycleStr $native.consumerSha256 $r.consumer.sha256) -or -not (Test-LifecycleStr $native.transportSha256 $r.transport.sha256) -or -not (Test-LifecycleStr $native.executableSha256 $r.executable.sha256) -or -not (Test-LifecycleStr $native.stateDir $r.stateDir) -or -not (Test-LifecycleStr $native.notePath $r.notePath) -or -not (Test-LifecycleStr $native.outboxPath $r.outboxPath) -or -not (Test-LifecycleCompleteBinding $native $r $p $proof)){throw 'NATIVE_BINDING'}
+    foreach($dir in @($r.stateDir,$r.vaultRoot,$r.tempRoot)){Assert-LifecyclePath $dir ''; if(-not [IO.Directory]::Exists($dir)){throw 'DIRECTORY_MISSING'}}
+    foreach($path in @($r.outboxPath,$r.journalPath,$r.publisherLease)){Assert-LifecyclePath $path $r.stateDir}
+    Assert-LifecyclePath $r.notePath $r.vaultRoot
+    Assert-LifecyclePath $r.canonicalLease ''
+    # The complete journal is its own file: the UPDATE journal is never read or written here.
+    if($r.publisherLease -cne (Join-Path $r.stateDir 'publisher.lock') -or $r.journalPath -cne (Join-Path $r.stateDir 'lifecycle-complete.journal.json') -or $r.outboxPath -cne (Join-Path $r.stateDir 'outbox.json') -or $r.canonicalLease -cne ($r.canonical.path+'.lock')){throw 'LEASE_BINDING'}
+    Assert-LifecyclePath $ReconcilePath ''
+    if((Get-LifecycleFileHash $ReconcilePath) -cne 'a18d8f1d5ef0ef8bba11580d2cbdabcc60937489195c88d9f406c551a443d4da'){throw 'RECONCILE_DRIFT'}
+    . $ReconcilePath
+    . $r.transport.path
+    try{$canonicalLease=[IO.File]::Open($r.canonicalLease,[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)}catch [IO.IOException]{return [pscustomobject]@{status='LOCKED';code='CANONICAL_LOCKED'}}
+    try{$publisherLease=[IO.File]::Open($r.publisherLease,[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)}catch [IO.IOException]{return [pscustomobject]@{status='LOCKED';code='PUBLISHER_LOCKED'}}
+    # Under both leases: every pin and the whole proof chain are re-authenticated.
+    foreach($k in $pinKeys){Assert-LifecyclePin $r[$k]}
+    & $proofNow
+    if(-not (Test-LifecycleStr $r.outboxSha256 (Get-LifecycleFileHash $r.outboxPath))){throw 'OUTBOX_DRIFT'}
+    $c=Read-LifecycleJson $r.canonical.path
+    Assert-LifecycleKeys $c @('taskId','canonicalRevision','publicTitle','publicSummary','publicStatus','nextAction')
+    foreach($k in @($c.Keys)){if($c[$k] -cne $p[$k]){throw 'CANONICAL_DRIFT'}}
+    $map=Read-LifecycleJson $r.mapping.path
+    Assert-LifecycleKeys $map @('taskId','repo','issueNumber','url','stableMarker','canonicalRevision')
+    $marker='factory-task-'+(Get-LifecycleHash ([Text.Encoding]::UTF8.GetBytes($p.taskId)))
+    if($map.taskId -cne $p.taskId -or $map.repo -cne 'hakanduyar/software-factory' -or -not($map.issueNumber -is [int] -or $map.issueNumber -is [long]) -or $map.issueNumber -lt 1 -or $map.issueNumber -gt 2147483647 -or $map.url -cne ('https://github.com/'+$map.repo+'/issues/'+$map.issueNumber) -or $map.stableMarker -cne $marker -or -not($map.canonicalRevision -is [int] -or $map.canonicalRevision -is [long]) -or $map.canonicalRevision -ge $p.canonicalRevision){throw 'MAPPING_INVALID'}
+    $before=Read-LifecycleJson $r.beforeIssue.path
+    Assert-LifecycleKeys $before @('title','body')
+    $afterBody=Set-LifecycleRegion $before.body $p.taskId (Get-LifecycleRegion $p)
+    $beforeNote=[Text.UTF8Encoding]::new($false,$true).GetString([IO.File]::ReadAllBytes($r.beforeNote.path))
+    if(-not $beforeNote.Contains(('GitHub: '+$map.url),[StringComparison]::Ordinal)){throw 'NOTE_MAPPING'}
+    $afterNote=Set-LifecycleNoteFields $beforeNote $p $map -Terminal
+    $oldRegion=[regex]::Match($before.body,'(?m)^<!-- factory-task-status:start -->\n[^\r]*?\n<!-- factory-task-status:end -->(?=\n|\z)').Value
+    $oldLines=$oldRegion.Split("`n")
+    if($oldLines.Count -ne 7 -or $oldLines[2] -cne ('Version: '+$map.canonicalRevision) -or -not $oldLines[3].StartsWith('Status: ',[StringComparison]::Ordinal) -or -not $oldLines[4].StartsWith('Next action: ',[StringComparison]::Ordinal) -or -not $oldLines[5].StartsWith('Summary: ',[StringComparison]::Ordinal)){throw 'BEFORE_VERSION_INVALID'}
+    # The before projection is validated as a non-terminal UPDATE-style state (no NONE).
+    $oldPacket=$p.Clone();$oldPacket.eventType='UPDATE';$oldPacket.canonicalRevision=$map.canonicalRevision;$oldPacket.publicTitle=$before.title
+    $oldPacket.publicStatus=$oldLines[3].Substring(8);$oldPacket.nextAction=$oldLines[4].Substring(13);$oldPacket.publicSummary=$oldLines[5].Substring(9)
+    [void](New-TaskLifecycleMirrorPacket $oldPacket)
+    if((Get-LifecycleRegion $oldPacket) -cne $oldRegion){throw 'BEFORE_REGION_MISMATCH'}
+    $noteAfterSha=Get-LifecycleHash ([Text.UTF8Encoding]::new($false,$true).GetBytes($afterNote))
+    $digest=Get-LifecycleHash ([Text.Encoding]::UTF8.GetBytes(($c | ConvertTo-Json -Depth 8 -Compress)))
+    $events=@(Read-Outbox $r.outboxPath)
+    $j=@{schema='LifecycleCompleteJournal/v1';events=@{};heads=@{}}
+    if(Test-Path -LiteralPath $r.journalPath){
+      $j=Read-LifecycleJson $r.journalPath
+      Assert-LifecycleKeys $j @('schema','events','heads')
+      if(-not (Test-LifecycleStr $j.schema 'LifecycleCompleteJournal/v1') -or $j.events -isnot [hashtable] -or $j.heads -isnot [hashtable]){throw 'JOURNAL_CORRUPT'}
+      foreach($hk in @($j.heads.Keys)){try{Assert-LifecycleKeys $j.heads[$hk] @('revision','digest')}catch{throw 'JOURNAL_CORRUPT'}}
+    }
+    $id=$p.idempotencyKey
+    # Unrelated events are validated, never rewritten into another shape.
+    foreach($k in @($j.events.Keys)){if($k -cne $id){Assert-LifecycleCompleteEvent $j.events[$k]}}
+    $head=$j.heads[$p.taskId]
+    if($null -ne $head -and ($p.canonicalRevision -lt $head['revision'] -or ($p.canonicalRevision -eq $head['revision'] -and $head['digest'] -cne $digest))){throw 'REVISION_CONFLICT'}
+    $e=$j.events[$id]
+    if($null -ne $e){
+      Assert-LifecycleCompleteEvent $e
+      if($e.digest -cne $digest -or $e.taskId -cne $p.taskId -or [long]$e.canonicalRevision -ne [long]$p.canonicalRevision){throw 'KEY_PAYLOAD_DRIFT'}
+      if($e.proofSha256 -cne $proof.proofSha256){throw 'PROOF_STATE_DRIFT'}
+    } elseif($r.recovery -cne 'INITIAL'){throw 'RECOVERY_WITHOUT_EVENT'}
+    if($null -eq $e){
+      $e=@{taskId=[string]$p.taskId;canonicalRevision=[long]$p.canonicalRevision;digest=$digest;proofSha256=[string]$proof.proofSha256;editSent=$false;editAck=$false;closeSent=$false;closeAck=$false;noteSent=$false;noteAck=$false}
+      $j.events[$id]=$e
+    }
+    $keys=@{}
+    foreach($dest in @('github','note')){
+      $key=Get-EventKey -TaskId $p.taskId -PayloadSha256 $digest -RunId ($id+':complete:'+$dest) -Status 'AWAITING_CONTROLLER' -Attempt 0
+      $keys[$dest]=$key
+      $existing=@($events|Where-Object {$_.key -ceq $key})
+      if($existing.Count -gt 0 -and $existing[0].PSObject.Properties.Name -contains 'retryPolicy' -and $existing[0].retryPolicy -ceq 'NO_RETRY'){throw 'EXCLUDED_NO_RETRY'}
+    }
+    $transport=New-GitHubCliLifecycleTransport216 -GhPath $r.executable.path -ExpectedGhSha256 $r.executable.sha256 -Repository $map.repo -TempRoot $r.tempRoot -ProcessRunner $ProcessRunner
+    $saveJournal={Write-LifecycleAtomic $r.journalPath ([Text.Encoding]::UTF8.GetBytes(($j|ConvertTo-Json -Depth 12 -Compress)))}
+    $read={
+      $rr=& $transport 'READ' @{repo=$map.repo;issueNumber=$map.issueNumber}
+      if($null -eq $rr -or $rr.ok -isnot [bool] -or -not $rr.ok){$diagBox.v=Get-LifecycleTransportDiagnostic $rr;throw 'GITHUB_READ_FAILED'}
+      if($rr.number -ne $map.issueNumber -or $rr.url -cne $map.url){throw 'READ_IDENTITY_MISMATCH'}
+      return $rr
+    }
+    $isDesired={param($x) return ($x.title -ceq $p.publicTitle -and $x.body -ceq $afterBody)}
+    $readbackProof={param($x) return ('readback:'+(Get-LifecycleHash ([Text.Encoding]::UTF8.GetBytes($x.state+"`n"+$x.title+"`n"+$x.body))))}
+    $rr=& $read
+    $isOpen=($rr.state -ceq 'OPEN'); $isClosed=($rr.state -ceq 'CLOSED')
+    $contentDesired=[bool](& $isDesired $rr)
+    $contentBefore=($rr.title -ceq $before.title -and $rr.body -ceq $before.body)
+    $noteHash=Get-LifecycleFileHash $r.notePath
+    if(-not (($isOpen -and ($contentDesired -or $contentBefore)) -or ($isClosed -and $contentDesired)) -or ($noteHash -cne $r.beforeNote.sha256 -and $noteHash -cne $noteAfterSha)){throw 'DESTINATION_DRIFT'}
+    $remoteClosed=($isClosed -and $contentDesired)
+    $remoteEdited=($isOpen -and $contentDesired)
+    if(($e.editAck -and -not $contentDesired) -or ($e.closeAck -and -not $remoteClosed) -or ($e.noteAck -and $noteHash -cne $noteAfterSha)){throw 'ACK_DRIFT'}
+    if($null -ne $head -and $p.canonicalRevision -eq $head['revision'] -and $remoteClosed -and $noteHash -ceq $noteAfterSha){return [pscustomobject]@{status='DELIVERED';code='DEBOUNCED';githubAck=$true;noteAck=$true}}
+    if(($e.editSent -or $e.closeSent -or $e.noteSent) -and $r.recovery -cne 'RECONCILE_MISSING'){throw 'EXPLICIT_RECOVERY_REQUIRED'}
+    # A sent marker with no observable effect is never repeated: report pending truth.
+    if($e.closeSent -and $isOpen){return [pscustomobject]@{status='PENDING';code='CLOSE_AMBIGUOUS_NO_RETRY';automaticRetry=$false;githubAck=$false;noteAck=[bool]$e.noteAck}}
+    if($e.editSent -and $isOpen -and $contentBefore){return [pscustomobject]@{status='PENDING';code='EDIT_AMBIGUOUS_NO_RETRY';automaticRetry=$false;githubAck=$false;noteAck=[bool]$e.noteAck}}
+    foreach($dest in @('github','note')){
+      if(@($events|Where-Object {$_.key -ceq $keys[$dest]}).Count -eq 0){$events += [pscustomobject]@{key=$keys[$dest];taskId=$p.taskId;payloadSha256=$digest;runId=($id+':complete:'+$dest);destination=$dest;status='AWAITING_CONTROLLER';attempt=0;deliveryStatus='PENDING';proof=$null}}
+    }
+    $ackGithub={param($x) $e.closeAck=$true; foreach($row in $events){if($row.key -ceq $keys['github']){$row.deliveryStatus='DELIVERED';$row.proof=(& $readbackProof $x)}}; Write-OutboxAtomic $r.outboxPath $events; & $saveJournal}
+    $ackNote={$e.noteAck=$true; foreach($row in $events){if($row.key -ceq $keys['note']){$row.deliveryStatus='DELIVERED';$row.proof=('bytes:'+$noteAfterSha)}}; Write-OutboxAtomic $r.outboxPath $events; & $saveJournal}
+    Write-OutboxAtomic $r.outboxPath $events; & $saveJournal
+    $phase='DELIVERY'
+    $fresh={foreach($k in $pinKeys){Assert-LifecyclePin $r[$k]}; & $proofNow}
+    if(-not $remoteEdited -and -not $remoteClosed){
+      & $fresh
+      $e.editSent=$true; & $saveJournal
+      $edited=& $transport 'EDIT' @{repo=$map.repo;issueNumber=$map.issueNumber;taskId=$p.taskId;title=$p.publicTitle;body=$afterBody;beforeTitle=$before.title;beforeBody=$before.body}
+      if($null -eq $edited -or $edited.ok -isnot [bool] -or -not $edited.ok){$diagBox.v=Get-LifecycleTransportDiagnostic $edited;throw 'EDIT_AMBIGUOUS_NO_RETRY'}
+      $rr=& $read
+      if($rr.state -cne 'OPEN' -or -not (& $isDesired $rr)){throw 'EDIT_READBACK_FAILED'}
+    }
+    if(-not $e.editAck){$e.editAck=$true; & $saveJournal}
+    if($remoteClosed){& $ackGithub $rr}
+    else {
+      if($e.closeSent){throw 'CLOSE_AMBIGUOUS_NO_RETRY'}
+      & $fresh
+      $e.closeSent=$true; & $saveJournal
+      $closed=& $transport 'CLOSE' @{repo=$map.repo;issueNumber=$map.issueNumber;taskId=$p.taskId;title=$p.publicTitle;body=$afterBody}
+      if($null -eq $closed -or $closed.ok -isnot [bool] -or -not $closed.ok -or $closed.number -ne $map.issueNumber -or $closed.url -cne $map.url){$diagBox.v=Get-LifecycleTransportDiagnostic $closed;throw 'CLOSE_AMBIGUOUS_NO_RETRY'}
+      $rr=& $read
+      if($rr.state -cne 'CLOSED' -or -not (& $isDesired $rr)){throw 'CLOSE_READBACK_FAILED'}
+      & $ackGithub $rr
+    }
+    if($noteHash -ceq $noteAfterSha){& $ackNote}
+    else {
+      & $fresh; Assert-LifecyclePath $r.notePath $r.vaultRoot
+      if((Get-LifecycleFileHash $r.notePath) -cne $r.beforeNote.sha256){throw 'NOTE_DRIFT'}
+      $e.noteSent=$true; & $saveJournal
+      Write-LifecycleAtomic $r.notePath ([Text.UTF8Encoding]::new($false,$true).GetBytes($afterNote))
+      if((Get-LifecycleFileHash $r.notePath) -cne $noteAfterSha){throw 'NOTE_READBACK_FAILED'}
+      & $ackNote
+    }
+    & $fresh
+    $j.heads[$p.taskId]=@{revision=$p.canonicalRevision;digest=$digest}; & $saveJournal
+    return [pscustomobject]@{status='DELIVERED';code='READBACK_ACK';githubAck=[bool]$e.closeAck;noteAck=[bool]$e.noteAck}
+  }catch{
+    $msg=$_.Exception.Message
+    if($msg -cnotmatch '^[A-Z][A-Z0-9_]{2,63}\z'){$msg='UNKNOWN'}
+    $out=[ordered]@{status=$(if($phase -ceq 'PREFLIGHT'){'REFUSED'}else{'PENDING'});code=$msg;automaticRetry=$false}
+    if($null -ne $diagBox.v){$out['diagnostic']=$diagBox.v}
     return [pscustomobject]$out
   }finally{if($publisherLease){$publisherLease.Dispose()};if($canonicalLease){$canonicalLease.Dispose()}}
 }
