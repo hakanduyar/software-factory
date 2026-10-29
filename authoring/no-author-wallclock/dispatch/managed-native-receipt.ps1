@@ -3929,10 +3929,9 @@ function Get-ManagedObserveUnknownParentChain {
             if ($isFailedNode) {
                 $soFar = New-ManagedUnkChainDto $parentInfo $failureDto $directionDto $nodeDtos $subtotal $extra $receiptPaths
                 $fbase = New-ManagedUnkFailedBase $ape $nc $nb $soFar
-                $vf = Get-ManagedObserveUnknownFailedFacts -Evidence $nd.v7ev -InternalChainBase $fbase
-                if (($null -ne $vf) -and ($null -ne $vf.PSObject.Properties['Status']) -and ($vf.Status -ceq 'UNKNOWN')) { Invoke-ManagedUnkUnknown (Get-ManagedUnkClean $vf.Reason 'ANCESTOR_UNKNOWN') }
-                if (($null -eq $vf) -or ($vf.Valid -isnot [bool]) -or (-not $vf.Valid) -or ($null -eq $vf.Facts)) { Invoke-ManagedUnkRefuse 'UNK_ANCESTOR_RECEIPT' }
-                $nf = $vf.Facts
+                # Structural assembly from a base built only from this routine's own already authenticated older nodes; refusals throw into this routine's catch, and
+                # the retained-chain recheck below (and the callers' later recheck) owns stability. This is not a public success path.
+                $nf = Get-ManagedUnkFailedAssembly -Evidence $nd.v7ev -Base $fbase
                 if (-not (Compare-ManagedObserveUnknownFailedReceiptV7ToFacts $nd.receipt $nf)) { Invoke-ManagedUnkRefuse 'UNK_ANCESTOR_RECEIPT' }
                 $rawRef = Test-ManagedObserveUnknownFailedRawDto -RawPath $rawPath -ExpectedSha256 $rawSha -Facts $nf
             }
@@ -4323,16 +4322,61 @@ function Compare-ManagedObserveUnknownFailedReceiptV7ToFacts {
 }
 
 function Get-ManagedObserveUnknownFailedFacts {
-    # Read-only. Authenticates ONE failed OBSERVE_ONLY native transport (terminal DEADLINE with a finite deadline, or NATURAL_EXIT with a nonzero typed exit and no total author duration) that follows UNKNOWN accounting history: it is
-    # joined to its immediate parent (the failed v5 root or a v6 pending receipt), the unresolved-failure root, the fixed human direction, its registration, its
-    # selected claim and its actual keyed start ACK. The facts preserve the actual failure and the last VERIFIED fully known subtotal; the current, used and
-    # cumulative counts stay UNKNOWN (null, never zero) and no SDK success, completion, dispatch, retry or successor authority is derived. The parent chain is
-    # authenticated by Get-ManagedObserveUnknownContinuationFacts in its failed-current mode. This verifier authenticates referenced data only, never external
-    # human authority.
+    # Read-only. Authenticates ONE failed OBSERVE_ONLY native transport (terminal DEADLINE with a finite deadline, or NATURAL_EXIT with a nonzero typed exit and no total
+    # author duration) that follows UNKNOWN accounting history. Evidence-only: the caller supplies nothing but the evidence DTO. Everything is derived here from pinned
+    # references: the current capture and binding, the parent ancestry back to the unresolved failed v5 root (Get-ManagedObserveUnknownContinuationFacts in its
+    # failed-current mode), and the registration, selected claim, keyed ACK, request and raw bindings. The derivation runs twice and must agree, and every retained
+    # ancestor pin, receipt, raw DTO and capture is rechecked after all other reads before any facts are returned. The facts preserve the actual failure and the last
+    # VERIFIED fully known subtotal; the current, used and cumulative counts stay UNKNOWN (null, never zero) and no SDK success, completion, dispatch, retry or
+    # successor authority is derived. This verifier authenticates referenced data only, never external human authority.
     [CmdletBinding()]
-    # -InternalChainBase is for the shared UNKNOWN parent-chain derivation ONLY: it supplies a base that derivation built bottom-up from its own already authenticated
-    # older nodes, so no parent-chain walk (and no circular trust) happens here. No other caller passes it, and it is never a supplied fact or authority.
-    param([Parameter(Mandatory)][AllowNull()]$Evidence, [AllowNull()]$InternalChainBase = $null)
+    param([Parameter(Mandatory)][AllowNull()]$Evidence)
+    Set-StrictMode -Version Latest
+    $ord = [System.StringComparison]::Ordinal
+    try {
+        $contEv = ConvertTo-ManagedUnkContinuationOfFailed $Evidence
+        $derive = {
+            $r = Get-ManagedObserveUnknownContinuationFacts -Evidence $contEv -FailedCurrent
+            if ((@($r).Count -ne 1) -or ($r -isnot [System.Management.Automation.PSCustomObject])) { Invoke-ManagedUnkRefuse 'OBSUF_BASE_SHAPE' }
+            $valid = Get-ManagedUnkMember $r 'Valid' 'OBSUF_BASE_SHAPE'
+            if ($valid -isnot [bool]) { Invoke-ManagedUnkRefuse 'OBSUF_BASE_SHAPE' }
+            if (-not $valid) {
+                if (($null -ne $r.PSObject.Properties['Status']) -and ($r.Status -ceq 'UNKNOWN')) { Invoke-ManagedUnkUnknown (Get-ManagedUnkClean $r.Reason 'BASE_UNKNOWN') }
+                Invoke-ManagedUnkRefuse (Get-ManagedUnkClean (Get-ManagedUnkMember $r 'Code' 'OBSUF_BASE_SHAPE') 'OBSUF_BASE_REFUSED')
+            }
+            $bs = Get-ManagedUnkMember $r 'Base' 'OBSUF_BASE_SHAPE'
+            if (($bs -isnot [System.Management.Automation.PSCustomObject]) -or ($null -eq $r.ChainRetained) -or ($r.ChainControlRoot -isnot [string])) { Invoke-ManagedUnkRefuse 'OBSUF_BASE_SHAPE' }
+            return , $r
+        }
+        $r1 = & $derive
+        $facts1 = Get-ManagedUnkFailedAssembly -Evidence $Evidence -Base $r1.Base
+        # Second independent derivation after the proof reads: the base and the assembled facts must be identical.
+        $r2 = & $derive
+        if ((ConvertTo-Json -InputObject $r2.Base -Depth 12 -Compress) -cne (ConvertTo-Json -InputObject $r1.Base -Depth 12 -Compress)) { Invoke-ManagedUnkRefuse 'OBSUF_STALE_BASE' }
+        $facts2 = Get-ManagedUnkFailedAssembly -Evidence $Evidence -Base $r2.Base
+        if ((ConvertTo-Json -InputObject $facts2 -Depth 12 -Compress) -cne (ConvertTo-Json -InputObject $facts1 -Depth 12 -Compress)) { Invoke-ManagedUnkRefuse 'OBSUF_STALE_PROOF' }
+        # Full-chain stability AFTER all other reads: every retained ancestor pin, receipt, raw DTO and capture is rechecked before facts escape.
+        Assert-ManagedUnkChainStable $r2.ChainRetained $r2.ChainControlRoot
+        return [pscustomobject]@{ Valid = $true; Code = $null; Result = 'UNKNOWN_FAILED'; Facts = $facts1 }
+    }
+    catch {
+        $m = [string]$_.Exception.Message
+        if ($m.StartsWith('UNKNOWN:', $ord) -and ($m.Length -le 56) -and ($m.Substring(8) -cmatch '^[A-Z0-9_]{1,48}$')) {
+            return [pscustomobject]@{ Valid = $false; Code = 'OBSERVE_UNKNOWN_FAILED_UNKNOWN'; Result = 'NONRECEIPT'; Status = 'UNKNOWN'; Reason = $m.Substring(8); Facts = $null }
+        }
+        $code = 'OBSUF_UNEXPECTED_ERROR'
+        if ($m.StartsWith('REFUSE:', $ord) -and ($m.Length -le 55) -and ($m.Substring(7) -cmatch '^[A-Z0-9_]{1,48}$')) { $code = $m.Substring(7) }
+        return [pscustomobject]@{ Valid = $false; Code = $code; Result = 'REFUSED'; Facts = $null }
+    }
+}
+
+function Get-ManagedUnkFailedAssembly {
+    # INTERNAL structural assembly of the failed (v7) facts for ONE node from an evidence DTO and a base that the parent-chain derivation built bottom-up from its own
+    # already authenticated older nodes. It is NOT a verifier and NOT authority: it returns no Valid/Code wrapper, throws on any refusal, skips no check of the
+    # registration, claim, ACK, request or raw bindings it performs, and performs no ancestry derivation and no final chain stability. Only the parent-chain routine
+    # (which has authenticated the preceding nodes and owns the final retained-chain recheck) and the public Get-ManagedObserveUnknownFailedFacts (which derives the base
+    # itself and owns its own rechecks) call it. No public success path accepts a supplied base.
+    param([Parameter(Mandatory)][AllowNull()]$Evidence, [Parameter(Mandatory)]$Base)
     Set-StrictMode -Version Latest
     $ord = [System.StringComparison]::Ordinal
     $ordIc = [System.StringComparison]::OrdinalIgnoreCase
@@ -4375,7 +4419,7 @@ function Get-ManagedObserveUnknownFailedFacts {
     }
     $refDto = { param($r) [pscustomobject]([ordered]@{ path = [string]$r.path; sha256 = [string]$r.sha256 }) }
 
-    try {
+    if ($true) {
         & $exact $Evidence @('schema', 'current', 'predecessorReceipt', 'unresolvedFailureReceipt', 'humanDirectionRef', 'registrationRef', 'selectedClaimRef', 'acknowledgementsRef') 'OBSUF_EVIDENCE_SHAPE'
         $evSchema = & $get $Evidence 'schema' 'OBSUF_EVIDENCE_SHAPE'
         if (($evSchema -isnot [string]) -or ($evSchema -cne 'ManagedObserveUnknownFailedEvidence/v1')) { & $fail 'OBSUF_EVIDENCE_SCHEMA' }
@@ -4406,23 +4450,7 @@ function Get-ManagedObserveUnknownFailedFacts {
         } catch { & $fail 'OBSUF_SIBLING_UNAVAILABLE' }
 
         # Parent chain + failed current capture: the shared UNKNOWN-continuation derivation in its failed-current mode.
-        $holder = @{ retained = $null; controlRoot = $null }
-        $baseOf = {
-            if ($null -ne $InternalChainBase) { return , $InternalChainBase }
-            $r = Get-ManagedObserveUnknownContinuationFacts -Evidence $contEv -FailedCurrent
-            if ((@($r).Count -ne 1) -or ($r -isnot [System.Management.Automation.PSCustomObject])) { & $fail 'OBSUF_BASE_SHAPE' }
-            $valid = & $get $r 'Valid' 'OBSUF_BASE_SHAPE'
-            if ($valid -isnot [bool]) { & $fail 'OBSUF_BASE_SHAPE' }
-            if (-not $valid) {
-                if (($null -ne $r.PSObject.Properties['Status']) -and ($r.Status -ceq 'UNKNOWN')) { & $unknown (& $clean $r.Reason 'BASE_UNKNOWN') }
-                & $fail (& $clean (& $get $r 'Code' 'OBSUF_BASE_SHAPE') 'OBSUF_BASE_REFUSED')
-            }
-            $bs = & $get $r 'Base' 'OBSUF_BASE_SHAPE'
-            if ($bs -isnot [System.Management.Automation.PSCustomObject]) { & $fail 'OBSUF_BASE_SHAPE' }
-            $holder.retained = $r.ChainRetained
-            $holder.controlRoot = $r.ChainControlRoot
-            return , $bs
-        }
+        $baseOf = { return , $Base }
 
         $claimNames = @('id', 'owner', 'claimId', 'intentId', 'receiptSha', 'planSha', 'statePath')
         $reqNames = @('RunId', 'Attempt', 'TicketPath', 'PayloadPath', 'GateTicketPath', 'SettingsPath', 'ArtifactPath', 'WorkingDirectory', 'Arguments', 'MaxElapsedMs', 'MaxStreamBytes', 'OutputStopProfile')
@@ -4583,12 +4611,7 @@ function Get-ManagedObserveUnknownFailedFacts {
 
         $base1 = & $baseOf
         $proof1 = & $bindAll $base1
-        # ---- stability: the whole parent/capture derivation and every registered record are reauthenticated after all other reads ----
-        $base2 = & $baseOf
-        if ((& $json $base2) -cne (& $json $base1)) { & $fail 'OBSUF_STALE_BASE' }
-        $proof2 = & $bindAll $base2
-        if ((& $json $proof2) -cne (& $json $proof1)) { & $fail 'OBSUF_STALE_PROOF' }
-
+        if ($base1 -isnot [System.Management.Automation.PSCustomObject]) { & $fail 'OBSUF_BASE_SHAPE' }
         $cap = $base1.Capture
         $bnd = $base1.Bound
         $par = $base1.ParentReceipt
@@ -4687,18 +4710,6 @@ function Get-ManagedObserveUnknownFailedFacts {
             inputPaths = @($paths.ToArray())
             noCompletion = $true; noDispatch = $true; noRetry = $true
         })
-        # Full-chain stability AFTER all other processing of this failed node: every retained ancestor pin, receipt, raw DTO and capture is rechecked before facts escape.
-        # (A caller that supplied the chain base performs its own final recheck; this path owns the chain it derived.)
-        if ($null -eq $InternalChainBase) { Assert-ManagedUnkChainStable $holder.retained $holder.controlRoot }
-        return [pscustomobject]@{ Valid = $true; Code = $null; Result = 'UNKNOWN_FAILED'; Facts = $facts }
-    }
-    catch {
-        $m = [string]$_.Exception.Message
-        if ($m.StartsWith('UNKNOWN:', $ord) -and ($m.Length -le 56) -and ($m.Substring(8) -cmatch '^[A-Z0-9_]{1,48}$')) {
-            return [pscustomobject]@{ Valid = $false; Code = 'OBSERVE_UNKNOWN_FAILED_UNKNOWN'; Result = 'NONRECEIPT'; Status = 'UNKNOWN'; Reason = $m.Substring(8); Facts = $null }
-        }
-        $code = 'OBSUF_UNEXPECTED_ERROR'
-        if ($m.StartsWith('REFUSE:', $ord) -and ($m.Length -le 55) -and ($m.Substring(7) -cmatch '^[A-Z0-9_]{1,48}$')) { $code = $m.Substring(7) }
-        return [pscustomobject]@{ Valid = $false; Code = $code; Result = 'REFUSED'; Facts = $null }
+        return $facts
     }
 }
