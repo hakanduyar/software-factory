@@ -164,7 +164,7 @@ describe("sf ollama task: run", () => {
     assert.equal(call.executable, f.args.executable);
     assert.deepEqual(call.argv, ["run", MODEL, "--nowordwrap"]);
     assert.equal(call.timeoutMs, null);
-    assert.equal(call.maxOutputBytes, undefined);
+    assert.equal(call.maxOutputBytes, null);
     assert.ok(call.input?.includes(TASK), "task preserved verbatim in the prompt");
     assert.match(call.input ?? "", /ANALYST/);
     assert.equal(call.env["OLLAMA_HOST"], OLLAMA_ENDPOINT);
