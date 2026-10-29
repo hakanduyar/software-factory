@@ -18,3 +18,6 @@
 
 /scripts/github/enqueue-canonical-lifecycle-complete.ps1 text eol=lf
 /tests/github/canonical-complete-enqueue.tests.ps1 text eol=lf
+
+/scripts/github/enqueue-canonical-lifecycle-update.ps1 text eol=lf
+/tests/github/canonical-update-enqueue.tests.ps1 text eol=lf
