@@ -170,6 +170,16 @@ function ConvertTo-ObserveOnlyPendingReceipt {
     $isInt = { param($v) ($v -is [int]) -or ($v -is [long]) }
     if ($Conflict) { return & $fail 'observe-only accounting evidence incompatible with other evidence parameters' }
     if ($null -eq $Evidence) { return & $fail 'ObserveOnlyAccountingEvidence is null' }
+    # An explicit UNKNOWN-continuation evidence schema selects the v6 branch. The selector is not authority: that branch authenticates the ticket continuation, the
+    # fixed human direction and the whole parent chain itself. Any other evidence keeps the existing v3 route unchanged.
+    $unkSelect = $false
+    if ($Evidence -is [System.Management.Automation.PSCustomObject]) {
+        $unkSchemaProps = @($Evidence.PSObject.Properties | Where-Object { [string]::Equals($_.Name, 'schema', [System.StringComparison]::Ordinal) })
+        if (($unkSchemaProps.Count -eq 1) -and ($unkSchemaProps[0].Value -is [string]) -and ($unkSchemaProps[0].Value -ceq 'ManagedObserveUnknownContinuationEvidence/v1')) { $unkSelect = $true }
+    }
+    if ($unkSelect) {
+        return ConvertTo-ObserveOnlyUnknownPendingReceipt -RawPath $RawPath -TicketPath $TicketPath -UsagePath $UsagePath -RunId $RunId -Attempt $Attempt -MaxAttempts $MaxAttempts -PriorElapsedMs $PriorElapsedMs -MaxElapsedMs $MaxElapsedMs -ReceiptPath $ReceiptPath -Evidence $Evidence -Conflict $Conflict
+    }
     $temp = $null
     try {
         # Trusted stage sibling only; every identity/count below comes from the authenticated facts, never from caller numbers.
@@ -459,6 +469,16 @@ function ConvertTo-ObserveOnlyFailedTransportReceipt {
     $sha = { param([byte[]]$b) [System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($b)).ToLowerInvariant() }
     if ($Conflict) { return & $fail 'observe-only failed transport evidence incompatible with other evidence parameters' }
     if ($null -eq $Evidence) { return & $fail 'ObserveOnlyFailedTransportEvidence is null' }
+    # An explicit UNKNOWN-history failed-evidence schema selects the v7 branch. The selector is not authority: that branch authenticates the ticket continuation, the
+    # fixed human direction, the parent chain, the registration, the claim and the ACK itself. Any other evidence keeps the existing v5 route unchanged.
+    $unkSelect = $false
+    if ($Evidence -is [System.Management.Automation.PSCustomObject]) {
+        $unkSchemaProps = @($Evidence.PSObject.Properties | Where-Object { [string]::Equals($_.Name, 'schema', [System.StringComparison]::Ordinal) })
+        if (($unkSchemaProps.Count -eq 1) -and ($unkSchemaProps[0].Value -is [string]) -and ($unkSchemaProps[0].Value -ceq 'ManagedObserveUnknownFailedEvidence/v1')) { $unkSelect = $true }
+    }
+    if ($unkSelect) {
+        return ConvertTo-ObserveOnlyUnknownFailedReceipt -RawPath $RawPath -TicketPath $TicketPath -UsagePath $UsagePath -RunId $RunId -Attempt $Attempt -MaxAttempts $MaxAttempts -PriorElapsedMs $PriorElapsedMs -MaxElapsedMs $MaxElapsedMs -ReceiptPath $ReceiptPath -Evidence $Evidence -Conflict $Conflict
+    }
     $temp = $null
     try {
         . (Join-Path $PSScriptRoot 'managed-native-receipt.ps1')
@@ -575,6 +595,294 @@ function ConvertTo-ObserveOnlyFailedTransportReceipt {
         }
     }
     catch { return & $fail ('observe-only failed transport receipt failed: ' + $_.Exception.Message) }
+    finally { if (($null -ne $temp) -and [System.IO.File]::Exists($temp)) { try { [System.IO.File]::Delete($temp) } catch { } } }
+}
+
+function ConvertTo-ObserveOnlyUnknownPendingReceipt {
+    # Explicit OBSERVE_ONLY UNKNOWN-history branch: shared authenticated UNKNOWN-continuation facts -> OperationalRunReceipt/v6 (AWAITING_CONTROLLER, pending only).
+    # Every used/cumulative/history total stays null (never 0); the last verified subtotal is separate and a measured per-child count is labelled child-only.
+    # Grants no completion, ACK or dispatch; never runs the whole-stream parser or numeric output-limit casts.
+    param(
+        [Parameter(Mandatory)][string]$RawPath,
+        [Parameter(Mandatory)][string]$TicketPath,
+        [Parameter(Mandatory)][string]$UsagePath,
+        [Parameter(Mandatory)][string]$RunId,
+        [Parameter(Mandatory)][int]$Attempt,
+        [Parameter(Mandatory)][int]$MaxAttempts,
+        [Parameter(Mandatory)][long]$PriorElapsedMs,
+        [Parameter(Mandatory)][AllowNull()][Nullable[long]]$MaxElapsedMs,
+        [Parameter(Mandatory)][string]$ReceiptPath,
+        [AllowNull()][object]$Evidence,
+        [Parameter(Mandatory)][bool]$Conflict
+    )
+    $fail = { param($reason) [PSCustomObject]@{ valid = $false; reason = $reason; rawSha256 = $null; ticketSha256 = $null } }
+    $ord = [System.StringComparison]::OrdinalIgnoreCase
+    $rp = [System.IO.FileAttributes]::ReparsePoint
+    $utf8 = [System.Text.UTF8Encoding]::new($false)
+    $sha = { param([byte[]]$b) [System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($b)).ToLowerInvariant() }
+    $isInt = { param($v) ($v -is [int]) -or ($v -is [long]) }
+    if ($Conflict) { return & $fail 'observe-only accounting evidence incompatible with other evidence parameters' }
+    if ($null -eq $Evidence) { return & $fail 'ObserveOnlyAccountingEvidence is null' }
+    $temp = $null
+    try {
+        # Trusted stage sibling only; every identity/count below comes from the authenticated facts, never from caller numbers.
+        . (Join-Path $PSScriptRoot 'managed-native-receipt.ps1')
+        $vf = Get-ManagedObserveUnknownContinuationFacts -Evidence $Evidence
+        if (($null -eq $vf) -or ($vf.Valid -isnot [bool]) -or (-not $vf.Valid) -or ($null -eq $vf.Facts)) {
+            $vc = if (($null -ne $vf) -and ($vf.PSObject.Properties['Code']) -and ($vf.Code -is [string])) { $vf.Code } else { 'UNKNOWN' }
+            return & $fail ('observe-only unknown continuation refused: ' + $vc)
+        }
+        $f = $vf.Facts
+        $id = $f.identity; $lim = $f.limits; $acct = $f.accounting
+
+        foreach ($p in @($RawPath, $TicketPath, $UsagePath)) {
+            if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { return & $fail "missing input: $p" }
+        }
+        if (($Attempt -lt 1) -or ($MaxAttempts -le 0) -or ($Attempt -gt $MaxAttempts)) { return & $fail 'invalid attempt range' }
+        if (-not [string]::Equals($RunId, [string]$id.runId, [System.StringComparison]::Ordinal)) { return & $fail 'runId does not match authenticated capture' }
+        if (([long]$Attempt -ne [long]$id.attempt) -or ([long]$MaxAttempts -ne [long]$lim.maxAttempts)) { return & $fail 'attempt or maxAttempts does not match authenticated capture' }
+        if ((($null -eq $MaxElapsedMs) -ne ($null -eq $lim.maxElapsedMs)) -or (($null -ne $lim.maxElapsedMs) -and ([long]$MaxElapsedMs -ne [long]$lim.maxElapsedMs)) -or ([long]$PriorElapsedMs -ne [long]$lim.priorElapsedMs)) { return & $fail 'elapsed limits do not match authenticated capture' }
+        $ticketFull = [System.IO.Path]::GetFullPath($TicketPath)
+        $usageFull = [System.IO.Path]::GetFullPath($UsagePath)
+        $rawFull = [System.IO.Path]::GetFullPath($RawPath)
+        $receiptFull = [System.IO.Path]::GetFullPath($ReceiptPath)
+        if (-not [string]::Equals($ticketFull, [string]$f.references.ticket.path, $ord)) { return & $fail 'TicketPath is not the authenticated ticket path' }
+        # The usage source must be the actual verified STDOUT path, not a byte-equivalent copy.
+        if (-not [string]::Equals($usageFull, [string]$f.stdout.path, $ord)) { return & $fail 'UsagePath is not the verified STDOUT path' }
+        foreach ($ip in @($f.inputPaths) + @($rawFull)) {
+            if ([string]::Equals($receiptFull, [System.IO.Path]::GetFullPath([string]$ip), $ord)) { return & $fail 'receiptPath collides with evidence path' }
+        }
+        if ([string]::Equals($rawFull, $usageFull, $ord) -or [string]::Equals($rawFull, $ticketFull, $ord)) { return & $fail 'raw path collides with evidence path' }
+
+        # Caller raw DTO is cross-checked only (shared with the v3 validator); it supplies no number that reaches the receipt.
+        $rv = Test-ManagedObserveUnknownPendingRawDto -RawPath $rawFull -ExpectedSha256 $null -Facts $f
+        if (($null -eq $rv) -or ($rv.Valid -isnot [bool]) -or (-not $rv.Valid)) { return & $fail ('raw cross-check refused: ' + $(if ($null -ne $rv) { $rv.Code } else { 'UNKNOWN' })) }
+        $rawSha = $rv.Sha256
+
+        $receipt = [PSCustomObject]([ordered]@{
+            schemaVersion   = 'OperationalRunReceipt/v6'
+            runId           = [string]$id.runId
+            taskId          = [string]$id.taskId
+            payloadSha256   = [string]$id.payloadSha256
+            destination     = 'Anthropic Claude'
+            status          = 'AWAITING_CONTROLLER'
+            attempt         = [int64]$id.attempt
+            sessionId       = [string]$id.sessionId
+            historyVerified = $false
+            budget          = [PSCustomObject]([ordered]@{
+                maxOutputTokens  = $null
+                maxElapsedMs     = $(if ($null -eq $lim.maxElapsedMs) { $null } else { [int64]$lim.maxElapsedMs })
+                maxAttempts      = [int64]$lim.maxAttempts
+                usedElapsedMs    = [int64]$f.timing.usedElapsedMs
+                usedOutputTokens = $null
+                attemptsUsed     = [int64]$id.attempt
+                softFraction     = $null
+            })
+            provider        = [PSCustomObject]([ordered]@{
+                startIdentity  = $null
+                sessionId      = [string]$id.sessionId
+                terminalReason = [string]$id.terminalReason
+                pid            = [int64]$id.pid
+            })
+            artifact        = [PSCustomObject]([ordered]@{ complete = $false; sha256 = $null; path = $null })
+            updatedAt       = [string]$f.timing.endedUtc
+            evidence        = [PSCustomObject]([ordered]@{
+                rawPath              = $rawFull
+                rawSha256            = $rawSha
+                ticketPath           = [string]$f.references.ticket.path
+                ticketSha256         = [string]$f.references.ticket.verifiedSha256
+                usagePath            = [string]$f.stdout.path
+                usageSha256          = [string]$f.stdout.sha256
+                nativeThinkingTokens = $null
+            })
+            outputStopMode                   = 'OBSERVE_ONLY'
+            observeUnknownContinuationEvidence   = $f.evidence
+            observeUnknownContinuationAccounting = $acct
+        })
+
+        # The strict validator independently reruns the shared verifier, so it also proves capture/predecessor stability up to here.
+        if (-not (Test-OperationalReceipt $receipt)) { return & $fail 'receipt failed validator' }
+        $rv2 = Test-ManagedObserveUnknownPendingRawDto -RawPath $rawFull -ExpectedSha256 $rawSha -Facts $f
+        if (($null -eq $rv2) -or ($rv2.Valid -isnot [bool]) -or (-not $rv2.Valid)) { return & $fail 'raw input changed before write' }
+
+        $json = $receipt | ConvertTo-Json -Depth 12
+        $bytes = $utf8.GetBytes($json)
+        $receiptSha = & $sha $bytes
+        $dir = [System.IO.Path]::GetDirectoryName($receiptFull)
+        $dirItem = if ($dir) { Get-Item -LiteralPath $dir -Force -ErrorAction SilentlyContinue } else { $null }
+        if (($null -eq $dirItem) -or (-not $dirItem.PSIsContainer) -or (($dirItem.Attributes -band $rp) -ne 0)) { return & $fail 'receipt parent directory invalid' }
+        $idempotent = $false
+        if ([System.IO.Directory]::Exists($receiptFull)) { return & $fail 'receipt path is a directory' }
+        if ([System.IO.File]::Exists($receiptFull)) {
+            $exItem = Get-Item -LiteralPath $receiptFull -Force
+            if (($exItem.Attributes -band $rp) -ne 0) { return & $fail 'existing receipt is a reparse point' }
+            $ex = [System.IO.File]::ReadAllBytes($receiptFull)
+            if ((& $sha $ex) -cne $receiptSha) { return & $fail 'receipt output exists with different content' }
+            $idempotent = $true
+        }
+        else {
+            $temp = Join-Path $dir ('.' + [System.IO.Path]::GetFileName($receiptFull) + '.tmp-' + [guid]::NewGuid().ToString('N'))
+            $fs = [System.IO.FileStream]::new($temp, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+            try { $fs.Write($bytes, 0, $bytes.Length); $fs.Flush($true) } finally { $fs.Dispose() }
+            # Move without overwrite: a concurrently created different output is never replaced.
+            [System.IO.File]::Move($temp, $receiptFull)
+            $temp = $null
+            $back = [System.IO.File]::ReadAllBytes($receiptFull)
+            if ((& $sha $back) -cne $receiptSha) { return & $fail 'receipt readback mismatch' }
+        }
+        return [PSCustomObject]@{
+            valid          = $true
+            receiptPath    = $receiptFull
+            receiptSha256  = $receiptSha
+            classification = 'OBSERVE_ONLY_UNKNOWN_PENDING'
+            idempotent     = $idempotent
+            receipt        = $receipt
+        }
+    }
+    catch { return & $fail ('observe-only unknown pending receipt failed: ' + $_.Exception.Message) }
+    finally { if (($null -ne $temp) -and [System.IO.File]::Exists($temp)) { try { [System.IO.File]::Delete($temp) } catch { } } }
+}
+
+function ConvertTo-ObserveOnlyUnknownFailedReceipt {
+    # Explicit OBSERVE_ONLY UNKNOWN-history failed-transport branch: shared authenticated facts -> OperationalRunReceipt/v7 (FAILED only, tagged).
+    # Preserves the actual DEADLINE failure, the unresolved-failure root, the immediate-parent chain and the last verified subtotal; current, used and cumulative
+    # counts stay UNKNOWN (null, never 0). Grants no completion, no dispatch, no retry and no successor; never runs the whole-stream parser or numeric output-limit casts.
+    param(
+        [Parameter(Mandatory)][string]$RawPath,
+        [Parameter(Mandatory)][string]$TicketPath,
+        [Parameter(Mandatory)][string]$UsagePath,
+        [Parameter(Mandatory)][string]$RunId,
+        [Parameter(Mandatory)][int]$Attempt,
+        [Parameter(Mandatory)][int]$MaxAttempts,
+        [Parameter(Mandatory)][long]$PriorElapsedMs,
+        [Parameter(Mandatory)][long]$MaxElapsedMs,
+        [Parameter(Mandatory)][string]$ReceiptPath,
+        [AllowNull()][object]$Evidence,
+        [Parameter(Mandatory)][bool]$Conflict
+    )
+    $fail = { param($reason) [PSCustomObject]@{ valid = $false; reason = $reason; rawSha256 = $null; ticketSha256 = $null } }
+    $ord = [System.StringComparison]::OrdinalIgnoreCase
+    $rp = [System.IO.FileAttributes]::ReparsePoint
+    $utf8 = [System.Text.UTF8Encoding]::new($false)
+    $sha = { param([byte[]]$b) [System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($b)).ToLowerInvariant() }
+    if ($Conflict) { return & $fail 'observe-only unknown failed evidence incompatible with other evidence parameters' }
+    if ($null -eq $Evidence) { return & $fail 'ObserveOnlyFailedTransportEvidence is null' }
+    $temp = $null
+    try {
+        . (Join-Path $PSScriptRoot 'managed-native-receipt.ps1')
+        $vf = Get-ManagedObserveUnknownFailedFacts -Evidence $Evidence
+        if (($null -eq $vf) -or ($vf.Valid -isnot [bool]) -or (-not $vf.Valid) -or ($null -eq $vf.Facts)) {
+            $vc = if (($null -ne $vf) -and ($vf.PSObject.Properties['Code']) -and ($vf.Code -is [string])) { $vf.Code } else { 'UNKNOWN' }
+            return & $fail ('observe-only unknown failed refused: ' + $vc)
+        }
+        $f = $vf.Facts
+        $id = $f.identity; $lim = $f.limits; $acct = $f.accounting
+
+        foreach ($x in @($RawPath, $TicketPath, $UsagePath)) {
+            if (-not (Test-Path -LiteralPath $x -PathType Leaf)) { return & $fail "missing input: $x" }
+        }
+        if (($Attempt -lt 1) -or ($MaxAttempts -le 0) -or ($Attempt -gt $MaxAttempts)) { return & $fail 'invalid attempt range' }
+        if (-not [string]::Equals($RunId, [string]$id.runId, [System.StringComparison]::Ordinal)) { return & $fail 'runId does not match authenticated capture' }
+        if (([long]$Attempt -ne [long]$id.attempt) -or ([long]$MaxAttempts -ne [long]$lim.maxAttempts)) { return & $fail 'attempt or maxAttempts does not match authenticated capture' }
+        if (([long]$MaxElapsedMs -ne [long]$lim.maxElapsedMs) -or ([long]$PriorElapsedMs -ne [long]$lim.priorElapsedMs)) { return & $fail 'elapsed limits do not match authenticated capture' }
+        $ticketFull = [System.IO.Path]::GetFullPath($TicketPath)
+        $usageFull = [System.IO.Path]::GetFullPath($UsagePath)
+        $rawFull = [System.IO.Path]::GetFullPath($RawPath)
+        $receiptFull = [System.IO.Path]::GetFullPath($ReceiptPath)
+        if (-not [string]::Equals($ticketFull, [string]$acct.references.ticket.path, $ord)) { return & $fail 'TicketPath is not the authenticated ticket path' }
+        # The usage source must be the actual verified STDOUT path, not a byte-equivalent copy.
+        if (-not [string]::Equals($usageFull, [string]$f.stdout.path, $ord)) { return & $fail 'UsagePath is not the verified STDOUT path' }
+        foreach ($ip in @($f.inputPaths) + @($rawFull)) {
+            if ([string]::Equals($receiptFull, [System.IO.Path]::GetFullPath([string]$ip), $ord)) { return & $fail 'receiptPath collides with evidence path' }
+        }
+        if ([string]::Equals($rawFull, $usageFull, $ord) -or [string]::Equals($rawFull, $ticketFull, $ord)) { return & $fail 'raw path collides with evidence path' }
+        foreach ($ip in @($f.inputPaths)) {
+            if ([string]::Equals($rawFull, [System.IO.Path]::GetFullPath([string]$ip), $ord)) { return & $fail 'raw path collides with evidence path' }
+        }
+
+        # Caller raw DTO is cross-checked only (re-read and bound to the derived facts); it supplies no number that reaches the receipt.
+        $rv = Test-ManagedObserveUnknownFailedRawDto -RawPath $rawFull -ExpectedSha256 $null -Facts $f
+        if (($null -eq $rv) -or ($rv.Valid -isnot [bool]) -or (-not $rv.Valid)) { return & $fail ('raw cross-check refused: ' + $(if ($null -ne $rv) { $rv.Code } else { 'UNKNOWN' })) }
+        $rawSha = $rv.Sha256
+
+        $receipt = [PSCustomObject]([ordered]@{
+            schemaVersion   = 'OperationalRunReceipt/v7'
+            runId           = [string]$id.runId
+            taskId          = [string]$id.taskId
+            payloadSha256   = [string]$id.payloadSha256
+            destination     = 'Anthropic Claude'
+            status          = 'FAILED'
+            attempt         = [int64]$id.attempt
+            sessionId       = [string]$id.sessionId
+            historyVerified = $false
+            budget          = [PSCustomObject]([ordered]@{
+                maxOutputTokens  = $null
+                maxElapsedMs     = [int64]$lim.maxElapsedMs
+                maxAttempts      = [int64]$lim.maxAttempts
+                usedElapsedMs    = [int64]$f.timing.usedElapsedMs
+                usedOutputTokens = $null
+                attemptsUsed     = [int64]$id.attempt
+                softFraction     = $null
+            })
+            provider        = [PSCustomObject]([ordered]@{
+                startIdentity  = [string]$id.startIdentity
+                sessionId      = [string]$id.sessionId
+                terminalReason = [string]$id.terminalReason
+                pid            = [int64]$id.pid
+            })
+            artifact        = [PSCustomObject]([ordered]@{ complete = $false; sha256 = $null; path = $null })
+            updatedAt       = [string]$f.timing.endedUtc
+            evidence        = [PSCustomObject]([ordered]@{
+                rawPath              = $rawFull
+                rawSha256            = $rawSha
+                ticketPath           = [string]$acct.references.ticket.path
+                ticketSha256         = [string]$acct.references.ticket.verifiedSha256
+                usagePath            = [string]$f.stdout.path
+                usageSha256          = [string]$f.stdout.sha256
+                nativeThinkingTokens = $null
+            })
+            outputStopMode                   = 'OBSERVE_ONLY'
+            observeUnknownFailedEvidence   = $f.evidence
+            observeUnknownFailedAccounting = $acct
+            observeUnknownFailed           = $f.proof
+        })
+
+        # The strict public validator independently reauthenticates the whole proof (parent, capture, registration, claim, ACK, raw DTO).
+        if (-not (Test-OperationalReceipt $receipt)) { return & $fail 'receipt failed validator' }
+
+        # Recapture immediately before the write: the facts rederived from scratch and the raw input must be unchanged.
+        $vf2 = Get-ManagedObserveUnknownFailedFacts -Evidence $Evidence
+        if (($null -eq $vf2) -or ($vf2.Valid -isnot [bool]) -or (-not $vf2.Valid) -or ($null -eq $vf2.Facts)) { return & $fail 'unknown failed evidence changed before write' }
+        if ((ConvertTo-Json -InputObject $vf2.Facts -Depth 12 -Compress) -cne (ConvertTo-Json -InputObject $f -Depth 12 -Compress)) { return & $fail 'unknown failed evidence changed before write' }
+        $rv2 = Test-ManagedObserveUnknownFailedRawDto -RawPath $rawFull -ExpectedSha256 $rawSha -Facts $f
+        if (($null -eq $rv2) -or ($rv2.Valid -isnot [bool]) -or (-not $rv2.Valid)) { return & $fail 'raw input changed before write' }
+
+        $json = $receipt | ConvertTo-Json -Depth 12
+        $bytes = $utf8.GetBytes($json)
+        $receiptSha = & $sha $bytes
+        $dir = [System.IO.Path]::GetDirectoryName($receiptFull)
+        $dirItem = if ($dir) { Get-Item -LiteralPath $dir -Force -ErrorAction SilentlyContinue } else { $null }
+        if (($null -eq $dirItem) -or (-not $dirItem.PSIsContainer) -or (($dirItem.Attributes -band $rp) -ne 0)) { return & $fail 'receipt parent directory invalid' }
+        # Only a NEW owned output is ever created; an existing path (any content) is never read as success and never overwritten.
+        if ([System.IO.Directory]::Exists($receiptFull) -or [System.IO.File]::Exists($receiptFull) -or ($null -ne (Get-Item -LiteralPath $receiptFull -Force -ErrorAction SilentlyContinue))) { return & $fail 'receipt output already exists' }
+        $temp = Join-Path $dir ('.' + [System.IO.Path]::GetFileName($receiptFull) + '.tmp-' + [guid]::NewGuid().ToString('N'))
+        $fs = [System.IO.FileStream]::new($temp, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        try { $fs.Write($bytes, 0, $bytes.Length); $fs.Flush($true) } finally { $fs.Dispose() }
+        # Move without overwrite: a concurrently created output is never replaced.
+        [System.IO.File]::Move($temp, $receiptFull)
+        $temp = $null
+        $back = [System.IO.File]::ReadAllBytes($receiptFull)
+        if ((& $sha $back) -cne $receiptSha) { return & $fail 'receipt readback mismatch' }
+        return [PSCustomObject]@{
+            valid          = $true
+            receiptPath    = $receiptFull
+            receiptSha256  = $receiptSha
+            classification = 'OBSERVE_ONLY_UNKNOWN_FAILED'
+            idempotent     = $false
+            receipt        = $receipt
+        }
+    }
+    catch { return & $fail ('observe-only unknown failed receipt failed: ' + $_.Exception.Message) }
     finally { if (($null -ne $temp) -and [System.IO.File]::Exists($temp)) { try { [System.IO.File]::Delete($temp) } catch { } } }
 }
 

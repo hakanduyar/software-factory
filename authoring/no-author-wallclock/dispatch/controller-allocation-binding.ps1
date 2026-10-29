@@ -75,6 +75,27 @@ function Get-ControllerAllocationScope {
         $names = @('taskId', 'owner', 'ownedPaths', 'outputStopMode', 'maxAdditionalOutput', 'aggregateCeiling', 'maxAttempts', 'maxElapsedMs')
         $budgetNames = @('maxAttempts', 'maxElapsedMs')
     }
+    # Exact-ordinal accountingStatus selects the explicit UNKNOWN-history shape (tagged accountingStatus, lastVerifiedSubtotal and unresolvedFailureReceipt, with a null
+    # cumulativeOutput). It is valid only inside the OBSERVE_ONLY shape; every mis-cased alias, partial tag set or tag in a legacy shape refuses and never falls back.
+    # Shape capture only: the tags are structural and are not authority, authentication or READY.
+    $unknownShape = $false
+    $unknownTagNames = @('accountingStatus', 'lastVerifiedSubtotal', 'unresolvedFailureReceipt')
+    $unknownAnyTag = 0
+    foreach ($tagMember in $members) {
+        foreach ($tagName in $unknownTagNames) {
+            if ([string]::Equals($tagMember.Name, $tagName, [System.StringComparison]::OrdinalIgnoreCase)) { $unknownAnyTag++ }
+        }
+    }
+    if ($unknownAnyTag -gt 0) {
+        if (-not $observeOnly) { & $fail }
+        foreach ($tagName in $unknownTagNames) {
+            $tagFound = @($members | Where-Object { [string]::Equals($_.Name, $tagName, [System.StringComparison]::Ordinal) })
+            if ($tagFound.Count -ne 1) { & $fail }
+        }
+        if ($unknownAnyTag -ne $unknownTagNames.Count) { & $fail }
+        $unknownShape = $true
+        $names = @('taskId', 'owner', 'ownedPaths', 'outputStopMode', 'accountingStatus', 'lastVerifiedSubtotal', 'unresolvedFailureReceipt', 'maxAdditionalOutput', 'aggregateCeiling', 'maxAttempts', 'maxElapsedMs')
+    }
     if ($members.Count -ne $names.Count) { & $fail }
     foreach ($expectedName in $names) {
         $found = @($members | Where-Object { [string]::Equals($_.Name, $expectedName, [System.StringComparison]::Ordinal) })
@@ -106,21 +127,50 @@ function Get-ControllerAllocationScope {
         if ($observeOnly -and $name -ceq 'maxElapsedMs' -and $null -eq $values[$name]) { continue }
         if (-not (& $isInteger $values[$name]) -or [long]$values[$name] -le 0) { & $fail }
     }
-    if (-not (& $isInteger $CumulativeOutput) -or [long]$CumulativeOutput -lt 0) { & $fail }
+    $ufrPath = $null
+    $ufrSha = $null
+    if ($unknownShape) {
+        # UNKNOWN-history shape: the cumulative output is an exact null (never cast, defaulted or minted) and the tags carry the last verified subtotal and the
+        # unresolved-failure reference. These are structural checks only; nothing here authenticates the reference or the subtotal.
+        if ($null -ne $CumulativeOutput) { & $fail }
+        if ($values['accountingStatus'] -isnot [string] -or -not [string]::Equals($values['accountingStatus'], 'UNKNOWN', [System.StringComparison]::Ordinal)) { & $fail }
+        if (-not (& $isInteger $values['lastVerifiedSubtotal']) -or [long]$values['lastVerifiedSubtotal'] -lt 0) { & $fail }
+        $ufr = $values['unresolvedFailureReceipt']
+        if ($null -eq $ufr -or $ufr -isnot [System.Management.Automation.PSCustomObject]) { & $fail }
+        $ufrMembers = @($ufr.PSObject.Properties)
+        if ($ufrMembers.Count -ne 2) { & $fail }
+        foreach ($ufrName in @('path', 'sha256')) {
+            $ufrFound = @($ufrMembers | Where-Object { [string]::Equals($_.Name, $ufrName, [System.StringComparison]::Ordinal) })
+            if ($ufrFound.Count -ne 1 -or $ufrFound[0].MemberType -ne [System.Management.Automation.PSMemberTypes]::NoteProperty) { & $fail }
+        }
+        $ufrPath = $ufr.PSObject.Properties['path'].Value
+        $ufrSha = $ufr.PSObject.Properties['sha256'].Value
+        if ($ufrPath -isnot [string] -or [string]::IsNullOrWhiteSpace($ufrPath) -or -not [System.IO.Path]::IsPathRooted($ufrPath)) { & $fail }
+        try { $ufrFull = [System.IO.Path]::GetFullPath($ufrPath) } catch { & $fail }
+        if (-not [string]::Equals($ufrFull, $ufrPath, [System.StringComparison]::Ordinal)) { & $fail }
+        if ($ufrSha -isnot [string] -or $ufrSha.Length -ne 64 -or $ufrSha -cnotmatch '\A[0-9a-f]{64}\z') { & $fail }
+    }
+    elseif (-not (& $isInteger $CumulativeOutput) -or [long]$CumulativeOutput -lt 0) { & $fail }
     if ($observeOnly) {
         # No output ceiling exists in this shape: both fields must be present and null; nothing is cast, defaulted or minted.
         if ($values['outputStopMode'] -isnot [string] -or -not [string]::Equals($values['outputStopMode'], 'OBSERVE_ONLY', [System.StringComparison]::Ordinal)) { & $fail }
         if ($null -ne $values['maxAdditionalOutput'] -or $null -ne $values['aggregateCeiling']) { & $fail }
-        return [pscustomobject][ordered]@{
-            taskId              = [string]::Copy($values['taskId'])
-            owner               = [string]::Copy($values['owner'])
-            ownedPaths          = [string[]]$copiedPaths
-            outputStopMode      = 'OBSERVE_ONLY'
-            maxAdditionalOutput = $null
-            aggregateCeiling    = $null
-            maxAttempts         = [long]$values['maxAttempts']
-            maxElapsedMs        = $(if ($null -eq $values['maxElapsedMs']) { $null } else { [long]$values['maxElapsedMs'] })
+        $observeResult = [ordered]@{
+            taskId         = [string]::Copy($values['taskId'])
+            owner          = [string]::Copy($values['owner'])
+            ownedPaths     = [string[]]$copiedPaths
+            outputStopMode = 'OBSERVE_ONLY'
         }
+        if ($unknownShape) {
+            $observeResult['accountingStatus'] = 'UNKNOWN'
+            $observeResult['lastVerifiedSubtotal'] = [long]$values['lastVerifiedSubtotal']
+            $observeResult['unresolvedFailureReceipt'] = [pscustomobject][ordered]@{ path = [string]::Copy($ufrPath); sha256 = [string]::Copy($ufrSha) }
+        }
+        $observeResult['maxAdditionalOutput'] = $null
+        $observeResult['aggregateCeiling'] = $null
+        $observeResult['maxAttempts'] = [long]$values['maxAttempts']
+        $observeResult['maxElapsedMs'] = $(if ($null -eq $values['maxElapsedMs']) { $null } else { [long]$values['maxElapsedMs'] })
+        return [pscustomobject]$observeResult
     }
     $ceiling = [long]$values['aggregateCeiling']
     $cumulative = [long]$CumulativeOutput
@@ -168,11 +218,12 @@ function Get-ControllerAllocationBinding {
 
     $result = [ordered]@{}
     foreach ($name in $names) {
-        $result[$name] = switch ($name) {
-            'cumulativeOutput' { [long]$cumulativeInput }
-            'allocation' { $scope }
-            default { $origin.$name }
+        if ($name -ceq 'cumulativeOutput') {
+            # An exact null is carried only by the explicit UNKNOWN-history scope (already proven above); it is never cast to 0.
+            if ($null -eq $cumulativeInput) { $result[$name] = $null } else { $result[$name] = [long]$cumulativeInput }
         }
+        elseif ($name -ceq 'allocation') { $result[$name] = $scope }
+        else { $result[$name] = $origin.$name }
     }
     return [pscustomobject]$result
 }

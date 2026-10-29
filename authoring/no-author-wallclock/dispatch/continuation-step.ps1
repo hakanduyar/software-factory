@@ -36,9 +36,33 @@ function Test-ContinuationStateEntry {
     if ($validStatuses -notcontains $e.status) { throw "Corrupt state entry: bad status." }
     if ($e.receiptPath -isnot [string] -or [string]::IsNullOrWhiteSpace($e.receiptPath)) { throw "Corrupt state entry: bad receiptPath." }
     if ($e.planPath -isnot [string] -or [string]::IsNullOrWhiteSpace($e.planPath)) { throw "Corrupt state entry: bad planPath." }
-    if (-not ($e.cumulativeOutput -is [int] -or $e.cumulativeOutput -is [long]) -or $e.cumulativeOutput -lt 0) { throw "Corrupt state entry: bad cumulativeOutput." }
+    # Exact-ordinal accountingStatus/lastVerifiedSubtotal/unresolvedFailureReceipt select the explicit UNKNOWN-history shape (cumulativeOutput is an exact null, never 0);
+    # any alias, partial tag set or tag outside the OBSERVE_ONLY shape refuses. The tags are structural and confer no authority.
+    $unkTagNames = @('accountingStatus', 'lastVerifiedSubtotal', 'unresolvedFailureReceipt')
+    $unkTagCount = 0
+    foreach ($unkMember in @($e.PSObject.Properties)) {
+        foreach ($unkTag in $unkTagNames) {
+            if ([string]::Equals([string]$unkMember.Name, $unkTag, [System.StringComparison]::OrdinalIgnoreCase)) { $unkTagCount++ }
+        }
+    }
+    $hasUnkTags = $false
+    if ($unkTagCount -gt 0) {
+        foreach ($unkTag in $unkTagNames) {
+            if (@($e.PSObject.Properties | Where-Object { [string]::Equals([string]$_.Name, $unkTag, [System.StringComparison]::Ordinal) -and $_.MemberType -eq [System.Management.Automation.PSMemberTypes]::NoteProperty }).Count -ne 1) { throw "Corrupt state entry: bad UNKNOWN accounting tags." }
+        }
+        if ($unkTagCount -ne $unkTagNames.Count) { throw "Corrupt state entry: bad UNKNOWN accounting tags." }
+        if ($null -ne $e.cumulativeOutput) { throw "Corrupt state entry: UNKNOWN accounting entry must carry a null cumulativeOutput." }
+        if ($e.accountingStatus -isnot [string] -or $e.accountingStatus -cne 'UNKNOWN') { throw "Corrupt state entry: bad accountingStatus." }
+        if (-not ($e.lastVerifiedSubtotal -is [int] -or $e.lastVerifiedSubtotal -is [long]) -or $e.lastVerifiedSubtotal -lt 0) { throw "Corrupt state entry: bad lastVerifiedSubtotal." }
+        $ufr = $e.unresolvedFailureReceipt
+        if ($ufr -isnot [PSCustomObject] -or @($ufr.PSObject.Properties).Count -ne 2 -or -not ($ufr.PSObject.Properties.Name -ccontains 'path') -or -not ($ufr.PSObject.Properties.Name -ccontains 'sha256')) { throw "Corrupt state entry: bad unresolvedFailureReceipt." }
+        if ($ufr.path -isnot [string] -or [string]::IsNullOrWhiteSpace($ufr.path) -or -not [System.IO.Path]::IsPathRooted($ufr.path) -or $ufr.sha256 -isnot [string] -or $ufr.sha256 -cnotmatch '^[0-9a-f]{64}$') { throw "Corrupt state entry: bad unresolvedFailureReceipt." }
+        $hasUnkTags = $true
+    }
+    elseif (-not ($e.cumulativeOutput -is [int] -or $e.cumulativeOutput -is [long]) -or $e.cumulativeOutput -lt 0) { throw "Corrupt state entry: bad cumulativeOutput." }
     # Exact-ordinal outputStopMode selects the OBSERVE_ONLY shape (both ceilings null); any alias or other value refuses and never reads as legacy.
     $modeProps = @($e.PSObject.Properties | Where-Object { [string]::Equals($_.Name, 'outputStopMode', [System.StringComparison]::OrdinalIgnoreCase) })
+    if ($hasUnkTags -and $modeProps.Count -ne 1) { throw "Corrupt state entry: UNKNOWN accounting entry requires the OBSERVE_ONLY shape." }
     if ($modeProps.Count -gt 0) {
         if ($modeProps.Count -ne 1 -or $modeProps[0].Name -cne 'outputStopMode' -or $modeProps[0].Value -isnot [string] -or $modeProps[0].Value -cne 'OBSERVE_ONLY') { throw "Corrupt state entry: bad outputStopMode." }
         if ($null -ne $e.aggregateCeiling -or $null -ne $e.maxAdditionalOutput) { throw "Corrupt state entry: OBSERVE_ONLY entry must carry null output ceilings." }
@@ -84,7 +108,26 @@ function Test-ContinuationStateEntry {
         $hasFtSchema = ($sAll -ccontains 'receiptSchemaVersion') -and ($e.settlement.receiptSchemaVersion -is [string]) -and ($e.settlement.receiptSchemaVersion -ceq 'OperationalRunReceipt/v5')
         $hasFtField = $false
         foreach ($ftn in $ftNames) { if ($sAll -ccontains $ftn) { $hasFtField = $true } }
-        if ($hasFtField -and -not $hasFtSchema) { throw "Corrupt state entry: failed-transport settlement fields without the v5 schema." }
+        # UNKNOWN-history failed settlement (v7) is its own tagged schema: it keeps the unresolved-failure root and the last verified subtotal, never a v5 parent total.
+        $v7Names = @('failureDisposition', 'accountingUnresolved', 'accountingStatus', 'lastVerifiedSubtotal', 'unresolvedFailureReceipt', 'parentReceiptSha256', 'failureProofSha256')
+        $hasV7Schema = ($sAll -ccontains 'receiptSchemaVersion') -and ($e.settlement.receiptSchemaVersion -is [string]) -and ($e.settlement.receiptSchemaVersion -ceq 'OperationalRunReceipt/v7')
+        $hasV7Only = ($sAll -ccontains 'lastVerifiedSubtotal') -or ($sAll -ccontains 'unresolvedFailureReceipt')
+        if ($hasV7Only -and -not $hasV7Schema) { throw "Corrupt state entry: UNKNOWN failed settlement fields without the v7 schema." }
+        if ($hasFtField -and -not $hasFtSchema -and -not $hasV7Schema) { throw "Corrupt state entry: failed-transport settlement fields without the v5 schema." }
+        if ($hasV7Schema) {
+            if ($hasFtSchema -or ($sAll -ccontains 'lastVerifiedParentOutputTokens')) { throw "Corrupt state entry: UNKNOWN failed settlement cannot carry a v5 parent total." }
+            foreach ($v7n in $v7Names) { if (-not ($sAll -ccontains $v7n)) { throw "Corrupt state entry: UNKNOWN failed settlement missing '$v7n'." } }
+            if ($sAll -cnotcontains 'status' -or $e.settlement.status -isnot [string] -or $e.settlement.status -cne 'FAILED') { throw "Corrupt state entry: UNKNOWN failed settlement must be FAILED." }
+            if ($sAll -cnotcontains 'terminalReason' -or $e.settlement.terminalReason -isnot [string] -or $e.settlement.terminalReason -cne 'DEADLINE') { throw "Corrupt state entry: UNKNOWN failed settlement terminalReason." }
+            if ($e.settlement.failureDisposition -isnot [string] -or $e.settlement.failureDisposition -cne 'AUTHENTICATED_FAILED_TERMINAL') { throw "Corrupt state entry: bad failureDisposition." }
+            if ($e.settlement.accountingUnresolved -isnot [bool] -or -not $e.settlement.accountingUnresolved) { throw "Corrupt state entry: UNKNOWN failed accounting must stay unresolved." }
+            if ($e.settlement.accountingStatus -isnot [string] -or $e.settlement.accountingStatus -cne 'UNKNOWN') { throw "Corrupt state entry: UNKNOWN failed accounting must stay UNKNOWN." }
+            if (-not ($e.settlement.lastVerifiedSubtotal -is [int] -or $e.settlement.lastVerifiedSubtotal -is [long]) -or $e.settlement.lastVerifiedSubtotal -lt 0) { throw "Corrupt state entry: bad settlement lastVerifiedSubtotal." }
+            $sufr = $e.settlement.unresolvedFailureReceipt
+            if ($sufr -isnot [PSCustomObject] -or @($sufr.PSObject.Properties).Count -ne 2 -or -not ($sufr.PSObject.Properties.Name -ccontains 'path') -or -not ($sufr.PSObject.Properties.Name -ccontains 'sha256') -or $sufr.path -isnot [string] -or [string]::IsNullOrWhiteSpace($sufr.path) -or $sufr.sha256 -isnot [string] -or $sufr.sha256 -cnotmatch '^[0-9a-f]{64}$') { throw "Corrupt state entry: bad settlement unresolvedFailureReceipt." }
+            if ($e.settlement.parentReceiptSha256 -isnot [string] -or $e.settlement.parentReceiptSha256 -cnotmatch '^[0-9a-f]{64}$') { throw "Corrupt state entry: bad parentReceiptSha256." }
+            if ($e.settlement.failureProofSha256 -isnot [string] -or $e.settlement.failureProofSha256 -cnotmatch '^[0-9a-f]{64}$') { throw "Corrupt state entry: bad failureProofSha256." }
+        }
         if ($hasFtSchema) {
             foreach ($ftn in $ftNames) { if (-not ($sAll -ccontains $ftn)) { throw "Corrupt state entry: failed-transport settlement missing '$ftn'." } }
             if ($sAll -cnotcontains 'status' -or $e.settlement.status -isnot [string] -or $e.settlement.status -cne 'FAILED') { throw "Corrupt state entry: failed-transport settlement must be FAILED." }
@@ -289,6 +332,11 @@ function Invoke-ContinuationStep {
         if ($ap -cne $capture.planSha256 -or $ar -cne $capture.receiptSha256) { throw $allocFail }
     }
     & $assertCapture
+    # UNKNOWN-history is reachable only through the full opt-in AND the explicit exact-ordinal accountingStatus allocation shape; a v5/v6 receipt or a plan marker alone refuses.
+    $unknownMode = $false
+    if ($optIn -and $null -ne $capture.binding.allocation.PSObject.Properties['accountingStatus']) { $unknownMode = $true }
+    $receiptIsFailedRoot = $false
+    $receiptIsUnkPending = $false
     # OBSERVE_ONLY is reachable only through the full opt-in; a v3 receipt or a plan marker alone refuses before any state IO.
     $receiptIsV3 = $false
     if (Test-Path -LiteralPath $receiptFull -PathType Leaf) {
@@ -298,9 +346,16 @@ function Invoke-ContinuationStep {
             $rsv = $rp.PSObject.Properties['schemaVersion']
             if ($null -ne $rsv -and $rsv.Value -is [string] -and $rsv.Value -ilike 'OperationalRunReceipt/v3*') { $receiptIsV3 = $true }
             if (@($rp.PSObject.Properties | Where-Object { @('observePendingAccountingEvidence', 'observePendingAccounting', 'outputStopMode') -contains [string]$_.Name }).Count -gt 0) { $receiptIsV3 = $true }
-            # A v5 failed-transport receipt is terminal settlement evidence only; it is never a new continuation candidate and refuses before any state IO.
+            # A v5 failed-transport receipt is terminal settlement evidence only; it is never a new continuation candidate and refuses before any state IO. The single
+            # exception is the explicit UNKNOWN-history shape, where the exact v5 failed root is the retained parent of the human-authorized continuation.
             if (($null -ne $rsv -and $rsv.Value -is [string] -and $rsv.Value -ilike 'OperationalRunReceipt/v5*') -or (@($rp.PSObject.Properties | Where-Object { @('observeFailedTransportEvidence', 'observeFailedTransportAccounting', 'observeFailedTransport') -contains [string]$_.Name }).Count -gt 0)) {
-                throw 'Failed-transport v5 receipt is settlement evidence only and cannot be continuation input.'
+                if ($unknownMode -and $null -ne $rsv -and $rsv.Value -is [string] -and $rsv.Value -ceq 'OperationalRunReceipt/v5') { $receiptIsFailedRoot = $true }
+                else { throw 'Failed-transport v5 receipt is settlement evidence only and cannot be continuation input.' }
+            }
+            # v6 (UNKNOWN-history pending) is continuation input only inside the explicit UNKNOWN allocation; v7 (UNKNOWN-history failed) is failed evidence only and never input.
+            if (($null -ne $rsv -and $rsv.Value -is [string] -and ($rsv.Value -ilike 'OperationalRunReceipt/v6*' -or $rsv.Value -ilike 'OperationalRunReceipt/v7*')) -or (@($rp.PSObject.Properties | Where-Object { @('observeUnknownContinuationEvidence', 'observeUnknownContinuationAccounting', 'observeUnknownFailedEvidence', 'observeUnknownFailedAccounting', 'observeUnknownFailed') -contains [string]$_.Name }).Count -gt 0)) {
+                if ($unknownMode -and $null -ne $rsv -and $rsv.Value -is [string] -and $rsv.Value -ceq 'OperationalRunReceipt/v6') { $receiptIsUnkPending = $true }
+                else { throw 'UNKNOWN-history v6/v7 receipts are not supported continuation input here (v7 is failed evidence only).' }
             }
             # A v4 reviewed-completion receipt is terminal settlement evidence only; it is never queue, allocation or pending-accounting input.
             if (($null -ne $rsv -and $rsv.Value -is [string] -and $rsv.Value -ilike 'OperationalRunReceipt/v4*') -or (@($rp.PSObject.Properties | Where-Object { @('observeReviewedCompletionEvidence', 'observeReviewedCompletion') -contains [string]$_.Name }).Count -gt 0)) {
@@ -312,7 +367,10 @@ function Invoke-ContinuationStep {
     if ($optIn -and $null -ne $capture.binding.allocation.PSObject.Properties['outputStopMode']) { $observeMode = $true }
     if ($observeMode) {
         $planMode = $capture.plan.PSObject.Properties['outputStopMode']
-        if (-not $receiptIsV3 -or $null -ne $predCapture -or $null -eq $planMode -or $planMode.Value -isnot [string] -or $planMode.Value -cne 'OBSERVE_ONLY' -or $capture.binding.allocation.outputStopMode -cne 'OBSERVE_ONLY') { throw $allocFail }
+        if ($unknownMode) {
+            if ($receiptIsV3 -or -not ($receiptIsFailedRoot -or $receiptIsUnkPending) -or $null -ne $predCapture -or $null -eq $planMode -or $planMode.Value -isnot [string] -or $planMode.Value -cne 'OBSERVE_ONLY' -or $capture.binding.allocation.outputStopMode -cne 'OBSERVE_ONLY') { throw $allocFail }
+        }
+        elseif (-not $receiptIsV3 -or $null -ne $predCapture -or $null -eq $planMode -or $planMode.Value -isnot [string] -or $planMode.Value -cne 'OBSERVE_ONLY' -or $capture.binding.allocation.outputStopMode -cne 'OBSERVE_ONLY') { throw $allocFail }
     } elseif ($receiptIsV3) {
         throw $allocFail
     }
@@ -355,7 +413,34 @@ $sw = [Diagnostics.Stopwatch]::StartNew()
     $receiptJson = Get-Content -LiteralPath $receiptFull -Raw
     $receipt = $receiptJson | ConvertFrom-Json -DateKind String
     if (-not (Test-OperationalReceipt $receipt)) { throw "Receipt failed C3 validator." }
-    if ($observeMode) {
+    if ($unknownMode) {
+        # UNKNOWN-history: the exact v5 failed root or the v6 pending receipt is validated directly (strict public validator + shared facts); it never enters general
+        # reconciliation. Every total stays null; only the separately tagged last verified subtotal and the unresolved-failure reference are compared to the captured binding.
+        . (Join-Path $PSScriptRoot 'managed-native-receipt.ps1')
+        if ($receipt.outputStopMode -cne 'OBSERVE_ONLY' -or $receipt.historyVerified -isnot [bool] -or $receipt.historyVerified -or $receipt.artifact.complete -isnot [bool] -or $receipt.artifact.complete) { throw "UNKNOWN-history receipt must be pending/failed evidence only." }
+        if ($null -ne $receipt.budget.usedOutputTokens) { throw "UNKNOWN-history receipt must carry a null used output." }
+        $unkReceiptSha = (Get-FileHash -LiteralPath $receiptFull -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($receiptIsFailedRoot) {
+            if ($receipt.schemaVersion -cne 'OperationalRunReceipt/v5' -or $receipt.status -cne 'FAILED') { throw "UNKNOWN-history root must be the failed v5 receipt." }
+            $unkFacts = Get-ManagedObserveFailedTransportFacts -Evidence $receipt.observeFailedTransportEvidence
+            if ($null -eq $unkFacts -or $unkFacts.Valid -isnot [bool] -or -not $unkFacts.Valid -or $null -eq $unkFacts.Facts) { throw "UNKNOWN-history failed root facts not verified." }
+            $unkSubtotal = $unkFacts.Facts.accounting.lastVerifiedParentOutputTokens
+            $unkFailurePath = $receiptFull
+            $unkFailureSha = $unkReceiptSha
+        } else {
+            if ($receipt.schemaVersion -cne 'OperationalRunReceipt/v6' -or $receipt.status -cne 'AWAITING_CONTROLLER') { throw "UNKNOWN-history continuation requires a v6 AWAITING_CONTROLLER receipt." }
+            $unkFacts = Get-ManagedObserveUnknownContinuationFacts -Evidence $receipt.observeUnknownContinuationEvidence
+            if ($null -eq $unkFacts -or $unkFacts.Valid -isnot [bool] -or -not $unkFacts.Valid -or $null -eq $unkFacts.Facts) { throw "UNKNOWN-history pending facts not verified." }
+            $unkSubtotal = $unkFacts.Facts.accounting.lastVerifiedSubtotal
+            $unkFailurePath = [string]$unkFacts.Facts.accounting.unresolvedFailure.receipt.path
+            $unkFailureSha = [string]$unkFacts.Facts.accounting.unresolvedFailure.receipt.sha256
+        }
+        $unkAlloc = $capture.binding.allocation
+        if (-not ($unkSubtotal -is [int] -or $unkSubtotal -is [long]) -or [long]$unkSubtotal -ne [long]$unkAlloc.lastVerifiedSubtotal) { throw "UNKNOWN-history subtotal mismatch." }
+        if (-not [string]::Equals($unkFailurePath, [string]$unkAlloc.unresolvedFailureReceipt.path, [System.StringComparison]::OrdinalIgnoreCase) -or $unkFailureSha -cne [string]$unkAlloc.unresolvedFailureReceipt.sha256) { throw "UNKNOWN-history unresolved failure reference mismatch." }
+        if ($null -ne $capture.binding.cumulativeOutput) { throw "UNKNOWN-history binding must carry a null cumulative output." }
+    }
+    if ($observeMode -and -not $unknownMode) {
         # The pending v3 receipt is validated directly (strict v3 validator + shared pending facts); it never enters general reconciliation.
         . (Join-Path $PSScriptRoot 'managed-native-receipt.ps1')
         if ($receipt.schemaVersion -cne 'OperationalRunReceipt/v3' -or $receipt.status -cne 'AWAITING_CONTROLLER' -or $receipt.outputStopMode -cne 'OBSERVE_ONLY') { throw "OBSERVE_ONLY requires a pending v3 AWAITING_CONTROLLER receipt." }
@@ -366,7 +451,7 @@ $sw = [Diagnostics.Stopwatch]::StartNew()
         if (-not ($usedFacts -is [int] -or $usedFacts -is [long]) -or [long]$usedFacts -ne [long]$receipt.budget.usedOutputTokens -or [long]$usedFacts -ne [long]$capture.binding.cumulativeOutput) { throw "OBSERVE_ONLY cumulative output mismatch." }
     }
     if ($receipt.status -ne 'AWAITING_CONTROLLER') {
-        if (-not ($blockedAdmit -and $receipt.schemaVersion -ceq 'OperationalRunReceipt/v2' -and $receipt.status -ceq 'BLOCKED')) { throw "Receipt status must be AWAITING_CONTROLLER." }
+        if (-not (($blockedAdmit -and $receipt.schemaVersion -ceq 'OperationalRunReceipt/v2' -and $receipt.status -ceq 'BLOCKED') -or ($unknownMode -and $receiptIsFailedRoot -and $receipt.schemaVersion -ceq 'OperationalRunReceipt/v5' -and $receipt.status -ceq 'FAILED'))) { throw "Receipt status must be AWAITING_CONTROLLER." }
     }
 
     $sha256 = [System.Security.Cryptography.SHA256]::Create()
@@ -396,9 +481,13 @@ if ($observeMode) {
         if ($plan.outputStopMode -isnot [string] -or $plan.outputStopMode -cne 'OBSERVE_ONLY') { throw "OBSERVE_ONLY plan marker mismatch." }
     }
     if (-not $observeMode -and (-not ($plan.maxAdditionalOutput -is [int] -or $plan.maxAdditionalOutput -is [long]) -or $plan.maxAdditionalOutput -le 0)) { throw "maxAdditionalOutput must be positive int." }
-    if (-not ($plan.cumulativeOutput -is [int] -or $plan.cumulativeOutput -is [long]) -or $plan.cumulativeOutput -lt 0) { throw "cumulativeOutput must be nonnegative int." }
+    if ($unknownMode) {
+        # UNKNOWN-history: the plan keeps an exact null cumulative output; it is never cast, compared arithmetically or coerced to 0.
+        if ($null -ne $plan.cumulativeOutput) { throw "UNKNOWN-history plan cumulativeOutput must be null." }
+    }
+    elseif (-not ($plan.cumulativeOutput -is [int] -or $plan.cumulativeOutput -is [long]) -or $plan.cumulativeOutput -lt 0) { throw "cumulativeOutput must be nonnegative int." }
     if (-not $observeMode -and (-not ($plan.aggregateCeiling -is [int] -or $plan.aggregateCeiling -is [long]) -or $plan.aggregateCeiling -le 0)) { throw "aggregateCeiling must be positive int." }
-    if ($plan.cumulativeOutput -ne $receipt.budget.usedOutputTokens) { throw "cumulativeOutput mismatch vs receipt.budget.usedOutputTokens." }
+    if (-not $unknownMode -and $plan.cumulativeOutput -ne $receipt.budget.usedOutputTokens) { throw "cumulativeOutput mismatch vs receipt.budget.usedOutputTokens." }
 
 if ($plan.ownedPaths -isnot [array] -or $plan.ownedPaths.Count -eq 0) { throw "ownedPaths must be a nonempty array." }
     $ownedPaths = $plan.ownedPaths
@@ -447,6 +536,16 @@ $knownOk = $plan.budgetKnown -and $plan.ownershipKnown
         }
     }
     try {
+        if ($unknownMode) {
+            # Reauthenticate the whole UNKNOWN-history input under the state lock, before any state read or write: bytes unchanged, then the actual receipt, next ticket,
+            # fixed human direction and parent chain are rederived from pinned bytes and must equal the first-window capture exactly.
+            & $assertCapture
+            $lockedBinding = Get-ControllerAllocationInputBinding -Snapshot $AllocationSnapshot -ExpectedOrigin $ExpectedAllocationOrigin -ReceiptPath $receiptFull -NextTicketPath $NextTicketPath -NextPayloadPath $NextPayloadPath
+            if ((ConvertTo-Json -InputObject $lockedBinding -Depth 12 -Compress) -cne (ConvertTo-Json -InputObject $capture.binding -Depth 12 -Compress)) { throw $allocFail }
+            $lockedReceipt = (Get-Content -LiteralPath $receiptFull -Raw) | ConvertFrom-Json -DateKind String
+            if (-not (Test-OperationalReceipt $lockedReceipt)) { throw "UNKNOWN-history receipt failed the locked revalidation." }
+            & $assertCapture
+        }
         if ($blockedAdmit) {
             $lockedBlockedMatch = & $getBlockedMatch
             if ($null -eq $lockedBlockedMatch -or $lockedBlockedMatch.fingerprintSha256 -isnot [string] -or $lockedBlockedMatch.fingerprintSha256 -cne $initialBlockedMatch.fingerprintSha256 -or $lockedBlockedMatch.fingerprintSha256 -cne $plannedMarker) { throw $predFail }
@@ -478,11 +577,18 @@ foreach ($p in $state.entries.PSObject.Properties) {
             if ($observeMode) {
                 if ($existingMode.Count -ne 1 -or $existingMode[0].Name -cne 'outputStopMode' -or $existingMode[0].Value -cne 'OBSERVE_ONLY') { throw "Persisted entry mode does not match the OBSERVE_ONLY plan." }
                 if ($null -ne $existing.aggregateCeiling -or $null -ne $existing.maxAdditionalOutput) { throw "Persisted OBSERVE_ONLY entry carries output ceilings." }
-                if ($existing.receiptSha256 -cne $receiptSha -or $existing.actionId -cne $plan.actionId -or [long]$existing.cumulativeOutput -ne [long]$capture.binding.cumulativeOutput -or [long]$existing.cumulativeOutput -ne [long]$plan.cumulativeOutput) { throw "Persisted OBSERVE_ONLY entry does not match receipt/plan/binding." }
+                if ($unknownMode) {
+                    # UNKNOWN-history parity: the persisted entry must carry the exact tagged values and a null cumulative output; nothing is cast.
+                    if ($existing.receiptSha256 -cne $receiptSha -or $existing.actionId -cne $plan.actionId -or $null -ne $existing.cumulativeOutput -or $null -ne $plan.cumulativeOutput -or $null -ne $capture.binding.cumulativeOutput) { throw "Persisted UNKNOWN entry does not match receipt/plan/binding." }
+                    $existingTags = @($existing.PSObject.Properties | Where-Object { @('accountingStatus', 'lastVerifiedSubtotal', 'unresolvedFailureReceipt') -ccontains [string]$_.Name })
+                    if ($existingTags.Count -ne 3 -or $existing.accountingStatus -cne 'UNKNOWN' -or [long]$existing.lastVerifiedSubtotal -ne [long]$capture.binding.allocation.lastVerifiedSubtotal -or $existing.unresolvedFailureReceipt.path -cne [string]$capture.binding.allocation.unresolvedFailureReceipt.path -or $existing.unresolvedFailureReceipt.sha256 -cne [string]$capture.binding.allocation.unresolvedFailureReceipt.sha256) { throw "Persisted UNKNOWN entry tags do not match the binding." }
+                }
+                elseif (@($existing.PSObject.Properties | Where-Object { @('accountingStatus', 'lastVerifiedSubtotal', 'unresolvedFailureReceipt') -contains [string]$_.Name }).Count -gt 0) { throw "Persisted UNKNOWN entry cannot be reinterpreted by another OBSERVE_ONLY plan." }
+                elseif ($existing.receiptSha256 -cne $receiptSha -or $existing.actionId -cne $plan.actionId -or [long]$existing.cumulativeOutput -ne [long]$capture.binding.cumulativeOutput -or [long]$existing.cumulativeOutput -ne [long]$plan.cumulativeOutput) { throw "Persisted OBSERVE_ONLY entry does not match receipt/plan/binding." }
                 $persistedOwned = @($existing.ownedPaths)
                 if ($persistedOwned.Count -ne $canonicalOwned.Count) { throw "Persisted OBSERVE_ONLY entry ownedPaths mismatch." }
                 for ($oi = 0; $oi -lt $canonicalOwned.Count; $oi++) { if ($persistedOwned[$oi] -cne $canonicalOwned[$oi]) { throw "Persisted OBSERVE_ONLY entry ownedPaths mismatch." } }
-            } elseif ($existingMode.Count -ne 0) {
+            } elseif ($existingMode.Count -ne 0 -or @($existing.PSObject.Properties | Where-Object { @('accountingStatus', 'lastVerifiedSubtotal', 'unresolvedFailureReceipt') -contains [string]$_.Name }).Count -gt 0) {
                 throw "Persisted OBSERVE_ONLY entry cannot be reinterpreted by a legacy plan."
             }
             $entry = $existing
@@ -507,6 +613,12 @@ foreach ($p in $state.entries.PSObject.Properties) {
                 nextWake        = [PSCustomObject]@{ reason = $status; status = $status }
             }
             if ($observeMode) { $entry | Add-Member -NotePropertyName 'outputStopMode' -NotePropertyValue 'OBSERVE_ONLY' }
+            if ($unknownMode) {
+                # The exact tagged UNKNOWN-history values and the unresolved-failure reference are persisted verbatim from the authenticated capture; cumulativeOutput stays null.
+                $entry | Add-Member -NotePropertyName 'accountingStatus' -NotePropertyValue 'UNKNOWN'
+                $entry | Add-Member -NotePropertyName 'lastVerifiedSubtotal' -NotePropertyValue ([long]$capture.binding.allocation.lastVerifiedSubtotal)
+                $entry | Add-Member -NotePropertyName 'unresolvedFailureReceipt' -NotePropertyValue ([PSCustomObject][ordered]@{ path = [string]$capture.binding.allocation.unresolvedFailureReceipt.path; sha256 = [string]$capture.binding.allocation.unresolvedFailureReceipt.sha256 })
+            }
             $entriesHash[$key] = $entry
         }
 
@@ -570,7 +682,8 @@ function Complete-ContinuationClaim {
         [Parameter(Mandatory)][string]$TerminalReceiptPath,
         [Parameter(Mandatory)][string]$TerminalSha256,
         [AllowNull()][object]$ExpectedBlockedReview,
-        [AllowNull()][object]$ExpectedFailedTransportEvidence
+        [AllowNull()][object]$ExpectedFailedTransportEvidence,
+        [AllowNull()][object]$ExpectedUnknownFailedEvidence
     )
 
     # Opt-in v2 BLOCKED path: capture once, before any StateDir IO; only returned values are used afterwards.
@@ -581,6 +694,13 @@ function Complete-ContinuationClaim {
     if ($hasFailedTransport) {
         if ($hasBlocked) { throw "Failed-transport settlement cannot combine with ExpectedBlockedReview; refusing to settle." }
         if ($null -eq $ExpectedFailedTransportEvidence) { throw "ExpectedFailedTransportEvidence is null; refusing to settle." }
+    }
+    # Explicit UNKNOWN-history failed opt-in (v7 only): the host-supplied expected evidence is mandatory for a v7 terminal and meaningless for any other.
+    $hasUnknownFailed = $PSBoundParameters.ContainsKey('ExpectedUnknownFailedEvidence')
+    $isV7 = $false
+    if ($hasUnknownFailed) {
+        if ($hasBlocked -or $hasFailedTransport) { throw "Unknown-history failed settlement cannot combine with another settlement evidence; refusing to settle." }
+        if ($null -eq $ExpectedUnknownFailedEvidence) { throw "ExpectedUnknownFailedEvidence is null; refusing to settle." }
     }
     $blockedInputs = $null
     $isV4 = $false
@@ -629,9 +749,14 @@ function Complete-ContinuationClaim {
         elseif ($termSchema.Value -ilike 'OperationalRunReceipt/v4*') { throw "Terminal receipt schema is not exactly OperationalRunReceipt/v4; refusing to settle." }
         if ($termSchema.Value -ceq 'OperationalRunReceipt/v5') { $isV5 = $true }
         elseif ($termSchema.Value -ilike 'OperationalRunReceipt/v5*') { throw "Terminal receipt schema is not exactly OperationalRunReceipt/v5; refusing to settle." }
+        if ($termSchema.Value -ilike 'OperationalRunReceipt/v6*') { throw "Pending v6 receipt cannot settle a claim; refusing to settle." }
+        if ($termSchema.Value -ceq 'OperationalRunReceipt/v7') { $isV7 = $true }
+        elseif ($termSchema.Value -ilike 'OperationalRunReceipt/v7*') { throw "Terminal receipt schema is not exactly OperationalRunReceipt/v7; refusing to settle." }
     }
     if ($isV5 -and -not $hasFailedTransport) { throw "Failed-transport v5 receipt requires explicit ExpectedFailedTransportEvidence; refusing to settle." }
     if ($hasFailedTransport -and -not $isV5) { throw "ExpectedFailedTransportEvidence requires an OperationalRunReceipt/v5 terminal; refusing to settle." }
+    if ($isV7 -and -not $hasUnknownFailed) { throw "Unknown-history failed v7 receipt requires explicit ExpectedUnknownFailedEvidence; refusing to settle." }
+    if ($hasUnknownFailed -and -not $isV7) { throw "ExpectedUnknownFailedEvidence requires an OperationalRunReceipt/v7 terminal; refusing to settle." }
     if (@('COMPLETED', 'FAILED') -notcontains $terminal.status) { throw "Terminal receipt status must be a definite terminal (COMPLETED or FAILED); AWAITING_CONTROLLER/deadline are not terminal." }
     if ([string]::IsNullOrWhiteSpace("$($terminal.provider.terminalReason)")) { throw "Terminal receipt missing terminalReason; refusing to settle." }
     }
@@ -764,6 +889,40 @@ function Complete-ContinuationClaim {
         $v5ProofSha = [System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.UTF8Encoding]::new($false).GetBytes((ConvertTo-Json -InputObject ([ordered]@{ proof = $v5Facts.proof; accounting = $v5Facts.accounting }) -Depth 12 -Compress)))).ToLowerInvariant()
     }
 
+    # Unknown-history failed mode (v7 only): rederive the whole failure proof from the pinned receipt and the host-supplied expected evidence, bind it to the
+    # ORIGINAL selected claim and keyed ACK. Nothing here classifies the run as completed or grants a next action.
+    $v7Facts = $null; $v7ProofSha = $null; $v7AckJson = $null; $verifyV7 = $null
+    if ($isV7) {
+        if ($identityKind -cne 'native') { throw "Unknown-history failed settlement requires a native execution identity; refusing to settle." }
+        . (Join-Path $PSScriptRoot 'managed-native-receipt.ps1')
+        $verifyV7 = {
+            param($rcpt)
+            if (-not (Test-ManagedObserveUnknownFailedReceiptV7Shape $rcpt)) { throw "Unknown-history failed receipt shape invalid; refusing to settle." }
+            $vf = Get-ManagedObserveUnknownFailedFacts -Evidence $rcpt.observeUnknownFailedEvidence
+            if (($null -eq $vf) -or ($vf.Valid -isnot [bool]) -or (-not $vf.Valid) -or ($null -eq $vf.Facts)) { throw "Unknown-history failed proof not verified; refusing to settle." }
+            if (-not (Compare-ManagedObserveUnknownFailedReceiptV7ToFacts $rcpt $vf.Facts)) { throw "Unknown-history failed receipt does not match the authenticated proof; refusing to settle." }
+            $rawPathV = [string]$rcpt.evidence.rawPath
+            $rv = Test-ManagedObserveUnknownFailedRawDto -RawPath $rawPathV -ExpectedSha256 ([string]$rcpt.evidence.rawSha256) -Facts $vf.Facts
+            if (($null -eq $rv) -or ($rv.Valid -isnot [bool]) -or (-not $rv.Valid) -or ($rv.Path -cne $rawPathV)) { throw "Unknown-history failed raw evidence not verified; refusing to settle." }
+            # The host-supplied expectation is independently authenticated and must equal the evidence stored in the receipt exactly.
+            $ex = Get-ManagedObserveUnknownFailedFacts -Evidence $ExpectedUnknownFailedEvidence
+            if (($null -eq $ex) -or ($ex.Valid -isnot [bool]) -or (-not $ex.Valid) -or ($null -eq $ex.Facts)) { throw "Expected unknown-history failed evidence not verified; refusing to settle." }
+            if ((ConvertTo-Json -InputObject $ex.Facts -Depth 12 -Compress) -cne (ConvertTo-Json -InputObject $vf.Facts -Depth 12 -Compress)) { throw "Expected unknown-history failed evidence does not match the receipt; refusing to settle." }
+            return $vf.Facts
+        }
+        $v7Facts = & $verifyV7 $terminal
+        $pc = $v7Facts.proof.claim
+        foreach ($cf in @('id', 'owner', 'claimId', 'intentId', 'receiptSha', 'planSha')) {
+            if ([string]$pc.$cf -cne [string]$SelectedClaim.$cf) { throw "Unknown-history failed proof claim does not match SelectedClaim; refusing to settle." }
+        }
+        if (-not [string]::Equals([System.IO.Path]::GetFullPath([string]$pc.statePath), $canonicalStatePath, [System.StringComparison]::OrdinalIgnoreCase)) { throw "Unknown-history failed proof claim statePath does not match canonical StateDir; refusing to settle." }
+        if (-not [string]::Equals([System.IO.Path]::GetFullPath([string]$v7Facts.proof.stateDir), $stateDirFull, [System.StringComparison]::OrdinalIgnoreCase)) { throw "Unknown-history failed proof stateDir does not match StateDir; refusing to settle." }
+        if (($ackEntry.dispatchedAt -isnot [string]) -or ($ackEntry.dispatchedAt -cne [string]$v7Facts.proof.startIdentity) -or ([int64]$binding.identity.pid -ne [int64]$v7Facts.proof.pid)) { throw "Acknowledgement start identity does not match unknown-history failed proof; refusing to settle." }
+        $v7AckJson = ConvertTo-Json -InputObject $ackEntry -Depth 20 -Compress
+        if ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.UTF8Encoding]::new($false).GetBytes($v7AckJson))).ToLowerInvariant() -cne [string]$v7Facts.proof.ackEntrySha256) { throw "Acknowledgement entry does not match the unknown-history failed proof snapshot; refusing to settle." }
+        $v7ProofSha = [System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.UTF8Encoding]::new($false).GetBytes((ConvertTo-Json -InputObject ([ordered]@{ proof = $v7Facts.proof; accounting = $v7Facts.accounting }) -Depth 12 -Compress)))).ToLowerInvariant()
+    }
+
     $terminalFingerprint = [PSCustomObject]@{
         terminalReceiptPath = $terminalFull
         terminalSha256      = $TerminalSha256.ToLowerInvariant()
@@ -784,6 +943,14 @@ function Complete-ContinuationClaim {
         $terminalFingerprint | Add-Member -NotePropertyName 'failureProofSha256' -NotePropertyValue $v5ProofSha
         $terminalFingerprint | Add-Member -NotePropertyName 'parentReceiptSha256' -NotePropertyValue ([string]$v5Facts.proof.parentReceiptSha256)
         $terminalFingerprint | Add-Member -NotePropertyName 'lastVerifiedParentOutputTokens' -NotePropertyValue ([int64]$v5Facts.accounting.lastVerifiedParentOutputTokens)
+    }
+    if ($isV7) {
+        $terminalFingerprint | Add-Member -NotePropertyName 'receiptSchemaVersion' -NotePropertyValue 'OperationalRunReceipt/v7'
+        $terminalFingerprint | Add-Member -NotePropertyName 'failureProofSha256' -NotePropertyValue $v7ProofSha
+        $terminalFingerprint | Add-Member -NotePropertyName 'parentReceiptSha256' -NotePropertyValue ([string]$v7Facts.proof.parentReceiptSha256)
+        $terminalFingerprint | Add-Member -NotePropertyName 'lastVerifiedSubtotal' -NotePropertyValue ([int64]$v7Facts.accounting.lastVerifiedSubtotal)
+        $terminalFingerprint | Add-Member -NotePropertyName 'unresolvedFailureReceiptPath' -NotePropertyValue ([string]$v7Facts.accounting.unresolvedFailure.receipt.path)
+        $terminalFingerprint | Add-Member -NotePropertyName 'unresolvedFailureReceiptSha256' -NotePropertyValue ([string]$v7Facts.accounting.unresolvedFailure.receipt.sha256)
     }
     if ($hasBlocked) {
         $terminalFingerprint.terminalSha256 = $blockedInputs.terminalSha256
@@ -870,6 +1037,25 @@ function Complete-ContinuationClaim {
             if ((ConvertTo-Json -InputObject $v5AckEntry -Depth 20 -Compress) -cne $v5AckJson) { throw "Acknowledgement changed before locked closure; refusing to settle." }
         }
 
+        # Window 2 (v7 only): recapture the pinned receipt, rederive the whole failure proof (parent, capture, registration, claim, ACK, raw DTO) and
+        # recheck the live keyed ACK under the lock, before any state read, idempotent replay return or write. Any drift refuses.
+        if ($isV7) {
+            if ((Get-FileHash -LiteralPath $terminalFull -Algorithm SHA256).Hash.ToLowerInvariant() -cne $terminalFingerprint.terminalSha256) { throw "Unknown-history failed receipt changed before locked closure; refusing to settle." }
+            try { $terminalNow = (Get-Content -LiteralPath $terminalFull -Raw) | ConvertFrom-Json -DateKind String } catch { throw "Unknown-history failed receipt unreadable at locked closure; refusing to settle." }
+            $v7Now = & $verifyV7 $terminalNow
+            if ((ConvertTo-Json -InputObject $v7Now -Depth 12 -Compress) -cne (ConvertTo-Json -InputObject $v7Facts -Depth 12 -Compress)) { throw "Unknown-history failed proof changed before locked closure; refusing to settle." }
+            if (-not (Test-Path -LiteralPath $ackPath -PathType Leaf)) { throw "Dispatch acknowledgement disappeared before locked closure; refusing to settle." }
+            $v7AckRaw = Get-Content -LiteralPath $ackPath -Raw
+            if ([string]::IsNullOrWhiteSpace($v7AckRaw)) { throw "Dispatch acknowledgement file is empty at locked closure; refusing to settle." }
+            try { $v7AckState = $v7AckRaw | ConvertFrom-Json -DateKind String } catch { throw "Dispatch acknowledgement file is not valid JSON at locked closure; refusing to settle." }
+            try { $v7AckHash = Test-HostDispatchAcknowledgementEnvelope -AckState $v7AckState } catch { throw "Dispatch acknowledgement file malformed at locked closure; refusing to settle. $($_.Exception.Message)" }
+            if (-not $v7AckHash.Contains($ackKey)) { throw "Acknowledgement entry missing at locked closure; refusing to settle." }
+            $v7AckEntry = $v7AckHash[$ackKey]
+            if ($null -eq $v7AckEntry -or -not ($v7AckEntry.PSObject.Properties.Name -contains 'executionBinding') -or $null -eq $v7AckEntry.executionBinding) { throw "Acknowledgement binding missing at locked closure; refusing to settle." }
+            try { Test-ExecutionBinding -Binding $v7AckEntry.executionBinding } catch { throw "Acknowledgement executionBinding failed strict validation at locked closure; refusing to settle. $($_.Exception.Message)" }
+            if ((ConvertTo-Json -InputObject $v7AckEntry -Depth 20 -Compress) -cne $v7AckJson) { throw "Acknowledgement changed before locked closure; refusing to settle." }
+        }
+
         if (-not (Test-Path -LiteralPath $canonicalStatePath -PathType Leaf)) { throw "Continuation state file not found; refusing to settle." }
         $raw = Get-Content -LiteralPath $canonicalStatePath -Raw
         if ([string]::IsNullOrWhiteSpace($raw)) { throw "Corrupt state file (empty); refusing to proceed." }
@@ -923,6 +1109,23 @@ function Complete-ContinuationClaim {
                     ($entry.settlement.failureDisposition -ceq 'AUTHENTICATED_FAILED_TERMINAL') -and
                     ($entry.settlement.accountingUnresolved -eq $true)
             }
+            if ($sameFingerprint -and $isV7) {
+                $sNames = @($entry.settlement.PSObject.Properties.Name)
+                $sameFingerprint = ($sNames -ccontains 'receiptSchemaVersion') -and ($sNames -ccontains 'failureProofSha256') -and ($sNames -ccontains 'failureDisposition') -and ($sNames -ccontains 'accountingUnresolved') -and ($sNames -ccontains 'parentReceiptSha256') -and ($sNames -ccontains 'lastVerifiedSubtotal') -and ($sNames -ccontains 'unresolvedFailureReceipt') -and
+                    ($entry.settlement.receiptSchemaVersion -ceq $terminalFingerprint.receiptSchemaVersion) -and
+                    ($entry.settlement.status -ceq $terminalFingerprint.status) -and
+                    ($entry.settlement.failureProofSha256 -ceq $terminalFingerprint.failureProofSha256) -and
+                    ($entry.settlement.parentReceiptSha256 -ceq $terminalFingerprint.parentReceiptSha256) -and
+                    ([int64]$entry.settlement.lastVerifiedSubtotal -eq $terminalFingerprint.lastVerifiedSubtotal) -and
+                    ($entry.settlement.unresolvedFailureReceipt.path -ceq $terminalFingerprint.unresolvedFailureReceiptPath) -and
+                    ($entry.settlement.unresolvedFailureReceipt.sha256 -ceq $terminalFingerprint.unresolvedFailureReceiptSha256) -and
+                    ($entry.settlement.failureDisposition -ceq 'AUTHENTICATED_FAILED_TERMINAL') -and
+                    ($entry.settlement.accountingUnresolved -eq $true)
+            }
+            if ($sameFingerprint -and $isV7) {
+                # Identical UNKNOWN-history failure replay: the same persisted settlement and retained claim, no write, no provider.
+                return [PSCustomObject]@{ status = 'SETTLED'; intentId = $SelectedClaim.intentId; replay = $true; statePath = $canonicalStatePath; disposition = 'FAILED'; accountingUnresolved = $true; settlement = $entry.settlement; claim = $entry.claim }
+            }
             if ($sameFingerprint -and $isV5) {
                 # Identical failure replay: the same persisted settlement and retained claim, no write, no provider.
                 return [PSCustomObject]@{ status = 'SETTLED'; intentId = $SelectedClaim.intentId; replay = $true; statePath = $canonicalStatePath; disposition = 'FAILED'; accountingUnresolved = $true; settlement = $entry.settlement; claim = $entry.claim }
@@ -937,6 +1140,13 @@ function Complete-ContinuationClaim {
         if ($entry.status -ne 'CLAIMED' -or $null -eq $entry.claim) { throw "Entry is not actively CLAIMED; refusing to settle." }
         if ($entry.claim.claimId -cne $SelectedClaim.claimId -or $entry.claim.owner -cne $SelectedClaim.owner) { throw "Entry claim does not match SelectedClaim owner/claimId; refusing to settle." }
         if ($entry.receiptSha256 -cne $SelectedClaim.receiptSha -or $entry.planSha256 -cne $SelectedClaim.planSha) { throw "Entry receipt/plan does not match SelectedClaim; refusing to settle." }
+        if ($isV7) {
+            # The retained claim entry is the immediate parent receipt's claim (the failed v5 root or a v6 pending receipt): parent hash, run, attempt and original action must
+            # equal the failure proof, and the entry must carry the same tagged unresolved-failure root and last verified subtotal; none of it is rewritten.
+            if ($entry.receiptSha256 -cne [string]$v7Facts.proof.parentReceiptSha256 -or $entry.runId -cne [string]$v7Facts.proof.parentRunId -or [int64]$entry.attempt -ne [int64]$v7Facts.proof.parentAttempt -or $entry.actionId -cne [string]$v7Facts.proof.originalActionId -or [string]$v7Facts.proof.originalActionId -cne [string]$v7Facts.proof.claim.id -or [string]$v7Facts.proof.claim.id -cne [string]$v7Facts.proof.taskId) { throw "Entry parent identity does not match the unknown-history failed proof; refusing to settle." }
+            if ($null -ne $entry.cumulativeOutput -or @($entry.PSObject.Properties | Where-Object { @('accountingStatus', 'lastVerifiedSubtotal', 'unresolvedFailureReceipt') -ccontains [string]$_.Name }).Count -ne 3) { throw "Entry is not an UNKNOWN-history entry; refusing to settle." }
+            if ([long]$entry.lastVerifiedSubtotal -ne [long]$v7Facts.accounting.lastVerifiedSubtotal -or $entry.unresolvedFailureReceipt.path -cne [string]$v7Facts.accounting.unresolvedFailure.receipt.path -or $entry.unresolvedFailureReceipt.sha256 -cne [string]$v7Facts.accounting.unresolvedFailure.receipt.sha256) { throw "Entry unresolved-failure root does not match the unknown-history failed proof; refusing to settle." }
+        }
         if ($isV5) {
             # The retained claim entry is the parent receipt's claim: parent hash, run, attempt and original action must equal the failure proof.
             if ($entry.receiptSha256 -cne [string]$v5Facts.proof.parentReceiptSha256 -or $entry.runId -cne [string]$v5Facts.proof.parentRunId -or [int64]$entry.attempt -ne [int64]$v5Facts.proof.parentAttempt -or $entry.actionId -cne [string]$v5Facts.proof.originalActionId -or [string]$v5Facts.proof.originalActionId -cne [string]$v5Facts.proof.claim.id -or [string]$v5Facts.proof.claim.id -cne [string]$v5Facts.proof.taskId) { throw "Entry parent identity does not match the failed-transport proof; refusing to settle." }
@@ -968,6 +1178,16 @@ function Complete-ContinuationClaim {
             $entry.settlement | Add-Member -NotePropertyName 'parentReceiptSha256' -NotePropertyValue $terminalFingerprint.parentReceiptSha256 -Force
             $entry.settlement | Add-Member -NotePropertyName 'failureProofSha256' -NotePropertyValue $terminalFingerprint.failureProofSha256 -Force
         }
+        if ($isV7) {
+            $entry.settlement | Add-Member -NotePropertyName 'receiptSchemaVersion' -NotePropertyValue $terminalFingerprint.receiptSchemaVersion -Force
+            $entry.settlement | Add-Member -NotePropertyName 'failureDisposition' -NotePropertyValue 'AUTHENTICATED_FAILED_TERMINAL' -Force
+            $entry.settlement | Add-Member -NotePropertyName 'accountingUnresolved' -NotePropertyValue $true -Force
+            $entry.settlement | Add-Member -NotePropertyName 'accountingStatus' -NotePropertyValue 'UNKNOWN' -Force
+            $entry.settlement | Add-Member -NotePropertyName 'lastVerifiedSubtotal' -NotePropertyValue $terminalFingerprint.lastVerifiedSubtotal -Force
+            $entry.settlement | Add-Member -NotePropertyName 'unresolvedFailureReceipt' -NotePropertyValue ([PSCustomObject][ordered]@{ path = $terminalFingerprint.unresolvedFailureReceiptPath; sha256 = $terminalFingerprint.unresolvedFailureReceiptSha256 }) -Force
+            $entry.settlement | Add-Member -NotePropertyName 'parentReceiptSha256' -NotePropertyValue $terminalFingerprint.parentReceiptSha256 -Force
+            $entry.settlement | Add-Member -NotePropertyName 'failureProofSha256' -NotePropertyValue $terminalFingerprint.failureProofSha256 -Force
+        }
         if ($hasBlocked) {
             $entry.settlement | Add-Member -NotePropertyName 'receiptSchemaVersion' -NotePropertyValue $terminalFingerprint.receiptSchemaVersion -Force
             $entry.settlement | Add-Member -NotePropertyName 'reviewedDispositionReviewSha256' -NotePropertyValue $terminalFingerprint.reviewedDispositionReviewSha256 -Force
@@ -980,7 +1200,7 @@ function Complete-ContinuationClaim {
         ($state | ConvertTo-Json -Depth 20) | Set-Content -LiteralPath $tmpPath -NoNewline
         Move-Item -LiteralPath $tmpPath -Destination $canonicalStatePath -Force
 
-        if ($isV5) {
+        if ($isV5 -or $isV7) {
             return [PSCustomObject]@{ status = 'SETTLED'; intentId = $SelectedClaim.intentId; replay = $false; statePath = $canonicalStatePath; disposition = 'FAILED'; accountingUnresolved = $true; settlement = $entry.settlement; claim = $entry.claim }
         }
         [PSCustomObject]@{ status = 'SETTLED'; intentId = $SelectedClaim.intentId; replay = $false; statePath = $canonicalStatePath }

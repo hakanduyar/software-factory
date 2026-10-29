@@ -60,7 +60,8 @@ function Get-ControllerAllocationInputBinding {
         $receipt = $docs[0]
         $ticket = $docs[1]
 
-        $cumulative = [long]$binding.cumulativeOutput
+        # An exact null cumulative output exists only in the explicit UNKNOWN-history shape (proven by the binding); it is never cast to 0.
+        $cumulative = $(if ($null -eq $binding.cumulativeOutput) { $null } else { [long]$binding.cumulativeOutput })
         if ($null -ne $binding.allocation.PSObject.Properties['outputStopMode']) {
             # OBSERVE_ONLY: the caller's marker and null fields decide nothing. The actual pending v3 receipt, the shared pending-accounting
             # verifier, the actual next ticket contract and the anchored policy decide the mode. Trusted staged siblings only; read-only.
@@ -79,6 +80,92 @@ function Get-ControllerAllocationInputBinding {
                 $m = @($o.PSObject.Properties | Where-Object { [string]::Equals($_.Name, $n, $ord) })
                 if ($m.Count -ne 1 -or $m[0].MemberType -ne $note) { & $fail }
                 return , $m[0].Value
+            }
+
+            if ($null -ne $binding.allocation.PSObject.Properties['accountingStatus']) {
+                # UNKNOWN-history: the caller's tags decide nothing. The ACTUAL receipt (the failed v5 root or a v6 pending receipt), the actual next ticket, the fixed human
+                # direction and the authenticated parent chain are rederived from pinned bytes here, then compared to the captured tags, subtotal and nulls. Read-only.
+                if ($null -ne $cumulative) { & $fail }
+                $unkAlloc = $binding.allocation
+                $unkSchema = & $cget $receipt 'schemaVersion'
+                $unkIsV5 = ($unkSchema -is [string]) -and ($unkSchema -ceq 'OperationalRunReceipt/v5')
+                $unkIsV6 = ($unkSchema -is [string]) -and ($unkSchema -ceq 'OperationalRunReceipt/v6')
+                if (-not ($unkIsV5 -or $unkIsV6)) { & $fail }
+                if (-not (Test-OperationalReceipt $receipt)) { & $fail }
+                if ((& $cget $receipt 'outputStopMode') -cne 'OBSERVE_ONLY') { & $fail }
+                $historyVerified = & $cget $receipt 'historyVerified'
+                if ($historyVerified -isnot [bool] -or $historyVerified) { & $fail }
+                $artifactComplete = & $cget (& $cget $receipt 'artifact') 'complete'
+                if ($artifactComplete -isnot [bool] -or $artifactComplete) { & $fail }
+                if ($null -ne (& $cget (& $cget $receipt 'budget') 'usedOutputTokens')) { & $fail }
+                if ($unkIsV5) {
+                    if ((& $cget $receipt 'status') -cne 'FAILED') { & $fail }
+                    $unkRes = Get-ManagedObserveFailedTransportFacts -Evidence (& $cget $receipt 'observeFailedTransportEvidence')
+                    if ($null -eq $unkRes -or $unkRes.Valid -isnot [bool] -or -not $unkRes.Valid -or $null -eq $unkRes.Facts) { & $fail }
+                    $unkFacts = $unkRes.Facts
+                    $unkSubtotal = $unkFacts.accounting.lastVerifiedParentOutputTokens
+                    $unkFailurePath = [System.IO.Path]::GetFullPath([string]$ReceiptPath)
+                    $unkFailureSha = [string]$binding.predecessorReceiptSha256
+                    $unkCur = $unkFacts.evidence.current
+                    $unkRecapture = Get-ManagedNativeCapturedFacts -ManifestPath $unkCur.manifestPath -ExpectedManifestSha256 $unkCur.manifestSha256 -TerminalPath $unkCur.terminalPath -ExpectedTerminalSha256 $unkCur.terminalSha256 -TicketPath $unkCur.ticketPath -RunId $unkCur.runId -Attempt ([int][long]$unkCur.attempt) -ForFailedTransportObservation
+                    $unkWantCode = 'OBSERVE_ONLY_FAILED_TRANSPORT_CAPTURE'
+                } else {
+                    if ((& $cget $receipt 'status') -cne 'AWAITING_CONTROLLER') { & $fail }
+                    $unkRes = Get-ManagedObserveUnknownContinuationFacts -Evidence (& $cget $receipt 'observeUnknownContinuationEvidence')
+                    if ($null -eq $unkRes -or $unkRes.Valid -isnot [bool] -or -not $unkRes.Valid -or $null -eq $unkRes.Facts) { & $fail }
+                    $unkFacts = $unkRes.Facts
+                    $unkSubtotal = $unkFacts.accounting.lastVerifiedSubtotal
+                    $unkFailurePath = [string]$unkFacts.accounting.unresolvedFailure.receipt.path
+                    $unkFailureSha = [string]$unkFacts.accounting.unresolvedFailure.receipt.sha256
+                    $unkCur = $unkFacts.evidence.current
+                    $unkRecapture = Get-ManagedNativeCapturedFacts -ManifestPath $unkCur.manifestPath -ExpectedManifestSha256 $unkCur.manifestSha256 -TerminalPath $unkCur.terminalPath -ExpectedTerminalSha256 $unkCur.terminalSha256 -TicketPath $unkCur.ticketPath -RunId $unkCur.runId -Attempt ([int][long]$unkCur.attempt) -ForOutputObservation
+                    $unkWantCode = 'OBSERVE_ONLY_TRANSPORT_CAPTURE'
+                }
+                if (-not (& $isInteger $unkSubtotal) -or [long]$unkSubtotal -lt 0 -or [long]$unkSubtotal -ne [long]$unkAlloc.lastVerifiedSubtotal) { & $fail }
+                if (-not [string]::Equals($unkFailurePath, [string]$unkAlloc.unresolvedFailureReceipt.path, [System.StringComparison]::OrdinalIgnoreCase) -or -not [string]::Equals($unkFailureSha, [string]$unkAlloc.unresolvedFailureReceipt.sha256, $ord)) { & $fail }
+
+                # ControlRoot comes only from the authenticated recapture of the receipt's own pinned evidence, never from the caller.
+                if (@($unkRecapture).Count -ne 1 -or $unkRecapture -isnot [System.Management.Automation.PSCustomObject]) { & $fail }
+                if ((& $cget $unkRecapture 'Valid') -isnot [bool] -or (& $cget $unkRecapture 'Valid') -or $null -ne (& $cget $unkRecapture 'Facts') -or (& $cget $unkRecapture 'Code') -cne $unkWantCode) { & $fail }
+                $unkOc = & $cget $unkRecapture 'ObservationCapture'
+                if ((& $cget $unkOc 'RunId') -cne [string]$unkFacts.identity.runId) { & $fail }
+                $unkWd = & $cget (& $cget $unkOc 'Core') 'workingDirectory'
+                if ($unkWd -isnot [string] -or $unkWd.Length -eq 0 -or $unkWd.Length -gt 1024 -or -not [System.IO.Path]::IsPathRooted($unkWd)) { & $fail }
+                if (-not [string]::Equals([System.IO.Path]::GetFullPath($unkWd), $unkWd, $ord)) { & $fail }
+                $unkLast = $unkWd[$unkWd.Length - 1]
+                if ($unkLast -eq [System.IO.Path]::DirectorySeparatorChar -or $unkLast -eq [System.IO.Path]::AltDirectorySeparatorChar) { & $fail }
+                $unkControlRoot = [System.IO.Path]::Combine($unkWd, '.factory-data', 'chief', 'controller-runtime', 'control')
+
+                # Next ticket: the captured bytes decide the mode through the native contract; the shared prelaunch verifier rederives the direction, the parent chain, the
+                # unresolved failed root and the lineage from pinned bytes and proves the next session is new.
+                $unkPre = Test-ManagedObserveUnknownContinuationPrelaunch -Ticket $ticket -PayloadSha256 ([string]$binding.nextPayloadSha256) -ControlRoot $unkControlRoot -ExpectedParentSha256 ([string]$binding.predecessorReceiptSha256) -ExpectedParentPath ([System.IO.Path]::GetFullPath([string]$ReceiptPath))
+                if ($null -eq $unkPre -or $unkPre.Valid -isnot [bool] -or -not $unkPre.Valid -or $null -eq $unkPre.Contract -or $null -eq $unkPre.Chain) { & $fail }
+                $unkContract = $unkPre.Contract
+                $unkAc = $unkContract.AccountingContinuation
+                if ([long]$unkAc.LastVerifiedSubtotal -ne [long]$unkAlloc.lastVerifiedSubtotal -or [long]$unkAc.LastVerifiedSubtotal -ne [long]$unkSubtotal) { & $fail }
+                if (-not [string]::Equals([string]$unkAc.UnresolvedFailureReceipt.Path, [string]$unkAlloc.unresolvedFailureReceipt.path, [System.StringComparison]::OrdinalIgnoreCase) -or -not [string]::Equals([string]$unkAc.UnresolvedFailureReceipt.Sha256, [string]$unkAlloc.unresolvedFailureReceipt.sha256, $ord)) { & $fail }
+                if (-not [string]::Equals([string]$unkPre.Chain.Parent.receiptSha256, [string]$binding.predecessorReceiptSha256, $ord)) { & $fail }
+                $unkAuthority = Resolve-ManagedOutputStopAuthority -TicketContract $unkContract -CapturedTicket ([byte[]]($bytesList[1].Clone())) -ControlRoot $unkControlRoot
+                if ($null -eq $unkAuthority -or $unkAuthority -isnot [System.Management.Automation.PSCustomObject] -or $unkAuthority.Schema -cne 'ManagedOutputStopAuthority/v1' -or $unkAuthority.Mode -cne 'OBSERVE_ONLY') { & $fail }
+                $unkElapsed = $unkContract.Budget.ElapsedMs
+                $unkAttempts = & $cget $ticket 'maxAttempts'
+                if (($null -ne $unkElapsed) -and (-not (& $isInteger $unkElapsed) -or [long]$unkElapsed -le 0)) { & $fail }
+                if (-not (& $isInteger $unkAttempts) -or [long]$unkAttempts -le 0) { & $fail }
+                $unkScope = Get-ControllerAllocationScope -CumulativeOutput $null -Scope ([pscustomobject][ordered]@{
+                        taskId                   = & $cget $ticket 'id'
+                        owner                    = & $cget $ticket 'owner'
+                        ownedPaths               = & $cget $ticket 'ownedPaths'
+                        outputStopMode           = 'OBSERVE_ONLY'
+                        accountingStatus         = 'UNKNOWN'
+                        lastVerifiedSubtotal     = [long]$unkAc.LastVerifiedSubtotal
+                        unresolvedFailureReceipt = [pscustomobject][ordered]@{ path = [string]$unkAc.UnresolvedFailureReceipt.Path; sha256 = [string]$unkAc.UnresolvedFailureReceipt.Sha256 }
+                        maxAdditionalOutput      = $null
+                        aggregateCeiling         = $null
+                        maxAttempts              = $unkAttempts
+                        maxElapsedMs             = $unkElapsed
+                    })
+                if ((ConvertTo-Json -InputObject $unkScope -Depth 6 -Compress) -cne (ConvertTo-Json -InputObject $unkAlloc -Depth 6 -Compress)) { & $fail }
+                return $binding
             }
 
             # Current pending receipt: strict v3 validator (reruns the shared verifier) and the same shared facts; no other mode or COMPLETED shortcut.

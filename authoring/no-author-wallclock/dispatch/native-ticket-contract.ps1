@@ -10,6 +10,9 @@ function Test-ManagedNativeTicketContract {
     $values = @{}
     $advisoryResult = $null
     $outputStopsResult = $null
+    $continuationResult = $null
+    $contMode = $false
+    $descMode = $false
     $read = {
         param($o, [string]$name)
         $found = @($o.PSObject.Properties | Where-Object { $_.Name -ceq $name })
@@ -39,6 +42,12 @@ function Test-ManagedNativeTicketContract {
                 }
             }
         }
+        # UNKNOWN-history continuation selector (pure structural; no IO, no authority). The exact-ordinal top-level accountingContinuation selects the
+        # branch; any other spelling, a duplicate, or a null/boolean value refuses and never falls back to a known-history reading.
+        $contProps = @($Ticket.PSObject.Properties | Where-Object { $_.Name -ceq 'accountingContinuation' })
+        if (@($Ticket.PSObject.Properties | Where-Object { $_.Name -ieq 'accountingContinuation' -and $_.Name -cne 'accountingContinuation' }).Count -gt 0) { $issues.Add('ACCOUNTINGCONTINUATION_CASE') }
+        if ($contProps.Count -gt 1) { $issues.Add('ACCOUNTINGCONTINUATION_DUPLICATE') }
+        $contMode = ($contProps.Count -eq 1)
         $before = $issues.Count
         $budget = & $read $Ticket 'budget'
         if ($issues.Count -eq $before) {
@@ -55,6 +64,11 @@ function Test-ManagedNativeTicketContract {
                     $before = $issues.Count
                     $v = & $read $budget $name
                     if ($issues.Count -ne $before) { continue }
+                    # UNKNOWN-history continuation: an exact null historicalOutputTokens is valid only with the explicit descriptor branch and is stored as null (never cast to 0).
+                    if ($contMode -and $descMode -and $name -ceq 'historicalOutputTokens') {
+                        if ($null -ne $v) { $issues.Add('CONTINUATION_HISTORY_NOT_NULL') } else { $values[$name] = $null }
+                        continue
+                    }
                     # Observe-only descriptor branch only: an exact null elapsedMs means NO TOTAL AUTHOR DEADLINE (not 0). Finite positive values remain valid for historical tickets.
                     if ($descMode -and $name -ceq 'elapsedMs' -and $null -eq $v) { $values[$name] = $null; continue }
                     if ($v -isnot [int] -and $v -isnot [long]) { $issues.Add('TYPE_' + $name.ToUpperInvariant()); continue }
@@ -172,6 +186,60 @@ function Test-ManagedNativeTicketContract {
             }
         }
     }
+    if ($contMode) {
+        $ci = [System.Collections.Generic.List[string]]::new()
+        $noteKind = [System.Management.Automation.PSMemberTypes]::NoteProperty
+        # Shape-only {path,sha256} check: a well-formed reference is never verified authority.
+        $ctRef = {
+            param($x)
+            $n = if ($x -is [System.Management.Automation.PSCustomObject]) { @($x.PSObject.Properties | ForEach-Object { $_.Name }) } else { @() }
+            if ($n.Count -ne 2 -or $n -cnotcontains 'path' -or $n -cnotcontains 'sha256') { return $null }
+            if (@($x.PSObject.Properties | Where-Object { $_.MemberType -ne [System.Management.Automation.PSMemberTypes]::NoteProperty }).Count -ne 0) { return $null }
+            $p = $x.path; $h = $x.sha256
+            if ($p -isnot [string] -or [string]::IsNullOrWhiteSpace($p) -or $p.Length -gt 2048 -or $h -isnot [string] -or $h -cnotmatch '^[0-9a-f]{64}\z') { return $null }
+            try {
+                if (-not [System.IO.Path]::IsPathFullyQualified($p) -or [System.IO.Path]::GetFullPath($p) -cne $p) { return $null }
+            } catch { return $null }
+            return [pscustomobject]@{ Path = [string]$p; Sha256 = [string]$h }
+        }
+        if (-not $descMode) { $ci.Add('CONTINUATION_REQUIRES_OBSERVE_ONLY') }
+        $cv = $contProps[0].Value
+        $cn = if ($cv -is [System.Management.Automation.PSCustomObject]) { @($cv.PSObject.Properties | ForEach-Object { $_.Name }) } else { $null }
+        $cFields = @('schema', 'status', 'lastVerifiedSubtotal', 'unresolvedFailureReceipt', 'humanDirectionRef')
+        $cSubtotal = $null; $cFail = $null; $cDir = $null; $cPre = $null
+        if ($null -eq $cn) { $ci.Add('CONTINUATION_NOT_OBJECT') }
+        elseif ($cn.Count -ne $cFields.Count -or @($cFields | Where-Object { $cn -cnotcontains $_ }).Count -ne 0 -or @($cv.PSObject.Properties | Where-Object { $_.MemberType -ne $noteKind }).Count -ne 0) { $ci.Add('CONTINUATION_FIELDS') }
+        else {
+            if ($cv.schema -isnot [string] -or $cv.schema -cne 'UnknownUsageContinuation/v1') { $ci.Add('CONTINUATION_SCHEMA') }
+            if ($cv.status -isnot [string] -or $cv.status -cne 'UNKNOWN') { $ci.Add('CONTINUATION_STATUS') }
+            $st = $cv.lastVerifiedSubtotal
+            if (($st -isnot [int] -and $st -isnot [long]) -or [long]$st -lt 0) { $ci.Add('CONTINUATION_SUBTOTAL') } else { $cSubtotal = [long]$st }
+            $cFail = & $ctRef $cv.unresolvedFailureReceipt
+            if ($null -eq $cFail) { $ci.Add('CONTINUATION_FAILURE_REF') }
+            $cDir = & $ctRef $cv.humanDirectionRef
+            if ($null -eq $cDir) { $ci.Add('CONTINUATION_DIRECTION_REF') }
+        }
+        # The existing immediate-parent binding must be present in the exact shape; it is compared to the actual parent elsewhere.
+        $pp = @($Ticket.PSObject.Properties | Where-Object { $_.Name -ceq 'observePredecessorReceipt' })
+        if ($pp.Count -ne 1 -or @($Ticket.PSObject.Properties | Where-Object { $_.Name -ieq 'observePredecessorReceipt' -and $_.Name -cne 'observePredecessorReceipt' }).Count -gt 0) { $ci.Add('CONTINUATION_PREDECESSOR_REF') }
+        else {
+            $cPre = & $ctRef $pp[0].Value
+            if ($null -eq $cPre) { $ci.Add('CONTINUATION_PREDECESSOR_REF') }
+        }
+        $tb = @($Ticket.PSObject.Properties | Where-Object { $_.Name -ceq 'budget' })
+        if ($tb.Count -eq 1 -and $tb[0].Value -is [System.Management.Automation.PSCustomObject] -and @($tb[0].Value.PSObject.Properties | Where-Object { $_.Name -ieq 'aggregateAdvisory' }).Count -gt 0) { $ci.Add('CONTINUATION_ADVISORY_CONFLICT') }
+        if ($ci.Count -gt 0) { foreach ($x in $ci) { $issues.Add($x) } }
+        else {
+            $continuationResult = [pscustomobject]@{
+                Schema = 'UnknownUsageContinuation/v1'
+                Status = 'UNKNOWN'
+                LastVerifiedSubtotal = [long]$cSubtotal
+                UnresolvedFailureReceipt = $cFail
+                HumanDirectionRef = $cDir
+                PredecessorReceipt = $cPre
+            }
+        }
+    }
     $valid = ($issues.Count -eq 0)
     $resultBudget = $null
     if ($valid) {
@@ -192,5 +260,7 @@ function Test-ManagedNativeTicketContract {
         Advisory = $(if ($valid) { $advisoryResult } else { $null })
         OutputStopMode = $(if ($valid -and $null -ne $outputStopsResult) { 'OBSERVE_ONLY_DESCRIPTOR' } else { 'LEGACY_HARDLIMIT' })
         OutputStops = $(if ($valid) { $outputStopsResult } else { $null })
+        AccountingMode = $(if ($valid -and $null -ne $continuationResult) { 'UNKNOWN_CONTINUATION' } else { 'KNOWN_HISTORY' })
+        AccountingContinuation = $(if ($valid) { $continuationResult } else { $null })
     }
 }

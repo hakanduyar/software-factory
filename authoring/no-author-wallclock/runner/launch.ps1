@@ -359,6 +359,27 @@ function Read-ManagedPinnedEvidenceJson {
     [PSCustomObject]@{ Path = $refPath; Sha256 = $actualHash; Length = $length; Value = $value }
 }
 
+function Get-ManagedUnknownContinuationDirectiveRef {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$ControlRoot)
+    # The fixed canonical human direction for UNKNOWN-history continuation. The path is derived from the canonical ControlRoot and the SHA-256 is anchored here;
+    # no caller-supplied path, hash, status or alias is ever accepted.
+    $anchorDirection = '9b515b11a3f09219191292dbf18b8e7d7ac9669c0bffda104f7dadbb0925b14d'
+    $path = $ControlRoot.TrimEnd('\') + '\resume-20261020\output-stop-removal-20261027-1\unknown-accounting-continuation-20261029-1\human-direction.json'
+    return [PSCustomObject]@{ Path = $path; Sha256 = $anchorDirection }
+}
+
+function Assert-ManagedUnknownContinuationDirective {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$ControlRoot)
+    # Reads the fixed human direction through the trusted pinned reader (ControlRoot descendant, canonical path, hash, strict JSON object). A modified byte, a wrong
+    # path or an alias refuses. Authenticates the pinned bytes only; it does not interpret or extend the direction and grants nothing by itself.
+    $ref = Get-ManagedUnknownContinuationDirectiveRef -ControlRoot $ControlRoot
+    $read = Read-ManagedPinnedEvidenceJson -Reference ([PSCustomObject]@{ path = $ref.Path; sha256 = $ref.Sha256 }) -ControlRoot $ControlRoot
+    if ($null -eq $read -or $read.Sha256 -isnot [string] -or $read.Sha256 -cne $ref.Sha256 -or $read.Path -isnot [string] -or $read.Path -cne $ref.Path -or $read.Value -isnot [PSCustomObject]) { throw 'UNKNOWN_DIRECTION: the fixed human direction is not the anchored pinned file.' }
+    return [PSCustomObject]@{ Path = [string]$read.Path; Sha256 = [string]$read.Sha256 }
+}
+
 function Resolve-ManagedAggregateAdvisory {
     [CmdletBinding()]
     param(
@@ -1340,6 +1361,26 @@ function Invoke-ManagedNativeCollector {
                     if ($cd.selected.$f -cne $claimC[$f]) { throw 'Refusing: canonical host decision does not match SelectedClaim.' }
                 }
                 if ($cd.selected.statePath -isnot [string] -or [System.IO.Path]::GetFullPath($cd.selected.statePath) -ine $csPath) { throw 'Refusing: canonical host decision statePath mismatch.' }
+            }
+            if ($noStop -and $null -ne $nativeTicketContract -and $nativeTicketContract.AccountingMode -ceq 'UNKNOWN_CONTINUATION') {
+                # UNKNOWN-history continuation: reauthenticate the fixed human direction, the exact failed v5 root (or the verified v6 immediate-successor chain back to
+                # it), the known lineage, the captured ticket/payload/output authority and the selected claim BEFORE any reservation or process start. Every value is
+                # rederived from pinned bytes; nothing is accepted from the caller. No argument, executable, cap or environment is added or relaxed by this gate.
+                if ($null -eq $ctx) { throw 'Refusing: an UNKNOWN-history continuation requires the acknowledged selected-claim context.' }
+                if ($null -ne $num['MaxElapsedMs']) { throw 'Refusing: an UNKNOWN-history continuation must carry a null MaxElapsedMs.' }
+                . (Join-Path $runnerDir '../dispatch/managed-native-receipt.ps1')
+                $unkControlRoot = [System.IO.Path]::GetFullPath($osControlRoot)
+                $unkPre = Test-ManagedObserveUnknownContinuationPrelaunch -Ticket $nativeTicket -PayloadSha256 $sha['PayloadPath'] -ControlRoot $unkControlRoot -RunId $runId -ExpectedParentSha256 ([string]$claimC['receiptSha'])
+                if ($null -eq $unkPre -or $unkPre.Valid -isnot [bool] -or -not $unkPre.Valid -or $null -eq $unkPre.Chain) {
+                    $unkCode = 'UNKNOWN'
+                    if ($null -ne $unkPre -and $null -ne $unkPre.PSObject.Properties['Code'] -and $unkPre.Code -is [string] -and $unkPre.Code -cmatch '^[A-Z0-9_]{1,48}$') { $unkCode = [string]$unkPre.Code }
+                    throw ('Refusing: UNKNOWN-history continuation prelaunch authentication failed: ' + $unkCode)
+                }
+                $unkParent = $unkPre.Chain.Parent
+                if ($claimC['id'] -cne $ctx['taskId']) { throw 'Refusing: UNKNOWN-history continuation claim id does not match the captured task.' }
+                if ($claimC['receiptSha'] -cne [string]$unkParent.receiptSha256) { throw 'Refusing: UNKNOWN-history continuation claim does not name the authenticated immediate parent.' }
+                $unkIntent = [string]$unkParent.receiptSha256 + '|' + [string]$unkParent.runId + '|' + [string]$unkParent.attempt + '|' + $claimC['id']
+                if ($claimC['intentId'] -cne $unkIntent) { throw 'Refusing: UNKNOWN-history continuation claim intent does not match the authenticated parent.' }
             }
             . (Join-Path (Split-Path -Parent $runnerDir) 'dispatch/packet-preflight.ps1')
             $gate = Invoke-PacketPreflight -TicketPath $paths['GateTicketPath'] -PayloadPath $paths['PayloadPath'] -EvidenceRoot (Split-Path -Parent (Split-Path -Parent $PSScriptRoot))

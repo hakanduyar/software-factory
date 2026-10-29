@@ -39,6 +39,21 @@ function Get-ControllerAllocationPlanScope {
     }
     elseif ($planMarkers.Count -ne 0) { & $fail }
 
+    # The captured binding also decides the UNKNOWN-history tags. The plan carries them as exact-ordinal NoteProperties only in that explicit shape; any alias, partial set
+    # or presence in another shape refuses and never falls back. These tags are structural: they are compared to the captured binding, never trusted as authority.
+    $unknownShape = ($null -ne $binding.allocation.PSObject.Properties['accountingStatus'])
+    $unknownTagNames = @('accountingStatus', 'lastVerifiedSubtotal', 'unresolvedFailureReceipt')
+    $planTagCount = 0
+    foreach ($planMember in @($Plan.PSObject.Properties)) {
+        foreach ($tagName in $unknownTagNames) {
+            if ([string]::Equals($planMember.Name, $tagName, [System.StringComparison]::OrdinalIgnoreCase)) { $planTagCount++ }
+        }
+    }
+    if ($unknownShape) {
+        if (-not $observeOnly -or $planTagCount -ne $unknownTagNames.Count -or -not (& $hasNotes $Plan $unknownTagNames)) { & $fail }
+    }
+    elseif ($planTagCount -ne 0) { & $fail }
+
     if ($Owner -isnot [string] -or [string]::IsNullOrWhiteSpace($Owner)) { & $fail }
     if (-not [string]::Equals($Owner, $binding.allocation.owner, $ordinal)) { & $fail }
 
@@ -60,21 +75,31 @@ function Get-ControllerAllocationPlanScope {
     }
     if ($observeOnly) {
         # Same ordered shape as the captured binding; the plan's null output fields are compared, never cast or defaulted.
-        $actualScope = [pscustomobject][ordered]@{
-            taskId              = $actualScope.taskId
-            owner               = $actualScope.owner
-            ownedPaths          = $actualScope.ownedPaths
-            outputStopMode      = $planMarkers[0].Value
-            maxAdditionalOutput = $actualScope.maxAdditionalOutput
-            aggregateCeiling    = $actualScope.aggregateCeiling
-            maxAttempts         = $actualScope.maxAttempts
-            maxElapsedMs        = $actualScope.maxElapsedMs
+        $observeScope = [ordered]@{
+            taskId         = $actualScope.taskId
+            owner          = $actualScope.owner
+            ownedPaths     = $actualScope.ownedPaths
+            outputStopMode = $planMarkers[0].Value
         }
+        if ($unknownShape) {
+            $observeScope['accountingStatus'] = $Plan.PSObject.Properties['accountingStatus'].Value
+            $observeScope['lastVerifiedSubtotal'] = $Plan.PSObject.Properties['lastVerifiedSubtotal'].Value
+            $observeScope['unresolvedFailureReceipt'] = $Plan.PSObject.Properties['unresolvedFailureReceipt'].Value
+        }
+        $observeScope['maxAdditionalOutput'] = $actualScope.maxAdditionalOutput
+        $observeScope['aggregateCeiling'] = $actualScope.aggregateCeiling
+        $observeScope['maxAttempts'] = $actualScope.maxAttempts
+        $observeScope['maxElapsedMs'] = $actualScope.maxElapsedMs
+        $actualScope = [pscustomobject]$observeScope
     }
     $cumulative = $Plan.PSObject.Properties['cumulativeOutput'].Value
     $planScope = Get-ControllerAllocationScope -Scope $actualScope -CumulativeOutput $cumulative
 
-    if ([long]$cumulative -ne [long]$binding.cumulativeOutput) { & $fail }
+    # UNKNOWN-history: the plan and the binding both carry an exact null cumulative output; it is never cast to a number, so nothing is compared arithmetically.
+    if ($unknownShape) {
+        if ($null -ne $cumulative -or $null -ne $binding.cumulativeOutput) { & $fail }
+    }
+    elseif ([long]$cumulative -ne [long]$binding.cumulativeOutput) { & $fail }
     $a = $planScope | ConvertTo-Json -Depth 6 -Compress
     $b = $binding.allocation | ConvertTo-Json -Depth 6 -Compress
     if (-not [string]::Equals($a, $b, $ordinal)) { & $fail }
