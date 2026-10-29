@@ -38,8 +38,15 @@ export interface ProcessRequest {
   readonly timeoutMs: number | null;
   /** Cooperative cancellation, e.g. from the caller's own request lifecycle. */
   readonly signal?: AbortSignal;
-  /** Caps captured bytes per stream; excess bytes are discarded (stream is still drained). */
-  readonly maxOutputBytes?: number;
+  /**
+   * Optional diagnostic ceiling on captured bytes per stream. `null` or
+   * omitted means NO artificial capture ceiling: every chunk is retained in
+   * memory (not spooled to disk) and `stdoutTruncated`/`stderrTruncated`
+   * stay false. A finite value must be a positive safe integer (anything else
+   * is refused before launch); excess bytes are then discarded, the stream is
+   * still drained, and truncation is reported. Never encoded as a huge number.
+   */
+  readonly maxOutputBytes?: number | null;
 }
 
 export const PROCESS_TERMINATION_REASONS = ["EXITED", "TIMEOUT", "CANCELLED", "SPAWN_ERROR"] as const;

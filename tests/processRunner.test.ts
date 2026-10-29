@@ -186,6 +186,62 @@ describe("ProcessRunner: bounded output capture", () => {
   });
 });
 
+describe("ProcessRunner: no artificial capture ceiling by default", () => {
+  const BYTES = 6 * 1024 * 1024; // above the former 5 MiB default
+  const BIG_CHILD =
+    `const n=${BYTES};process.stdout.write("a".repeat(n-7)+"OUTTAIL");process.stderr.write("b".repeat(n-7)+"ERRTAIL");`;
+
+  for (const [label, extra] of [["omitted", {}], ["null", { maxOutputBytes: null }]] as const) {
+    it(`retains every byte of both streams when maxOutputBytes is ${label}`, async () => {
+      const result = await fastRunner.run(
+        baseRequest({ executable: process.execPath, argv: ["-e", BIG_CHILD], timeoutMs: null, ...extra }),
+      );
+      assert.equal(result.terminationReason, "EXITED");
+      assert.equal(result.exitCode, 0);
+      assert.equal(result.stdout.length, BYTES);
+      assert.equal(result.stderr.length, BYTES);
+      assert.ok(result.stdout.endsWith("OUTTAIL"));
+      assert.ok(result.stderr.endsWith("ERRTAIL"));
+      assert.equal(result.stdoutTruncated, false);
+      assert.equal(result.stderrTruncated, false);
+    });
+  }
+
+  it("still truncates truthfully (and drains) under an explicit finite diagnostic ceiling", async () => {
+    const result = await fastRunner.run(
+      baseRequest({ executable: process.execPath, argv: ["-e", BIG_CHILD], timeoutMs: null, maxOutputBytes: 4096 }),
+    );
+    assert.equal(result.terminationReason, "EXITED");
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.stdout.length, 4096);
+    assert.equal(result.stderr.length, 4096);
+    assert.equal(result.stdoutTruncated, true);
+    assert.equal(result.stderrTruncated, true);
+  });
+
+  for (const bad of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 53, "1000", true]) {
+    it(`rejects invalid maxOutputBytes ${String(bad)} before launching any child`, async () => {
+      const dir = mkdtempSync(path.join(tmpdir(), "sf-runner-"));
+      const marker = path.join(dir, "launched");
+      try {
+        const request = {
+          executable: process.execPath,
+          argv: ["-e", `require("node:fs").writeFileSync(${JSON.stringify(marker)},"x")`],
+          cwd: REPO_ROOT,
+          env: {},
+          timeoutMs: null,
+          maxOutputBytes: bad,
+        } as unknown as ProcessRequest;
+        await assert.rejects(() => fastRunner.run(request), /maxOutputBytes must be null/);
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        assert.equal(existsSync(marker), false);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
 describe("ProcessRunner: hostile stdin", () => {
   it("does not crash or hang when the child exits without reading stdin", async () => {
     const largeInput = "x".repeat(5 * 1024 * 1024);

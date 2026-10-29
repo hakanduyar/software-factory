@@ -266,6 +266,73 @@ describe("cliWorker: verified recalled note forwarding (request -> adapter promp
   });
 });
 
+describe("cliWorker: author output retention (no artificial ceilings)", () => {
+  const SECRET = "sk-ant-test-1234567890abcdefghijklmnop";
+  const LONG = `${"x".repeat(20_000)} ${SECRET} ${"y".repeat(20_000)} END-TAIL-MARKER`;
+
+  function build(calls: ProcessRequest[], processResult: ProcessResult, reported: CliReportedResult, extra: Partial<CliWorkerAdapterConfig> = {}) {
+    return createCliWorker({
+      id: "stub-worker",
+      tool: "codex-cli",
+      roles: ["IMPLEMENTER"],
+      executable: "irrelevant-not-actually-spawned",
+      model: "m",
+      timeoutMs: null,
+      workspace: resolveWorkspace(createTempWorkspace()),
+      processRunner: { run: async (req) => { calls.push(req); return processResult; } },
+      environmentPolicy: { allowedVars: [] },
+      buildInvocation: () => ({ argv: [], effortApplication: { applied: false } }),
+      interpretOutput: () => reported,
+      ...extra,
+    });
+  }
+
+  for (const [label, extra] of [["omitted", {}], ["null", { maxOutputBytes: null, maxEvidenceChars: null }]] as const) {
+    it(`forwards a null raw cap to the runner when settings are ${label}`, async () => {
+      const calls: ProcessRequest[] = [];
+      await build(calls, fakeProcessResult(), {}, extra).execute(request());
+      assert.equal(calls.length, 1);
+      assert.equal(calls[0]!.maxOutputBytes, null);
+      assert.equal(calls[0]!.timeoutMs, null);
+    });
+  }
+
+  for (const key of ["maxOutputBytes", "maxEvidenceChars"] as const) {
+    for (const bad of [4000, 1, 0, -1, "4000", Number.NaN, true]) {
+      it(`refuses author ${key}=${String(bad)} without calling the runner`, () => {
+        const calls: ProcessRequest[] = [];
+        assert.throws(() => build(calls, fakeProcessResult(), {}, { [key]: bad } as Partial<CliWorkerAdapterConfig>), new RegExp(`${key} must be null`));
+        assert.equal(calls.length, 0);
+      });
+    }
+  }
+
+  it("keeps the complete redacted structured final text in /transcript with a concise summary", async () => {
+    const outcome = await build([], fakeProcessResult(), { finalMessage: LONG }).execute(request());
+    const transcript = outcome.evidence.find((e) => e.reference.endsWith("/transcript"));
+    assert.ok(transcript !== undefined);
+    assert.ok(transcript.summary.endsWith("END-TAIL-MARKER"));
+    assert.ok(!transcript.summary.includes(SECRET));
+    assert.ok(!transcript.summary.includes("truncated"));
+    assert.equal(transcript.summary.length, LONG.length - SECRET.length + "[REDACTED]".length);
+    assert.ok(outcome.summary.length < 400);
+    assert.equal(outcome.claimsAcceptanceMet, false);
+  });
+
+  it("keeps the complete redacted raw fallback in /raw-output only, without exit authority change", async () => {
+    const outcome = await build([], fakeProcessResult({ exitCode: 3, stdout: LONG }), {}).execute(request());
+    assert.equal(outcome.status, "FAILED");
+    assert.equal(outcome.evidence.find((e) => e.reference.endsWith("/transcript")), undefined);
+    const raw = outcome.evidence.find((e) => e.reference.endsWith("/raw-output"));
+    assert.ok(raw !== undefined);
+    assert.ok(raw.summary.endsWith("END-TAIL-MARKER"));
+    assert.ok(!raw.summary.includes(SECRET));
+    assert.match(raw.summary, /\[REDACTED\]/);
+    assert.ok(!raw.summary.includes("truncated"));
+    assert.equal(outcome.claimsAcceptanceMet, false);
+  });
+});
+
 describe("cliWorker: author timeout policy (no total deadline)", () => {
   function configWith(timeoutMs: unknown, calls: ProcessRequest[]): CliWorkerAdapterConfig {
     return {

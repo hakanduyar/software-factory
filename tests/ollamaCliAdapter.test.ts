@@ -121,7 +121,7 @@ describe("ollamaCliAdapter: createOllamaCliWorker", () => {
     assert.deepEqual(call.argv, ["run", "m:1", "--nowordwrap"]);
     assert.equal(call.cwd, ws.root);
     assert.equal(call.timeoutMs, null);
-    assert.equal(call.maxOutputBytes, undefined);
+    assert.equal(call.maxOutputBytes, null);
     assert.ok(call.input?.includes("Do the thing."));
     assert.equal(call.env["ANTHROPIC_API_KEY"], undefined);
     assert.equal(outcome.status, "SUCCEEDED");

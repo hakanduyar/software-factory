@@ -21,10 +21,11 @@
  *   a finite timeout, when given, still terminates the child.
  * - Timeout/cancellation escalate SIGTERM -> (grace period) -> SIGKILL
  *   rather than assuming the child honours SIGTERM.
- * - stdout/stderr are capped at `maxOutputBytes` per stream (default 5 MiB):
- *   once the cap is hit, further bytes are discarded but the stream is
- *   still drained, so a chatty child cannot block on a full pipe forever
- *   while the runner is quietly ignoring it.
+ * - stdout/stderr have NO default capture ceiling: omitted or `null`
+ *   `maxOutputBytes` retains every byte in memory (no disk spool). Only an
+ *   explicit positive-integer `maxOutputBytes` caps a stream; once that cap
+ *   is hit, further bytes are discarded but the stream is still drained, so
+ *   a chatty child cannot block on a full pipe, and truncation is reported.
  * - stdin is always explicitly ended (with `input`, if given) — never left
  *   open and inherited — so a CLI that only proceeds once stdin reaches EOF
  *   never hangs waiting on it. Errors writing to stdin (a child that closes
@@ -36,7 +37,6 @@ import { spawn } from "node:child_process";
 import type { Timestamp } from "../../domain/time.js";
 import type { ProcessRequest, ProcessResult, ProcessRunner, ProcessTerminationReason } from "../../ports/processRunner.js";
 
-const DEFAULT_MAX_OUTPUT_BYTES = 5 * 1024 * 1024;
 const DEFAULT_KILL_GRACE_MS = 3000;
 /** setTimeout silently coerces larger delays to 1ms, which would turn a "long" budget into an instant kill. */
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
@@ -51,17 +51,28 @@ export interface NodeProcessRunnerOptions {
   readonly killGraceMs?: number;
 }
 
+/** `undefined`/`null` (no artificial ceiling) or a positive safe integer; anything else is refused. */
+function isValidMaxOutputBytes(value: unknown): value is number | null | undefined {
+  return value === undefined || value === null || (typeof value === "number" && Number.isSafeInteger(value) && value > 0);
+}
+
 class BoundedCollector {
-  private readonly limit: number;
+  private readonly limit: number | null;
   private readonly chunks: Buffer[] = [];
   private size = 0;
   private truncated = false;
 
-  constructor(limit: number) {
+  /** `null` retains everything; a number keeps at most that many bytes. */
+  constructor(limit: number | null) {
     this.limit = limit;
   }
 
   push(chunk: Buffer): void {
+    if (this.limit === null) {
+      this.chunks.push(chunk);
+      this.size += chunk.length;
+      return;
+    }
     if (this.size >= this.limit) {
       this.truncated = true;
       return;
@@ -113,8 +124,16 @@ export function createNodeProcessRunner(options: NodeProcessRunnerOptions = {}):
           ),
         );
       }
+      const requestedMaxOutput: unknown = request.maxOutputBytes;
+      if (!isValidMaxOutputBytes(requestedMaxOutput)) {
+        return Promise.reject(
+          new TypeError(
+            `ProcessRequest.maxOutputBytes must be null/omitted (no capture ceiling) or a positive safe integer; got ${String(requestedMaxOutput)}. No child process was launched.`,
+          ),
+        );
+      }
       const startedAt: Timestamp = Date.now();
-      const maxOutputBytes = request.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
+      const maxOutputBytes = requestedMaxOutput ?? null;
       const stdout = new BoundedCollector(maxOutputBytes);
       const stderr = new BoundedCollector(maxOutputBytes);
 
