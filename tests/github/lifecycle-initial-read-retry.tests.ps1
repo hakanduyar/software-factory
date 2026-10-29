@@ -70,7 +70,7 @@ function PolicyText([long]$max=3,[long]$delay=60000,[string]$cats='"RATE_LIMITED
 }
 function ValidRecord([string]$category='RATE_LIMITED'){@{schema='LifecycleUpdateFailure/v1';code='GITHUB_READ_FAILED';phase='INITIAL_READ';destination='github';operation='READ';diagnostic=@{category=$category;exitCode=1;timedOut=$false;stderrTruncated=$false;stderrEncoding='NOT_OBSERVED'}}}
 function PolicySha($d){(Read-LifecycleJson (Join-Path $d 'release.json')).retryPolicy.sha256}
-function SeedJournal($d,[string]$schema,$events){PutJson (JournalPath $d) @{schema=$schema;events=$events;heads=@{}}}
+function SeedJournal($d,[string]$schema,$events){PutJson (JournalPath $d) @{schema=$schema;events=$events;heads=@{}};Refresh-Fixture $d}
 function SeedRetry($d,$attempts,$reservedAt,$nextAt,$lastFailure,[hashtable]$Flags=@{}){
   $ev=LegacyEvent (FixtureDigest $d);$ev.lastFailure=$lastFailure
   $ev.retry=@{policySha256=(PolicySha $d);attempts=$attempts;reservedAt=$reservedAt;nextAt=$nextAt}
@@ -119,13 +119,14 @@ function Refresh-Fixture($d,[string]$recovery='INITIAL'){
   $r=Read-LifecycleJson (Join-Path $d 'release.json')
   $v2=($r.schema -ceq 'TaskLifecycleUpdateRelease/v2')
   foreach($name in @('packet','canonical','mapping','beforeIssue','beforeNote')){$r[$name]=Ref $r[$name].path}
-  if($v2){$r.retryPolicy=Ref $r.retryPolicy.path}
+  $exp=$null;if(HasJournal $d){$exp=JHash $d}
+  if($v2){$r.retryPolicy=Ref $r.retryPolicy.path;$r.expectedRetryJournalSha256=$exp}
   $r.recovery=$recovery;$r.outboxSha256=Get-LifecycleFileHash $r.outboxPath
   $rv=[ordered]@{schema=$(if($v2){'LifecycleIndependentReview/v2'}else{'LifecycleIndependentReview/v1'});decision='ADMIT';packetSha256=$r.packet.sha256;consumerSha256=$r.consumer.sha256;transportSha256=$r.transport.sha256}
-  if($v2){$rv.retryPolicySha256=$r.retryPolicy.sha256}
+  if($v2){$rv.retryPolicySha256=$r.retryPolicy.sha256;$rv.expectedRetryJournalSha256=$exp}
   PutJson $r.review.path $rv;$r.review=Ref $r.review.path
   $nv=[ordered]@{schema=$(if($v2){'LifecycleNativeRequest/v2'}else{'LifecycleNativeRequest/v1'});action='UPDATE';packetSha256=$r.packet.sha256;reviewSha256=$r.review.sha256;consumerSha256=$r.consumer.sha256;transportSha256=$r.transport.sha256;executableSha256=$r.executable.sha256;stateDir=$r.stateDir;notePath=$r.notePath;outboxPath=$r.outboxPath}
-  if($v2){$nv.retryPolicySha256=$r.retryPolicy.sha256}
+  if($v2){$nv.retryPolicySha256=$r.retryPolicy.sha256;$nv.expectedRetryJournalSha256=$exp}
   PutJson $r.nativeRequest.path $nv
   $r.nativeRequest=Ref $r.nativeRequest.path
   PutJson (Join-Path $d 'release.json') $r
@@ -160,6 +161,12 @@ function Invoke-Fixture($d,[hashtable]$Override=@{}){
   $a=@{ReleasePath=(Join-Path $d 'release.json');ExpectedReleaseSha256=(Get-LifecycleFileHash (Join-Path $d 'release.json'));ExpectedReviewSha256=$r.review.sha256;ExpectedNativeRequestSha256=$r.nativeRequest.sha256;ReconcilePath=$ReconcilePath;UtcClock=$script:ClockBlock}
   foreach($k in $Override.Keys){$a[$k]=$Override[$k]}
   Invoke-AdmittedTaskLifecycleUpdate @a -ProcessRunner (New-Runner $d)
+}
+function SetExpected($d,$value){
+  $r=Read-LifecycleJson (Join-Path $d 'release.json')
+  $rv=Read-LifecycleJson $r.review.path;$rv.expectedRetryJournalSha256=$value;PutJson $r.review.path $rv;$r.review=Ref $r.review.path
+  $n=Read-LifecycleJson $r.nativeRequest.path;$n.expectedRetryJournalSha256=$value;$n.reviewSha256=$r.review.sha256;PutJson $r.nativeRequest.path $n;$r.nativeRequest=Ref $r.nativeRequest.path
+  $r.expectedRetryJournalSha256=$value;PutJson (Join-Path $d 'release.json') $r
 }
 function Describe($res){$res|ConvertTo-Json -Compress -Depth 6}
 function Assert-Refused($d,$res,[string]$code,[string]$why){
@@ -289,13 +296,13 @@ Check 'due retry needs fresh admission; attempts count; budget exhaustion is zer
   [void](Invoke-Fixture $d)
   Assert-Retry (Ev $d) 1 '2030-01-01T00:00:00.000Z' '2030-01-01T00:01:00.000Z'
   # Exactly at nextAt the retry is due: second attempt, fails again, new schedule from the new clock.
-  Refresh-Fixture $d;SetClock '2030-01-01T00:01:00.000Z'
+  Refresh-Fixture $d 'RECONCILE_MISSING';SetClock '2030-01-01T00:01:00.000Z'
   $res=Invoke-Fixture $d
   Assert ((Field $res 'code') -ceq 'GITHUB_READ_FAILED' -and (ReadCount $d) -eq 2) ('second attempt '+(Describe $res))
   Assert ((Read-LifecycleJson (Join-Path $d 'journal-at-read.json')).events['update-2']['retry']['attempts'] -eq 2) 'second reservation durable before READ'
   Assert-Retry (Ev $d) 2 '2030-01-01T00:01:00.000Z' '2030-01-01T00:02:00.000Z'
   # Third and last attempt: no nextAt because the budget is spent.
-  Refresh-Fixture $d;SetClock '2030-01-01T00:05:00.000Z'
+  Refresh-Fixture $d 'RECONCILE_MISSING';SetClock '2030-01-01T00:05:00.000Z'
   [void](Invoke-Fixture $d)
   Assert ((ReadCount $d) -eq 3) 'third attempt read'
   Assert-Retry (Ev $d) 3 '2030-01-01T00:05:00.000Z' $null
@@ -315,7 +322,7 @@ Check 'due retry needs fresh admission; attempts count; budget exhaustion is zer
   # A due attempt that succeeds continues the unchanged admitted UPDATE path and ACKs by readback.
   $d=New-Fixture 'due-success';SetMode $d 'read-fail:NETWORK_UNAVAILABLE';SetClock '2030-01-01T00:00:00.000Z'
   [void](Invoke-Fixture $d)
-  SetMode $d '';Refresh-Fixture $d;SetClock '2030-01-01T00:02:00.000Z'
+  SetMode $d '';Refresh-Fixture $d 'RECONCILE_MISSING';SetClock '2030-01-01T00:02:00.000Z'
   $ok=Invoke-Fixture $d
   Assert ((Field $ok 'status') -ceq 'DELIVERED' -and (Field $ok 'code') -ceq 'READBACK_ACK' -and (EditCount $d) -eq 1) ('due success '+(Describe $ok))
   $ev=Ev $d;Assert-Flags $ev $true $true $true $true
@@ -334,11 +341,11 @@ Check 'changed, missing or legacy policy state refuses with zero transport' {
   Assert ((ReadCount $d) -eq 1 -and (JHash $d) -ceq $h) 'changed policy: zero new transport, journal unchanged'
   # A v1 (no policy) release cannot drive an event that carries retry state.
   $d=New-Fixture 'pin-missing';SeedRetry $d 1 '2030-01-01T00:00:00.000Z' '2030-01-01T00:01:00.000Z' (ValidRecord)
-  $r=Read-LifecycleJson (Join-Path $d 'release.json');$r.Remove('retryPolicy');$r.schema='TaskLifecycleUpdateRelease/v1';PutJson (Join-Path $d 'release.json') $r;Refresh-Fixture $d
+  $r=Read-LifecycleJson (Join-Path $d 'release.json');$r.Remove('retryPolicy');$r.Remove('expectedRetryJournalSha256');$r.schema='TaskLifecycleUpdateRelease/v1';PutJson (Join-Path $d 'release.json') $r;Refresh-Fixture $d
   $h=JHash $d;SetClock '2031-01-01T00:00:00.000Z'
   $res=Invoke-Fixture $d
-  Assert-Refused $d $res 'JOURNAL_CORRUPT' 'v1 release on a v3 journal'
-  Assert ((JHash $d) -ceq $h) 'v1 release on a v3 journal: journal unchanged'
+  Assert-Refused $d $res 'RETRY_POLICY_REQUIRED' 'v1 release targeting a retry-bearing event'
+  Assert ((JHash $d) -ceq $h) 'v1 release targeting a retry event: journal unchanged'
   # Legacy v1/v2 events carry an UNKNOWN prior count: never opted in, inferred, reset or migrated.
   foreach($shape in @('v1-event','v2-null-failure','v2-initial-read-failure')){
     $d=New-Fixture ('legacy-'+$shape);$ev=LegacyEvent (FixtureDigest $d);$schema='LifecycleUpdateJournal/v1'
@@ -507,12 +514,138 @@ Check 'checked UTC arithmetic, clock seam and persisted state validation' {
       plain-schema-v2 {$j.schema='LifecycleUpdateJournal/v2'}
       missing-retry-key {$ev.Remove('retry')}
     }
-    PutJson (JournalPath $d) $j;$h=JHash $d;SetClock '2040-01-01T00:00:00.000Z'
+    PutJson (JournalPath $d) $j;Refresh-Fixture $d;$h=JHash $d;SetClock '2040-01-01T00:00:00.000Z'
     $res=Invoke-Fixture $d
     $expected=$(if($case -ceq 'missing-retry-key'){'RETRY_COUNT_UNKNOWN'}else{'JOURNAL_CORRUPT'})
     Assert-Refused $d $res $expected $case
     Assert ((JHash $d) -ceq $h) ($case+': journal unchanged')
   }
+}
+
+Check 'stale or unchanged admission cannot consume a retry; fresh state-bound RECONCILE_MISSING can' {
+  $d=New-Fixture 'fresh-admission';SetMode $d 'read-fail:TIMEOUT';SetClock '2030-01-01T00:00:00.000Z'
+  [void](Invoke-Fixture $d)
+  Assert-Retry (Ev $d) 1 '2030-01-01T00:00:00.000Z' '2030-01-01T00:01:00.000Z'
+  $h=JHash $d
+  # The identical first admission (journal pin = absent) is stale now, even far in the future.
+  SetClock '2040-01-01T00:00:00.000Z'
+  Assert-Refused2 $d (Invoke-Fixture $d) 'RETRY_JOURNAL_STATE_MISMATCH' 1 'identical stale admission'
+  Assert ((JHash $d) -ceq $h) 'stale admission wrote nothing'
+  # A fresh admission for the current state but still INITIAL cannot perform the due retry.
+  Refresh-Fixture $d 'INITIAL'
+  Assert-Refused2 $d (Invoke-Fixture $d) 'RECOVERY_MODE_REQUIRED' 1 'INITIAL due retry'
+  Assert ((JHash $d) -ceq $h) 'INITIAL refusal wrote nothing'
+  # Fresh state-bound RECONCILE_MISSING performs exactly the permitted attempt.
+  Refresh-Fixture $d 'RECONCILE_MISSING'
+  $res=Invoke-Fixture $d
+  Assert ((Field $res 'code') -ceq 'GITHUB_READ_FAILED' -and (ReadCount $d) -eq 2) ('due attempt '+(Describe $res))
+  Assert-Retry (Ev $d) 2 '2040-01-01T00:00:00.000Z' '2040-01-01T00:01:00.000Z'
+  # Wrong, null-for-existing and hash-for-absent pins (consistent across all three shapes), and
+  # review/native disagreeing with the release, fail before any transport, counter or write.
+  foreach($v in @('wrong-hash','null-for-existing','review-mismatch','native-mismatch','uppercase','non-string')){
+    $d=New-Fixture ('state-pin-'+$v);SetMode $d 'read-fail:TIMEOUT';SetClock '2030-01-01T00:00:00.000Z'
+    [void](Invoke-Fixture $d);Refresh-Fixture $d 'RECONCILE_MISSING';SetClock '2040-01-01T00:00:00.000Z';$code='RETRY_JOURNAL_STATE_MISMATCH'
+    switch($v){
+      wrong-hash {SetExpected $d ('0'*64)}
+      null-for-existing {SetExpected $d $null}
+      review-mismatch {$r=Read-LifecycleJson (Join-Path $d 'release.json');$rv=Read-LifecycleJson $r.review.path;$rv.expectedRetryJournalSha256=$null;PutJson $r.review.path $rv;$r.review=Ref $r.review.path;PutJson (Join-Path $d 'release.json') $r;$code='REVIEW_BINDING'}
+      native-mismatch {$r=Read-LifecycleJson (Join-Path $d 'release.json');$n=Read-LifecycleJson $r.nativeRequest.path;$n.expectedRetryJournalSha256=('1'*64);PutJson $r.nativeRequest.path $n;$r.nativeRequest=Ref $r.nativeRequest.path;PutJson (Join-Path $d 'release.json') $r;$code='NATIVE_BINDING'}
+      uppercase {$r=Read-LifecycleJson (Join-Path $d 'release.json');$r.expectedRetryJournalSha256=((JHash $d).ToUpperInvariant());PutJson (Join-Path $d 'release.json') $r;$code='RELEASE_INVALID'}
+      non-string {$r=Read-LifecycleJson (Join-Path $d 'release.json');$r.expectedRetryJournalSha256=5;PutJson (Join-Path $d 'release.json') $r;$code='RELEASE_INVALID'}
+    }
+    $h=JHash $d;$reads=ReadCount $d;$rr=Read-LifecycleJson (Join-Path $d 'release.json')
+    $res=Invoke-Fixture $d @{ExpectedReviewSha256=$rr.review.sha256;ExpectedNativeRequestSha256=$rr.nativeRequest.sha256}
+    Assert-Refused2 $d $res $code $reads $v
+    Assert ((JHash $d) -ceq $h) ($v+': journal unchanged')
+  }
+  $d=New-Fixture 'state-pin-absent';SetExpected $d ('2'*64);$rr=Read-LifecycleJson (Join-Path $d 'release.json')
+  $res=Invoke-Fixture $d @{ExpectedReviewSha256=$rr.review.sha256;ExpectedNativeRequestSha256=$rr.nativeRequest.sha256}
+  Assert-Refused $d $res 'RETRY_JOURNAL_STATE_MISMATCH' 'hash cannot match an absent journal'
+  Assert (-not (HasJournal $d)) 'absent journal stays absent'
+  $d=New-Fixture 'state-pin-late-journal'
+  PutJson (JournalPath $d) @{schema='LifecycleUpdateJournal/v1';events=@{};heads=@{}}
+  Assert-Refused $d (Invoke-Fixture $d) 'RETRY_JOURNAL_STATE_MISMATCH' 'a journal created after issue cannot match null'
+}
+
+Check 'different-key debounce needs real readbacks and changes no journal state' {
+  $d=New-Fixture 'dup-debounce';SetClock '2030-01-01T00:00:00.000Z'
+  $first=Invoke-Fixture $d
+  Assert ((Field $first 'code') -ceq 'READBACK_ACK') ('first delivery '+(Describe $first))
+  $p=Read-LifecycleJson (Join-Path $d 'packet.json');$p.idempotencyKey='update-2b';PutJson (Join-Path $d 'packet.json') $p;Refresh-Fixture $d
+  $h=JHash $d;$reads=ReadCount $d;$outHash=Get-LifecycleFileHash (Join-Path $d 'state/outbox.json')
+  $res=Invoke-Fixture $d
+  Assert ((Field $res 'status') -ceq 'DELIVERED' -and (Field $res 'code') -ceq 'DEBOUNCED') ('debounced '+(Describe $res))
+  Assert ((ReadCount $d) -eq ($reads+1) -and (EditCount $d) -eq 1) 'a real GitHub READ happened, no EDIT'
+  Assert ((JHash $d) -ceq $h -and (Get-LifecycleFileHash (Join-Path $d 'state/outbox.json')) -ceq $outHash) 'journal and outbox byte-identical'
+  Assert (@((ReadJournal $d).events.Keys).Count -eq 1 -and $null -eq (ReadJournal $d).events['update-2b']) 'no new event'
+  # Failed READ, drifted GitHub body and drifted note bytes never deliver and never reserve.
+  SetMode $d 'read-fail:TIMEOUT'
+  $res=Invoke-Fixture $d
+  Assert ((Field $res 'status') -ceq 'REFUSED' -and (Field $res 'code') -ceq 'GITHUB_READ_FAILED') ('failed readback '+(Describe $res))
+  Assert ((JHash $d) -ceq $h) 'failed readback wrote nothing'
+  SetMode $d ''
+  $s=Read-LifecycleJson (Join-Path $d 'remote.json');$orig=$s.body;$s.body+=' drift';PutJson (Join-Path $d 'remote.json') $s
+  $res=Invoke-Fixture $d
+  Assert ((Field $res 'status') -ceq 'REFUSED' -and (Field $res 'code') -ceq 'DEBOUNCE_NOT_AUTHENTICATED') ('drifted github '+(Describe $res))
+  Assert ((JHash $d) -ceq $h -and (EditCount $d) -eq 1) 'drifted github: no write, no EDIT'
+  $s.body=$orig;PutJson (Join-Path $d 'remote.json') $s
+  $note=[IO.File]::ReadAllText((Join-Path $d 'vault/task.md'));PutText (Join-Path $d 'vault/task.md') ($note+' ')
+  $res=Invoke-Fixture $d
+  Assert ((Field $res 'code') -ceq 'DEBOUNCE_NOT_AUTHENTICATED' -and (JHash $d) -ceq $h -and (EditCount $d) -eq 1) ('drifted note '+(Describe $res))
+}
+
+Check 'v1 release works on unrelated legacy events inside a v3 journal and never touches retry events' {
+  $otherRetry=LegacyEvent ('c'*64);$otherRetry.lastFailure=(ValidRecord);$otherRetry.retry=@{policySha256=('e'*64);attempts=2;reservedAt='2030-01-01T00:00:00.000Z';nextAt='2030-01-01T00:01:00.000Z'}
+  $otherLegacy=LegacyEvent ('b'*64);$otherLegacy.githubSent=$true;$otherLegacy.githubAck=$true
+  foreach($target in @('new-event','existing-legacy-event')){
+    $d=New-Fixture ('mixed-'+$target) -Legacy
+    $events=@{'other-retry'=$otherRetry;'other-legacy'=$otherLegacy}
+    if($target -ceq 'existing-legacy-event'){$events['update-2']=LegacyEvent (FixtureDigest $d)}
+    SeedJournal $d 'LifecycleUpdateJournal/v3' $events
+    $res=Invoke-Fixture $d
+    Assert ((Field $res 'status') -ceq 'DELIVERED' -and (Field $res 'code') -ceq 'READBACK_ACK') ($target+' '+(Describe $res))
+    $j=ReadJournal $d
+    Assert ($j.schema -ceq 'LifecycleUpdateJournal/v3') 'schema stays v3, never downgraded'
+    $kept=$j.events['other-retry']
+    Assert ($kept.Count -eq 7 -and $kept['digest'] -ceq ('c'*64) -and $kept['retry']['policySha256'] -ceq ('e'*64) -and [long]$kept['retry']['attempts'] -eq 2 -and $kept['retry']['reservedAt'] -ceq '2030-01-01T00:00:00.000Z' -and $kept['retry']['nextAt'] -ceq '2030-01-01T00:01:00.000Z' -and $kept['lastFailure']['code'] -ceq 'GITHUB_READ_FAILED') 'retry record preserved'
+    $kl=$j.events['other-legacy'];Assert ($kl.Count -eq 5 -and $kl['githubSent'] -eq $true -and $kl['githubAck'] -eq $true) 'legacy event preserved'
+    $cur=$j.events['update-2'];Assert ($cur.Count -eq 6 -and -not $cur.ContainsKey('retry')) 'target stays a strict legacy event'
+    Assert-Flags $cur $true $true $true $true
+  }
+  # A failed v1 read inside a v3 journal keeps v3 and the retry record too.
+  $d=New-Fixture 'mixed-failure' -Legacy;SeedJournal $d 'LifecycleUpdateJournal/v3' @{'other-retry'=$otherRetry};SetMode $d 'read-fail:TIMEOUT'
+  $res=Invoke-Fixture $d
+  Assert ((Field $res 'code') -ceq 'GITHUB_READ_FAILED') ('v1 failure '+(Describe $res))
+  $j=ReadJournal $d;Assert ($j.schema -ceq 'LifecycleUpdateJournal/v3' -and $j.events['other-retry'].Count -eq 7 -and $j.events['update-2'].Count -eq 6) 'v3 preserved after v1 failure record'
+  # v1 targeting a retry-bearing event refuses and cannot reset or bypass it.
+  $d=New-Fixture 'mixed-target-retry' -Legacy
+  $ev=LegacyEvent (FixtureDigest $d);$ev.lastFailure=(ValidRecord);$ev.retry=@{policySha256=('e'*64);attempts=1;reservedAt='2030-01-01T00:00:00.000Z';nextAt=$null}
+  SeedJournal $d 'LifecycleUpdateJournal/v3' @{'update-2'=$ev};$h=JHash $d
+  Assert-Refused $d (Invoke-Fixture $d) 'RETRY_POLICY_REQUIRED' 'v1 on retry event'
+  Assert ((JHash $d) -ceq $h) 'retry event untouched by v1'
+  # Retained retry records are structurally validated from stored data only (no external policy needed)...
+  foreach($shape in @('bad-nextAt','extra-key','missing-lastFailure-with-nextAt','non-bool-flag','digest-not-string')){
+    $bad=LegacyEvent ('c'*64);$bad.lastFailure=(ValidRecord);$bad.retry=@{policySha256=('e'*64);attempts=1;reservedAt='2030-01-01T00:00:00.000Z';nextAt='2030-01-01T00:01:00.000Z'}
+    switch($shape){
+      bad-nextAt {$bad.retry.nextAt='2030-01-01T00:01:00Z'}
+      extra-key {$bad.retry.extra=1}
+      missing-lastFailure-with-nextAt {$bad.lastFailure=$null}
+      non-bool-flag {$bad.githubSent='yes'}
+      digest-not-string {$bad.digest=5}
+    }
+    foreach($mode in @('v1','v2')){
+      $d=$(if($mode -ceq 'v1'){New-Fixture ('retained-'+$shape+'-v1') -Legacy}else{New-Fixture ('retained-'+$shape+'-v2')})
+      SeedJournal $d 'LifecycleUpdateJournal/v3' @{'other-retry'=$bad};$h=JHash $d
+      Assert-Refused $d (Invoke-Fixture $d) 'JOURNAL_CORRUPT' ($shape+' '+$mode)
+      Assert ((JHash $d) -ceq $h) ($shape+' '+$mode+': journal untouched')
+    }
+  }
+  # ...so a retained record under a different policy pin does not block a v2 target.
+  $d=New-Fixture 'retained-other-policy'
+  SeedJournal $d 'LifecycleUpdateJournal/v3' @{'other-retry'=$otherRetry}
+  SetMode $d 'read-fail:TIMEOUT';SetClock '2030-01-01T00:00:00.000Z'
+  Assert ((Field (Invoke-Fixture $d) 'code') -ceq 'GITHUB_READ_FAILED') 'v2 target works beside an unrelated retry record'
+  $j=ReadJournal $d;Assert ($j.events['other-retry']['retry']['policySha256'] -ceq ('e'*64) -and $j.schema -ceq 'LifecycleUpdateJournal/v3') 'unrelated record preserved'
 }
 
 Check 'legacy v1 release behavior on a failed initial read is unchanged' {
