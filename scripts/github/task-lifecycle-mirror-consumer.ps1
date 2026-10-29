@@ -272,6 +272,14 @@ function Assert-LifecycleRetainedEvent {
     foreach($k in @('githubSent','noteSent','githubAck','noteAck')){if($Rec[$k] -isnot [bool]){throw 'x'}}
   } catch { throw 'JOURNAL_CORRUPT' }
 }
+function Test-LifecycleBoundHash {
+  # Type and grammar are validated BEFORE comparing to the already typed release value;
+  # no boolean, array, number or object is ever coerced into equality.
+  param($Value,$Bound,[bool]$AllowNull)
+  if($null -eq $Value){return ($AllowNull -and $null -eq $Bound)}
+  if($Value -isnot [string] -or $Value -cnotmatch '^[0-9a-f]{64}\z'){return $false}
+  return ($Bound -is [string] -and [string]::Equals($Value,$Bound,[StringComparison]::Ordinal))
+}
 function Assert-LifecycleExpectedJournal {
   # Binds the admission to the actual journal state: null iff absent, else exact byte digest.
   param([string]$Path,$Expected)
@@ -334,10 +342,10 @@ function Invoke-AdmittedTaskLifecycleUpdate {
     if($retry){$reviewKeys+=@('retryPolicySha256','expectedRetryJournalSha256');$nativeKeys+=@('retryPolicySha256','expectedRetryJournalSha256')}
     $schemaSuffix=$(if($retry){'/v2'}else{'/v1'})
     Assert-LifecycleKeys $review $reviewKeys
-    if($review.schema -cne ('LifecycleIndependentReview'+$schemaSuffix) -or $review.decision -cne 'ADMIT' -or $review.packetSha256 -cne $r.packet.sha256 -or $review.consumerSha256 -cne $r.consumer.sha256 -or $review.transportSha256 -cne $r.transport.sha256 -or ($retry -and ($review.retryPolicySha256 -cne $r.retryPolicy.sha256 -or $review.expectedRetryJournalSha256 -cne $r.expectedRetryJournalSha256))){throw 'REVIEW_BINDING'}
+    if($review.schema -cne ('LifecycleIndependentReview'+$schemaSuffix) -or $review.decision -cne 'ADMIT' -or $review.packetSha256 -cne $r.packet.sha256 -or $review.consumerSha256 -cne $r.consumer.sha256 -or $review.transportSha256 -cne $r.transport.sha256 -or ($retry -and -not ((Test-LifecycleBoundHash $review.retryPolicySha256 $r.retryPolicy.sha256 $false) -and (Test-LifecycleBoundHash $review.expectedRetryJournalSha256 $r.expectedRetryJournalSha256 $true)))){throw 'REVIEW_BINDING'}
     $native=Read-LifecycleJson $r.nativeRequest.path
     Assert-LifecycleKeys $native $nativeKeys
-    if($retry -and ($native.retryPolicySha256 -cne $r.retryPolicy.sha256 -or $native.expectedRetryJournalSha256 -cne $r.expectedRetryJournalSha256)){throw 'NATIVE_BINDING'}
+    if($retry -and -not ((Test-LifecycleBoundHash $native.retryPolicySha256 $r.retryPolicy.sha256 $false) -and (Test-LifecycleBoundHash $native.expectedRetryJournalSha256 $r.expectedRetryJournalSha256 $true))){throw 'NATIVE_BINDING'}
     if($native.schema -cne ('LifecycleNativeRequest'+$schemaSuffix) -or $native.action -cne 'UPDATE' -or $native.packetSha256 -cne $r.packet.sha256 -or $native.reviewSha256 -cne $r.review.sha256 -or $native.consumerSha256 -cne $r.consumer.sha256 -or $native.transportSha256 -cne $r.transport.sha256 -or $native.executableSha256 -cne $r.executable.sha256 -or $native.stateDir -cne $r.stateDir -or $native.notePath -cne $r.notePath -or $native.outboxPath -cne $r.outboxPath){throw 'NATIVE_BINDING'}
     $p=New-TaskLifecycleMirrorPacket (Read-LifecycleJson $r.packet.path)
     if($p.eventType -cne 'UPDATE'){throw 'UNSUPPORTED_EVENT'}

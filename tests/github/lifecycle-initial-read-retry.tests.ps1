@@ -648,6 +648,38 @@ Check 'v1 release works on unrelated legacy events inside a v3 journal and never
   $j=ReadJournal $d;Assert ($j.events['other-retry']['retry']['policySha256'] -ceq ('e'*64) -and $j.schema -ceq 'LifecycleUpdateJournal/v3') 'unrelated record preserved'
 }
 
+Check 'review and native v2 binding fields are type-checked before comparison' {
+  # Valid controls: bound hash for an existing journal, and null for an absent journal.
+  $d=New-Fixture 'typed-control-null';SetMode $d 'read-fail:TIMEOUT';SetClock '2030-01-01T00:00:00.000Z'
+  Assert ((Field (Invoke-Fixture $d) 'code') -ceq 'GITHUB_READ_FAILED' -and (ReadCount $d) -eq 1) 'absent-journal null control'
+  Refresh-Fixture $d 'RECONCILE_MISSING';SetClock '2040-01-01T00:00:00.000Z'
+  Assert ((Field (Invoke-Fixture $d) 'code') -ceq 'GITHUB_READ_FAILED' -and (ReadCount $d) -eq 2) 'bound-hash control'
+  $table=@(
+    @{n='true';v=$true},@{n='false';v=$false},@{n='array';v=@('x')},@{n='empty-array';v=@()},@{n='number';v=5},@{n='short-hash';v='abc'},
+    @{n='uppercase';v='A'*64},@{n='wrong-hash';v='0'*64},@{n='null';v=$null}
+  )
+  foreach($doc in @('review','native')){
+    foreach($field in @('retryPolicySha256','expectedRetryJournalSha256')){
+      foreach($c in $table){
+        $d=New-Fixture ('typed-'+$doc+'-'+$field+'-'+$c.n)
+        # Existing journal so the release carries a nonempty valid hash for the journal field.
+        SeedJournal $d 'LifecycleUpdateJournal/v1' @{'older-key'=@{digest=('b'*64);githubSent=$true;noteSent=$true;githubAck=$true;noteAck=$true}}
+        $r=Read-LifecycleJson (Join-Path $d 'release.json')
+        $path=$(if($doc -ceq 'review'){$r.review.path}else{$r.nativeRequest.path})
+        $x=Read-LifecycleJson $path
+        $x[$field]=$c.v;PutJson $path $x
+        if($doc -ceq 'review'){$r.review=Ref $path}else{$r.nativeRequest=Ref $path}
+        PutJson (Join-Path $d 'release.json') $r
+        $rr=Read-LifecycleJson (Join-Path $d 'release.json');$h=JHash $d;$o=Get-LifecycleFileHash (Join-Path $d 'state/outbox.json')
+        $res=Invoke-Fixture $d @{ExpectedReviewSha256=$rr.review.sha256;ExpectedNativeRequestSha256=$rr.nativeRequest.sha256}
+        $code=$(if($doc -ceq 'review'){'REVIEW_BINDING'}else{'NATIVE_BINDING'})
+        Assert-Refused $d $res $code ($doc+' '+$field+' '+$c.n)
+        Assert ((JHash $d) -ceq $h -and (Get-LifecycleFileHash (Join-Path $d 'state/outbox.json')) -ceq $o) ($doc+' '+$field+' '+$c.n+': journal/outbox changed')
+      }
+    }
+  }
+}
+
 Check 'legacy v1 release behavior on a failed initial read is unchanged' {
   $d=New-Fixture 'legacy-read-failure' -Legacy;SetMode $d 'read-fail:RATE_LIMITED'
   $res=Invoke-Fixture $d
