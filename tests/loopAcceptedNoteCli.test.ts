@@ -163,20 +163,12 @@ describe("sf loop start acceptedNote selection", () => {
     assert.ok(!("recalledNote" in stored!));
   });
 
-  it("missing or non-ordinary factory DB refuses without creating any DB", async () => {
-    const fx = await fixture();
+  // Shared by the DB-refusal cases: each path must refuse, create no DB/directory and make no runner call.
+  async function assertDbRefused(fx: Fixture, base: string, paths: readonly string[]): Promise<void> {
     const s = stubRunner();
-    const base = mkdtempSync(path.join(tmpdir(), "sf-loop-note-nodb-"));
-    cleanup.push(base);
     const cfg = writeConfig(selector(fx));
-    const real = path.join(base, "real.db");
-    writeFileSync(real, "");
-    const link = path.join(base, "link.db");
-    symlinkSync(real, link);
-    const dirDb = path.join(base, "dir.db");
-    mkdirSync(dirDb);
     const before = readdirSync(base).sort();
-    for (const factoryDbPath of [path.join(base, "missing", "factory.db"), link, dirDb]) {
+    for (const factoryDbPath of paths) {
       const loopsDbPath = path.join(base, "sub", "loops.db");
       await assert.rejects(
         runLoopStart(fx.target.id, cfg, { factoryDbPath, loopsDbPath, processRunner: s.runner }),
@@ -187,6 +179,35 @@ describe("sf loop start acceptedNote selection", () => {
     assert.ok(!existsSync(path.join(base, "missing")));
     assert.deepEqual(readdirSync(base).sort(), before);
     assert.equal(s.requests.length, 0);
+  }
+
+  it("missing or directory factory DB refuses without creating any DB", async () => {
+    const fx = await fixture();
+    const base = mkdtempSync(path.join(tmpdir(), "sf-loop-note-nodb-"));
+    cleanup.push(base);
+    const dirDb = path.join(base, "dir.db");
+    mkdirSync(dirDb);
+    await assertDbRefused(fx, base, [path.join(base, "missing", "factory.db"), dirDb]);
+  });
+
+  it("symlinked factory DB refuses without creating any DB", async (t) => {
+    const fx = await fixture();
+    const base = mkdtempSync(path.join(tmpdir(), "sf-loop-note-symlink-"));
+    cleanup.push(base);
+    const real = path.join(base, "real.db");
+    writeFileSync(real, "");
+    const link = path.join(base, "link.db");
+    try {
+      symlinkSync(real, link);
+    } catch (error) {
+      // Only the unavailable Windows file-symlink privilege is skipped; any other failure (and every Linux run) is real.
+      if (process.platform === "win32" && (error as NodeJS.ErrnoException).code === "EPERM") {
+        t.skip("file symlink creation requires a privilege unavailable on this Windows host (EPERM)");
+        return;
+      }
+      throw error;
+    }
+    await assertDbRefused(fx, base, [link]);
   });
 
   it("malformed or raw-body selectors refuse before stores open or any runner call", async () => {
