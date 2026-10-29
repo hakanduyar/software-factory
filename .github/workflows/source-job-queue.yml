@@ -1,0 +1,23 @@
+name: Source job queue and launcher
+on:
+  pull_request:
+  push:
+permissions:
+  contents: read
+jobs:
+  source-job-queue:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: "false"
+      - name: Verify durable queue on private fixtures
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File (Join-Path $env:GITHUB_WORKSPACE 'tests/orchestration/source-job-queue.tests.ps1')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify launcher with controlled local children
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File (Join-Path $env:GITHUB_WORKSPACE 'tests/orchestration/supervised-source-job.tests.ps1')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

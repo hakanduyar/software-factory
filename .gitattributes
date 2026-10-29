@@ -21,3 +21,8 @@
 
 /scripts/github/enqueue-canonical-lifecycle-update.ps1 text eol=lf
 /tests/github/canonical-update-enqueue.tests.ps1 text eol=lf
+
+/scripts/orchestration/source-job-queue.ps1 text eol=lf
+/scripts/orchestration/invoke-supervised-source-job.ps1 text eol=lf
+/tests/orchestration/source-job-queue.tests.ps1 text eol=lf
+/tests/orchestration/supervised-source-job.tests.ps1 text eol=lf
