@@ -117,6 +117,19 @@ function Assert-NoSideEffects {
   Assert-Eq @(Get-Names $Case.state).Count 0 "$Msg state dir untouched"
 }
 
+# Directory link fixtures: Junction on Windows, SymbolicLink elsewhere. Removal deletes only the link
+# itself (never the target or its contents), and only when it is still a reparse point.
+function New-DirLink {
+  param([string]$Path,[string]$Target)
+  $type=$(if($IsWindows){'Junction'}else{'SymbolicLink'})
+  New-Item -ItemType $type -Path $Path -Target $Target | Out-Null
+}
+function Remove-DirLink {
+  param([string]$Path)
+  if(([IO.File]::GetAttributes($Path) -band [IO.FileAttributes]::ReparsePoint) -eq 0){throw "refusing to remove non-link: $Path"}
+  if($IsWindows){[IO.Directory]::Delete($Path,$false)}else{[IO.File]::Delete($Path)}
+}
+
 $Results=[System.Collections.Generic.List[object]]::new()
 function Test-Step {
   param([string]$Name,[scriptblock]$Body)
@@ -246,15 +259,17 @@ Test-Step 'AC4 omitted outbox pin refuses; absent vs empty semantics are explici
 Test-Step 'AC4 reparse and outside-owned or non-canonical paths refuse' {
   $c=New-Case
   $link=Join-Path $c.dir 'linkstate'
-  New-Item -ItemType Junction -Path $link -Target $c.state | Out-Null
+  $made=$false
   try{
+    New-DirLink $link $c.state; $made=$true
     Assert-Refused (Invoke-Enq $c @{StateDir=$link;OutboxPath=(Join-Path $link 'outbox.json')}) 'REPARSE_REFUSED' 'state via junction'
-  } finally { [IO.Directory]::Delete($link,$false) }
+  } finally { if($made){Remove-DirLink $link} }
   $linkDir=Join-Path $Ev ('linkdir'+$script:CaseN)
-  New-Item -ItemType Junction -Path $linkDir -Target $c.dir | Out-Null
+  $made=$false
   try{
+    New-DirLink $linkDir $c.dir; $made=$true
     Assert-Refused (Invoke-Enq $c @{CanonicalPath=(Join-Path $linkDir 'canonical.json')}) 'REPARSE_REFUSED' 'canonical via junction'
-  } finally { [IO.Directory]::Delete($linkDir,$false) }
+  } finally { if($made){Remove-DirLink $linkDir} }
   Assert-Refused (Invoke-Enq $c @{OutboxPath=(Join-Path $c.dir 'outbox.json')}) 'PATH_OUTSIDE_OWNER' 'outbox outside state dir'
   Assert-Refused (Invoke-Enq $c @{OutboxPath='outbox.json'}) 'PATH_INVALID' 'relative outbox'
   Assert-Refused (Invoke-Enq $c @{StateDir=(Join-Path $c.dir 'state\..\state')}) 'PATH_INVALID' 'non-canonical state dir'
@@ -328,9 +343,11 @@ Test-Step 'Closure: accepted reconcile+capture are stable; capture drift/missing
   $c=New-Case; $k=New-CompatCopy $c
   $dispatch=Join-Path $k.root 'dispatch'
   Remove-Item -LiteralPath $dispatch -Recurse -Force
-  New-Item -ItemType Junction -Path $dispatch -Target (Get-SourceFile 'scripts\github\lifecycle-compat\dispatch') | Out-Null
-  try{ Assert-Refused (Invoke-Enq $c @{ReconcilePath=$k.reconcile}) 'REPARSE_REFUSED' 'capture via junction' }
-  finally { [IO.Directory]::Delete($dispatch,$false) }
+  $made=$false
+  try{
+    New-DirLink $dispatch (Get-SourceFile 'scripts\github\lifecycle-compat\dispatch'); $made=$true
+    Assert-Refused (Invoke-Enq $c @{ReconcilePath=$k.reconcile}) 'REPARSE_REFUSED' 'capture via junction'
+  } finally { if($made){Remove-DirLink $dispatch} }
   Assert-NoSideEffects $c 'capture reparse'
 
   # A caller cannot choose a different reconcile executable by pinning its own hash.
