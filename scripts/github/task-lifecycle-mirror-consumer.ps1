@@ -187,6 +187,81 @@ function New-LifecycleFailureRecord {
   if (-not (Test-LifecycleFailureRecord $rec)) { throw 'FAILURE_RECORD_INVALID' }
   return $rec
 }
+# Explicit opt-in INITIAL_READ retry scheduling. These helpers are structural
+# validators and a pure clock seam; none of them issues authority or retries.
+$script:LifecycleRetryCategories = @('TIMEOUT','NETWORK_UNAVAILABLE','RATE_LIMITED')
+$script:LifecycleSafeInteger = [long]9007199254740991
+$script:LifecycleUtcFormat = "yyyy-MM-dd'T'HH:mm:ss.fff'Z'"
+function Test-LifecycleIntegral { param($Value) return ($Value -is [int] -or $Value -is [long]) }
+function Assert-LifecycleRetryPolicy {
+  # Exact LifecycleInitialReadRetryPolicy/v1. Returns a normalized read-only view.
+  param($Policy)
+  try {
+    Assert-LifecycleKeys $Policy @('schema','maxAttempts','delayMs','retryableCategories')
+    if($Policy.schema -isnot [string] -or $Policy.schema -cne 'LifecycleInitialReadRetryPolicy/v1'){throw 'x'}
+    foreach($k in @('maxAttempts','delayMs')){if(-not (Test-LifecycleIntegral $Policy[$k]) -or [long]$Policy[$k] -gt $script:LifecycleSafeInteger){throw 'x'}}
+    if([long]$Policy.maxAttempts -lt 1 -or [long]$Policy.delayMs -lt 0){throw 'x'}
+    $c=$Policy.retryableCategories
+    if($c -isnot [array] -or $c.Count -lt 1 -or $c.Count -gt $script:LifecycleRetryCategories.Count){throw 'x'}
+    $seen=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach($x in $c){if($x -isnot [string] -or $x -cnotin $script:LifecycleRetryCategories -or -not $seen.Add($x)){throw 'x'}}
+    return [pscustomobject]@{maxAttempts=[long]$Policy.maxAttempts;delayMs=[long]$Policy.delayMs;retryableCategories=[string[]]@($c)}
+  } catch { throw 'RETRY_POLICY_INVALID' }
+}
+function Read-LifecycleRetryPolicy {
+  param($Pin)
+  $raw=$null
+  try { $raw=Read-LifecycleJson $Pin.path } catch { throw 'RETRY_POLICY_INVALID' }
+  if((Get-LifecycleFileHash $Pin.path) -cne $Pin.sha256){throw 'PIN_DRIFT'}
+  Assert-LifecycleRetryPolicy $raw
+}
+function Get-LifecycleUtcNow {
+  # Injectable clock; it only supplies time and grants no authority.
+  param([scriptblock]$Clock)
+  $v=$null
+  if($null -eq $Clock){$v=[DateTime]::UtcNow}
+  else { $o=@(& $Clock); if($o.Count -ne 1){throw 'CLOCK_INVALID'}; $v=$o[0] }
+  if($v -isnot [datetime] -or $v.Kind -ne [DateTimeKind]::Utc){throw 'CLOCK_INVALID'}
+  return [datetime]::new($v.Ticks-($v.Ticks % 10000),[DateTimeKind]::Utc)
+}
+function Format-LifecycleUtc { param([datetime]$Time) $Time.ToString($script:LifecycleUtcFormat,[Globalization.CultureInfo]::InvariantCulture) }
+function ConvertFrom-LifecycleUtc {
+  # Only the canonical millisecond UTC form round-trips; anything else is corrupt.
+  param($Text)
+  if($Text -isnot [string] -or $Text -cnotmatch '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z\z'){throw 'JOURNAL_CORRUPT'}
+  $t=[datetime]::MinValue
+  if(-not [datetime]::TryParseExact($Text,$script:LifecycleUtcFormat,[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal,[ref]$t) -or (Format-LifecycleUtc $t) -cne $Text){throw 'JOURNAL_CORRUPT'}
+  return [datetime]::new($t.Ticks,[DateTimeKind]::Utc)
+}
+function Add-LifecycleCheckedMs {
+  param([datetime]$Time,[long]$Ms)
+  $room=[long][Math]::Floor([decimal]([datetime]::MaxValue.Ticks-$Time.Ticks)/10000)
+  if($Ms -lt 0 -or $Ms -gt $room){throw 'RETRY_TIME_OVERFLOW'}
+  return [datetime]::new($Time.Ticks+($Ms*10000),[DateTimeKind]::Utc)
+}
+function Assert-LifecycleRetryState {
+  # Exact current-event retry state of LifecycleUpdateJournal/v3.
+  param($State,$Policy,[string]$PolicySha256)
+  try { Assert-LifecycleKeys $State @('policySha256','attempts','reservedAt','nextAt') } catch { throw 'JOURNAL_CORRUPT' }
+  if($State.policySha256 -isnot [string] -or $State.policySha256 -cnotmatch '^[0-9a-f]{64}\z'){throw 'JOURNAL_CORRUPT'}
+  if($State.policySha256 -cne $PolicySha256){throw 'RETRY_POLICY_PIN_MISMATCH'}
+  if(-not (Test-LifecycleIntegral $State.attempts) -or [long]$State.attempts -lt 1 -or [long]$State.attempts -gt $Policy.maxAttempts){throw 'JOURNAL_CORRUPT'}
+  $reserved=ConvertFrom-LifecycleUtc $State.reservedAt
+  if($null -ne $State.nextAt){
+    $next=ConvertFrom-LifecycleUtc $State.nextAt
+    if($next -lt $reserved -or [long]$State.attempts -ge $Policy.maxAttempts){throw 'JOURNAL_CORRUPT'}
+  }
+}
+function Test-LifecycleInitialReadRetryEligible {
+  # Eligible only when the previous failure is a valid typed INITIAL_READ transport
+  # diagnostic whose category the policy explicitly selects.
+  param($Failure,$Policy)
+  try {
+    if(-not (Test-LifecycleFailureRecord $Failure)){return $false}
+    if($Failure.code -cne 'GITHUB_READ_FAILED' -or $Failure.phase -cne 'INITIAL_READ' -or $null -eq $Failure.diagnostic){return $false}
+    return [bool]($Failure.diagnostic.category -cin $Policy.retryableCategories)
+  } catch { return $false }
+}
 function Invoke-AdmittedTaskLifecycleUpdate {
   [CmdletBinding()]
   param(
@@ -195,7 +270,8 @@ function Invoke-AdmittedTaskLifecycleUpdate {
     [Parameter(Mandatory)][string]$ExpectedReviewSha256,
     [Parameter(Mandatory)][string]$ExpectedNativeRequestSha256,
     [Parameter(Mandatory)][string]$ReconcilePath,
-    [scriptblock]$ProcessRunner
+    [scriptblock]$ProcessRunner,
+    [scriptblock]$UtcClock
   )
   # These exact pins are arguments of the separately native-approved invocation,
   # not an API which issues approval. There is deliberately no approved boolean,
@@ -206,24 +282,39 @@ function Invoke-AdmittedTaskLifecycleUpdate {
   # $op.phase is set only while an admitted destination operation is in flight; a
   # durable failure record is written only for a failure raised during one.
   $op=@{phase=$null}; $r=$null; $j=$null; $e=$null
+  $retry=$false; $policy=$null; $reserved=$false; $freshEvent=$false
   try {
     foreach($h in @($ExpectedReleaseSha256,$ExpectedReviewSha256,$ExpectedNativeRequestSha256)){if($h -cnotmatch '^[0-9a-f]{64}\z'){throw 'ADMISSION_PIN_MISSING'}}
     Assert-LifecyclePath $ReleasePath ''
     if((Get-LifecycleFileHash $ReleasePath) -cne $ExpectedReleaseSha256){throw 'RELEASE_DRIFT'}
     $r=Read-LifecycleJson $ReleasePath
-    Assert-LifecycleKeys $r @('schema','packet','canonical','mapping','beforeIssue','beforeNote','review','nativeRequest','consumer','transport','executable','stateDir','vaultRoot','notePath','outboxPath','journalPath','canonicalLease','publisherLease','tempRoot','outboxSha256','recovery')
-    if($r.schema -cne 'TaskLifecycleUpdateRelease/v1' -or $r.recovery -cnotin @('INITIAL','RECONCILE_MISSING')){throw 'RELEASE_INVALID'}
-    foreach($k in @('packet','canonical','mapping','beforeIssue','beforeNote','review','nativeRequest','consumer','transport','executable')){Assert-LifecyclePin $r[$k]}
+    # v2 is the explicit opt-in: v1 keys plus an immutable retryPolicy pin. v1 keeps
+    # its exact original shape; a v1 release carrying retryPolicy is FIELDS_INVALID.
+    $retry=($r -is [hashtable] -and $r.ContainsKey('schema') -and $r.schema -ceq 'TaskLifecycleUpdateRelease/v2')
+    $releaseKeys=@('schema','packet','canonical','mapping','beforeIssue','beforeNote','review','nativeRequest','consumer','transport','executable','stateDir','vaultRoot','notePath','outboxPath','journalPath','canonicalLease','publisherLease','tempRoot','outboxSha256','recovery')
+    if($retry){$releaseKeys+='retryPolicy'}
+    Assert-LifecycleKeys $r $releaseKeys
+    if((-not $retry -and $r.schema -cne 'TaskLifecycleUpdateRelease/v1') -or $r.recovery -cnotin @('INITIAL','RECONCILE_MISSING')){throw 'RELEASE_INVALID'}
+    $pinKeys=@('packet','canonical','mapping','beforeIssue','beforeNote','review','nativeRequest','consumer','transport','executable')
+    $freshKeys=@('canonical','mapping','packet','consumer','transport','executable')
+    if($retry){$pinKeys+='retryPolicy';$freshKeys+='retryPolicy'}
+    foreach($k in $pinKeys){Assert-LifecyclePin $r[$k]}
     if($r.consumer.path -cne $script:LifecycleConsumerSource -or $r.transport.path -cne (Join-Path (Split-Path $script:LifecycleConsumerSource) 'github-cli-transport216.ps1')){throw 'SOURCE_BINDING'}
     if($r.review.sha256 -cne $ExpectedReviewSha256 -or $r.nativeRequest.sha256 -cne $ExpectedNativeRequestSha256){throw 'ADMISSION_BINDING'}
     $review=Read-LifecycleJson $r.review.path
-    Assert-LifecycleKeys $review @('schema','decision','packetSha256','consumerSha256','transportSha256')
-    if($review.schema -cne 'LifecycleIndependentReview/v1' -or $review.decision -cne 'ADMIT' -or $review.packetSha256 -cne $r.packet.sha256 -or $review.consumerSha256 -cne $r.consumer.sha256 -or $review.transportSha256 -cne $r.transport.sha256){throw 'REVIEW_BINDING'}
+    $reviewKeys=@('schema','decision','packetSha256','consumerSha256','transportSha256')
+    $nativeKeys=@('schema','action','packetSha256','reviewSha256','consumerSha256','transportSha256','executableSha256','stateDir','notePath','outboxPath')
+    if($retry){$reviewKeys+='retryPolicySha256';$nativeKeys+='retryPolicySha256'}
+    $schemaSuffix=$(if($retry){'/v2'}else{'/v1'})
+    Assert-LifecycleKeys $review $reviewKeys
+    if($review.schema -cne ('LifecycleIndependentReview'+$schemaSuffix) -or $review.decision -cne 'ADMIT' -or $review.packetSha256 -cne $r.packet.sha256 -or $review.consumerSha256 -cne $r.consumer.sha256 -or $review.transportSha256 -cne $r.transport.sha256 -or ($retry -and $review.retryPolicySha256 -cne $r.retryPolicy.sha256)){throw 'REVIEW_BINDING'}
     $native=Read-LifecycleJson $r.nativeRequest.path
-    Assert-LifecycleKeys $native @('schema','action','packetSha256','reviewSha256','consumerSha256','transportSha256','executableSha256','stateDir','notePath','outboxPath')
-    if($native.schema -cne 'LifecycleNativeRequest/v1' -or $native.action -cne 'UPDATE' -or $native.packetSha256 -cne $r.packet.sha256 -or $native.reviewSha256 -cne $r.review.sha256 -or $native.consumerSha256 -cne $r.consumer.sha256 -or $native.transportSha256 -cne $r.transport.sha256 -or $native.executableSha256 -cne $r.executable.sha256 -or $native.stateDir -cne $r.stateDir -or $native.notePath -cne $r.notePath -or $native.outboxPath -cne $r.outboxPath){throw 'NATIVE_BINDING'}
+    Assert-LifecycleKeys $native $nativeKeys
+    if($retry -and $native.retryPolicySha256 -cne $r.retryPolicy.sha256){throw 'NATIVE_BINDING'}
+    if($native.schema -cne ('LifecycleNativeRequest'+$schemaSuffix) -or $native.action -cne 'UPDATE' -or $native.packetSha256 -cne $r.packet.sha256 -or $native.reviewSha256 -cne $r.review.sha256 -or $native.consumerSha256 -cne $r.consumer.sha256 -or $native.transportSha256 -cne $r.transport.sha256 -or $native.executableSha256 -cne $r.executable.sha256 -or $native.stateDir -cne $r.stateDir -or $native.notePath -cne $r.notePath -or $native.outboxPath -cne $r.outboxPath){throw 'NATIVE_BINDING'}
     $p=New-TaskLifecycleMirrorPacket (Read-LifecycleJson $r.packet.path)
     if($p.eventType -cne 'UPDATE'){throw 'UNSUPPORTED_EVENT'}
+    $policy=$null; if($retry){$policy=Read-LifecycleRetryPolicy $r.retryPolicy}
     foreach($dir in @($r.stateDir,$r.vaultRoot,$r.tempRoot)){Assert-LifecyclePath $dir ''; if(-not [IO.Directory]::Exists($dir)){throw 'DIRECTORY_MISSING'}}
     foreach($path in @($r.outboxPath,$r.journalPath,$r.publisherLease)){Assert-LifecyclePath $path $r.stateDir}
     Assert-LifecyclePath $r.notePath $r.vaultRoot
@@ -236,7 +327,7 @@ function Invoke-AdmittedTaskLifecycleUpdate {
     . $r.transport.path
     try{$canonicalLease=[IO.File]::Open($r.canonicalLease,[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)}catch [IO.IOException]{return [pscustomobject]@{status='LOCKED';code='CANONICAL_LOCKED'}}
     try{$publisherLease=[IO.File]::Open($r.publisherLease,[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)}catch [IO.IOException]{return [pscustomobject]@{status='LOCKED';code='PUBLISHER_LOCKED'}}
-    foreach($k in @('packet','canonical','mapping','beforeIssue','beforeNote','review','nativeRequest','consumer','transport','executable')){Assert-LifecyclePin $r[$k]}
+    foreach($k in $pinKeys){Assert-LifecyclePin $r[$k]}
     if((Get-LifecycleFileHash $r.outboxPath) -cne $r.outboxSha256){throw 'OUTBOX_DRIFT'}
     $c=Read-LifecycleJson $r.canonical.path
     Assert-LifecycleKeys $c @('taskId','canonicalRevision','publicTitle','publicSummary','publicStatus','nextAction')
@@ -263,17 +354,32 @@ function Invoke-AdmittedTaskLifecycleUpdate {
     $digest=Get-LifecycleHash ([Text.Encoding]::UTF8.GetBytes(($c | ConvertTo-Json -Depth 8 -Compress)))
     $events=@(Read-Outbox $r.outboxPath)
     $j=@{schema='LifecycleUpdateJournal/v1';events=@{};heads=@{}}
-    if(Test-Path -LiteralPath $r.journalPath){$j=Read-LifecycleJson $r.journalPath; Assert-LifecycleKeys $j @('schema','events','heads'); if($j.schema -cnotin @('LifecycleUpdateJournal/v1','LifecycleUpdateJournal/v2') -or $j.events -isnot [hashtable] -or $j.heads -isnot [hashtable]){throw 'JOURNAL_CORRUPT'}}
+    if(Test-Path -LiteralPath $r.journalPath){$j=Read-LifecycleJson $r.journalPath; Assert-LifecycleKeys $j @('schema','events','heads'); if($j.schema -cnotin $(if($retry){@('LifecycleUpdateJournal/v1','LifecycleUpdateJournal/v2','LifecycleUpdateJournal/v3')}else{@('LifecycleUpdateJournal/v1','LifecycleUpdateJournal/v2')}) -or $j.events -isnot [hashtable] -or $j.heads -isnot [hashtable]){throw 'JOURNAL_CORRUPT'}}
     $id=$p.idempotencyKey
     $head=$j.heads[$p.taskId]
     if($null -ne $head -and ($p.canonicalRevision -lt $head.revision -or ($p.canonicalRevision -eq $head.revision -and $head.digest -cne $digest))){throw 'REVISION_CONFLICT'}
     $e=$j.events[$id]
     if($null -ne $e -and $e.digest -cne $digest){throw 'KEY_PAYLOAD_DRIFT'}
     if($null -eq $e -and $r.recovery -cne 'INITIAL'){throw 'RECOVERY_WITHOUT_EVENT'}
-    if($null -eq $e){$e=@{digest=$digest;githubSent=$false;noteSent=$false;githubAck=$false;noteAck=$false}; $j.events[$id]=$e}
+    # Retry state is never inferred: an existing event without it has an UNKNOWN prior
+    # attempt count and cannot be opted in. A v3 journal is refused by v1 releases above.
+    if($retry -and $null -ne $e -and -not ($e -is [hashtable] -and $e.ContainsKey('retry'))){throw 'RETRY_COUNT_UNKNOWN'}
+    $freshEvent=($null -eq $e)
+    if($freshEvent){
+      $e=@{digest=$digest;githubSent=$false;noteSent=$false;githubAck=$false;noteAck=$false}
+      if($retry){$e['lastFailure']=$null;$e['retry']=$null}
+      $j.events[$id]=$e
+    }
     # A v1 event has exactly five fields. In a v2 journal the current event may still
     # be an inherited five-field event; it gains lastFailure on the first durable write.
-    if($e.ContainsKey('lastFailure')){
+    if($retry){
+      Assert-LifecycleKeys $e @('digest','githubSent','noteSent','githubAck','noteAck','lastFailure','retry')
+      if($null -ne $e.lastFailure -and -not (Test-LifecycleFailureRecord $e.lastFailure)){throw 'JOURNAL_CORRUPT'}
+      if(-not $freshEvent){
+        if($j.schema -cne 'LifecycleUpdateJournal/v3'){throw 'JOURNAL_CORRUPT'}
+        Assert-LifecycleRetryState $e.retry $policy $r.retryPolicy.sha256
+      }
+    } elseif($e.ContainsKey('lastFailure')){
       if($j.schema -cne 'LifecycleUpdateJournal/v2'){throw 'JOURNAL_CORRUPT'}
       Assert-LifecycleKeys $e @('digest','githubSent','noteSent','githubAck','noteAck','lastFailure')
       if($null -ne $e.lastFailure -and -not (Test-LifecycleFailureRecord $e.lastFailure)){throw 'JOURNAL_CORRUPT'}
@@ -287,13 +393,43 @@ function Invoke-AdmittedTaskLifecycleUpdate {
       if($existing.Count -gt 0 -and $existing[0].PSObject.Properties.Name -contains 'retryPolicy' -and $existing[0].retryPolicy -ceq 'NO_RETRY'){throw 'EXCLUDED_NO_RETRY'}
     }
     $transport=New-GitHubCliLifecycleTransport216 -GhPath $r.executable.path -ExpectedGhSha256 $r.executable.sha256 -Repository $map.repo -TempRoot $r.tempRoot -ProcessRunner $ProcessRunner
+    # First admitted durable write upgrades the journal (v2, or v3 for an opt-in
+    # retry release) and gives the current event its nullable lastFailure; other
+    # inherited events are written unchanged.
+    $saveJournal={$j.schema=$(if($retry){'LifecycleUpdateJournal/v3'}else{'LifecycleUpdateJournal/v2'}); if(-not $e.ContainsKey('lastFailure')){$e['lastFailure']=$null}; Write-LifecycleAtomic $r.journalPath ([Text.Encoding]::UTF8.GetBytes(($j|ConvertTo-Json -Depth 12 -Compress)))}
     $read={
+      param([bool]$StrictIdentity)
       $rr=& $transport 'READ' @{repo=$map.repo;issueNumber=$map.issueNumber}
       if($null -eq $rr -or $rr.ok -isnot [bool] -or -not $rr.ok){$diagBox.v=Get-LifecycleTransportDiagnostic $rr;throw 'GITHUB_READ_FAILED'}
-      if($rr.number -ne $map.issueNumber -or $rr.url -cne $map.url -or $rr.state -cne 'OPEN'){throw 'GITHUB_READ_FAILED'}
+      # An ok-shaped READ for another issue/state is a fail-closed identity error,
+      # never a transport failure a retry policy could select.
+      if($rr.number -ne $map.issueNumber -or $rr.url -cne $map.url -or $rr.state -cne 'OPEN'){throw $(if($StrictIdentity){'READ_IDENTITY_MISMATCH'}else{'GITHUB_READ_FAILED'})}
       return $rr
     }
-    $op.phase='INITIAL_READ'; $rr=& $read; $op.phase=$null
+    # Opt-in gate. Only an event whose four delivery flags are all false may be
+    # (re)attempted, and only a due, explicitly eligible INITIAL_READ transport
+    # failure. The attempt is reserved durably BEFORE the transport READ; a crash
+    # leaves it consumed (nextAt null => unknown outcome) and is never retried.
+    $reserved=$false
+    if($retry -and -not ($e.githubSent -or $e.noteSent -or $e.githubAck -or $e.noteAck)){
+      $now=Get-LifecycleUtcNow $UtcClock
+      $prior=0
+      if(-not $freshEvent){
+        $st=$e.retry; $prior=[long]$st.attempts
+        if($null -eq $st.nextAt){
+          if($prior -ge $policy.maxAttempts){return [pscustomobject]@{status='BUDGET_EXHAUSTED';code='BUDGET_EXHAUSTED';automaticRetry=$false;attempts=$prior}}
+          if($null -ne $e.lastFailure -and -not (Test-LifecycleInitialReadRetryEligible $e.lastFailure $policy)){throw 'RETRY_NOT_ELIGIBLE'}
+          throw 'RETRY_ATTEMPT_UNKNOWN'
+        }
+        if(-not (Test-LifecycleInitialReadRetryEligible $e.lastFailure $policy)){throw 'JOURNAL_CORRUPT'}
+        if($now -lt (ConvertFrom-LifecycleUtc $st.nextAt)){return [pscustomobject]@{status='NOT_DUE';code='NOT_DUE';automaticRetry=$false;attempts=$prior;nextAt=[string]$st.nextAt}}
+      }
+      $e.retry=@{policySha256=[string]$r.retryPolicy.sha256;attempts=($prior+1);reservedAt=(Format-LifecycleUtc $now);nextAt=$null}
+      Assert-LifecycleRetryState $e.retry $policy $r.retryPolicy.sha256
+      try{& $saveJournal}catch{throw 'RETRY_RESERVATION_NOT_PERSISTED'}
+      $reserved=$true
+    }
+    $op.phase='INITIAL_READ'; $rr=& $read $retry; $op.phase=$null
     $ghDesired=($rr.title -ceq $p.publicTitle -and $rr.body -ceq $afterBody)
     $ghBefore=($rr.title -ceq $before.title -and $rr.body -ceq $before.body)
     $noteHash=Get-LifecycleFileHash $r.notePath
@@ -306,14 +442,11 @@ function Invoke-AdmittedTaskLifecycleUpdate {
     foreach($dest in @('github','note')){
       if(@($events|Where-Object {$_.key -ceq $keys[$dest]}).Count -eq 0){$events += [pscustomobject]@{key=$keys[$dest];taskId=$p.taskId;payloadSha256=$digest;runId=($id+':'+$dest);destination=$dest;status='AWAITING_CONTROLLER';attempt=0;deliveryStatus='PENDING';proof=$null}}
     }
-    # First admitted durable write upgrades the journal to v2 and gives the current
-    # event its nullable lastFailure; other inherited events are written unchanged.
-    $saveJournal={$j.schema='LifecycleUpdateJournal/v2'; if(-not $e.ContainsKey('lastFailure')){$e['lastFailure']=$null}; Write-LifecycleAtomic $r.journalPath ([Text.Encoding]::UTF8.GetBytes(($j|ConvertTo-Json -Depth 12 -Compress)))}
     $ack={param($dest,$proof) $e[$dest+'Ack']=$true; foreach($row in $events){if($row.key -ceq $keys[$dest]){$row.deliveryStatus='DELIVERED';$row.proof=$proof}}; Write-OutboxAtomic $r.outboxPath $events; & $saveJournal}
     Write-OutboxAtomic $r.outboxPath $events; & $saveJournal
     $phase='DELIVERY'
     # Fresh source/canonical/mapping check immediately before external mutation.
-    $fresh={foreach($k in @('canonical','mapping','packet','consumer','transport','executable')){Assert-LifecyclePin $r[$k]}}
+    $fresh={foreach($k in $freshKeys){Assert-LifecyclePin $r[$k]}}
     if($ghDesired){& $ack 'github' ('readback:'+ (Get-LifecycleHash ([Text.Encoding]::UTF8.GetBytes($rr.title+"`n"+$rr.body))))}
     else {
       if($e.githubSent){throw 'AMBIGUOUS_EDIT_NO_RETRY'}
@@ -323,7 +456,7 @@ function Invoke-AdmittedTaskLifecycleUpdate {
       $edited=& $transport 'EDIT' @{repo=$map.repo;issueNumber=$map.issueNumber;taskId=$p.taskId;title=$p.publicTitle;body=$afterBody;beforeTitle=$before.title;beforeBody=$before.body}
       if($null -eq $edited -or $edited.ok -isnot [bool] -or -not $edited.ok){$diagBox.v=Get-LifecycleTransportDiagnostic $edited;throw 'EDIT_AMBIGUOUS_NO_RETRY'}
       $op.phase='EDIT_READBACK'
-      $rr=& $read
+      $rr=& $read $false
       if($rr.title -cne $p.publicTitle -or $rr.body -cne $afterBody){throw 'EDIT_READBACK_FAILED'}
       $op.phase=$null
       & $ack 'github' ('readback:'+(Get-LifecycleHash ([Text.Encoding]::UTF8.GetBytes($rr.title+"`n"+$rr.body))))
@@ -356,7 +489,18 @@ function Invoke-AdmittedTaskLifecycleUpdate {
       $rec=$null
       try{
         $rec=New-LifecycleFailureRecord -Message $msg -Phase $op.phase -Diagnostic $diagBox.v
-        $e['lastFailure']=$rec; $j.schema='LifecycleUpdateJournal/v2'
+        $e['lastFailure']=$rec
+        $j.schema=$(if($retry){'LifecycleUpdateJournal/v3'}else{'LifecycleUpdateJournal/v2'})
+        # Schedule only the attempt this run reserved, only for a policy-selected
+        # INITIAL_READ transport diagnostic and only while budget remains. A clock
+        # or overflow error leaves nextAt null: the attempt stays consumed, no retry.
+        if($retry -and $reserved -and $op.phase -ceq 'INITIAL_READ' -and [long]$e.retry.attempts -lt $policy.maxAttempts -and (Test-LifecycleInitialReadRetryEligible $rec $policy)){
+          try{
+            $base=Get-LifecycleUtcNow $UtcClock; $res=ConvertFrom-LifecycleUtc $e.retry.reservedAt
+            if($base -lt $res){$base=$res}
+            $e.retry.nextAt=(Format-LifecycleUtc (Add-LifecycleCheckedMs $base $policy.delayMs))
+          }catch{$e.retry.nextAt=$null}
+        }
         Write-LifecycleAtomic $r.journalPath ([Text.Encoding]::UTF8.GetBytes(($j|ConvertTo-Json -Depth 12 -Compress)))
       }catch{
         $out['failureJournal']='NOT_PERSISTED'
