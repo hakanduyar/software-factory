@@ -82,6 +82,12 @@ Usage:
                       Write a local note for an already-accepted result into an
                       owned directory and verify it by readback. Approves and
                       dispatches nothing; not a remote ACK. See --help.
+  sf ollama task --model <local-model> --task-file <abs-path> --workspace <abs-path>
+                    --output-dir <fresh-abs-path> --executable <abs-path>
+                      Make ONE explicit ANALYST request to a cached local Ollama
+                      model after a loopback readiness check; writes the redacted
+                      outcome and model provenance to a new directory. Accepts
+                      and approves nothing. See --help.
   sf help             Show this message
 `;
 
@@ -471,6 +477,28 @@ async function main(argv: readonly string[]): Promise<number> {
         return 1;
       }
       return await runPersistAccepted(parsed.value, {
+        log: (line) => console.log(line),
+        error: (line) => console.error(line),
+      });
+    }
+    case "ollama": {
+      if (argv[1] !== "task") {
+        console.error("Usage: sf ollama task ...");
+        return 1;
+      }
+      const { parseOllamaTaskArgs, runOllamaTask, OLLAMA_TASK_HELP, OLLAMA_TASK_USAGE } = await import("./ollamaTask.js");
+      const rest = argv.slice(2);
+      if (rest.length === 1 && (rest[0] === "--help" || rest[0] === "-h")) {
+        console.log(OLLAMA_TASK_HELP);
+        return 0;
+      }
+      const parsed = parseOllamaTaskArgs(rest);
+      if (!parsed.ok) {
+        console.error(parsed.error);
+        console.error(OLLAMA_TASK_USAGE);
+        return 1;
+      }
+      return await runOllamaTask(parsed.value, {
         log: (line) => console.log(line),
         error: (line) => console.error(line),
       });
