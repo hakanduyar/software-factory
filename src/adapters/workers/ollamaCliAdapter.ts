@@ -1,8 +1,10 @@
 /**
  * Ollama CLI adapter (opt-in, explicit caller only).
  *
- * Invocation (docs.ollama.com/cli): `ollama run MODEL`, with the complete
- * prompt written to a non-terminal stdin. No positional prompt, no flags.
+ * Invocation (docs.ollama.com/cli): `ollama run MODEL --nowordwrap`, with the
+ * complete prompt written to a non-terminal stdin. No positional prompt.
+ * --nowordwrap only stops the CLI renderer from wrapping lines inside output;
+ * it does not make the model emit JSON or any particular format.
  *
  * ACTUAL-DISPATCH PREREQUISITE: constructing this Worker admits nothing. The
  * `ollama` CLI may automatically pull a missing model and may resolve cloud
@@ -69,7 +71,7 @@ export function resolveOllamaEffort(effort: string | undefined): EffortApplicati
 /** Pure argv/stdin building: no I/O. */
 export function buildOllamaInvocation(args: BuildInvocationArgs): CliInvocationPlan {
   return {
-    argv: ["run", args.model],
+    argv: ["run", args.model, "--nowordwrap"],
     input: args.prompt,
     effortApplication: resolveOllamaEffort(args.effort),
   };

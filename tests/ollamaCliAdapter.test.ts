@@ -73,8 +73,11 @@ describe("ollamaCliAdapter: pure helpers", () => {
       model: "m:1",
       effort: undefined,
     });
-    assert.deepEqual(plan.argv, ["run", "m:1"]);
+    assert.deepEqual(plan.argv, ["run", "m:1", "--nowordwrap"]);
     assert.equal(plan.input, "PROMPT");
+    assert.equal(plan.argv.filter((a) => a === "--nowordwrap").length, 1);
+    assert.equal(plan.argv.length, 3);
+    assert.ok(!plan.argv.includes("PROMPT"));
     assert.deepEqual(plan.effortApplication, { applied: false });
   });
 
@@ -115,7 +118,7 @@ describe("ollamaCliAdapter: createOllamaCliWorker", () => {
     assert.equal(calls.length, 1);
     const call = calls[0]!;
     assert.equal(call.executable, "ollama");
-    assert.deepEqual(call.argv, ["run", "m:1"]);
+    assert.deepEqual(call.argv, ["run", "m:1", "--nowordwrap"]);
     assert.equal(call.cwd, ws.root);
     assert.equal(call.timeoutMs, null);
     assert.equal(call.maxOutputBytes, undefined);
