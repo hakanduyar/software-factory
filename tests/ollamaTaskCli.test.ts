@@ -238,11 +238,11 @@ describe("sf ollama task: run", () => {
       ["symlink output ancestor", (f) => {
         const real = join(f.parent, "real");
         mkdirSync(real);
-        symlinkSync(real, join(f.parent, "link"));
+        symlinkSync(real, join(f.parent, "link"), process.platform === "win32" ? "junction" : "dir");
         return { args: { outputDir: join(f.parent, "link", "out") } };
       }],
       ["output is a symlink", (f) => {
-        symlinkSync(f.parent, f.args.outputDir);
+        symlinkSync(f.parent, f.args.outputDir, process.platform === "win32" ? "junction" : "dir");
         return {};
       }],
     ];
