@@ -53,6 +53,10 @@ export function createLoopWorker(config: LoopWorkerConfig, options: LoopWorkerFa
       throw new ValidationError(
         "supervised gemini-cli model/server/account/tool-policy admission is unavailable; no worker was constructed",
       );
+    case "opencode-cli":
+      throw new ValidationError(
+        "supervised opencode-cli model/server/account/tool-policy admission is unavailable; no worker was constructed",
+      );
     default: {
       const exhaustive: never = config.tool;
       throw new ValidationError(`unsupported worker tool: ${String(exhaustive)}`);
