@@ -12,3 +12,4 @@
 /tests/github/lifecycle-failure-journal.tests.ps1 text eol=lf
 /scripts/github/lifecycle-compat/**/*.ps1 -text
 /authoring/observe-failed-transport/**/*.ps1 -text
+/tests/github/lifecycle-initial-read-retry.tests.ps1 text eol=lf
