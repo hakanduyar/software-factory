@@ -423,6 +423,16 @@ describe("TASK-006 NEW-MODEL-1: only allowlisted models reach argv", () => {
     assert.ok(!("value" in result));
   });
 
+  it("keeps opencode-cli deliberately empty and refuses before any Claude/Codex argv is built", () => {
+    assert.equal(SUPPORTED_MODELS["opencode-cli"].length, 0);
+    const result = planAiRunConfig({ provider: "opencode-cli", model: "synthetic/model", role: "IMPLEMENTER" });
+    assert.equal(result.ok, false);
+    assert.ok(!("value" in result));
+    if (result.ok === false) {
+      assert.match(result.reason, /opencode-cli admission is unavailable/);
+    }
+  });
+
   it("never records an unsupported model as merely UNVERIFIED", () => {
     // The precise defect: `UNVERIFIED` is an honest label for "the provider did
     // not echo this back", and it was being used as a licence to launch

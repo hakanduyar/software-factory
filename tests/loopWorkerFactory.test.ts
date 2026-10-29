@@ -87,9 +87,9 @@ describe("createLoopWorker: author timeout policy", () => {
     });
   }
 
-  it("keeps ollama/gemini admission closed, even with null timeout", () => {
+  it("keeps ollama/gemini/opencode admission closed, even with null timeout", () => {
     const { runner, calls } = stub();
-    for (const tool of ["ollama-cli", "gemini-cli"] as const) {
+    for (const tool of ["ollama-cli", "gemini-cli", "opencode-cli"] as const) {
       const config: LoopWorkerConfig = { tool, model: "m", timeoutMs: null };
       assert.throws(
         () => createLoopWorker(config, { workspace: resolveWorkspace(createTempWorkspace()), processRunner: runner, roles: ["REVIEWER"] }),

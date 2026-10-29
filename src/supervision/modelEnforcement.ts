@@ -115,6 +115,8 @@ export const SUPPORTED_MODELS: Readonly<Record<WorkerTool, readonly string[]>> =
   "ollama-cli": Object.freeze([]),
   // Intentionally empty: supervised Gemini CLI admission is unavailable.
   "gemini-cli": Object.freeze([]),
+  // Intentionally empty: supervised OpenCode admission is unavailable.
+  "opencode-cli": Object.freeze([]),
 });
 
 /**
@@ -148,6 +150,9 @@ export function planAiRunConfig(request: AiRunConfigRequest): AiRunConfigResult 
   }
   if (request.provider === "gemini-cli") {
     return { ok: false, reason: "supervised gemini-cli admission is unavailable; no Gemini model is supported" };
+  }
+  if (request.provider === "opencode-cli") {
+    return { ok: false, reason: "supervised opencode-cli admission is unavailable; no OpenCode model is supported" };
   }
   if (!supported.includes(request.model)) {
     return {
