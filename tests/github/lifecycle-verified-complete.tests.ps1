@@ -551,7 +551,7 @@ Check 'transport CLOSE and terminal EDIT: structural validation, compare-before-
   $req={param($o) $h=@{repo='hakanduyar/software-factory';issueNumber=67;taskId=$TaskId;title='Reviewed task';body=$desired};foreach($k in $o.Keys){if($null -eq $o[$k]){$h.Remove($k)}else{$h[$k]=$o[$k]}};$h}
   # Static rejections never start a process.
   $bad=@(
-    @{extra=1},@{repo='other/repo'},@{issueNumber='67'},@{issueNumber=0},@{taskId='bad id!'},@{title='Different title'},
+    @{extra=1},@{repo='other/repo'},@{issueNumber='67'},@{issueNumber=0},@{taskId='bad id!'},
     @{body=(& $mk 'IN_PROGRESS' 'RUN_FOCUSED_CHECKS' 'Reviewed summary')},
     @{body=(& $mk 'ACCEPTED_SCOPED' 'INDEPENDENT_REVIEW' 'Reviewed summary')},
     @{body=(& $mk 'IN_PROGRESS' 'NONE' 'Reviewed summary')},
@@ -568,6 +568,12 @@ Check 'transport CLOSE and terminal EDIT: structural validation, compare-before-
     $calls.Clear();$res=& $t 'CLOSE' (& $req @{})
     Assert ($res.ok -eq $false -and @($calls|Where-Object {$_[1] -ceq 'close'}).Count -eq 0) ('compare-before-write refused '+(Describe $v))
   }
+  # A requested title that differs from the remote title is only recognized by the READ: the READ must
+  # occur and CLOSE must never run.
+  $st.state='OPEN';$st.title='Reviewed task';$st.body=$desired;$st.number=67;$st.mode='';$calls.Clear()
+  $res=& $t 'CLOSE' (& $req @{title='Different title'})
+  Assert ($res.ok -eq $false) 'requested title mismatch refused'
+  Assert (@($calls|Where-Object {$_[1] -ceq 'view'}).Count -eq 1 -and @($calls|Where-Object {$_[1] -ceq 'close'}).Count -eq 0) 'title mismatch: READ occurred and zero CLOSE calls'
   # Exact success: one view then one fixed close argv; structural result.
   $st.state='OPEN';$st.title='Reviewed task';$st.body=$desired;$st.number=67;$st.mode='';$calls.Clear()
   $ok=& $t 'CLOSE' (& $req @{})
@@ -591,6 +597,21 @@ Check 'transport CLOSE and terminal EDIT: structural validation, compare-before-
   Assert ($create.ok -eq $false -and $calls.Count -eq 0) 'CREATE does not accept NONE'
   $unknown=& $t 'REOPEN' (& $req @{})
   Assert ($unknown.ok -eq $false -and $calls.Count -eq 0) 'no reopen operation'
+}
+
+Check 'held canonical or publisher lock yields LOCKED with zero transport calls and no byte changes' {
+  foreach($which in @('canonical','publisher')){
+    $d=New-Fixture ('locked-'+$which)
+    $lockPath=$(if($which -ceq 'canonical'){(Join-Path $d 'canonical.json')+'.lock'}else{Join-Path $d 'state/publisher.lock'})
+    $expect=$(if($which -ceq 'canonical'){'CANONICAL_LOCKED'}else{'PUBLISHER_LOCKED'})
+    $s=Snap $d;$hadJournal=HasJournal $d
+    $held=[IO.File]::Open($lockPath,[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
+    try{ $res=Invoke-Complete $d }finally{ $held.Dispose() }
+    Assert ((Field $res 'status') -ceq 'LOCKED' -and (Field $res 'code') -ceq $expect) ($which+' expected LOCKED '+$expect+' got '+(Describe $res))
+    Assert ((Cnt $d 'reads') -eq 0 -and (Cnt $d 'edits') -eq 0 -and (Cnt $d 'closes') -eq 0) ($which+' lock: transport was used')
+    Assert ((HasJournal $d) -eq $hadJournal -and -not (HasJournal $d)) ($which+' lock: journal created')
+    Assert-Same $d $s ($which+' lock')
+  }
 }
 
 PutJson (Join-Path $Root 'results.json') @{schema='LifecycleVerifiedCompleteTestResults/v1';sourceSha256=$SourceSha256;results=@($script:Results.ToArray())}
