@@ -1,0 +1,19 @@
+name: Lifecycle initial read retry
+on:
+  pull_request:
+  push:
+permissions:
+  contents: read
+jobs:
+  lifecycle-initial-read-retry:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: "false"
+      - name: Verify admitted read retries without remote calls
+        shell: pwsh
+        run: |
+          $root = $env:GITHUB_WORKSPACE
+          pwsh -NoProfile -File (Join-Path $root 'tests/github/lifecycle-initial-read-retry.tests.ps1') -SourcePath (Join-Path $root 'scripts/github/task-lifecycle-mirror-consumer.ps1') -EvidenceRoot (Join-Path $env:RUNNER_TEMP 'lifecycle-initial-read-retry')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
