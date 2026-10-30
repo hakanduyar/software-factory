@@ -732,6 +732,31 @@ try {
     $planHistory = (Get-JobRec $idx $rr2.JobId)['plan']['history']
     Assert-That ((ConvertTo-SjqCanonical $planHistory) -ceq '["prior-refusal-1"]') 'registered history is preserved'
 
+    # ===== 3b. evidence readiness shares read access but still refuses an open writer =====
+    $shareDir = Join-Path $work 'readiness'
+    [void][IO.Directory]::CreateDirectory($shareDir)
+    $readPath = Join-Path $shareDir 'read-held.json'
+    [IO.File]::WriteAllBytes($readPath, [Text.Encoding]::UTF8.GetBytes('{"held":"read"}'))
+    $readHeld = [IO.File]::Open($readPath, 'Open', 'Read', 'Read')
+    try {
+        Assert-That (Test-SjoReadyFile $readPath) 'readiness is true while another read-only handle holds nonempty evidence'
+        $heldRef = Get-SjoFileRef $readPath
+        Assert-That ($heldRef['sha256'] -ceq (Get-Sha $readPath)) 'the evidence hash is exact while a read-only handle is held'
+    }
+    finally { $readHeld.Dispose() }
+    $writePath = Join-Path $shareDir 'write-held.json'
+    $writeBytes = [Text.Encoding]::UTF8.GetBytes('{"held":"write"}')
+    $writer = [IO.File]::Open($writePath, 'CreateNew', 'Write', 'None')
+    try {
+        $writer.Write($writeBytes, 0, $writeBytes.Length); $writer.Flush($true)
+        Assert-That (-not (Test-SjoReadyFile $writePath)) 'readiness stays false while a writer holds the evidence open'
+    }
+    finally { $writer.Dispose() }
+    Assert-That ((Test-SjoReadyFile $writePath) -and (Get-SjoFileRef $writePath)['sha256'] -ceq (Get-Sha $writePath) -and (Get-Sha $writePath) -ceq (Get-SjoSha $writeBytes)) 'after the writer closes readiness is true and the hash matches the final bytes'
+    $emptyPath = Join-Path $shareDir 'empty.json'
+    [IO.File]::WriteAllBytes($emptyPath, [byte[]]@())
+    Assert-That (-not (Test-SjoReadyFile (Join-Path $shareDir 'missing.json')) -and -not (Test-SjoReadyFile $emptyPath)) 'missing and zero-length evidence are not ready'
+
     # ===== 4. account gate: weekly 75 / session-backend exhaustion stops ALL new launches, evidence keeps advancing =====
     function Get-Gate($Usages) { Get-SjoAccountGate @($Usages | ForEach-Object { [ordered]@{ jobId = 'x'; runDirectory = $work; usageRef = $_ } }) ([DateTimeOffset]::UtcNow) }
     Assert-That ((Get-Gate @((New-Usage 'g1' 10 600 74 99))).State -ceq 'AVAILABLE') 'week 74 / session 99 is not a stop (no session-75 rule)'

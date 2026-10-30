@@ -88,6 +88,13 @@ Usage:
                       model after a loopback readiness check; writes the redacted
                       outcome and model provenance to a new directory. Accepts
                       and approves nothing. See --help.
+  sf gemini-api task --model <gemini-model> --task-file <abs-path> --workspace <abs-path>
+                    --output-dir <fresh-abs-path> --credential-env <ENV_VAR_NAME>
+                      Make ONE explicit ANALYST request through the Gemini API
+                      worker. Needs operator-host credential and transport
+                      configuration; the ordinary CLI reports
+                      CONFIGURATION_REQUIRED and contacts nothing. Accepts and
+                      approves nothing. See --help.
   sf help             Show this message
 `;
 
@@ -499,6 +506,29 @@ async function main(argv: readonly string[]): Promise<number> {
         return 1;
       }
       return await runOllamaTask(parsed.value, {
+        log: (line) => console.log(line),
+        error: (line) => console.error(line),
+      });
+    }
+    case "gemini-api": {
+      if (argv[1] !== "task") {
+        console.error("Usage: sf gemini-api task ...");
+        return 1;
+      }
+      const { parseGeminiApiTaskArgs, runGeminiApiTask, GEMINI_API_TASK_HELP, GEMINI_API_TASK_USAGE } = await import("./geminiApiTask.js");
+      const rest = argv.slice(2);
+      if (rest.length === 1 && (rest[0] === "--help" || rest[0] === "-h")) {
+        console.log(GEMINI_API_TASK_HELP);
+        return 0;
+      }
+      const parsed = parseGeminiApiTaskArgs(rest);
+      if (!parsed.ok) {
+        console.error(parsed.error);
+        console.error(GEMINI_API_TASK_USAGE);
+        return 1;
+      }
+      // No host configuration is supplied here: the runner refuses truthfully.
+      return await runGeminiApiTask(parsed.value, {
         log: (line) => console.log(line),
         error: (line) => console.error(line),
       });
