@@ -64,9 +64,10 @@ function Get-SjoCode($Exception) {
 
 # Reads are lease-free; a concurrent atomic replace can make one read fail, so a few reads are tried.
 function Get-SjoSnapshot([string]$IndexPath) {
-    Assert-SjqIndexPath $IndexPath
     for ($attempt = 0; ; $attempt++) {
-        try { return (Read-SjqIndexState $IndexPath) }
+        # The path assertion is re-run inside every bounded attempt so a transient existence refusal is retried
+        # too; the final attempt rethrows the original refusal. Nothing is cached or created.
+        try { Assert-SjqIndexPath $IndexPath; return (Read-SjqIndexState $IndexPath) }
         catch { if ($attempt -ge 4) { throw }; Start-Sleep -Milliseconds 100 }
     }
 }
