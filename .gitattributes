@@ -41,3 +41,6 @@ tests/github/canonical-lifecycle-complete-commit.tests.ps1 text eol=lf
 
 /scripts/github/consume-canonical-create-note.ps1 text eol=lf
 /tests/github/canonical-create-note-consumer.tests.ps1 text eol=lf
+/scripts/github/consume-canonical-create-github.ps1 text eol=lf
+/tests/github/canonical-create-github-consumer.tests.ps1 text eol=lf
+/tests/github/canonical-update-delivery-integration.tests.ps1 text eol=lf
