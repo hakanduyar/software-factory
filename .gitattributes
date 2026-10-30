@@ -26,3 +26,6 @@
 /scripts/orchestration/invoke-supervised-source-job.ps1 text eol=lf
 /tests/orchestration/source-job-queue.tests.ps1 text eol=lf
 /tests/orchestration/supervised-source-job.tests.ps1 text eol=lf
+
+/scripts/orchestration/source-job-owner.ps1 text eol=lf
+/tests/orchestration/source-job-owner.tests.ps1 text eol=lf

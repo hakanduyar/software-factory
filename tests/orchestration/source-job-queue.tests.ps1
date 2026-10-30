@@ -588,6 +588,52 @@ try {
     finally { Set-Item -Path function:Invoke-SjqReplace -Value $original }
     Assert-That ((Invoke-Consume $idx $kl 'klres-1' 'klatt-1').Status -ceq 'NEWLY_CONSUMED') 'after a failed write the same reservation can still be consumed once'
 
+    # ---------- 15. dependency seam and review-state gates (state forced on a private copy; the full evidence chain is in source-job-owner.tests.ps1) ----------
+    function Set-JobState([string]$Index, [string]$JobId, [string]$State) {
+        $root = Read-Root $Index
+        $root['controllerTaskRegistry']['sourceOnlyJobQueue']['jobs'][$JobId]['state'] = $State
+        Write-Json $Index $root
+    }
+    $idx = New-IndexCopy 'depseam'
+    $d1 = New-JobFixture 'd1' 1
+    $d2 = New-JobFixture 'd2' 2 -Deps @('job-d1')
+    Register-Fixture $idx $d1; Register-Fixture $idx $d2
+    $n = 0
+    foreach ($blockedState in 'SOURCE_PREPARED', 'DISPATCH_UNCERTAIN', 'RUNNING', 'REVIEW_REQUIRED', 'FAILED', 'SOURCE_REJECTED', 'SOURCE_REVIEW_ACCEPTED', 'DELIVERED_PENDING_RELEASE', 'RELEASED_FAILED') {
+        Set-JobState $idx $d1.JobId $blockedState
+        $n++
+        $got = Invoke-Reserve $idx @($d2.JobId) "dep-res-$n"
+        Assert-That ($got.Status -ceq 'NO_ELIGIBLE_CANDIDATE' -and $got.Skips[0].Reasons -ccontains 'UNRESOLVED_DEPENDENCY:job-d1') "dependency on a $blockedState job stays unresolved"
+    }
+    Assert-That ($got.Skips[0].Reasons -ccontains 'DEPENDENCY_FAILED_RELEASED:job-d1') 'a failed release is reported as such and still does not satisfy the dependency'
+    Assert-That ((Invoke-Reserve $idx @($d2.JobId) 'dep-res-missing').Status -ceq 'NO_ELIGIBLE_CANDIDATE') 'dependency state unchanged by repeated checks'
+    Set-JobState $idx $d1.JobId 'DELIVERED_RELEASED'
+    $ok = Invoke-Reserve $idx @($d2.JobId) 'dep-res-ok'
+    Assert-That ($ok.Status -ceq 'RESERVED' -and $ok.JobId -ceq $d2.JobId) 'only a delivered-and-released dependency is satisfied'
+
+    $idx = New-IndexCopy 'overlapfree'
+    $sharedO = Join-Path $work 'shared-o'
+    $o1 = New-JobFixture 'o1' 1 $sharedO
+    $o2 = New-JobFixture 'o2' 2 (Join-Path $sharedO 'sub')
+    Register-Fixture $idx $o1; Register-Fixture $idx $o2
+    Set-JobState $idx $o1.JobId 'SOURCE_REJECTED'
+    Assert-That ((Invoke-Reserve $idx @($o2.JobId) 'ov-1').Skips[0].Reasons -ccontains "PATH_CONFLICT:$($o1.JobId)") 'a rejected-but-unreleased job still protects its paths'
+    Set-JobState $idx $o1.JobId 'RELEASED_FAILED'
+    Assert-That ((Invoke-Reserve $idx @($o2.JobId) 'ov-2').Status -ceq 'RESERVED') 'a failed release frees the overlapping paths'
+
+    $idx = New-IndexCopy 'newevents'
+    $ne = New-JobFixture 'ne' 1
+    Register-Fixture $idx $ne
+    $dummy = [ordered]@{ path = (Join-Path $work 'nonexistent.json'); sha256 = ('1' * 64) }
+    $intentEvt = [ordered]@{ schema = 'SourceJobQueueEvent/v1'; eventId = 'ne-intent'; type = 'REVIEW_INTENT'; jobId = $ne.JobId; intentRef = $dummy }
+    Assert-EventRefused $idx 'STATE_NOT_REVIEWABLE' { Send-Event $idx $intentEvt } 'intent for a job that has no terminal evidence'
+    $extraIntent = [ordered]@{ schema = 'SourceJobQueueEvent/v1'; eventId = 'ne-intent2'; type = 'REVIEW_INTENT'; jobId = $ne.JobId; intentRef = $dummy; surprise = 1 }
+    Assert-EventRefused $idx 'UNEXPECTED_KEY' { Send-Event $idx $extraIntent } 'intent event with an unknown key'
+    $releaseEvt = [ordered]@{ schema = 'SourceJobQueueEvent/v1'; eventId = 'ne-release'; type = 'SOURCE_OWNERSHIP_RELEASE'; jobId = $ne.JobId; releaseRef = $dummy }
+    Assert-EventRefused $idx 'RELEASE_WITHOUT_DISPOSITION' { Send-Event $idx $releaseEvt } 'release without any admitted disposition'
+    $dispEvt = [ordered]@{ schema = 'SourceJobQueueEvent/v1'; eventId = 'ne-disp'; type = 'SOURCE_DISPOSITION'; jobId = $ne.JobId; dispositionRef = $dummy; dispositionAdmissionRef = $dummy }
+    Assert-EventRefused $idx 'MISSING_FILE' { Send-Event $idx $dispEvt } 'disposition whose pinned evidence file does not exist'
+
     # ---------- 11. no process / claim / acceptance surface ----------
     $source = Get-Content -LiteralPath $libPath -Raw
     Assert-That ($source -cnotmatch 'Start-Process|Invoke-Expression|Diagnostics\.Process|Invoke-RestMethod|Invoke-WebRequest|\biex\b') 'library has no process, network or dynamic-code surface'
