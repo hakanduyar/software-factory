@@ -1,0 +1,18 @@
+name: Canonical CREATE enqueue
+on:
+  pull_request:
+  push:
+permissions:
+  contents: read
+jobs:
+  canonical-create-enqueue:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: "false"
+      - name: Verify CREATE enqueue without publication
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File (Join-Path $env:GITHUB_WORKSPACE 'tests/github/canonical-create-enqueue.tests.ps1') -SourcePath $env:GITHUB_WORKSPACE -EvidenceRoot (Join-Path $env:RUNNER_TEMP 'canonical-create-enqueue')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
