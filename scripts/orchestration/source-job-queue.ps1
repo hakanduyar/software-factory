@@ -15,6 +15,8 @@
 # import independently supplied evidence only. A source review never releases paths or resolves a
 # dependency: only SOURCE review -> verified delivery -> separate release (DELIVERED_RELEASED) does.
 # A failed or rejected release (RELEASED_FAILED) frees overlapping paths but never satisfies a dependency.
+# A SOURCE_REVIEW_ACCEPTED job whose delivery CI actually failed is moved to SOURCE_REJECTED by a SOURCE_DISPOSITION of
+# kind CI_REJECTED (never after delivery); only the separate release then frees its paths as RELEASED_FAILED.
 # None of these states is Factory completion.
 #
 # Refusals throw 'SJQ_REFUSED:<CODE>[:<detail>]'.
@@ -33,6 +35,8 @@ $script:SjqOwnerIdentity = '/root/bounded_state_check'
 $script:SjqActorPattern = '^/?[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$'
 $script:SjqNonrootPattern = '^/root/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$'
 $script:SjqSha40Pattern = '^[0-9a-f]{40}$'
+$script:SjqPrUrlPattern = '^https://github\.com/(?<owner>[A-Za-z0-9][A-Za-z0-9-]{0,38})/(?<repo>[A-Za-z0-9._-]{1,100})/pull/(?<number>[1-9][0-9]{0,9})$'
+$script:SjqRelativeSourcePathPattern = '^[^\\:\x00-\x1f/]+(/[^\\:\x00-\x1f/]+)*$'
 
 function Stop-SjqRefused([string]$Code, [string]$Detail = '') {
     if ($Detail) { throw "SJQ_REFUSED:${Code}:$Detail" }
@@ -822,6 +826,8 @@ function Assert-SjqScopedMapping($Map, $Ref, [string]$Kind, [string]$Reviewer, $
 
 # Returns the scoped-mapping info when that variant was used, otherwise $null (legacy IndependentComponentReview/v1).
 function Assert-SjqReviewReceipt($Ref, [string]$Kind, [string]$Reviewer, $Head, $Job, $Pins) {
+    # CI_REJECTED has its own strict receipt, validated by Assert-SjqCiFailureReview; it never takes the opaque path below.
+    if ($Kind -ceq 'CI_REJECTED') { return }
     $bytes = Get-SjqPinnedBytes $Ref.path $Ref.sha256 'reviewRef'
     try { $probe = ConvertFrom-SjqJsonBytes $bytes 'review' } catch { $probe = $null }
     if (($probe -is [System.Collections.IDictionary]) -and (Test-SjqHasKey $probe 'schema') -and ($probe['schema'] -ceq 'SourceJobScopedReviewMapping/v1')) {
@@ -873,6 +879,113 @@ function Assert-SjqDeliveryReceipt($Ref, [string]$Head, $Accepted, $DeliveredMap
     if ((Get-SjqString $d 'sourceReviewSha256' 'delivery' $script:SjqShaPattern) -cne [string]$Accepted['reviewRef']['sha256']) { Stop-SjqRefused 'DELIVERY_MISMATCH' 'sourceReviewSha256' }
 }
 
+# ---------- CI rejection of an accepted-but-undelivered source review ----------
+# Only retained, typed evidence is read: a gh-shaped PR snapshot and the independent head review. Nothing is
+# queried live, no prose is interpreted and no hash is substituted (Git blob and working SHA stay distinct).
+
+function Assert-SjqCiSnapshot($Doc, [string]$Head, [string]$PrUrl, [string]$Owner, [string]$Repo) {
+    Assert-SjqKeys $Doc @('headRefOid', 'state', 'statusCheckRollup', 'url') 'ciSnapshot'
+    if ((Get-SjqString $Doc 'headRefOid' 'ciSnapshot' $script:SjqSha40Pattern) -cne $Head) { Stop-SjqRefused 'CI_SNAPSHOT_MISMATCH' 'headRefOid' }
+    $null = Get-SjqString $Doc 'state' 'ciSnapshot'
+    if ((Get-SjqString $Doc 'url' 'ciSnapshot') -cne $PrUrl) { Stop-SjqRefused 'CI_SNAPSHOT_MISMATCH' 'url' }
+    $rollup = Get-SjqList $Doc 'statusCheckRollup' 'ciSnapshot'
+    $detailsPattern = '^https://github\.com/' + [regex]::Escape($Owner) + '/' + [regex]::Escape($Repo) + '/actions/runs/[0-9]+(/job/[0-9]+)?$'
+    $failures = 0
+    foreach ($check in $rollup) {
+        Assert-SjqKeys $check @('__typename', 'status', 'conclusion', 'name', 'detailsUrl', 'workflowName', 'startedAt', 'completedAt') 'ciSnapshot.check'
+        if ((Get-SjqString $check '__typename' 'ciSnapshot.check') -cne 'CheckRun') { Stop-SjqRefused 'CI_SNAPSHOT_UNSUPPORTED' 'ciSnapshot.check.__typename' }
+        foreach ($key in 'status', 'conclusion', 'name', 'detailsUrl', 'workflowName', 'startedAt', 'completedAt') {
+            if ($check[$key] -isnot [string]) { Stop-SjqRefused 'BAD_TYPE' "ciSnapshot.check.$key" }
+        }
+        # Only a COMPLETED/FAILURE run counts; IN_PROGRESS, SUCCESS and everything else is carried but never a failure.
+        if ($check['status'] -ceq 'COMPLETED' -and $check['conclusion'] -ceq 'FAILURE') {
+            if ([string]::IsNullOrWhiteSpace($check['name'])) { Stop-SjqRefused 'CI_SNAPSHOT_MALFORMED' 'ciSnapshot.check.name' }
+            if ($check['detailsUrl'] -cnotmatch $detailsPattern) { Stop-SjqRefused 'CI_SNAPSHOT_MALFORMED' 'ciSnapshot.check.detailsUrl' }
+            $null = ConvertTo-SjqUtc $check['completedAt'] 'ciSnapshot.check.completedAt'
+            $failures++
+        }
+    }
+    if ($failures -lt 1) { Stop-SjqRefused 'CI_SNAPSHOT_NO_FAILURE' }
+    $failures
+}
+
+# The supported concrete head-review shape. Its candidate paths are repository-relative, so they are only
+# resolved against the sourceWorktree the registered (immutable) job plan itself pins; no root is ever guessed.
+function Assert-SjqCandidateHeadReview($Doc, [string]$Head, [string]$PrUrl, $Pins, $Job, [string]$Owner) {
+    Assert-SjqKeys $Doc @('schema', 'decision', 'reviewer', 'commit', 'pr', 'priorComponentReviewSha256', 'affectedResultSha256', 'passedAffectedGroups', 'failedAffectedGroups', 'candidateGitBlobs', 'adminPeerReview', 'deliveryPendingCI', 'operationalActivation') 'headReview'
+    if ((Get-SjqString $Doc 'schema' 'headReview') -cne 'IndependentComponentReview/v1') { Stop-SjqRefused 'HEAD_REVIEW_SCHEMA' }
+    if ((Get-SjqString $Doc 'decision' 'headReview') -cne 'ACCEPT_SCOPED_SOURCE_DELIVERY') { Stop-SjqRefused 'HEAD_REVIEW_DECISION' }
+    Assert-SjqIndependentActor (Get-SjqString $Doc 'reviewer' 'headReview' $script:SjqActorPattern) $Job $Owner 'headReview.reviewer'
+    if ((Get-SjqString $Doc 'commit' 'headReview' $script:SjqSha40Pattern) -cne $Head) { Stop-SjqRefused 'HEAD_REVIEW_MISMATCH' 'commit' }
+    if ((Get-SjqString $Doc 'pr' 'headReview') -cne $PrUrl) { Stop-SjqRefused 'HEAD_REVIEW_MISMATCH' 'pr' }
+    $null = Get-SjqString $Doc 'priorComponentReviewSha256' 'headReview' $script:SjqShaPattern
+    $null = Get-SjqString $Doc 'affectedResultSha256' 'headReview' $script:SjqShaPattern
+    $null = Get-SjqInt $Doc 'passedAffectedGroups' 'headReview' 1
+    if ((Get-SjqInt $Doc 'failedAffectedGroups' 'headReview' 0) -ne 0) { Stop-SjqRefused 'HEAD_REVIEW_FAILED_GROUPS' }
+    $null = Get-SjqString $Doc 'adminPeerReview' 'headReview'
+    # A head review that is not pending CI, or that claims activation, is not the source-delivery record this transition rejects.
+    if ((Get-SjqBool $Doc 'deliveryPendingCI' 'headReview') -ne $true) { Stop-SjqRefused 'HEAD_REVIEW_MISMATCH' 'deliveryPendingCI' }
+    if ((Get-SjqBool $Doc 'operationalActivation' 'headReview') -ne $false) { Stop-SjqRefused 'HEAD_REVIEW_MISMATCH' 'operationalActivation' }
+
+    $plan = Get-SjqEvidenceJson $Job['plan']['ref'] 'plan'
+    if (-not (Test-SjqHasKey $plan 'sourceWorktree')) { Stop-SjqRefused 'HEAD_REVIEW_ROOT_UNDECLARED' }
+    $root = Get-SjqString $plan 'sourceWorktree' 'plan'
+    Assert-SjqNormalizedPath $root 'plan.sourceWorktree'
+    if (-not [IO.Directory]::Exists($root)) { Stop-SjqRefused 'MISSING_FILE' 'plan.sourceWorktree' }
+
+    $blobs = Get-SjqList $Doc 'candidateGitBlobs' 'headReview'
+    if ($blobs.Count -eq 0) { Stop-SjqRefused 'EMPTY_LIST' 'headReview.candidateGitBlobs' }
+    $matched = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($blob in $blobs) {
+        Assert-SjqKeys $blob @('path', 'blob', 'workingSha256') 'headReview.candidateGitBlobs'
+        $relative = Get-SjqString $blob 'path' 'headReview.candidateGitBlobs' $script:SjqRelativeSourcePathPattern
+        foreach ($segment in $relative.Split('/')) { if ($segment -ceq '.' -or $segment -ceq '..') { Stop-SjqRefused 'BAD_VALUE' 'headReview.candidateGitBlobs.path' } }
+        $null = Get-SjqString $blob 'blob' 'headReview.candidateGitBlobs' $script:SjqSha40Pattern
+        $working = Get-SjqString $blob 'workingSha256' 'headReview.candidateGitBlobs' $script:SjqShaPattern
+        $absolute = [IO.Path]::Combine($root, $relative.Replace('/', [string][IO.Path]::DirectorySeparatorChar))
+        $pin = $null
+        foreach ($candidate in $Pins) { if ([string]::Equals([string]$candidate['path'], $absolute, $script:SjqPathComparison)) { $pin = $candidate } }
+        if ($null -eq $pin) { Stop-SjqRefused 'HEAD_REVIEW_CANDIDATE_MISMATCH' 'unmatched_path' }
+        if ($working -cne [string]$pin['sha256']) { Stop-SjqRefused 'HEAD_REVIEW_CANDIDATE_MISMATCH' 'workingSha256' }
+        if (-not $matched.Add([string]$pin['path'])) { Stop-SjqRefused 'HEAD_REVIEW_CANDIDATE_MISMATCH' 'duplicate' }
+    }
+    if ($matched.Count -ne @($Pins).Count) { Stop-SjqRefused 'HEAD_REVIEW_CANDIDATE_MISMATCH' 'missing_pin' }
+}
+
+function Assert-SjqCiFailureReview($Ref, [string]$Reviewer, $Head, $Job, $Pins, $Accepted) {
+    if ($null -eq $Head) { Stop-SjqRefused 'SOURCE_HEAD_REQUIRED' }
+    $r = Get-SjqEvidenceJson $Ref 'ciFailureReview'
+    Assert-SjqKeys $r @('schema', 'reviewer', 'jobId', 'taskId', 'planRef', 'admissionRef', 'terminalRef', 'candidatePins', 'sourceHead', 'priorAcceptedDispositionRef', 'priorAcceptedAdmissionRef', 'prUrl', 'ciSnapshotRef', 'candidateHeadReviewRef', 'decision') 'ciFailureReview'
+    if ((Get-SjqString $r 'schema' 'ciFailureReview') -cne 'IndependentCiFailureReview/v1') { Stop-SjqRefused 'CI_REVIEW_SCHEMA' }
+    if ((Get-SjqString $r 'decision' 'ciFailureReview') -cne 'REJECT_DELIVERY_CI') { Stop-SjqRefused 'CI_REVIEW_DECISION' }
+    $owner = Get-SjqJobOwner $Job
+    # PowerShell variables are case-insensitive: the receipt value must not share a name with the $Reviewer parameter.
+    $actualReviewer = Get-SjqString $r 'reviewer' 'ciFailureReview' $script:SjqActorPattern
+    Assert-SjqIndependentActor $actualReviewer $Job $owner 'ciFailureReview.reviewer'
+    if ($actualReviewer -cne $Reviewer) { Stop-SjqRefused 'CI_REVIEW_MISMATCH' 'reviewer' }
+    Assert-SjqTuple $r $Job 'ciFailureReview'
+    $reviewPins = Get-SjqPins $r 'candidatePins' 'ciFailureReview' @($Job['ownedPaths'])
+    if ((ConvertTo-SjqCanonical $reviewPins) -cne (ConvertTo-SjqCanonical $Pins)) { Stop-SjqRefused 'CI_REVIEW_MISMATCH' 'candidatePins' }
+    if ([string](Get-SjqSourceHead $r 'ciFailureReview') -cne [string]$Head) { Stop-SjqRefused 'CI_REVIEW_MISMATCH' 'sourceHead' }
+    if (-not (Test-SjqRefEqual (Get-SjqRef $r['priorAcceptedDispositionRef'] 'ciFailureReview.priorAcceptedDispositionRef') $Accepted['ref'])) { Stop-SjqRefused 'CI_REVIEW_PRIOR_MISMATCH' 'priorAcceptedDispositionRef' }
+    if (-not (Test-SjqRefEqual (Get-SjqRef $r['priorAcceptedAdmissionRef'] 'ciFailureReview.priorAcceptedAdmissionRef') $Accepted['admissionRef'])) { Stop-SjqRefused 'CI_REVIEW_PRIOR_MISMATCH' 'priorAcceptedAdmissionRef' }
+    # Ref equality is not file authentication: both original accepted files are re-read and re-hashed (under the caller's lease).
+    $null = Get-SjqPinnedBytes ([string]$Accepted['ref']['path']) ([string]$Accepted['ref']['sha256']) 'priorAcceptedDispositionRef'
+    $null = Get-SjqPinnedBytes ([string]$Accepted['admissionRef']['path']) ([string]$Accepted['admissionRef']['sha256']) 'priorAcceptedAdmissionRef'
+    $prUrl = Get-SjqString $r 'prUrl' 'ciFailureReview' $script:SjqPrUrlPattern
+    $null = $prUrl -cmatch $script:SjqPrUrlPattern
+    $prOwner = $Matches['owner']
+    $prRepo = $Matches['repo']
+    $snapshotRef = Get-SjqRef $r['ciSnapshotRef'] 'ciFailureReview.ciSnapshotRef'
+    $failures = Assert-SjqCiSnapshot (Get-SjqEvidenceJson $snapshotRef 'ciSnapshot') $Head $prUrl $prOwner $prRepo
+    $headReviewRef = Get-SjqRef $r['candidateHeadReviewRef'] 'ciFailureReview.candidateHeadReviewRef'
+    Assert-SjqCandidateHeadReview (Get-SjqEvidenceJson $headReviewRef 'headReview') $Head $prUrl $Pins $Job $owner
+    [ordered]@{
+        variant = 'CI_FAILURE_REVIEW'; prUrl = $prUrl; ciSnapshotRef = $snapshotRef; candidateHeadReviewRef = $headReviewRef; failedCheckRuns = [long]$failures
+        priorAcceptedDispositionRef = $Accepted['ref']; priorAcceptedAdmissionRef = $Accepted['admissionRef']
+    }
+}
+
 function Add-SjqDisposition($Queue, $Event, [string]$AtUtc) {
     Assert-SjqKeys $Event @('schema', 'eventId', 'type', 'jobId', 'dispositionRef', 'dispositionAdmissionRef') 'event'
     $job = Get-SjqExistingJob $Queue (Get-SjqString $Event 'jobId' 'event' $script:SjqIdPattern)
@@ -887,7 +1000,7 @@ function Add-SjqDisposition($Queue, $Event, [string]$AtUtc) {
     $dispositionId = Get-SjqString $a 'dispositionId' 'disposition' $script:SjqIdPattern
     Assert-SjqTuple $a $job 'disposition'
     $kind = Get-SjqString $a 'kind' 'disposition'
-    if (@('SOURCE_ACCEPTED', 'SOURCE_REJECTED', 'FAILED', 'DELIVERED') -cnotcontains $kind) { Stop-SjqRefused 'BAD_VALUE' 'disposition.kind' }
+    if (@('SOURCE_ACCEPTED', 'SOURCE_REJECTED', 'FAILED', 'DELIVERED', 'CI_REJECTED') -cnotcontains $kind) { Stop-SjqRefused 'BAD_VALUE' 'disposition.kind' }
     $owner = Get-SjqJobOwner $job
     $reviewer = Get-SjqString $a 'reviewer' 'disposition' $script:SjqActorPattern
     Assert-SjqIndependentActor $reviewer $job $owner 'disposition.reviewer'
@@ -922,6 +1035,11 @@ function Add-SjqDisposition($Queue, $Event, [string]$AtUtc) {
         'DELIVERED' {
             if ($state -cne 'SOURCE_REVIEW_ACCEPTED') { Stop-SjqRefused 'STATE_KIND_MISMATCH' "$state/$kind" }
         }
+        'CI_REJECTED' {
+            # Only an accepted, still undelivered review: a delivered or released job is never revoked or re-run from here.
+            $current = $review['disposition']
+            if ($state -cne 'SOURCE_REVIEW_ACCEPTED' -or $current -isnot [System.Collections.IDictionary] -or [string]$current['kind'] -cne 'SOURCE_ACCEPTED') { Stop-SjqRefused 'STATE_KIND_MISMATCH' "$state/$kind" }
+        }
     }
 
     $terminalPins = Get-SjqTerminalPins $job
@@ -931,6 +1049,13 @@ function Add-SjqDisposition($Queue, $Event, [string]$AtUtc) {
         if ($null -eq $head) { Stop-SjqRefused 'SOURCE_HEAD_REQUIRED' }
     }
     elseif ($null -ne $deliveryRef -or $null -ne $mappingRef) { Stop-SjqRefused 'DELIVERY_REF_NOT_ALLOWED' $kind }
+    if ($kind -ceq 'CI_REJECTED') {
+        # The candidate is exactly the currently accepted one (no new files, no mapping) and the head is explicit.
+        if ($null -eq $head) { Stop-SjqRefused 'SOURCE_HEAD_REQUIRED' }
+        $acceptedHead = $review['disposition']['sourceHead']
+        if ($null -ne $acceptedHead -and [string]$acceptedHead -cne $head) { Stop-SjqRefused 'CANDIDATE_MISMATCH' 'sourceHead' }
+        $terminalCanon = ConvertTo-SjqCanonical @($review['disposition']['candidatePins'])
+    }
 
     if ($null -eq $mappingRef) {
         if ((ConvertTo-SjqCanonical $pins) -cne $terminalCanon) { Stop-SjqRefused 'CANDIDATE_MISMATCH' 'disposition' }
@@ -955,6 +1080,8 @@ function Add-SjqDisposition($Queue, $Event, [string]$AtUtc) {
     }
 
     $scoped = Assert-SjqReviewReceipt $reviewRef $kind $reviewer $head $job $pins
+    $ci = $null
+    if ($kind -ceq 'CI_REJECTED') { $ci = Assert-SjqCiFailureReview $reviewRef $reviewer $head $job $pins $review['disposition'] }
     if ($kind -ceq 'DELIVERED') {
         $accepted = $review['disposition']
         if ($null -eq $accepted -or [string]$accepted['kind'] -cne 'SOURCE_ACCEPTED') { Stop-SjqRefused 'STATE_KIND_MISMATCH' 'no accepted source review' }
@@ -976,6 +1103,7 @@ function Add-SjqDisposition($Queue, $Event, [string]$AtUtc) {
         deliveryRef = $deliveryRef; candidateMappingRef = $mappingRef; scopedMapping = $scoped; candidatePins = $pins; sourceHead = $head; eventId = Get-SjqString $Event 'eventId' 'event'
         evidenceMode = $(if (($handoff -is [System.Collections.IDictionary]) -and $handoff['mock'] -eq $true) { 'HANDOFF_MOCK_NOT_LIVE' } else { 'NOT_MOCK_LABELLED' })
     }
+    if ($kind -ceq 'CI_REJECTED') { $record['ciRejection'] = $ci }
     $history = [Collections.Generic.List[object]]::new()
     foreach ($earlier in @($review['history'])) { $history.Add($earlier) }
     $history.Add($record)
@@ -985,6 +1113,7 @@ function Add-SjqDisposition($Queue, $Event, [string]$AtUtc) {
         'FAILED' { $job['notice'] = 'FAILURE_DISPOSITIONED_AWAITING_RELEASE' }
         'SOURCE_ACCEPTED' { $job['state'] = 'SOURCE_REVIEW_ACCEPTED'; $job['notice'] = 'SOURCE_REVIEW_ACCEPTED_PENDING_DELIVERY_NOT_FACTORY_COMPLETE' }
         'SOURCE_REJECTED' { $job['state'] = 'SOURCE_REJECTED'; $job['notice'] = 'SOURCE_REJECTED_AWAITING_RELEASE' }
+        'CI_REJECTED' { $job['state'] = 'SOURCE_REJECTED'; $job['notice'] = 'CI_REJECTED_AWAITING_FAILED_RELEASE' }
         'DELIVERED' { $job['state'] = 'DELIVERED_PENDING_RELEASE'; $job['notice'] = 'DELIVERED_AWAITING_SEPARATE_RELEASE' }
     }
     [string]$job['jobId']
