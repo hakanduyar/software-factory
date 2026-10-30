@@ -1,0 +1,18 @@
+name: Canonical CREATE delivery integration
+on:
+  pull_request:
+  push:
+permissions:
+  contents: read
+jobs:
+  canonical-create-delivery-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: "false"
+      - name: Verify CREATE delivery integration offline
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File (Join-Path $env:GITHUB_WORKSPACE 'tests/github/canonical-create-delivery-integration.tests.ps1') -SourcePath $env:GITHUB_WORKSPACE -EvidenceRoot (Join-Path $env:RUNNER_TEMP 'canonical-create-delivery-integration')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
