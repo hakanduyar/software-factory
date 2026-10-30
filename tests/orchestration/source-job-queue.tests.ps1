@@ -82,16 +82,19 @@ function New-IndexCopy([string]$Name) {
     $path
 }
 
-function New-JobFixture([string]$Name, [long]$Priority, [string]$Owned = '', [string]$Expires = '2026-10-30T00:00:00.0000000Z', [string[]]$Deps = @()) {
+function New-JobFixture([string]$Name, [long]$Priority, [string]$Owned = '', [string]$Expires = '2026-10-30T00:00:00.0000000Z', [string[]]$Deps = @(), $RepoRoot = '') {
     if (-not $Owned) { $Owned = Join-Path $work "owned-$Name" }
     $editable = Join-Path $Owned 'target.ps1'
     $run = Join-Path (Join-Path $work 'runs') $Name
     $planPath = Join-Path (Join-Path $work 'plans') "$Name.plan.json"
-    Write-Json $planPath ([ordered]@{
-            schema = 'SupervisedCodeSourceOnlyTask/v1'; taskId = "task-$Name"; sessionId = "session-$Name"; runDirectory = $run
-            editablePins = @([ordered]@{ path = $editable; sha256 = ('a' * 64) }); history = @('prior-refusal-1')
-            protectedPins = @([ordered]@{ path = (Join-Path $work 'protected.txt'); sha256 = ('d' * 64) })
-        })
+    $planDoc = [ordered]@{
+        schema = 'SupervisedCodeSourceOnlyTask/v1'; taskId = "task-$Name"; sessionId = "session-$Name"; runDirectory = $run
+        editablePins = @([ordered]@{ path = $editable; sha256 = ('a' * 64) }); history = @('prior-refusal-1')
+        protectedPins = @([ordered]@{ path = (Join-Path $work 'protected.txt'); sha256 = ('d' * 64) })
+    }
+    # Real registered plans pin the root as sourceWorktree; '' omits it and a non-string value is kept as given (wrong-type control).
+    if (($RepoRoot -isnot [string]) -or $RepoRoot) { $planDoc['sourceWorktree'] = $RepoRoot }
+    Write-Json $planPath $planDoc
     $admPath = Join-Path (Join-Path $work 'plans') "$Name.admission.json"
     Write-Json $admPath ([ordered]@{
             schema = 'IndependentSupervisedSourceOnlyAdmission/v1'; decision = 'ADMIT_SOURCE_ONLY_ONCE'; planSha256 = (Get-Sha $planPath)
@@ -633,6 +636,321 @@ try {
     Assert-EventRefused $idx 'RELEASE_WITHOUT_DISPOSITION' { Send-Event $idx $releaseEvt } 'release without any admitted disposition'
     $dispEvt = [ordered]@{ schema = 'SourceJobQueueEvent/v1'; eventId = 'ne-disp'; type = 'SOURCE_DISPOSITION'; jobId = $ne.JobId; dispositionRef = $dummy; dispositionAdmissionRef = $dummy }
     Assert-EventRefused $idx 'MISSING_FILE' { Send-Event $idx $dispEvt } 'disposition whose pinned evidence file does not exist'
+
+    # ---------- 16. CI_REJECTED: accepted-but-undelivered source whose delivery CI failed (controlled fixtures only) ----------
+    $ciHead = '5' * 40
+    $ciPr = 'https://github.com/example-owner/example-repo/pull/7'
+    $script:CiSeq = 0
+
+    function Merge-Over($Doc, [hashtable]$Over) {
+        foreach ($key in $Over.Keys) {
+            if (($Over[$key] -is [string]) -and $Over[$key] -ceq '__REMOVE__') { $Doc.Remove($key) } else { $Doc[$key] = $Over[$key] }
+        }
+        $Doc
+    }
+    function Get-CiTuple($Fx) {
+        [ordered]@{ jobId = $Fx.JobId; taskId = "task-$($Fx.Name)"; planRef = (Get-Ref $Fx.PlanPath); admissionRef = (Get-Ref $Fx.AdmPath); terminalRef = (Get-Ref (Join-Path $Fx.Run 'terminal.json')) }
+    }
+    function New-CheckRun([string]$Status, [string]$Conclusion, [string]$Name = 'unit', [string]$Details = 'https://github.com/example-owner/example-repo/actions/runs/11/job/22') {
+        [ordered]@{ __typename = 'CheckRun'; completedAt = '2026-10-30T04:59:02Z'; conclusion = $Conclusion; detailsUrl = $Details; name = $Name; startedAt = '2026-10-30T04:58:37Z'; status = $Status; workflowName = 'wf' }
+    }
+    function New-DispositionFiles($C, [string]$Tag, [string]$Kind, [string]$Reviewer, $Head, [string]$ReviewPath, [hashtable]$DispOver = @{}, [hashtable]$AdmOver = @{}) {
+        $tuple = Get-CiTuple $C.Fx
+        $disp = [ordered]@{ schema = 'SourceJobIndependentDisposition/v1'; dispositionId = "disp-$Tag" }
+        foreach ($key in $tuple.Keys) { $disp[$key] = $tuple[$key] }
+        $disp['candidatePins'] = $C.Pins; $disp['sourceHead'] = $Head; $disp['kind'] = $Kind; $disp['reviewer'] = $Reviewer
+        $disp['reviewRef'] = Get-Ref $ReviewPath; $disp['deliveryRef'] = $null; $disp['candidateMappingRef'] = $null
+        $null = Merge-Over $disp $DispOver
+        $dispPath = Join-Path $C.Dir "$Tag.disposition.json"
+        Write-Json $dispPath $disp
+        $adm = [ordered]@{ schema = 'SourceJobDispositionAdmission/v1'; admissionId = "dadm-$Tag"; decision = 'ADMIT_SCOPED_SOURCE_DISPOSITION'; reviewer = 'disposition-admitter'; dispositionRef = (Get-Ref $dispPath) }
+        foreach ($key in $tuple.Keys) { $adm[$key] = $tuple[$key] }
+        $adm['candidatePins'] = $C.Pins; $adm['sourceHead'] = $Head
+        $null = Merge-Over $adm $AdmOver
+        $admPath = Join-Path $C.Dir "$Tag.dispadmission.json"
+        Write-Json $admPath $adm
+        $evt = [ordered]@{ schema = 'SourceJobQueueEvent/v1'; eventId = "disp-evt-$Tag"; type = 'SOURCE_DISPOSITION'; jobId = $C.Fx.JobId; dispositionRef = (Get-Ref $dispPath); dispositionAdmissionRef = (Get-Ref $admPath) }
+        [pscustomobject]@{ Event = $evt; DispPath = $dispPath; AdmPath = $admPath }
+    }
+    # Builds the job to SOURCE_REVIEW_ACCEPTED (or REVIEW_REQUIRED) through the real event chain; nothing is forced.
+    function New-CiChain([string]$Index, [string]$Name, [switch]$OmitRoot, [switch]$StopBeforeAccept, $SourceWorktree = $null) {
+        $repo = Join-Path $work "repo-$Name"
+        $owned = Join-Path $repo 'src'
+        $pinnedRoot = if ($null -ne $SourceWorktree) { $SourceWorktree } else { $repo }
+        $fx = if ($OmitRoot) { New-JobFixture $Name 1 $owned } else { New-JobFixture $Name 1 $owned -RepoRoot $pinnedRoot }
+        [void][IO.Directory]::CreateDirectory($owned)
+        [IO.File]::WriteAllText($fx.Editable, "candidate $Name")
+        $pinSha = Get-Sha $fx.Editable
+        Move-ToRunning $Index $fx "res-$Name"
+        Write-Terminal $fx @{ editableAfter = @([ordered]@{ path = $fx.Editable; sha256 = $pinSha }) }
+        $null = Send-Event $Index (Get-TerminalEvent $fx) $T_START
+        $c = [pscustomobject]@{
+            Fx = $fx; Dir = (Join-Path $work "ci-$Name"); Sha = $pinSha; Owner = '/root/owner-ci'
+            Pins = @([ordered]@{ path = $fx.Editable; sha256 = $pinSha }); AcceptedDispRef = $null; AcceptedAdmRef = $null
+        }
+        if ($StopBeforeAccept) { return $c }
+        $tuple = Get-CiTuple $fx
+        $intent = [ordered]@{ schema = 'SourceJobReviewIntent/v1'; intentId = "intent-$Name" }
+        foreach ($key in $tuple.Keys) { $intent[$key] = $tuple[$key] }
+        $intent['candidatePins'] = $c.Pins; $intent['sourceHead'] = $null; $intent['owner'] = $c.Owner; $intent['reviewerTarget'] = '/root/target-ci'; $intent['createdUtc'] = $T_START
+        $intentPath = Join-Path $c.Dir 'intent.json'
+        Write-Json $intentPath $intent
+        $null = Send-Event $Index ([ordered]@{ schema = 'SourceJobQueueEvent/v1'; eventId = "intent-evt-$Name"; type = 'REVIEW_INTENT'; jobId = $fx.JobId; intentRef = (Get-Ref $intentPath) })
+        $toolPath = Join-Path $c.Dir 'tool.json'
+        Write-Json $toolPath ([ordered]@{ tool = 'collaboration.followup_task'; target = '/root/target-ci'; intentId = "intent-$Name" })
+        $ackPath = Join-Path $c.Dir 'ack.json'
+        Write-Json $ackPath ([ordered]@{ schema = 'SourceJobReviewHandoffAck/v1'; ackId = "ack-$Name"; intentRef = (Get-Ref $intentPath); reviewerTarget = '/root/target-ci'; acknowledgedUtc = '2026-10-29T10:05:00.0000000Z'; toolResultRef = (Get-Ref $toolPath) })
+        $null = Send-Event $Index ([ordered]@{ schema = 'SourceJobQueueEvent/v1'; eventId = "ack-evt-$Name"; type = 'REVIEW_HANDOFF_ACK'; jobId = $fx.JobId; ackRef = (Get-Ref $ackPath) })
+        $acceptReview = Join-Path $c.Dir 'accept-review.json'
+        Write-Json $acceptReview ([ordered]@{ schema = 'IndependentComponentReview/v1'; decision = 'ACCEPT_SCOPED_SOURCE'; typecheck = 'PASS'; build = 'PASS'; focusedTests = @('focused'); ciRequiredBeforeDelivery = $true; commit = ('1' * 40); reviewer = 'accept-reviewer' })
+        $accept = New-DispositionFiles $c "acc-$Name" 'SOURCE_ACCEPTED' 'accept-reviewer' $null $acceptReview
+        $null = Send-Event $Index $accept.Event
+        $c.AcceptedDispRef = Get-Ref $accept.DispPath
+        $c.AcceptedAdmRef = Get-Ref $accept.AdmPath
+        $c
+    }
+    # One complete, valid CI rejection evidence set; every override knob mutates exactly one document.
+    function New-CiEvidence($C, [string]$Tag, [hashtable]$ReviewOver = @{}, [hashtable]$SnapOver = @{}, [hashtable]$HeadOver = @{}, [hashtable]$DispOver = @{}, [hashtable]$AdmOver = @{}, $Rollup = $null, [string]$Reviewer = 'ci-reviewer', $Head = $ciHead) {
+        if ($null -eq $Rollup) { $Rollup = @((New-CheckRun 'COMPLETED' 'FAILURE' 'canonical-complete-commit'), (New-CheckRun 'IN_PROGRESS' '' 'verify'), (New-CheckRun 'COMPLETED' 'SUCCESS' 'lint')) }
+        $snapPath = Join-Path $C.Dir "$Tag.snapshot.json"
+        Write-Json $snapPath (Merge-Over ([ordered]@{ headRefOid = $ciHead; state = 'OPEN'; statusCheckRollup = $Rollup; url = $ciPr }) $SnapOver)
+        $headPath = Join-Path $C.Dir "$Tag.headreview.json"
+        Write-Json $headPath (Merge-Over ([ordered]@{
+                    schema = 'IndependentComponentReview/v1'; decision = 'ACCEPT_SCOPED_SOURCE_DELIVERY'; reviewer = 'head-reviewer'; commit = $ciHead; pr = $ciPr
+                    priorComponentReviewSha256 = ('1' * 64); affectedResultSha256 = ('2' * 64); passedAffectedGroups = 5; failedAffectedGroups = 0
+                    candidateGitBlobs = @([ordered]@{ workingSha256 = $C.Sha; path = 'src/target.ps1'; blob = ('3' * 40) })
+                    adminPeerReview = 'reviewed'; deliveryPendingCI = $true; operationalActivation = $false
+                }) $HeadOver)
+        $tuple = Get-CiTuple $C.Fx
+        $review = [ordered]@{ schema = 'IndependentCiFailureReview/v1'; reviewer = $Reviewer }
+        foreach ($key in $tuple.Keys) { $review[$key] = $tuple[$key] }
+        $review['candidatePins'] = $C.Pins; $review['sourceHead'] = $ciHead
+        $review['priorAcceptedDispositionRef'] = $(if ($null -ne $C.AcceptedDispRef) { $C.AcceptedDispRef } else { Get-Ref $C.Fx.PlanPath })
+        $review['priorAcceptedAdmissionRef'] = $(if ($null -ne $C.AcceptedAdmRef) { $C.AcceptedAdmRef } else { Get-Ref $C.Fx.PlanPath })
+        $review['prUrl'] = $ciPr; $review['ciSnapshotRef'] = Get-Ref $snapPath; $review['candidateHeadReviewRef'] = Get-Ref $headPath; $review['decision'] = 'REJECT_DELIVERY_CI'
+        $reviewPath = Join-Path $C.Dir "$Tag.cireview.json"
+        Write-Json $reviewPath (Merge-Over $review $ReviewOver)
+        $files = New-DispositionFiles $C "ci-$Tag" 'CI_REJECTED' $Reviewer $Head $reviewPath $DispOver $AdmOver
+        [pscustomobject]@{ Event = $files.Event; SnapPath = $snapPath; HeadPath = $headPath; ReviewPath = $reviewPath; DispPath = $files.DispPath; AdmPath = $files.AdmPath }
+    }
+    function Assert-CiRefused($C, [string]$Index, [string]$Code, [string]$Message, [hashtable]$Variant = @{}) {
+        $script:CiSeq++
+        $ev = New-CiEvidence $C "n$($script:CiSeq)" @Variant
+        # Each negative runs on its own index copy: an unexpected acceptance is reported as a failure of that case
+        # alone and can never mutate the shared positive fixture or cascade into later state-dependent checks.
+        $iso = Join-Path $work "cirej-iso-$($script:CiSeq).index.json"
+        Copy-Item -LiteralPath $Index -Destination $iso
+        $sharedBefore = Get-Sha $Index
+        Assert-EventRefused $iso $Code { Send-Event $iso $ev.Event $T_REG } $Message
+        Assert-That ((Get-Sha $Index) -ceq $sharedBefore) "$Message (shared index must be untouched)"
+    }
+
+    $idx = New-IndexCopy 'cirej'
+    $c1 = New-CiChain $idx 'ci1'
+    $ci2 = New-JobFixture 'ci2' 2 (Join-Path $c1.Fx.Owned 'sub')
+    $ci3 = New-JobFixture 'ci3' 3 -Deps @($c1.Fx.JobId)
+    $ci4 = New-JobFixture 'ci4' 4
+    foreach ($x in $ci2, $ci3, $ci4) { Register-Fixture $idx $x }
+    $job = Get-Job $idx $c1.Fx.JobId
+    Assert-That ($job['state'] -ceq 'SOURCE_REVIEW_ACCEPTED' -and $job['review']['disposition']['kind'] -ceq 'SOURCE_ACCEPTED') 'CI chain fixture reaches SOURCE_REVIEW_ACCEPTED through the real event chain'
+    Assert-That ((Invoke-Reserve $idx @($ci2.JobId) 'ci-res-0').Skips[0].Reasons -ccontains "PATH_CONFLICT:$($c1.Fx.JobId)") 'an accepted but undelivered job protects its paths'
+
+    # wrong initial states are refused: not yet accepted, delivered, released
+    $idxReview = New-IndexCopy 'cirej-review'
+    $cr = New-CiChain $idxReview 'cir' -StopBeforeAccept
+    $evReview = New-CiEvidence $cr 'wrongstate'
+    Assert-EventRefused $idxReview 'STATE_KIND_MISMATCH' { Send-Event $idxReview $evReview.Event } 'CI_REJECTED while still REVIEW_REQUIRED'
+    $ciOk = New-CiEvidence $c1 'ok'
+    foreach ($forced in 'DELIVERED_PENDING_RELEASE', 'DELIVERED_RELEASED', 'RELEASED_FAILED', 'SOURCE_REJECTED') {
+        $forcedIdx = Join-Path $work "cirej-forced-$forced.index.json"
+        Copy-Item -LiteralPath $idx -Destination $forcedIdx
+        Set-JobState $forcedIdx $c1.Fx.JobId $forced
+        Assert-EventRefused $forcedIdx 'STATE_KIND_MISMATCH' { Send-Event $forcedIdx $ciOk.Event } "CI_REJECTED from $forced never revokes or re-opens the job"
+    }
+    $noRoot = New-IndexCopy 'cirej-noroot'
+    $cn = New-CiChain $noRoot 'cin' -OmitRoot
+    $evNoRoot = New-CiEvidence $cn 'x'
+    Assert-EventRefused $noRoot 'HEAD_REVIEW_ROOT_UNDECLARED' { Send-Event $noRoot $evNoRoot.Event } 'a plan without a pinned sourceWorktree cannot map relative head-review paths'
+    # the plan root is only the immutable sourceWorktree: a repositoryRoot is neither required nor a substitute
+    $planDocActual = Get-Content -LiteralPath $c1.Fx.PlanPath -Raw | ConvertFrom-Json -AsHashtable
+    Assert-That ($planDocActual.ContainsKey('sourceWorktree') -and -not $planDocActual.ContainsKey('repositoryRoot')) 'the supported positive fixture is actual-shaped: sourceWorktree and no invented repositoryRoot'
+    $badRoots = [ordered]@{
+        wrongtype   = @{ Code = 'BAD_TYPE'; Root = 7 }
+        noncanon    = @{ Code = 'BAD_PATH'; Root = ((Join-Path $work 'repo-cinoncanon') + [IO.Path]::DirectorySeparatorChar) }
+        relative    = @{ Code = 'BAD_PATH'; Root = 'repo-cirelative' }
+        missingdir  = @{ Code = 'MISSING_FILE'; Root = (Join-Path $work 'repo-cimissingdir-never-created') }
+    }
+    foreach ($label in $badRoots.Keys) {
+        $badIdx = New-IndexCopy "cirej-root-$label"
+        $cb = New-CiChain $badIdx "cir$label" -SourceWorktree $badRoots[$label].Root
+        $evBad = New-CiEvidence $cb 'x'
+        Assert-EventRefused $badIdx $badRoots[$label].Code { Send-Event $badIdx $evBad.Event } "sourceWorktree $label is refused, never guessed or reinterpreted"
+    }
+    $linkTarget = Join-Path $work 'repo-cirlink'
+    $linkPath = Join-Path $work 'repo-cirlink-junction'
+    [void][IO.Directory]::CreateDirectory($linkTarget)
+    if (New-TestLink $linkPath $linkTarget $true) {
+        try {
+            $linkIdx = New-IndexCopy 'cirej-root-reparse'
+            $cl = New-CiChain $linkIdx 'cirlink' -SourceWorktree $linkPath
+            $evLink = New-CiEvidence $cl 'x'
+            Assert-EventRefused $linkIdx 'REPARSE' { Send-Event $linkIdx $evLink.Event } 'a reparse-point sourceWorktree is refused'
+        }
+        finally { [IO.Directory]::Delete($linkPath) }
+    }
+    else { $script:Skipped++ }
+
+    # stale/wrong prior refs, head/PR/candidate mismatch, malformed evidence
+    $wrongRef = Get-Ref $c1.Fx.AdmPath
+    Assert-CiRefused $c1 $idx 'CI_REVIEW_PRIOR_MISMATCH' 'stale prior accepted disposition ref' @{ ReviewOver = @{ priorAcceptedDispositionRef = $wrongRef } }
+    Assert-CiRefused $c1 $idx 'CI_REVIEW_PRIOR_MISMATCH' 'stale prior accepted admission ref' @{ ReviewOver = @{ priorAcceptedAdmissionRef = $wrongRef } }
+    Assert-CiRefused $c1 $idx 'CI_SNAPSHOT_MISMATCH' 'snapshot head differs from sourceHead' @{ SnapOver = @{ headRefOid = ('6' * 40) } }
+    Assert-CiRefused $c1 $idx 'CI_SNAPSHOT_MISMATCH' 'snapshot url differs from prUrl' @{ SnapOver = @{ url = 'https://github.com/example-owner/example-repo/pull/8' } }
+    Assert-CiRefused $c1 $idx 'HEAD_REVIEW_MISMATCH' 'head review commit differs from sourceHead' @{ HeadOver = @{ commit = ('6' * 40) } }
+    Assert-CiRefused $c1 $idx 'HEAD_REVIEW_MISMATCH' 'head review pr differs from prUrl' @{ HeadOver = @{ pr = 'https://github.com/example-owner/example-repo/pull/8' } }
+    Assert-CiRefused $c1 $idx 'HEAD_REVIEW_CANDIDATE_MISMATCH' 'head review working digest differs from the accepted pin' @{ HeadOver = @{ candidateGitBlobs = @([ordered]@{ workingSha256 = ('9' * 64); path = 'src/target.ps1'; blob = ('3' * 40) }) } }
+    Assert-CiRefused $c1 $idx 'HEAD_REVIEW_CANDIDATE_MISMATCH' 'git blob id is not accepted in place of the working digest' @{ HeadOver = @{ candidateGitBlobs = @([ordered]@{ workingSha256 = ('3' * 64); path = 'src/target.ps1'; blob = ('3' * 40) }) } }
+    Assert-CiRefused $c1 $idx 'HEAD_REVIEW_CANDIDATE_MISMATCH' 'head review path outside the accepted pins' @{ HeadOver = @{ candidateGitBlobs = @([ordered]@{ workingSha256 = $c1.Sha; path = 'src/other.ps1'; blob = ('3' * 40) }) } }
+    Assert-CiRefused $c1 $idx 'HEAD_REVIEW_CANDIDATE_MISMATCH' 'head review with an extra unmatched entry' @{ HeadOver = @{ candidateGitBlobs = @([ordered]@{ workingSha256 = $c1.Sha; path = 'src/target.ps1'; blob = ('3' * 40) }, [ordered]@{ workingSha256 = $c1.Sha; path = 'src/extra.ps1'; blob = ('4' * 40) }) } }
+    Assert-CiRefused $c1 $idx 'HEAD_REVIEW_CANDIDATE_MISMATCH' 'head review listing the same path twice' @{ HeadOver = @{ candidateGitBlobs = @([ordered]@{ workingSha256 = $c1.Sha; path = 'src/target.ps1'; blob = ('3' * 40) }, [ordered]@{ workingSha256 = $c1.Sha; path = 'src/target.ps1'; blob = ('4' * 40) }) } }
+    Assert-CiRefused $c1 $idx 'BAD_VALUE' 'head review path escaping the repository root' @{ HeadOver = @{ candidateGitBlobs = @([ordered]@{ workingSha256 = $c1.Sha; path = '../src/target.ps1'; blob = ('3' * 40) }) } }
+    Assert-CiRefused $c1 $idx 'EMPTY_LIST' 'head review without any candidate entry' @{ HeadOver = @{ candidateGitBlobs = @() } }
+    Assert-CiRefused $c1 $idx 'HEAD_REVIEW_FAILED_GROUPS' 'head review with failed affected groups' @{ HeadOver = @{ failedAffectedGroups = 1 } }
+    Assert-CiRefused $c1 $idx 'BAD_VALUE' 'head review with no passed affected groups' @{ HeadOver = @{ passedAffectedGroups = 0 } }
+    Assert-CiRefused $c1 $idx 'BAD_TYPE' 'head review with a string group count' @{ HeadOver = @{ passedAffectedGroups = '5' } }
+    Assert-CiRefused $c1 $idx 'HEAD_REVIEW_DECISION' 'head review with another decision' @{ HeadOver = @{ decision = 'ACCEPT_SCOPED_SOURCE' } }
+    Assert-CiRefused $c1 $idx 'HEAD_REVIEW_MISMATCH' 'head review that is no longer pending CI' @{ HeadOver = @{ deliveryPendingCI = $false } }
+    Assert-CiRefused $c1 $idx 'UNEXPECTED_KEY' 'head review with an unknown key' @{ HeadOver = @{ surprise = 1 } }
+    Assert-CiRefused $c1 $idx 'CI_REVIEW_MISMATCH' 'review candidate pins differ from the accepted pins' @{ ReviewOver = @{ candidatePins = @([ordered]@{ path = $c1.Fx.Editable; sha256 = ('9' * 64) }) } }
+    Assert-CiRefused $c1 $idx 'CANDIDATE_MISMATCH' 'disposition and admission pins differ from the accepted pins' @{ DispOver = @{ candidatePins = @([ordered]@{ path = $c1.Fx.Editable; sha256 = ('9' * 64) }) }; AdmOver = @{ candidatePins = @([ordered]@{ path = $c1.Fx.Editable; sha256 = ('9' * 64) }) } }
+    Assert-CiRefused $c1 $idx 'SOURCE_HEAD_REQUIRED' 'null sourceHead' @{ Head = $null }
+    Assert-CiRefused $c1 $idx 'DISPOSITION_ADMISSION_MISMATCH' 'admission restating a different head' @{ AdmOver = @{ sourceHead = ('6' * 40) } }
+    Assert-CiRefused $c1 $idx 'DELIVERY_REF_NOT_ALLOWED' 'CI_REJECTED with a deliveryRef' @{ DispOver = @{ deliveryRef = (Get-Ref $c1.Fx.PlanPath) } }
+    Assert-CiRefused $c1 $idx 'DELIVERY_REF_NOT_ALLOWED' 'CI_REJECTED with a candidateMappingRef' @{ DispOver = @{ candidateMappingRef = (Get-Ref $c1.Fx.PlanPath) } }
+    Assert-CiRefused $c1 $idx 'CI_REVIEW_SCHEMA' 'review with another schema' @{ ReviewOver = @{ schema = 'IndependentComponentReview/v1' } }
+    Assert-CiRefused $c1 $idx 'CI_REVIEW_DECISION' 'review with another decision' @{ ReviewOver = @{ decision = 'ACCEPT_SCOPED_SOURCE_DELIVERY' } }
+    Assert-CiRefused $c1 $idx 'UNEXPECTED_KEY' 'review with an unknown key' @{ ReviewOver = @{ surprise = 1 } }
+    Assert-CiRefused $c1 $idx 'MISSING_KEY' 'review without a required key' @{ ReviewOver = @{ prUrl = '__REMOVE__' } }
+    Assert-CiRefused $c1 $idx 'BAD_TYPE' 'review with a non-string prUrl' @{ ReviewOver = @{ prUrl = 7 } }
+    Assert-CiRefused $c1 $idx 'BAD_VALUE' 'review with a prUrl that is not a repository pull request' @{ ReviewOver = @{ prUrl = 'https://github.com/example-owner/example-repo/issues/7' } }
+    Assert-CiRefused $c1 $idx 'TUPLE_MISMATCH' 'review for another job' @{ ReviewOver = @{ jobId = 'job-other' } }
+    # independence
+    Assert-CiRefused $c1 $idx 'REVIEWER_NOT_INDEPENDENT' 'reviewer is the job owner' @{ Reviewer = $c1.Owner }
+    Assert-CiRefused $c1 $idx 'REVIEWER_NOT_INDEPENDENT' 'reviewer is the authoring session' @{ Reviewer = $c1.Fx.SessionId }
+    Assert-CiRefused $c1 $idx 'CI_REVIEW_MISMATCH' 'review reviewer disagrees with the disposition reviewer' @{ ReviewOver = @{ reviewer = 'someone-else' } }
+    Assert-CiRefused $c1 $idx 'CI_REVIEW_MISMATCH' 'review reviewer differing from the disposition reviewer only by case is not an alias' @{ ReviewOver = @{ reviewer = 'CI-Reviewer' } }
+    Assert-CiRefused $c1 $idx 'REVIEWER_NOT_INDEPENDENT' 'head review reviewer is the owner' @{ HeadOver = @{ reviewer = $c1.Owner } }
+    # snapshot failure evidence
+    $okRun = New-CheckRun 'COMPLETED' 'SUCCESS'
+    Assert-CiRefused $c1 $idx 'CI_SNAPSHOT_NO_FAILURE' 'all-success snapshot' @{ Rollup = @($okRun) }
+    Assert-CiRefused $c1 $idx 'CI_SNAPSHOT_NO_FAILURE' 'pending-only snapshot' @{ Rollup = @((New-CheckRun 'IN_PROGRESS' '')) }
+    Assert-CiRefused $c1 $idx 'CI_SNAPSHOT_NO_FAILURE' 'cancelled-only snapshot' @{ Rollup = @((New-CheckRun 'COMPLETED' 'CANCELLED')) }
+    Assert-CiRefused $c1 $idx 'CI_SNAPSHOT_NO_FAILURE' 'a FAILURE conclusion on a run that is not COMPLETED' @{ Rollup = @((New-CheckRun 'IN_PROGRESS' 'FAILURE')) }
+    Assert-CiRefused $c1 $idx 'CI_SNAPSHOT_NO_FAILURE' 'empty rollup' @{ Rollup = @() }
+    Assert-CiRefused $c1 $idx 'CI_SNAPSHOT_MALFORMED' 'failed run without a name' @{ Rollup = @((New-CheckRun 'COMPLETED' 'FAILURE' '')) }
+    Assert-CiRefused $c1 $idx 'CI_SNAPSHOT_MALFORMED' 'failed run with a details URL of another repository' @{ Rollup = @((New-CheckRun 'COMPLETED' 'FAILURE' 'unit' 'https://github.com/example-owner/other-repo/actions/runs/11/job/22')) }
+    Assert-CiRefused $c1 $idx 'CI_SNAPSHOT_MALFORMED' 'failed run whose details URL is not an actions run' @{ Rollup = @((New-CheckRun 'COMPLETED' 'FAILURE' 'unit' 'https://example.com/log')) }
+    $ctx = New-CheckRun 'COMPLETED' 'FAILURE'; $ctx['__typename'] = 'StatusContext'
+    Assert-CiRefused $c1 $idx 'CI_SNAPSHOT_UNSUPPORTED' 'non-CheckRun rollup entry' @{ Rollup = @($ctx) }
+    $typed = New-CheckRun 'COMPLETED' 'FAILURE'; $typed['status'] = 1
+    Assert-CiRefused $c1 $idx 'BAD_TYPE' 'wrong-typed check status' @{ Rollup = @($typed) }
+    $short = New-CheckRun 'COMPLETED' 'FAILURE'; $short.Remove('workflowName')
+    Assert-CiRefused $c1 $idx 'MISSING_KEY' 'check run missing a field' @{ Rollup = @($short) }
+    Assert-CiRefused $c1 $idx 'MISSING_KEY' 'snapshot missing a top-level field' @{ SnapOver = @{ state = '__REMOVE__' } }
+    Assert-CiRefused $c1 $idx 'UNEXPECTED_KEY' 'snapshot with an extra top-level field' @{ SnapOver = @{ surprise = 1 } }
+    Assert-CiRefused $c1 $idx 'BAD_TYPE' 'snapshot rollup that is not a list' @{ SnapOver = @{ statusCheckRollup = 'FAILURE' } }
+    # missing/modified evidence and absent external admission
+    foreach ($mutation in @(@('SnapPath', 'HASH_DRIFT'), @('HeadPath', 'HASH_DRIFT'), @('ReviewPath', 'HASH_DRIFT'), @('DispPath', 'HASH_DRIFT'), @('AdmPath', 'HASH_DRIFT'))) {
+        $script:CiSeq++
+        $ev = New-CiEvidence $c1 "m$($script:CiSeq)"
+        [IO.File]::AppendAllText($ev.($mutation[0]), ' ')
+        Assert-EventRefused $idx $mutation[1] { Send-Event $idx $ev.Event } "modified $($mutation[0]) after hashing"
+    }
+    foreach ($missing in 'SnapPath', 'HeadPath', 'ReviewPath', 'AdmPath') {
+        $script:CiSeq++
+        $ev = New-CiEvidence $c1 "g$($script:CiSeq)"
+        Remove-Item -LiteralPath $ev.$missing -Force
+        Assert-EventRefused $idx 'MISSING_FILE' { Send-Event $idx $ev.Event } "missing $missing"
+    }
+    $script:CiSeq++
+    $noAdm = New-CiEvidence $c1 "h$($script:CiSeq)"
+    $noAdm.Event.dispositionAdmissionRef = [ordered]@{ path = (Join-Path $c1.Dir 'never-admitted.json'); sha256 = ('1' * 64) }
+    Assert-EventRefused $idx 'MISSING_FILE' { Send-Event $idx $noAdm.Event } 'absent external disposition admission'
+    $script:CiSeq++
+    $badAdm = New-CiEvidence $c1 "i$($script:CiSeq)" -AdmOver @{ decision = 'REFUSE' }
+    Assert-EventRefused $idx 'DISPOSITION_ADMISSION_DECISION' { Send-Event $idx $badAdm.Event } 'admission that does not admit the disposition'
+    Assert-That ((Get-Job $idx $c1.Fx.JobId)['state'] -ceq 'SOURCE_REVIEW_ACCEPTED') 'every refused CI_REJECTED leaves the accepted job untouched'
+
+    # the ORIGINAL accepted disposition/admission files are re-authenticated, not merely compared by ref
+    foreach ($original in @(@('accepted disposition', $c1.AcceptedDispRef), @('accepted admission', $c1.AcceptedAdmRef))) {
+        $originalPath = [string]$original[1]['path']
+        $originalSha = [string]$original[1]['sha256']
+        $originalBytes = [IO.File]::ReadAllBytes($originalPath)
+        $held = "$originalPath.held"
+        try {
+            [IO.File]::WriteAllBytes($originalPath, [byte[]]($originalBytes + [byte]0x20))
+            Assert-CiRefused $c1 $idx 'HASH_DRIFT' "tampered original $($original[0]) with unchanged refs"
+        }
+        finally { [IO.File]::WriteAllBytes($originalPath, $originalBytes) }
+        Assert-That ((Get-Sha $originalPath) -ceq $originalSha) "original $($original[0]) bytes restored exactly"
+        try {
+            [IO.File]::Move($originalPath, $held)
+            Assert-CiRefused $c1 $idx 'MISSING_FILE' "missing original $($original[0]) with unchanged refs"
+        }
+        finally { if ([IO.File]::Exists($held)) { [IO.File]::Move($held, $originalPath) } }
+        Assert-That ((Get-Sha $originalPath) -ceq $originalSha) "original $($original[0]) file restored exactly"
+    }
+
+    # positive: actual-shaped accepted source -> CI_REJECTED
+    $verBefore = Get-Ver $idx
+    $before = Get-Job $idx $c1.Fx.JobId
+    $acceptedCanon = ConvertTo-Canon $before['review']['disposition']
+    $terminalCanon = ConvertTo-Canon $before['terminal']
+    $applied = Send-Event $idx $ciOk.Event
+    $job = Get-Job $idx $c1.Fx.JobId
+    $disp = $job['review']['disposition']
+    Assert-That ($applied.Status -ceq 'APPLIED' -and $applied.JobState -ceq 'SOURCE_REJECTED' -and (Get-Ver $idx) -eq ($verBefore + 1)) 'CI_REJECTED applies once and bumps the version'
+    Assert-That ($job['state'] -ceq 'SOURCE_REJECTED' -and $job['notice'] -ceq 'CI_REJECTED_AWAITING_FAILED_RELEASE') 'CI_REJECTED waits for the separate failed release'
+    Assert-That ($disp['kind'] -ceq 'CI_REJECTED' -and $null -eq $disp['deliveryRef'] -and $null -eq $disp['candidateMappingRef'] -and $disp['sourceHead'] -ceq $ciHead) 'current disposition is CI_REJECTED with no delivery or mapping ref and the explicit head'
+    Assert-That ($disp['ciRejection']['prUrl'] -ceq $ciPr -and $disp['ciRejection']['failedCheckRuns'] -eq 1) 'the CI rejection records the PR and the one failed run (mixed in-progress/success runs do not count)'
+    Assert-That (@($job['review']['history']).Count -eq 2 -and (ConvertTo-Canon ($job['review']['history'][0])) -ceq $acceptedCanon) 'the original accepted record is preserved as the first history entry'
+    Assert-That ((ConvertTo-Canon $job['terminal']) -ceq $terminalCanon -and $job['review']['history'][1]['dispositionId'] -ceq $disp['dispositionId']) 'terminal evidence is unchanged and the new record is appended'
+    Assert-That ((ConvertTo-Canon (Get-QueueOrNull $idx)) -cnotmatch '"(DONE|ACCEPTED|accepted|DELIVERED_RELEASED)"') 'no completion or delivery state is recorded'
+
+    # duplicate / conflicting event / stale CAS
+    $bytes = Get-Sha $idx
+    $dup = Send-RawEvent $idx 0 (ConvertTo-Json -InputObject $ciOk.Event -Depth 20) "$($ciOk.Event.eventId).json"
+    Assert-That ($dup.Status -ceq 'NOOP_DUPLICATE' -and (Get-Sha $idx) -ceq $bytes) 'the exact same CI_REJECTED event is a byte-stable no-op'
+    $conflict = New-CiEvidence $c1 'conflict'
+    $conflict.Event.eventId = $ciOk.Event.eventId
+    Assert-EventRefused $idx 'EVENT_ID_CONFLICT' { Send-Event $idx $conflict.Event } 'same eventId with different CI_REJECTED bytes'
+    $again = New-CiEvidence $c1 'again'
+    Assert-EventRefused $idx 'STATE_KIND_MISMATCH' { Send-Event $idx $again.Event } 'a second CI_REJECTED is not a new transition'
+    Assert-EventRefused $idx 'VERSION_CONFLICT' { Send-RawEvent $idx ((Get-Ver $idx) - 1) (ConvertTo-Json -InputObject $again.Event -Depth 20) 'cas.json' } 'stale expected version'
+
+    # still protects paths until the separate release; delivery can no longer be recorded
+    Assert-That ((Invoke-Reserve $idx @($ci2.JobId) 'ci-res-1').Skips[0].Reasons -ccontains "PATH_CONFLICT:$($c1.Fx.JobId)") 'CI_REJECTED alone does not free the owned paths'
+    $releaseTuple = Get-CiTuple $c1.Fx
+    function Send-CiRelease([string]$Index, $C, $DispRef, $AdmRef, [string]$Tag) {
+        $doc = [ordered]@{ schema = 'SourceJobOwnershipRelease/v1'; releaseId = "rel-$Tag" }
+        foreach ($key in $releaseTuple.Keys) { $doc[$key] = $releaseTuple[$key] }
+        $doc['dispositionRef'] = $DispRef; $doc['dispositionAdmissionRef'] = $AdmRef; $doc['ownedPaths'] = @($C.Fx.Owned); $doc['reviewer'] = 'release-reviewer'; $doc['releasedUtc'] = $T_LATE
+        $path = Join-Path $C.Dir "$Tag.release.json"
+        Write-Json $path $doc
+        Send-Event $Index ([ordered]@{ schema = 'SourceJobQueueEvent/v1'; eventId = "rel-evt-$Tag"; type = 'SOURCE_OWNERSHIP_RELEASE'; jobId = $C.Fx.JobId; releaseRef = (Get-Ref $path) })
+    }
+    $currentDisp = Get-Ref $ciOk.DispPath
+    $currentAdm = Get-Ref $ciOk.AdmPath
+    Assert-EventRefused $idx 'RELEASE_LINKAGE' { Send-CiRelease $idx $c1 $c1.AcceptedDispRef $c1.AcceptedAdmRef 'stale' } 'release naming the superseded accepted disposition'
+    $released = Send-CiRelease $idx $c1 $currentDisp $currentAdm 'ok'
+    $job = Get-Job $idx $c1.Fx.JobId
+    Assert-That ($released.JobState -ceq 'RELEASED_FAILED' -and $job['notice'] -ceq 'RELEASED_FAILED_FREES_PATHS_NEVER_SUCCESS') 'the separate release reaches RELEASED_FAILED'
+    Assert-That ($job['review']['release']['releasedFrom'] -ceq 'SOURCE_REJECTED' -and $job['review']['release']['dispositionKind'] -ceq 'CI_REJECTED' -and @($job['review']['history']).Count -eq 2) 'release is linked to the CI_REJECTED disposition and history is intact after restart'
+    Assert-EventRefused $idx 'STATE_KIND_MISMATCH' { Send-Event $idx $again.Event } 'CI_REJECTED after the failed release'
+    $depBlocked = Invoke-Reserve $idx @($ci3.JobId) 'ci-res-2'
+    Assert-That ($depBlocked.Status -ceq 'NO_ELIGIBLE_CANDIDATE' -and $depBlocked.Skips[0].Reasons -ccontains "UNRESOLVED_DEPENDENCY:$($c1.Fx.JobId)" -and $depBlocked.Skips[0].Reasons -ccontains "DEPENDENCY_FAILED_RELEASED:$($c1.Fx.JobId)") 'a failed release never satisfies a dependency'
+    Assert-That ((Invoke-Reserve $idx @($ci4.JobId) 'ci-res-3').JobId -ceq $ci4.JobId) 'an independent job is unaffected'
+    Assert-That ((Invoke-Reserve $idx @($ci2.JobId) 'ci-res-4').JobId -ceq $ci2.JobId) 'the failed release frees the overlapping path'
 
     # ---------- 11. no process / claim / acceptance surface ----------
     $source = Get-Content -LiteralPath $libPath -Raw
