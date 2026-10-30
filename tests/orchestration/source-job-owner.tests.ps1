@@ -378,7 +378,102 @@ function Assert-FlatIntent([string]$Index, $Fx, [int]$Expected, [string]$Label) 
     }
 }
 
+$script:OrigAssertIndexPath = (Get-Command Assert-SjqIndexPath -CommandType Function).ScriptBlock
+$script:OrigReadIndexState = (Get-Command Read-SjqIndexState -CommandType Function).ScriptBlock
+$script:OrigGetSjoSnapshot = (Get-Command Get-SjoSnapshot -CommandType Function).ScriptBlock
+$script:InsideSnapshot = $false
+function Restore-IndexHelpers {
+    Set-Item -Path Function:\Assert-SjqIndexPath -Value $script:OrigAssertIndexPath
+    Set-Item -Path Function:\Read-SjqIndexState -Value $script:OrigReadIndexState
+    Set-Item -Path Function:\Get-SjoSnapshot -Value $script:OrigGetSjoSnapshot
+    $script:InsideSnapshot = $false
+}
+
 try {
+    # ===== 00. index-path assertion lives inside the bounded snapshot retry (test-local substitution, restored in finally) =====
+    $retryIdx = New-IndexCopy 'retry'
+    $script:AssertCalls = 0; $script:ReadCalls = 0; $script:FailAssertUntil = 0
+    function Assert-SjqIndexPath([string]$Path) { $script:AssertCalls++; if ($script:AssertCalls -le $script:FailAssertUntil) { Stop-SjqRefused 'MISSING_FILE' 'index' } }
+    function Read-SjqIndexState([string]$Path) { $script:ReadCalls++; & $script:OrigReadIndexState $Path }
+
+    # transient: first existence observation refuses, the next one passes -> exactly one snapshot, assertion re-run per attempt
+    $script:FailAssertUntil = 1
+    $snap = Get-SjoSnapshot $retryIdx
+    Assert-That ($null -ne $snap) 'transient MISSING_FILE:index on the first observation yields one valid snapshot'
+    Assert-That ($script:AssertCalls -eq 2) "assertion re-run on the retry attempt (calls: $script:AssertCalls)"
+    Assert-That ($script:ReadCalls -eq 1) "exactly one read after the transient refusal (reads: $script:ReadCalls)"
+
+    # persistent: refusal on every observation -> original refusal after the existing 5 attempts, no read, no index change
+    $script:AssertCalls = 0; $script:ReadCalls = 0; $script:FailAssertUntil = [int]::MaxValue
+    $beforeIdx = Get-Sha $retryIdx
+    Assert-Refused 'MISSING_FILE' { Get-SjoSnapshot $retryIdx } 'persistent index refusal is surfaced unchanged'
+    Assert-That ($script:AssertCalls -eq 5) "persistent refusal is bounded to the existing 5 attempts (calls: $script:AssertCalls)"
+    Assert-That ($script:ReadCalls -eq 0) 'security assertion gates every read; no read happens while it refuses'
+    Assert-That ((Get-Sha $retryIdx) -ceq $beforeIdx) 'persistent refusal does not change canonical index bytes'
+
+    # permanent real-path failures still fail closed with the original assertion restored
+    Restore-IndexHelpers
+    $missing = Join-Path $work 'no-such.index.json'
+    Assert-Refused 'MISSING_FILE' { Get-SjoSnapshot $missing } 'a permanently missing index is refused'
+    Assert-That (-not [IO.File]::Exists($missing)) 'a missing index is never synthesized'
+    $malformed = Join-Path $work 'malformed.index.json'
+    [IO.File]::WriteAllText($malformed, '{ not json')
+    $malformedBefore = Get-Sha $malformed
+    $malformedRefused = $false
+    try { $null = Get-SjoSnapshot $malformed } catch { $malformedRefused = $true }
+    Assert-That $malformedRefused 'a malformed index is refused after the bounded attempts'
+    Assert-That ((Get-Sha $malformed) -ceq $malformedBefore) 'a malformed index is not normalized'
+    Assert-Refused '*' { Get-SjoSnapshot ((Join-Path $work 'x') + '\..\no-such.index.json') } 'a noncanonical index path is refused'
+
+    # ===== 01. already-consumed/start evidence + transient observation refusal: same-owner reentry launches nothing more =====
+    # Integration label: real fixture launcher/core in separate processes; the refusal is injected in THIS process only.
+    $idx = New-IndexCopy 'reentry'; $ev = Join-Path $work 'ev-reentry'
+    $script:Actions.Clear(); $script:LaunchLog.Clear()
+    $re = New-JobFixture 're' 1 -Behavior @{ sleepMs = 2500 }
+    $null = Register-Job $idx $re
+    $usageR = New-Usage 're-ok' 30 1800 10 20
+    $null = Invoke-Owner $idx @((New-Entry $re $usageR)) $ev
+    Assert-That ((Get-LaunchCount 'job-re') -eq 1) 'reentry fixture: first owner call launched the job exactly once'
+    $consumedBefore = Get-JobRec $idx 'job-re'
+    # The public Assert-SjqIndexPath precheck stays fully active (original validation). The single MISSING_FILE
+    # observation is injected only while the ORIGINAL Get-SjoSnapshot is executing, so its own bounded retry handles it.
+    $script:InsideSnapshot = $false; $script:SnapshotEntries = 0; $script:InjectHits = 0; $script:InjectAtSnapshotEntry = 0
+    $script:InsideAssertCalls = 0; $script:OutsideAssertCalls = 0; $script:FirstAssertInside = $null
+    $again = $null
+    try {
+        function Get-SjoSnapshot([string]$IndexPath) {
+            $script:SnapshotEntries++
+            $previousInside = $script:InsideSnapshot
+            $script:InsideSnapshot = $true
+            try { & $script:OrigGetSjoSnapshot $IndexPath } finally { $script:InsideSnapshot = $previousInside }
+        }
+        function Assert-SjqIndexPath([string]$Path) {
+            if ($null -eq $script:FirstAssertInside) { $script:FirstAssertInside = $script:InsideSnapshot }
+            if ($script:InsideSnapshot) {
+                $script:InsideAssertCalls++
+                if ($script:InjectHits -lt 1) { $script:InjectHits++; $script:InjectAtSnapshotEntry = $script:SnapshotEntries; Stop-SjqRefused 'MISSING_FILE' 'index' }
+            }
+            else { $script:OutsideAssertCalls++ }
+            & $script:OrigAssertIndexPath $Path
+        }
+        $again = Invoke-Owner $idx @((New-Entry $re $usageR)) $ev
+    }
+    finally { Restore-IndexHelpers }
+    Assert-That ($null -ne $again) 'reentry after an injected transient observation refusal returns a result'
+    Assert-That ($script:InjectHits -eq 1) "the injected refusal was hit exactly once (hits: $script:InjectHits)"
+    Assert-That ($script:InjectAtSnapshotEntry -ge 1 -and $script:InsideAssertCalls -ge 2) "the injection occurred inside Get-SjoSnapshot and its existing bounded loop re-ran the assertion (inside calls: $script:InsideAssertCalls)"
+    Assert-That ($script:FirstAssertInside -eq $false -and $script:OutsideAssertCalls -ge 1) "the public precheck ran the original validation outside the snapshot and succeeded (outside calls: $script:OutsideAssertCalls)"
+    Assert-That ((Get-Command Get-SjoSnapshot -CommandType Function).ScriptBlock -eq $script:OrigGetSjoSnapshot -and -not $script:InsideSnapshot) 'the original Get-SjoSnapshot and the scoped flag were restored'
+    Assert-That ((Get-LaunchCount 'job-re') -eq 1) 'reentry reported no second launch'
+    Assert-That (@(Get-ChildItem -LiteralPath (Split-Path -Parent $re.Run) -Directory | Where-Object Name -ceq 're').Count -eq 1) 'single run directory; no duplicate run'
+    $consumedAfter = Get-JobRec $idx 'job-re'
+    $resBefore = if ($consumedBefore.Contains('reservation')) { ConvertTo-Json -InputObject $consumedBefore['reservation'] -Depth 10 } else { $null }
+    $resAfter = if ($consumedAfter.Contains('reservation')) { ConvertTo-Json -InputObject $consumedAfter['reservation'] -Depth 10 } else { $null }
+    Assert-That (($null -ne $resBefore) -and ($resBefore -ceq $resAfter)) 'the consumed reservation record is unchanged; no additional reservation was created'
+    $null = Invoke-Until $idx @((New-Entry $re $usageR)) $ev { param($r) @(Get-ActionsFor 'job-re').Count -ge 1 }
+    Assert-That ((Get-LaunchCount 'job-re') -eq 1) 'job still launched exactly once after completion'
+    Assert-That (@(Get-ActionsFor 'job-re').Count -eq 1) 'one handoff action only; no resend'
+
     # ===== 0. flat candidatePins intent shape with several pins, through the real owner and core =====
     $idx = New-IndexCopy 'flat'; $ev = Join-Path $work 'ev-flat'
     $script:Actions.Clear(); $script:LaunchLog.Clear()
@@ -792,6 +887,7 @@ catch {
     Write-Host 'MASKED/NOT_EXECUTED: every owner group after the stopping point did not run and is not passed.'
 }
 finally {
+    Restore-IndexHelpers
     Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
 }
 
