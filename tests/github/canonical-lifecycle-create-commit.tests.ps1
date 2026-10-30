@@ -301,7 +301,7 @@ Test-Step '2b Malformed, missing, mistyped, duplicate, mismatched request/admiss
     'operation id not stable string'=@{code='OPERATION_ID_INVALID';make={param($c) New-Op $c -Req @{operationId='..\x'}}}
     'outbox not state outbox'=@{code='PATH_OUTSIDE_OWNER';make={param($c) New-Op $c -Req @{outboxPath=(Join-Path $c.dir 'outbox.json')}}}
     'relative canonical path'=@{code='PATH_INVALID';make={param($c) New-Op $c -Req @{canonicalPath='canon\canonical.json'}}}
-    'noncanonical canonical path'=@{code='PATH_INVALID';make={param($c) New-Op $c -Req @{canonicalPath=($c.dir+'\canon\..\canon\canonical.json')}}}
+    'noncanonical canonical path'=@{code='PATH_INVALID';make={param($c) New-Op $c -Req @{canonicalPath=($c.dir+[IO.Path]::DirectorySeparatorChar+'canon'+[IO.Path]::DirectorySeparatorChar+'..'+[IO.Path]::DirectorySeparatorChar+'canon'+[IO.Path]::DirectorySeparatorChar+'canonical.json')}}}
     'canonical parent missing'=@{code='CANONICAL_DIR_MISSING';make={param($c) New-Op $c -Req @{canonicalPath=(Join-Path $c.dir 'nodir\canonical.json')}}}
     'canonical inside state'=@{code='PATHS_NOT_DISJOINT';make={param($c) New-Op $c -Req @{canonicalPath=(Join-Path $c.state 'canonical.json')}}}
     'canonical is the candidate'=@{code='PATHS_NOT_DISJOINT';make={param($c) New-Op $c -Req @{canonicalPath=(Join-Path $c.dir 'candidate-op1.json')}}}
