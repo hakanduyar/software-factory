@@ -530,7 +530,11 @@ Test-Refusal 'engine state appears after admission' 'ENGINE_STATE_DRIFT' -Tamper
 Test-Refusal 'recovery without event' 'RECOVERY_WITHOUT_EVENT' -ExpectLease -Rel @{recovery='RECONCILE_MISSING'} -Rev @{recovery='RECONCILE_MISSING'} -Nat @{recovery='RECONCILE_MISSING'}
 Test-Refusal 'reparse tempRoot' 'REPARSE_REFUSED' -Late {param($c,$e)
   $j=Join-Path $c.dir 'temp-junction'
-  New-Item -ItemType Junction -Path $j -Target $c.temp | Out-Null
+  $type=$(if($IsWindows){'Junction'}else{'SymbolicLink'})
+  Assert-True ([IO.Directory]::Exists($c.temp)) 'reparse fixture target temp directory exists'
+  New-Item -ItemType $type -Path $j -Target $c.temp | Out-Null
+  Assert-True ([IO.Directory]::Exists($j)) 'reparse fixture link exists and reaches a directory'
+  Assert-True (([IO.File]::GetAttributes($j) -band [IO.FileAttributes]::ReparsePoint) -ne 0) 'reparse fixture link has ReparsePoint attribute'
   @{tempRoot=$j}
 }
 Pass 'AC3 refusals leave no runner call or mutation'
