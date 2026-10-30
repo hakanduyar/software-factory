@@ -11,6 +11,12 @@
 # DISPATCH_UNCERTAIN and is neither a start, an acceptance nor a Factory claim.
 # REVIEW_REQUIRED means "evidence exists and a reviewer must look", never accepted.
 #
+# Review/ownership events (REVIEW_INTENT, REVIEW_HANDOFF_ACK, SOURCE_DISPOSITION, SOURCE_OWNERSHIP_RELEASE)
+# import independently supplied evidence only. A source review never releases paths or resolves a
+# dependency: only SOURCE review -> verified delivery -> separate release (DELIVERED_RELEASED) does.
+# A failed or rejected release (RELEASED_FAILED) frees overlapping paths but never satisfies a dependency.
+# None of these states is Factory completion.
+#
 # Refusals throw 'SJQ_REFUSED:<CODE>[:<detail>]'.
 Set-StrictMode -Version Latest
 
@@ -21,7 +27,12 @@ $script:SjqIdPattern = '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
 $script:SjqShaPattern = '^[0-9a-f]{64}$'
 $script:SjqPathComparison = if ($IsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
 # States that keep their owned paths protected until an explicit owner disposition.
-$script:SjqBlockingStates = @('DISPATCH_UNCERTAIN', 'RUNNING', 'REVIEW_REQUIRED', 'FAILED', 'REFUSED', 'RECONCILIATION_REQUIRED')
+$script:SjqBlockingStates = @('DISPATCH_UNCERTAIN', 'RUNNING', 'REVIEW_REQUIRED', 'FAILED', 'REFUSED', 'RECONCILIATION_REQUIRED', 'SOURCE_REJECTED', 'SOURCE_REVIEW_ACCEPTED', 'DELIVERED_PENDING_RELEASE')
+# Source-only terminal ownership states. Neither is a Factory completion; only DELIVERED_RELEASED satisfies a dependency.
+$script:SjqOwnerIdentity = '/root/bounded_state_check'
+$script:SjqActorPattern = '^/?[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$'
+$script:SjqNonrootPattern = '^/root/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$'
+$script:SjqSha40Pattern = '^[0-9a-f]{40}$'
 
 function Stop-SjqRefused([string]$Code, [string]$Detail = '') {
     if ($Detail) { throw "SJQ_REFUSED:${Code}:$Detail" }
@@ -573,6 +584,445 @@ function Add-SjqObservedTerminal($Queue, $Event, [string]$AtUtc) {
     [string]$job['jobId']
 }
 
+# ---------- review, disposition and release evidence ----------
+# Every document consumed below is independently supplied immutable evidence. These reducers only check
+# it against the registered job and record it under the lease; nothing here issues an admission, reviews
+# a candidate or declares Factory completion. Admissibility of reviewers is a trusted-host boundary: the
+# JSON and hashes are not cryptographic origin authentication.
+
+function Get-SjqReview($Job) {
+    if ($Job['review'] -isnot [System.Collections.IDictionary]) {
+        $Job['review'] = [ordered]@{ intent = $null; handoff = $null; disposition = $null; history = @(); release = $null }
+    }
+    $Job['review']
+}
+
+function Get-SjqJobOwner($Job) {
+    $review = $Job['review']
+    if (($review -is [System.Collections.IDictionary]) -and ($review['intent'] -is [System.Collections.IDictionary])) { return [string]$review['intent']['owner'] }
+    $script:SjqOwnerIdentity
+}
+
+function Get-SjqEvidenceJson($Ref, [string]$What) {
+    ConvertFrom-SjqJsonBytes (Get-SjqPinnedBytes $Ref.path $Ref.sha256 $What) $What
+}
+
+function Get-SjqNullableRef($Object, [string]$Key, [string]$What) {
+    if (-not (Test-SjqHasKey $Object $Key)) { Stop-SjqRefused 'MISSING_KEY' "$What.$Key" }
+    if ($null -eq $Object[$Key]) { return $null }
+    Get-SjqRef $Object[$Key] "$What.$Key"
+}
+
+function Get-SjqSourceHead($Object, [string]$What) {
+    if (-not (Test-SjqHasKey $Object 'sourceHead')) { Stop-SjqRefused 'MISSING_KEY' "$What.sourceHead" }
+    if ($null -eq $Object['sourceHead']) { return $null }
+    Get-SjqString $Object 'sourceHead' $What $script:SjqSha40Pattern
+}
+
+function Test-SjqRefEqual($A, $B) {
+    ([string]$A['path'] -ceq [string]$B['path']) -and ([string]$A['sha256'] -ceq [string]$B['sha256'])
+}
+
+function Get-SjqPins($Object, [string]$Key, [string]$What, [string[]]$Owned) {
+    $list = Get-SjqList $Object $Key $What
+    $paths = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $pins = [Collections.Generic.List[object]]::new()
+    foreach ($item in $list) {
+        $pin = Get-SjqRef $item "$What.$Key"
+        Assert-SjqNormalizedPath $pin.path "$What.$Key.path"
+        if (-not (Test-SjqPathCovered $pin.path $Owned)) { Stop-SjqRefused 'PIN_NOT_OWNED' "$What.$Key" }
+        if (-not $paths.Add($pin.path)) { Stop-SjqRefused 'DUPLICATE_ITEM' "$What.$Key" }
+        $pins.Add($pin)
+    }
+    if ($pins.Count -eq 0) { Stop-SjqRefused 'EMPTY_LIST' "$What.$Key" }
+    $pins.Sort([Comparison[object]] { param($x, $y) [string]::CompareOrdinal([string]$x['path'], [string]$y['path']) })
+    , $pins.ToArray()
+}
+
+# The immutable candidate: exactly the editableAfter rows of the pinned terminal record, never the mutable source.
+function Get-SjqTerminalPins($Job) {
+    if ($null -eq $Job['terminal']) { Stop-SjqRefused 'NO_TERMINAL' ([string]$Job['jobId']) }
+    $terminalRef = $Job['terminal']['ref']
+    $terminal = ConvertFrom-SjqJsonBytes (Get-SjqPinnedBytes ([string]$terminalRef['path']) ([string]$terminalRef['sha256']) 'terminalRef') 'terminal'
+    Get-SjqPins $terminal 'editableAfter' 'terminal' @($Job['ownedPaths'])
+}
+
+function ConvertTo-SjqSortedKey([string[]]$Items) {
+    $sorted = [Collections.Generic.List[string]]::new([string[]]@($Items))
+    $sorted.Sort([StringComparer]::Ordinal)
+    $sorted -join "`n"
+}
+
+function Assert-SjqTuple($Doc, $Job, [string]$What) {
+    if ($null -eq $Job['terminal']) { Stop-SjqRefused 'NO_TERMINAL' $What }
+    if ((Get-SjqString $Doc 'jobId' $What) -cne [string]$Job['jobId']) { Stop-SjqRefused 'TUPLE_MISMATCH' "$What.jobId" }
+    if ((Get-SjqString $Doc 'taskId' $What) -cne [string]$Job['plan']['taskId']) { Stop-SjqRefused 'TUPLE_MISMATCH' "$What.taskId" }
+    $expected = [ordered]@{ planRef = $Job['plan']['ref']; admissionRef = $Job['admission']['ref']; terminalRef = $Job['terminal']['ref'] }
+    foreach ($key in @($expected.Keys)) {
+        if (-not (Test-SjqRefEqual (Get-SjqRef $Doc[$key] "$What.$key") $expected[$key])) { Stop-SjqRefused 'TUPLE_MISMATCH' "$What.$key" }
+    }
+}
+
+function Assert-SjqIndependentActor($Value, $Job, [string]$Owner, [string]$What) {
+    if ($Value -isnot [string] -or $Value -cnotmatch $script:SjqActorPattern) { Stop-SjqRefused 'BAD_VALUE' $What }
+    if ($Value -ceq '/root' -or $Value -ceq $Owner -or $Value -ceq $script:SjqOwnerIdentity -or $Value -ceq [string]$Job['plan']['sessionId']) {
+        Stop-SjqRefused 'REVIEWER_NOT_INDEPENDENT' $What
+    }
+}
+
+function Add-SjqReviewIntent($Queue, $Event, [string]$AtUtc) {
+    Assert-SjqKeys $Event @('schema', 'eventId', 'type', 'jobId', 'intentRef') 'event'
+    $job = Get-SjqExistingJob $Queue (Get-SjqString $Event 'jobId' 'event' $script:SjqIdPattern)
+    # REVIEW_REQUIRED gets a source review; FAILED/REFUSED get an independent failure DIAGNOSIS through the same
+    # correlated contract. Diagnosis never changes the state, never accepts and never retries. Reconciliation
+    # states need explicit evidence reconciliation first, not a review of a candidate that may not be sound.
+    if (@('REVIEW_REQUIRED', 'FAILED', 'REFUSED') -cnotcontains [string]$job['state']) { Stop-SjqRefused 'STATE_NOT_REVIEWABLE' ([string]$job['state']) }
+    $review = Get-SjqReview $job
+    # A changed candidate is a different job revision; an existing intent is never merged or replaced.
+    if ($null -ne $review['intent']) { Stop-SjqRefused 'INTENT_EXISTS' ([string]$job['jobId']) }
+    $intentRef = Get-SjqRef $Event['intentRef'] 'event.intentRef'
+    $doc = Get-SjqEvidenceJson $intentRef 'intent'
+    Assert-SjqKeys $doc @('schema', 'intentId', 'jobId', 'taskId', 'planRef', 'admissionRef', 'terminalRef', 'candidatePins', 'sourceHead', 'owner', 'reviewerTarget', 'createdUtc') 'intent'
+    if ((Get-SjqString $doc 'schema' 'intent') -cne 'SourceJobReviewIntent/v1') { Stop-SjqRefused 'INTENT_SCHEMA' }
+    $intentId = Get-SjqString $doc 'intentId' 'intent' $script:SjqIdPattern
+    Assert-SjqTuple $doc $job 'intent'
+    $pins = Get-SjqPins $doc 'candidatePins' 'intent' @($job['ownedPaths'])
+    if ((ConvertTo-SjqCanonical $pins) -cne (ConvertTo-SjqCanonical (Get-SjqTerminalPins $job))) { Stop-SjqRefused 'CANDIDATE_MISMATCH' 'intent' }
+    $head = Get-SjqSourceHead $doc 'intent'
+    $owner = Get-SjqString $doc 'owner' 'intent' $script:SjqActorPattern
+    $target = Get-SjqString $doc 'reviewerTarget' 'intent' $script:SjqNonrootPattern
+    if ($owner -ceq '/root' -or $target -ceq $owner -or $target -ceq $script:SjqOwnerIdentity -or $target -ceq [string]$job['plan']['sessionId']) { Stop-SjqRefused 'REVIEWER_TARGET' 'intent.reviewerTarget' }
+    $createdUtc = Get-SjqString $doc 'createdUtc' 'intent'
+    $null = ConvertTo-SjqUtc $createdUtc 'intent.createdUtc'
+    $review['intent'] = [ordered]@{
+        intentId = $intentId; ref = $intentRef; owner = $owner; reviewerTarget = $target; createdUtc = $createdUtc; sourceHead = $head
+        candidatePins = $pins; eventId = Get-SjqString $Event 'eventId' 'event'; status = 'INTENT_PERSISTED_BEFORE_TOOLCALL'
+        purpose = $(if ([string]$job['state'] -ceq 'REVIEW_REQUIRED') { 'SOURCE_REVIEW' } else { 'FAILURE_DIAGNOSIS' })
+    }
+    [string]$job['jobId']
+}
+
+# An acknowledgment proves the follow-up was scheduled for the target; it never implies a review result.
+function Add-SjqReviewAck($Queue, $Event, [string]$AtUtc) {
+    Assert-SjqKeys $Event @('schema', 'eventId', 'type', 'jobId', 'ackRef') 'event'
+    $job = Get-SjqExistingJob $Queue (Get-SjqString $Event 'jobId' 'event' $script:SjqIdPattern)
+    if (@('REVIEW_REQUIRED', 'FAILED', 'REFUSED') -cnotcontains [string]$job['state']) { Stop-SjqRefused 'STATE_NOT_REVIEWABLE' ([string]$job['state']) }
+    $review = Get-SjqReview $job
+    $intent = $review['intent']
+    if ($null -eq $intent) { Stop-SjqRefused 'NO_INTENT' ([string]$job['jobId']) }
+    if ($null -ne $review['handoff']) { Stop-SjqRefused 'ACK_EXISTS' ([string]$job['jobId']) }
+    $ackRef = Get-SjqRef $Event['ackRef'] 'event.ackRef'
+    $ack = Get-SjqEvidenceJson $ackRef 'ack'
+    Assert-SjqKeys $ack @('schema', 'ackId', 'intentRef', 'reviewerTarget', 'acknowledgedUtc', 'toolResultRef') 'ack'
+    if ((Get-SjqString $ack 'schema' 'ack') -cne 'SourceJobReviewHandoffAck/v1') { Stop-SjqRefused 'ACK_SCHEMA' }
+    $ackId = Get-SjqString $ack 'ackId' 'ack' $script:SjqIdPattern
+    if (-not (Test-SjqRefEqual (Get-SjqRef $ack['intentRef'] 'ack.intentRef') $intent['ref'])) { Stop-SjqRefused 'ACK_CORRELATION' 'intentRef' }
+    $target = Get-SjqString $ack 'reviewerTarget' 'ack' $script:SjqNonrootPattern
+    if ($target -cne [string]$intent['reviewerTarget']) { Stop-SjqRefused 'ACK_CORRELATION' 'reviewerTarget' }
+    $acknowledgedUtc = Get-SjqString $ack 'acknowledgedUtc' 'ack'
+    if ((ConvertTo-SjqUtc $acknowledgedUtc 'ack.acknowledgedUtc') -lt (ConvertTo-SjqUtc ([string]$intent['createdUtc']) 'createdUtc')) { Stop-SjqRefused 'ACK_CORRELATION' 'acknowledgedUtc' }
+    $toolRef = Get-SjqRef $ack['toolResultRef'] 'ack.toolResultRef'
+    $tool = Get-SjqEvidenceJson $toolRef 'toolResult'
+    if ($tool -isnot [System.Collections.IDictionary]) { Stop-SjqRefused 'NOT_OBJECT' 'toolResult' }
+    # The saved response must name the exact tool, destination and intent; the external broker attests the real call.
+    foreach ($pair in @(@('tool', 'collaboration.followup_task'), @('target', $target), @('intentId', [string]$intent['intentId']))) {
+        if (-not (Test-SjqHasKey $tool $pair[0]) -or $tool[$pair[0]] -isnot [string] -or $tool[$pair[0]] -cne $pair[1]) { Stop-SjqRefused 'ACK_CORRELATION' "toolResult.$($pair[0])" }
+    }
+    $mock = $false
+    if (Test-SjqHasKey $tool 'label') {
+        if ($tool['label'] -isnot [string] -or $tool['label'] -cne 'MOCK/NOT_LIVE') { Stop-SjqRefused 'BAD_VALUE' 'toolResult.label' }
+        $mock = $true
+    }
+    $review['handoff'] = [ordered]@{
+        ackId = $ackId; ackRef = $ackRef; toolResultRef = $toolRef; reviewerTarget = $target; acknowledgedUtc = $acknowledgedUtc
+        mock = $mock; actualHandoffEvidence = (-not $mock); proves = 'DISPATCH_ONLY_NOT_REVIEW'; eventId = Get-SjqString $Event 'eventId' 'event'
+    }
+    [string]$job['jobId']
+}
+
+# Typed verdict indicators read from the ROOT of a result wrapper only (no recursion, no field paths):
+#   exitCode            integer; 0 is success, anything else failure
+#   failed, raceFailed  non-negative integer; 0 is success, positive is failure
+#   result, status, overall   exact string; SUCCESS/PASS success; FAIL/FAILED/NA/NOT_EXECUTED/NOT_AVAILABLE failure
+# A recognized indicator of the wrong type, a negative count or an unknown string refuses (fail closed).
+function Get-SjqVerdictCounts($Doc, [string]$What, [switch]$IgnoreUnknownStrings) {
+    $success = 0
+    $failure = 0
+    if (Test-SjqHasKey $Doc 'exitCode') {
+        $value = $Doc['exitCode']
+        if (($value -isnot [int]) -and ($value -isnot [long])) { Stop-SjqRefused 'SCOPED_MAPPING_RESULT_MALFORMED' "$What.exitCode" }
+        if ($value -eq 0) { $success++ } else { $failure++ }
+    }
+    foreach ($key in 'failed', 'raceFailed') {
+        if (Test-SjqHasKey $Doc $key) {
+            $value = $Doc[$key]
+            if ((($value -isnot [int]) -and ($value -isnot [long])) -or $value -lt 0) { Stop-SjqRefused 'SCOPED_MAPPING_RESULT_MALFORMED' "$What.$key" }
+            if ($value -eq 0) { $success++ } else { $failure++ }
+        }
+    }
+    foreach ($key in 'result', 'status', 'overall') {
+        if (Test-SjqHasKey $Doc $key) {
+            $value = $Doc[$key]
+            if ($value -isnot [string]) { Stop-SjqRefused 'SCOPED_MAPPING_RESULT_MALFORMED' "$What.$key" }
+            if ($value -ceq 'SUCCESS' -or $value -ceq 'PASS') { $success++ }
+            elseif (@('FAIL', 'FAILED', 'NA', 'NOT_EXECUTED', 'NOT_AVAILABLE') -ccontains $value) { $failure++ }
+            elseif (-not $IgnoreUnknownStrings) { Stop-SjqRefused 'SCOPED_MAPPING_RESULT_UNSUPPORTED' "$What.$key" }
+        }
+    }
+    [pscustomobject]@{ Success = $success; Failure = $failure }
+}
+
+# The ONE explicit source-only variant for reviews whose original receipt has no commit/typecheck/build fields
+# (e.g. uncommitted PowerShell source). It is independently supplied and host-attested through the disposition
+# admission; this module only validates its exact shape and its binding to the job, terminal and candidate.
+function Assert-SjqScopedMapping($Map, $Ref, [string]$Kind, [string]$Reviewer, $Head, $Job, $Pins) {
+    Assert-SjqKeys $Map @('schema', 'mappingId', 'jobId', 'taskId', 'terminalRef', 'candidatePins', 'sourceHead', 'originalReviewRef', 'resultRefs', 'scope', 'decision', 'reviewer') 'scopedMapping'
+    $mappingId = Get-SjqString $Map 'mappingId' 'scopedMapping' $script:SjqIdPattern
+    if ((Get-SjqString $Map 'jobId' 'scopedMapping') -cne [string]$Job['jobId'] -or (Get-SjqString $Map 'taskId' 'scopedMapping') -cne [string]$Job['plan']['taskId']) { Stop-SjqRefused 'SCOPED_MAPPING_MISMATCH' 'identity' }
+    if (-not (Test-SjqRefEqual (Get-SjqRef $Map['terminalRef'] 'scopedMapping.terminalRef') $Job['terminal']['ref'])) { Stop-SjqRefused 'SCOPED_MAPPING_MISMATCH' 'terminalRef' }
+    $mapPins = Get-SjqPins $Map 'candidatePins' 'scopedMapping' @($Job['ownedPaths'])
+    if ((ConvertTo-SjqCanonical $mapPins) -cne (ConvertTo-SjqCanonical $Pins)) { Stop-SjqRefused 'SCOPED_MAPPING_MISMATCH' 'candidatePins' }
+    if ([string](Get-SjqSourceHead $Map 'scopedMapping') -cne [string]$Head) { Stop-SjqRefused 'SCOPED_MAPPING_MISMATCH' 'sourceHead' }
+    if ((Get-SjqString $Map 'scope' 'scopedMapping') -cne 'SOURCE_ONLY_SCOPED_OFFLINE') { Stop-SjqRefused 'SCOPED_MAPPING_SCOPE' }
+    $decision = Get-SjqString $Map 'decision' 'scopedMapping'
+    $expectedDecision = if ($Kind -ceq 'DELIVERED') { 'SOURCE_ACCEPTED' } else { $Kind }
+    if ($decision -cne $expectedDecision) { Stop-SjqRefused 'SCOPED_MAPPING_DECISION' "$decision/$Kind" }
+    if ((Get-SjqString $Map 'reviewer' 'scopedMapping') -cne $Reviewer) { Stop-SjqRefused 'SCOPED_MAPPING_MISMATCH' 'reviewer' }
+    $original = Get-SjqRef $Map['originalReviewRef'] 'scopedMapping.originalReviewRef'
+    $originalBytes = Get-SjqPinnedBytes $original.path $original.sha256 'scopedMapping.originalReviewRef'
+    if ($decision -ceq 'SOURCE_ACCEPTED') {
+        # The original review keeps its own scoped schema/decision and needs no root PASS, but a root outcome that
+        # records a known failed/not-run required check can never back an acceptance.
+        try { $originalDoc = ConvertFrom-SjqJsonBytes $originalBytes 'originalReview' } catch { $originalDoc = $null }
+        if ($originalDoc -is [System.Collections.IDictionary]) {
+            $originalCounts = Get-SjqVerdictCounts $originalDoc 'scopedMapping.originalReviewRef' -IgnoreUnknownStrings
+            if ($originalCounts.Failure -gt 0) { Stop-SjqRefused 'SCOPED_MAPPING_RESULT_FAILED' 'originalReviewRef' }
+        }
+    }
+    $results =Get-SjqList $Map 'resultRefs' 'scopedMapping'
+    if ($results.Count -eq 0) { Stop-SjqRefused 'EMPTY_LIST' 'scopedMapping.resultRefs' }
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($item in $results) {
+        $result = Get-SjqRef $item 'scopedMapping.resultRefs'
+        if (-not $seen.Add("$($result.path)|$($result.sha256)")) { Stop-SjqRefused 'DUPLICATE_ITEM' 'scopedMapping.resultRefs' }
+        $resultBytes = Get-SjqPinnedBytes $result.path $result.sha256 'scopedMapping.resultRefs'
+        # An acceptance needs executable results that positively say success through the small set of typed ROOT
+        # indicators; a hash or a non-empty file proves nothing. Rejection/failure decisions are not checked here.
+        if ($decision -ceq 'SOURCE_ACCEPTED') {
+            try { $parsed = ConvertFrom-SjqJsonBytes $resultBytes 'result' } catch { Stop-SjqRefused 'SCOPED_MAPPING_RESULT_UNSUPPORTED' 'resultRefs' }
+            if ($parsed -isnot [System.Collections.IDictionary]) { Stop-SjqRefused 'SCOPED_MAPPING_RESULT_UNSUPPORTED' 'resultRefs' }
+            $counts = Get-SjqVerdictCounts $parsed 'scopedMapping.resultRefs'
+            if ($counts.Failure -gt 0 -and $counts.Success -gt 0) { Stop-SjqRefused 'SCOPED_MAPPING_RESULT_CONFLICT' 'resultRefs' }
+            if ($counts.Failure -gt 0) { Stop-SjqRefused 'SCOPED_MAPPING_RESULT_FAILED' 'resultRefs' }
+            if ($counts.Success -eq 0) { Stop-SjqRefused 'SCOPED_MAPPING_RESULT_UNSUPPORTED' 'resultRefs' }
+        }
+    }
+    [ordered]@{ variant = 'SOURCE_ONLY_SCOPED_MAPPING'; mappingId = $mappingId; originalReviewRef = $original; scope = 'SOURCE_ONLY_SCOPED_OFFLINE' }
+}
+
+# Returns the scoped-mapping info when that variant was used, otherwise $null (legacy IndependentComponentReview/v1).
+function Assert-SjqReviewReceipt($Ref, [string]$Kind, [string]$Reviewer, $Head, $Job, $Pins) {
+    $bytes = Get-SjqPinnedBytes $Ref.path $Ref.sha256 'reviewRef'
+    try { $probe = ConvertFrom-SjqJsonBytes $bytes 'review' } catch { $probe = $null }
+    if (($probe -is [System.Collections.IDictionary]) -and (Test-SjqHasKey $probe 'schema') -and ($probe['schema'] -ceq 'SourceJobScopedReviewMapping/v1')) {
+        return (Assert-SjqScopedMapping $probe $Ref $Kind $Reviewer $Head $Job $Pins)
+    }
+    if ($Kind -ceq 'SOURCE_ACCEPTED') {
+        $review = ConvertFrom-SjqJsonBytes $bytes 'review'
+        if ((Get-SjqString $review 'schema' 'review') -cne 'IndependentComponentReview/v1') { Stop-SjqRefused 'REVIEW_SCHEMA' }
+        if ((Get-SjqString $review 'decision' 'review') -cne 'ACCEPT_SCOPED_SOURCE') { Stop-SjqRefused 'REVIEW_DECISION' }
+        if ((Get-SjqString $review 'typecheck' 'review') -cne 'PASS' -or (Get-SjqString $review 'build' 'review') -cne 'PASS') { Stop-SjqRefused 'REVIEW_CHECKS' }
+        if (-not (Test-SjqHasKey $review 'focusedTests') -or $null -eq $review['focusedTests']) { Stop-SjqRefused 'MISSING_KEY' 'review.focusedTests' }
+        if ((Get-SjqBool $review 'ciRequiredBeforeDelivery' 'review') -ne $true) { Stop-SjqRefused 'REVIEW_CHECKS' 'ciRequiredBeforeDelivery' }
+        $commit = Get-SjqString $review 'commit' 'review' $script:SjqSha40Pattern
+        if ($null -ne $Head -and $commit -cne $Head) { Stop-SjqRefused 'REVIEW_HEAD_MISMATCH' }
+        if ((Get-SjqString $review 'reviewer' 'review') -cne $Reviewer) { Stop-SjqRefused 'REVIEW_REVIEWER_MISMATCH' }
+        return
+    }
+    # A rejection/failure diagnosis is opaque, but it may not be a structured acceptance in disguise.
+    try { $parsed = ConvertFrom-SjqJsonBytes $bytes 'review' } catch { return }
+    if (($parsed -is [System.Collections.IDictionary]) -and (Test-SjqHasKey $parsed 'decision') -and ($parsed['decision'] -ceq 'ACCEPT_SCOPED_SOURCE') -and $Kind -cne 'DELIVERED') {
+        Stop-SjqRefused 'REVIEW_CONTRADICTS_KIND' $Kind
+    }
+}
+
+function Assert-SjqDeliveryReceipt($Ref, [string]$Head, $Accepted, $DeliveredMapping) {
+    $d = Get-SjqEvidenceJson $Ref 'delivery'
+    if ((Get-SjqString $d 'schema' 'delivery') -cne 'IndependentDeliveryReceipt/v1') { Stop-SjqRefused 'DELIVERY_SCHEMA' }
+    if ($null -ne $DeliveredMapping) {
+        # Source-only variant: the actual typed receipt (PR, head, merge, CI) linked to the reviewed delivery verdict.
+        # Source-only evidence never claims activation or continuous-owner acceptance, so both must be explicit false.
+        Assert-SjqKeys $d @('schema', 'pr', 'head', 'merge', 'mergedAt', 'checks', 'checksConclusion', 'componentVerdictSha256', 'operationalActivation', 'continuousOwnerAccepted') 'delivery'
+        $null = Get-SjqString $d 'pr' 'delivery'
+        if ((Get-SjqString $d 'head' 'delivery' $script:SjqSha40Pattern) -cne $Head) { Stop-SjqRefused 'DELIVERY_MISMATCH' 'head' }
+        $null = Get-SjqString $d 'merge' 'delivery' $script:SjqSha40Pattern
+        $null = ConvertTo-SjqUtc (Get-SjqString $d 'mergedAt' 'delivery') 'delivery.mergedAt'
+        if ((Get-SjqInt $d 'checks' 'delivery' 1) -lt 1) { Stop-SjqRefused 'DELIVERY_CHECKS' 'checks' }
+        if ((Get-SjqString $d 'checksConclusion' 'delivery') -cne 'ALL_SUCCESS') { Stop-SjqRefused 'DELIVERY_CHECKS' 'checksConclusion' }
+        if ((Get-SjqBool $d 'operationalActivation' 'delivery') -ne $false -or (Get-SjqBool $d 'continuousOwnerAccepted' 'delivery') -ne $false) { Stop-SjqRefused 'DELIVERY_CLAIMS' }
+        if ((Get-SjqString $d 'componentVerdictSha256' 'delivery' $script:SjqShaPattern) -cne [string]$DeliveredMapping['originalReviewRef']['sha256']) { Stop-SjqRefused 'DELIVERY_MISMATCH' 'componentVerdictSha256' }
+        return
+    }
+    if ((Get-SjqString $d 'head' 'delivery' $script:SjqSha40Pattern) -cne $Head) { Stop-SjqRefused 'DELIVERY_MISMATCH' 'head' }
+    $null = Get-SjqString $d 'merge' 'delivery' $script:SjqSha40Pattern
+    foreach ($key in 'pr', 'checks', 'focusedTests') {
+        if (-not (Test-SjqHasKey $d $key) -or $null -eq $d[$key] -or (($d[$key] -is [string]) -and [string]::IsNullOrWhiteSpace($d[$key]))) { Stop-SjqRefused 'DELIVERY_CHECKS' $key }
+    }
+    if ((Get-SjqString $d 'checksConclusion' 'delivery') -cne 'ALL_SUCCESS') { Stop-SjqRefused 'DELIVERY_CHECKS' 'checksConclusion' }
+    if ((Get-SjqString $d 'normalTypecheck' 'delivery') -cne 'PASS' -or (Get-SjqString $d 'normalBuild' 'delivery') -cne 'PASS') { Stop-SjqRefused 'DELIVERY_CHECKS' 'typecheck/build' }
+    if ((Get-SjqString $d 'sourceReviewSha256' 'delivery' $script:SjqShaPattern) -cne [string]$Accepted['reviewRef']['sha256']) { Stop-SjqRefused 'DELIVERY_MISMATCH' 'sourceReviewSha256' }
+}
+
+function Add-SjqDisposition($Queue, $Event, [string]$AtUtc) {
+    Assert-SjqKeys $Event @('schema', 'eventId', 'type', 'jobId', 'dispositionRef', 'dispositionAdmissionRef') 'event'
+    $job = Get-SjqExistingJob $Queue (Get-SjqString $Event 'jobId' 'event' $script:SjqIdPattern)
+    $state = [string]$job['state']
+    $review = Get-SjqReview $job
+    $dispositionRef = Get-SjqRef $Event['dispositionRef'] 'event.dispositionRef'
+    $admissionDocRef = Get-SjqRef $Event['dispositionAdmissionRef'] 'event.dispositionAdmissionRef'
+
+    $a = Get-SjqEvidenceJson $dispositionRef 'disposition'
+    Assert-SjqKeys $a @('schema', 'dispositionId', 'jobId', 'taskId', 'planRef', 'admissionRef', 'terminalRef', 'candidatePins', 'sourceHead', 'kind', 'reviewer', 'reviewRef', 'deliveryRef', 'candidateMappingRef') 'disposition'
+    if ((Get-SjqString $a 'schema' 'disposition') -cne 'SourceJobIndependentDisposition/v1') { Stop-SjqRefused 'DISPOSITION_SCHEMA' }
+    $dispositionId = Get-SjqString $a 'dispositionId' 'disposition' $script:SjqIdPattern
+    Assert-SjqTuple $a $job 'disposition'
+    $kind = Get-SjqString $a 'kind' 'disposition'
+    if (@('SOURCE_ACCEPTED', 'SOURCE_REJECTED', 'FAILED', 'DELIVERED') -cnotcontains $kind) { Stop-SjqRefused 'BAD_VALUE' 'disposition.kind' }
+    $owner = Get-SjqJobOwner $job
+    $reviewer = Get-SjqString $a 'reviewer' 'disposition' $script:SjqActorPattern
+    Assert-SjqIndependentActor $reviewer $job $owner 'disposition.reviewer'
+    $reviewRef = Get-SjqRef $a['reviewRef'] 'disposition.reviewRef'
+    $deliveryRef = Get-SjqNullableRef $a 'deliveryRef' 'disposition'
+    $mappingRef = Get-SjqNullableRef $a 'candidateMappingRef' 'disposition'
+    $head = Get-SjqSourceHead $a 'disposition'
+    $pins = Get-SjqPins $a 'candidatePins' 'disposition' @($job['ownedPaths'])
+
+    # The host-reviewed admission must restate exactly the same envelope; this module never issues it.
+    $b = Get-SjqEvidenceJson $admissionDocRef 'dispositionAdmission'
+    Assert-SjqKeys $b @('schema', 'admissionId', 'decision', 'reviewer', 'dispositionRef', 'jobId', 'taskId', 'planRef', 'admissionRef', 'terminalRef', 'candidatePins', 'sourceHead') 'dispositionAdmission'
+    if ((Get-SjqString $b 'schema' 'dispositionAdmission') -cne 'SourceJobDispositionAdmission/v1') { Stop-SjqRefused 'DISPOSITION_ADMISSION_SCHEMA' }
+    $null = Get-SjqString $b 'admissionId' 'dispositionAdmission' $script:SjqIdPattern
+    if ((Get-SjqString $b 'decision' 'dispositionAdmission') -cne 'ADMIT_SCOPED_SOURCE_DISPOSITION') { Stop-SjqRefused 'DISPOSITION_ADMISSION_DECISION' }
+    Assert-SjqIndependentActor (Get-SjqString $b 'reviewer' 'dispositionAdmission' $script:SjqActorPattern) $job $owner 'dispositionAdmission.reviewer'
+    if (-not (Test-SjqRefEqual (Get-SjqRef $b['dispositionRef'] 'dispositionAdmission.dispositionRef') $dispositionRef)) { Stop-SjqRefused 'DISPOSITION_ADMISSION_MISMATCH' 'dispositionRef' }
+    Assert-SjqTuple $b $job 'dispositionAdmission'
+    $bPins = Get-SjqPins $b 'candidatePins' 'dispositionAdmission' @($job['ownedPaths'])
+    if ((ConvertTo-SjqCanonical $bPins) -cne (ConvertTo-SjqCanonical $pins)) { Stop-SjqRefused 'DISPOSITION_ADMISSION_MISMATCH' 'candidatePins' }
+    if ([string](Get-SjqSourceHead $b 'dispositionAdmission') -cne [string]$head) { Stop-SjqRefused 'DISPOSITION_ADMISSION_MISMATCH' 'sourceHead' }
+
+    # Kind and state must agree; a rejected or failed review never upgrades itself to acceptance.
+    switch -CaseSensitive ($kind) {
+        'FAILED' {
+            if (@('FAILED', 'REFUSED', 'RECONCILIATION_REQUIRED') -cnotcontains $state -or $null -ne $review['disposition']) { Stop-SjqRefused 'STATE_KIND_MISMATCH' "$state/$kind" }
+        }
+        { $_ -ceq 'SOURCE_ACCEPTED' -or $_ -ceq 'SOURCE_REJECTED' } {
+            if ($state -cne 'REVIEW_REQUIRED') { Stop-SjqRefused 'STATE_KIND_MISMATCH' "$state/$kind" }
+            if ($null -eq $review['handoff']) { Stop-SjqRefused 'NO_HANDOFF_ACK' ([string]$job['jobId']) }
+        }
+        'DELIVERED' {
+            if ($state -cne 'SOURCE_REVIEW_ACCEPTED') { Stop-SjqRefused 'STATE_KIND_MISMATCH' "$state/$kind" }
+        }
+    }
+
+    $terminalPins = Get-SjqTerminalPins $job
+    $terminalCanon = ConvertTo-SjqCanonical $terminalPins
+    if ($kind -ceq 'DELIVERED') {
+        if ($null -eq $deliveryRef) { Stop-SjqRefused 'DELIVERY_REF_REQUIRED' }
+        if ($null -eq $head) { Stop-SjqRefused 'SOURCE_HEAD_REQUIRED' }
+    }
+    elseif ($null -ne $deliveryRef -or $null -ne $mappingRef) { Stop-SjqRefused 'DELIVERY_REF_NOT_ALLOWED' $kind }
+
+    if ($null -eq $mappingRef) {
+        if ((ConvertTo-SjqCanonical $pins) -cne $terminalCanon) { Stop-SjqRefused 'CANDIDATE_MISMATCH' 'disposition' }
+    }
+    else {
+        # The only supported normalization: an independently reviewed from->to pin mapping anchored to the immutable terminal.
+        $f = Get-SjqEvidenceJson $mappingRef 'mapping'
+        Assert-SjqKeys $f @('schema', 'mappingId', 'jobId', 'taskId', 'terminalRef', 'fromPins', 'toPins', 'sourceHead', 'reviewRef', 'reviewer') 'mapping'
+        if ((Get-SjqString $f 'schema' 'mapping') -cne 'SourceJobCandidateMapping/v1') { Stop-SjqRefused 'MAPPING_SCHEMA' }
+        $null = Get-SjqString $f 'mappingId' 'mapping' $script:SjqIdPattern
+        if ((Get-SjqString $f 'jobId' 'mapping') -cne [string]$job['jobId'] -or (Get-SjqString $f 'taskId' 'mapping') -cne [string]$job['plan']['taskId']) { Stop-SjqRefused 'MAPPING_MISMATCH' 'identity' }
+        if (-not (Test-SjqRefEqual (Get-SjqRef $f['terminalRef'] 'mapping.terminalRef') $job['terminal']['ref'])) { Stop-SjqRefused 'MAPPING_MISMATCH' 'terminalRef' }
+        $from = Get-SjqPins $f 'fromPins' 'mapping' @($job['ownedPaths'])
+        $to = Get-SjqPins $f 'toPins' 'mapping' @($job['ownedPaths'])
+        if ((ConvertTo-SjqCanonical $from) -cne $terminalCanon) { Stop-SjqRefused 'MAPPING_MISMATCH' 'fromPins' }
+        if ((ConvertTo-SjqCanonical $to) -cne (ConvertTo-SjqCanonical $pins)) { Stop-SjqRefused 'MAPPING_MISMATCH' 'toPins' }
+        if ((ConvertTo-SjqCanonical $from) -ceq (ConvertTo-SjqCanonical $to)) { Stop-SjqRefused 'MAPPING_NOT_NEEDED' }
+        if ([string](Get-SjqSourceHead $f 'mapping') -cne [string]$head) { Stop-SjqRefused 'MAPPING_MISMATCH' 'sourceHead' }
+        $mappingReview = Get-SjqRef $f['reviewRef'] 'mapping.reviewRef'
+        $null = Get-SjqPinnedBytes $mappingReview.path $mappingReview.sha256 'mapping.reviewRef'
+        Assert-SjqIndependentActor (Get-SjqString $f 'reviewer' 'mapping' $script:SjqActorPattern) $job $owner 'mapping.reviewer'
+    }
+
+    $scoped = Assert-SjqReviewReceipt $reviewRef $kind $reviewer $head $job $pins
+    if ($kind -ceq 'DELIVERED') {
+        $accepted = $review['disposition']
+        if ($null -eq $accepted -or [string]$accepted['kind'] -cne 'SOURCE_ACCEPTED') { Stop-SjqRefused 'STATE_KIND_MISMATCH' 'no accepted source review' }
+        # The scoped variant is all-or-nothing across the chain: a mapped acceptance needs a mapped delivery verdict.
+        if (($null -ne $accepted['scopedMapping']) -ne ($null -ne $scoped)) { Stop-SjqRefused 'REVIEW_VARIANT_MISMATCH' }
+        Assert-SjqDeliveryReceipt $deliveryRef $head $accepted $scoped
+    }
+    # Candidate bytes are rechecked here, under the lease, immediately before the index is replaced.
+    if ($kind -ceq 'SOURCE_ACCEPTED' -or $kind -ceq 'DELIVERED') {
+        foreach ($pin in $pins) {
+            if (-not [IO.File]::Exists($pin.path)) { Stop-SjqRefused 'CANDIDATE_DRIFT' $pin.path }
+            if ((Get-SjqStreamedDigest $pin.path 'candidate').Sha256 -cne $pin.sha256) { Stop-SjqRefused 'CANDIDATE_DRIFT' $pin.path }
+        }
+    }
+
+    $handoff = $review['handoff']
+    $record = [ordered]@{
+        dispositionId = $dispositionId; kind = $kind; reviewer = $reviewer; ref = $dispositionRef; admissionRef = $admissionDocRef; reviewRef = $reviewRef
+        deliveryRef = $deliveryRef; candidateMappingRef = $mappingRef; scopedMapping = $scoped; candidatePins = $pins; sourceHead = $head; eventId = Get-SjqString $Event 'eventId' 'event'
+        evidenceMode = $(if (($handoff -is [System.Collections.IDictionary]) -and $handoff['mock'] -eq $true) { 'HANDOFF_MOCK_NOT_LIVE' } else { 'NOT_MOCK_LABELLED' })
+    }
+    $history = [Collections.Generic.List[object]]::new()
+    foreach ($earlier in @($review['history'])) { $history.Add($earlier) }
+    $history.Add($record)
+    $review['history'] = $history.ToArray()
+    $review['disposition'] = $record
+    switch -CaseSensitive ($kind) {
+        'FAILED' { $job['notice'] = 'FAILURE_DISPOSITIONED_AWAITING_RELEASE' }
+        'SOURCE_ACCEPTED' { $job['state'] = 'SOURCE_REVIEW_ACCEPTED'; $job['notice'] = 'SOURCE_REVIEW_ACCEPTED_PENDING_DELIVERY_NOT_FACTORY_COMPLETE' }
+        'SOURCE_REJECTED' { $job['state'] = 'SOURCE_REJECTED'; $job['notice'] = 'SOURCE_REJECTED_AWAITING_RELEASE' }
+        'DELIVERED' { $job['state'] = 'DELIVERED_PENDING_RELEASE'; $job['notice'] = 'DELIVERED_AWAITING_SEPARATE_RELEASE' }
+    }
+    [string]$job['jobId']
+}
+
+function Add-SjqRelease($Queue, $Event, [string]$AtUtc) {
+    Assert-SjqKeys $Event @('schema', 'eventId', 'type', 'jobId', 'releaseRef') 'event'
+    $job = Get-SjqExistingJob $Queue (Get-SjqString $Event 'jobId' 'event' $script:SjqIdPattern)
+    $state = [string]$job['state']
+    $review = Get-SjqReview $job
+    $disposition = $review['disposition']
+    if ($null -eq $disposition) { Stop-SjqRefused 'RELEASE_WITHOUT_DISPOSITION' ([string]$job['jobId']) }
+    $releaseRef = Get-SjqRef $Event['releaseRef'] 'event.releaseRef'
+    $e = Get-SjqEvidenceJson $releaseRef 'release'
+    Assert-SjqKeys $e @('schema', 'releaseId', 'jobId', 'taskId', 'planRef', 'admissionRef', 'terminalRef', 'dispositionRef', 'dispositionAdmissionRef', 'ownedPaths', 'reviewer', 'releasedUtc') 'release'
+    if ((Get-SjqString $e 'schema' 'release') -cne 'SourceJobOwnershipRelease/v1') { Stop-SjqRefused 'RELEASE_SCHEMA' }
+    $releaseId = Get-SjqString $e 'releaseId' 'release' $script:SjqIdPattern
+    Assert-SjqTuple $e $job 'release'
+    if (-not (Test-SjqRefEqual (Get-SjqRef $e['dispositionRef'] 'release.dispositionRef') $disposition['ref'])) { Stop-SjqRefused 'RELEASE_LINKAGE' 'dispositionRef' }
+    if (-not (Test-SjqRefEqual (Get-SjqRef $e['dispositionAdmissionRef'] 'release.dispositionAdmissionRef') $disposition['admissionRef'])) { Stop-SjqRefused 'RELEASE_LINKAGE' 'dispositionAdmissionRef' }
+    $paths = Get-SjqPathList $e 'ownedPaths' 'release'
+    if ((ConvertTo-SjqSortedKey $paths) -cne (ConvertTo-SjqSortedKey ([string[]]@($job['ownedPaths'])))) { Stop-SjqRefused 'RELEASE_PATHS_MISMATCH' }
+    $reviewer = Get-SjqString $e 'reviewer' 'release' $script:SjqActorPattern
+    Assert-SjqIndependentActor $reviewer $job (Get-SjqJobOwner $job) 'release.reviewer'
+    $releasedUtc = Get-SjqString $e 'releasedUtc' 'release'
+    $null = ConvertTo-SjqUtc $releasedUtc 'release.releasedUtc'
+
+    if ($state -ceq 'DELIVERED_PENDING_RELEASE') { $newState = 'DELIVERED_RELEASED'; $notice = 'DELIVERED_RELEASED_SOURCE_ONLY_NOT_FACTORY_COMPLETE' }
+    elseif ($state -ceq 'SOURCE_REVIEW_ACCEPTED') { Stop-SjqRefused 'RELEASE_BEFORE_DELIVERY' }
+    elseif (@('FAILED', 'REFUSED', 'RECONCILIATION_REQUIRED', 'SOURCE_REJECTED') -ccontains $state) { $newState = 'RELEASED_FAILED'; $notice = 'RELEASED_FAILED_FREES_PATHS_NEVER_SUCCESS' }
+    else { Stop-SjqRefused 'RELEASE_STATE' $state }
+
+    $job['state'] = $newState
+    $job['notice'] = $notice
+    $review['release'] = [ordered]@{ releaseId = $releaseId; ref = $releaseRef; reviewer = $reviewer; releasedUtc = $releasedUtc; releasedFrom = $state; dispositionKind = [string]$disposition['kind']; eventId = Get-SjqString $Event 'eventId' 'event' }
+    [string]$job['jobId']
+}
+
 # ---------- public API ----------
 
 function Invoke-SourceJobQueueEvent {
@@ -610,6 +1060,10 @@ function Invoke-SourceJobQueueEvent {
             'REGISTER_SOURCE_JOB' { $jobId = Add-SjqRegistration $queue $evt $AtUtc }
             'OBSERVED_START' { $jobId = Add-SjqObservedStart $queue $evt $AtUtc }
             'OBSERVED_TERMINAL' { $jobId = Add-SjqObservedTerminal $queue $evt $AtUtc }
+            'REVIEW_INTENT' { $jobId = Add-SjqReviewIntent $queue $evt $AtUtc }
+            'REVIEW_HANDOFF_ACK' { $jobId = Add-SjqReviewAck $queue $evt $AtUtc }
+            'SOURCE_DISPOSITION' { $jobId = Add-SjqDisposition $queue $evt $AtUtc }
+            'SOURCE_OWNERSHIP_RELEASE' { $jobId = Add-SjqRelease $queue $evt $AtUtc }
             default { Stop-SjqRefused 'UNKNOWN_EVENT_TYPE' $type }
         }
         $queue['events'][$eventId] = $ExpectedEventSha256
@@ -625,8 +1079,14 @@ function Get-SjqSkipReasons($Queue, $Job, [DateTimeOffset]$At) {
     $reasons = [Collections.Generic.List[string]]::new()
     $state = [string]$Job['state']
     if ($state -cne 'SOURCE_PREPARED') { $reasons.Add("STATE_$state"); return , $reasons.ToArray() }
-    # No event in this core can accept a job, so a dependency never resolves here.
-    foreach ($dependency in $Job['dependsOn']) { $reasons.Add("UNRESOLVED_DEPENDENCY:$dependency") }
+    # Only a verified source delivery followed by its separate release satisfies a dependency. Missing,
+    # pending, review, uncertain, unreleased and failed-released dependencies all keep blocking.
+    foreach ($dependency in $Job['dependsOn']) {
+        $dependencyJob = if ($Queue['jobs'].Contains([string]$dependency)) { $Queue['jobs'][[string]$dependency] } else { $null }
+        $dependencyState = if ($null -eq $dependencyJob) { '' } else { [string]$dependencyJob['state'] }
+        if ($dependencyState -cne 'DELIVERED_RELEASED') { $reasons.Add("UNRESOLVED_DEPENDENCY:$dependency") }
+        if ($dependencyState -ceq 'RELEASED_FAILED') { $reasons.Add("DEPENDENCY_FAILED_RELEASED:$dependency") }
+    }
     if ($At -ge (ConvertTo-SjqUtc $Job['admission']['expiresUtc'] 'expiresUtc')) { $reasons.Add('REFRESH_REQUIRED:ADMISSION_EXPIRED') }
     try {
         $null = Get-SjqPinnedBytes $Job['plan']['ref']['path'] $Job['plan']['ref']['sha256'] 'planRef'

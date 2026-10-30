@@ -21,3 +21,8 @@ jobs:
         run: |
           pwsh -NoProfile -File (Join-Path $env:GITHUB_WORKSPACE 'tests/orchestration/supervised-source-job.tests.ps1')
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify source owner review and batch progression
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File (Join-Path $env:GITHUB_WORKSPACE 'tests/orchestration/source-job-owner.tests.ps1')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
