@@ -311,7 +311,7 @@ Test-Step 'Invalid, missing or mis-bound request/admission/closure/content/proof
 }
 
 Test-Step 'Non-canonical or reparse paths refuse before any effect' {
-  $c=New-Case; $o=New-Op $c -Req @{canonicalPath=($c.canonical.Replace('canonical.json','.\canonical.json'))}
+  $c=New-Case; $o=New-Op $c -Req @{canonicalPath=($c.canonical.Replace('canonical.json',('.'+[IO.Path]::DirectorySeparatorChar+'canonical.json')))}
   $r=Invoke-Commit $o; Assert-Eq $r.status 'REFUSED' 'dotted path status'; Assert-Eq $r.code 'PATH_INVALID' 'dotted path code'; Assert-NoEffects $o 'dotted path'
   $probe=Join-Path $Ev 'probe-link'
   $can=$true; try{New-DirLink $probe (Join-Path $Ev 'probe-target-missing')}catch{$can=$false}
