@@ -32,3 +32,6 @@
 
 /scripts/github/commit-canonical-lifecycle-update.ps1 text eol=lf
 /tests/github/canonical-lifecycle-update-commit.tests.ps1 text eol=lf
+
+scripts/github/commit-canonical-lifecycle-complete.ps1 text eol=lf
+tests/github/canonical-lifecycle-complete-commit.tests.ps1 text eol=lf
