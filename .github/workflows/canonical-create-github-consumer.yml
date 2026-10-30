@@ -1,0 +1,18 @@
+name: Canonical CREATE GitHub consumer
+on:
+  pull_request:
+  push:
+permissions:
+  contents: read
+jobs:
+  canonical-create-github-consumer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: "false"
+      - name: Verify CREATE GitHub consumer offline
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File (Join-Path $env:GITHUB_WORKSPACE 'tests/github/canonical-create-github-consumer.tests.ps1') -SourcePath $env:GITHUB_WORKSPACE -EvidenceRoot (Join-Path $env:RUNNER_TEMP 'canonical-create-github-consumer')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

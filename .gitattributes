@@ -38,3 +38,6 @@ tests/github/canonical-lifecycle-complete-commit.tests.ps1 text eol=lf
 
 /scripts/github/enqueue-canonical-lifecycle-create.ps1 text eol=lf
 /tests/github/canonical-create-enqueue.tests.ps1 text eol=lf
+
+/scripts/github/consume-canonical-create-github.ps1 text eol=lf
+/tests/github/canonical-create-github-consumer.tests.ps1 text eol=lf
