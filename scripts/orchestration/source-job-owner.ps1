@@ -78,11 +78,12 @@ function Get-SjoJob([string]$IndexPath, [string]$JobId) {
     $null
 }
 
-# A file still being written by the launcher is held without sharing, so it is simply not ready yet.
+# A file still being written by the launcher is held without sharing, so it is simply not ready yet. The probe
+# itself shares read access so it never denies a concurrent read-only owner hashing the same evidence.
 function Test-SjoReadyFile([string]$Path) {
     if (-not [IO.File]::Exists($Path)) { return $false }
     try {
-        $stream = [IO.File]::Open($Path, 'Open', 'Read', 'None')
+        $stream = [IO.File]::Open($Path, 'Open', 'Read', 'Read')
         try { return ($stream.Length -gt 0) } finally { $stream.Dispose() }
     }
     catch { return $false }
